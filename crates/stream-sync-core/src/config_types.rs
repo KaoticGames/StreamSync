@@ -209,7 +209,11 @@ pub fn normalize_display_mode(raw: &str) -> String {
 }
 
 pub fn normalize_popup_duration(raw: u32) -> u32 {
-    if raw == 0 { 8 } else { raw }
+    if raw == 0 {
+        8
+    } else {
+        raw
+    }
 }
 
 fn default_popup_duration() -> u32 {

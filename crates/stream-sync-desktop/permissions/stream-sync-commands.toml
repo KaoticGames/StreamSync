@@ -4,6 +4,7 @@ description = "Stream Sync desktop invoke commands"
 commands.allow = [
   "get_overlay_base_url",
   "get_overlay_port",
+  "get_control_capability",
   "open_external",
   "open_logs_folder",
   "open_discord",

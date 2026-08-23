@@ -2,8 +2,8 @@
 
 use crate::broadcast::FeedHub;
 use crate::config_types::{
-    DelegatedSessionFile, DockConfigFile, EventsDockConfig, EventsOverlayConfigFile,
-    KickTokenFile, OverlayConfigFile, TwitchActiveMode, TwitchActiveModeFile, TwitchTokenFile,
+    DelegatedSessionFile, DockConfigFile, EventsDockConfig, EventsOverlayConfigFile, KickTokenFile,
+    OverlayConfigFile, TwitchActiveMode, TwitchActiveModeFile, TwitchTokenFile,
 };
 use crate::storage::{self, StoragePaths};
 use std::collections::HashMap;
@@ -70,6 +70,8 @@ pub struct AppState {
     pub personal_kick: RwLock<KickTokenFile>,
     pub kick: RwLock<KickRuntime>,
     pub kick_feed_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
+    /// Per-installation localhost control capability (privileged routes + control socket).
+    control_token: String,
 }
 
 impl AppState {
@@ -97,14 +99,15 @@ impl AppState {
 
         let overlay_server_dir = repo_root.join("overlay-server");
 
-        let mut dock = storage::read_json_or_default(&paths.dock_config, &DockConfigFile::default())?;
-        dock.profiles.entry("chat-default".into()).or_insert_with(|| {
-            crate::config_types::DockProfile {
+        let mut dock =
+            storage::read_json_or_default(&paths.dock_config, &DockConfigFile::default())?;
+        dock.profiles
+            .entry("chat-default".into())
+            .or_insert_with(|| crate::config_types::DockProfile {
                 font_size: 13,
                 show_timestamps: true,
                 show_badges: true,
-            }
-        });
+            });
         let mut events_dock = EventsDockConfig::default();
         if let Some(ed) = dock.events_dock.take() {
             events_dock.font_size = ed.font_size;
@@ -130,10 +133,8 @@ impl AppState {
             &EventsOverlayConfigFile::default(),
         )?;
 
-        let personal = storage::read_json_or_default(
-            &paths.twitch_tokens,
-            &TwitchTokenFile::default(),
-        )?;
+        let personal =
+            storage::read_json_or_default(&paths.twitch_tokens, &TwitchTokenFile::default())?;
         let delegated = if paths.twitch_delegated.is_file() {
             storage::read_json_or_default(&paths.twitch_delegated, &DelegatedSessionFile::default())
                 .ok()
@@ -166,11 +167,11 @@ impl AppState {
             TwitchActiveMode::Local => personal.clone(),
         };
 
-        let personal_kick = storage::read_json_or_default(
-            &paths.kick_tokens,
-            &KickTokenFile::default(),
-        )?;
+        let personal_kick =
+            storage::read_json_or_default(&paths.kick_tokens, &KickTokenFile::default())?;
         let live_kick = live_kick_tokens(active_mode, delegated.as_ref(), &personal_kick);
+        let control_token =
+            crate::control_plane::load_or_create_control_token(&paths.control_token)?;
 
         Ok(Arc::new(Self {
             paths: paths.clone(),
@@ -199,7 +200,12 @@ impl AppState {
                 connected: false,
             }),
             kick_feed_handle: RwLock::new(None),
+            control_token,
         }))
+    }
+
+    pub fn control_token(&self) -> &str {
+        &self.control_token
     }
 
     pub async fn save_dock(&self) -> anyhow::Result<()> {
@@ -380,10 +386,7 @@ mod tests {
 
     #[test]
     fn align_localhost_redirect_port_rewrites_port() {
-        let out = align_localhost_redirect_port(
-            "http://localhost:4040/auth/twitch/callback",
-            4041,
-        );
+        let out = align_localhost_redirect_port("http://localhost:4040/auth/twitch/callback", 4041);
         assert_eq!(out, "http://localhost:4041/auth/twitch/callback");
     }
 

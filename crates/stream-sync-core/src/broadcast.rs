@@ -6,10 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-pub type WsSender = futures_util::stream::SplitSink<
-    axum::extract::ws::WebSocket,
-    Message,
->;
+pub type WsSender = futures_util::stream::SplitSink<axum::extract::ws::WebSocket, Message>;
 
 #[derive(Clone, Default)]
 pub struct FeedHub {

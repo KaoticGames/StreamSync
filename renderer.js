@@ -36,11 +36,32 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function patchIntegrationUrlInputs() {
     const base = OVERLAY_BASE_URL;
+
+    async function privilegedDockUrl(path) {
+      let token = window.STREAMSYNC_CONTROL_TOKEN || "";
+      if (!token && window.electronAPI?.getControlCapability) {
+        try {
+          token = await window.electronAPI.getControlCapability();
+          if (token) window.STREAMSYNC_CONTROL_TOKEN = token;
+        } catch (_) {}
+      }
+      if (!token) return `${base}${path}`;
+      return `${base}${path}#control=${encodeURIComponent(token)}`;
+    }
+
+    const tasks = [];
     document.querySelectorAll("[data-overlay-url-kind]").forEach((el) => {
       const kind = el.getAttribute("data-overlay-url-kind");
       const profile =
         el.getAttribute("data-overlay-profile") || "chat-default";
-      if (kind === "chat-dock") el.value = `${base}/dock/chat`;
+      if (kind === "chat-dock") {
+        tasks.push(privilegedDockUrl("/dock/chat").then((url) => { el.value = url; }));
+        return;
+      }
+      if (kind === "kick-chat-dock") {
+        tasks.push(privilegedDockUrl("/dock/kick-chat").then((url) => { el.value = url; }));
+        return;
+      }
       if (kind === "chat-overlay") {
         el.value = `${base}/overlay/chat?profile=${encodeURIComponent(profile)}`;
       }
@@ -50,11 +71,11 @@ document.addEventListener("DOMContentLoaded", () => {
           el.getAttribute("data-overlay-profile") || "default"
         )}`;
       }
-      if (kind === "kick-chat-dock") el.value = `${base}/dock/kick-chat`;
       if (kind === "kick-chat-overlay") el.value = `${base}/overlay/kick-chat`;
       if (kind === "kick-events-dock") el.value = `${base}/dock/kick-events`;
       if (kind === "kick-events-overlay") el.value = `${base}/overlay/kick-events`;
     });
+    return Promise.all(tasks);
   }
 
   // Map top-level views to their HTML partials
@@ -92,7 +113,7 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!res.ok) throw new Error(`HTTP ${res.status} loading ${path}`);
       const html = await res.text();
       appRoot.innerHTML = html;
-      patchIntegrationUrlInputs();
+      await patchIntegrationUrlInputs();
 
       // Run per-view init
       switch (viewName) {
@@ -292,7 +313,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (!res.ok) throw new Error(`HTTP ${res.status} loading ${path}`);
         const html = await res.text();
         subviewContainer.innerHTML = html;
-        patchIntegrationUrlInputs();
+        await patchIntegrationUrlInputs();
 
         // Run per-subview init
         const profileId =

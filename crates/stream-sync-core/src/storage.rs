@@ -35,8 +35,7 @@ pub fn rust_workspace_root() -> PathBuf {
 
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for _ in 0..8 {
-        if dir.join("Cargo.toml").is_file()
-            && dir.join("crates").join("stream-sync-core").is_dir()
+        if dir.join("Cargo.toml").is_file() && dir.join("crates").join("stream-sync-core").is_dir()
         {
             return dir;
         }
@@ -50,7 +49,8 @@ pub fn rust_workspace_root() -> PathBuf {
 
 /// UI/static asset root (`shell.html`, `overlay-server/`) — workspace root in dev, Tauri bundle when packaged.
 pub fn resolve_ui_assets_root() -> PathBuf {
-    if let Ok(r) = std::env::var("STREAMSYNC_UI_ROOT").or_else(|_| std::env::var("STREAMSYNC_REPO_ROOT"))
+    if let Ok(r) =
+        std::env::var("STREAMSYNC_UI_ROOT").or_else(|_| std::env::var("STREAMSYNC_REPO_ROOT"))
     {
         let trimmed = r.trim();
         if !trimmed.is_empty() {
@@ -125,6 +125,8 @@ pub struct StoragePaths {
     pub fonts_dir: PathBuf,
     /// Local copies of events alert media (`/events-media/...`).
     pub events_media_dir: PathBuf,
+    /// Per-installation localhost control capability.
+    pub control_token: PathBuf,
 }
 
 fn looks_like_asar(p: &Path) -> bool {
@@ -170,21 +172,22 @@ pub fn user_data_root() -> Result<PathBuf> {
 pub fn get_paths() -> Result<StoragePaths> {
     let root = user_data_root()?;
 
-    let dock_config = env_path("STREAMSYNC_DOCK_CONFIG")
-        .unwrap_or_else(|| root.join("dock-config.json"));
-    let overlay_config = env_path("STREAMSYNC_OVERLAY_CONFIG")
-        .unwrap_or_else(|| root.join("overlay-config.json"));
+    let dock_config =
+        env_path("STREAMSYNC_DOCK_CONFIG").unwrap_or_else(|| root.join("dock-config.json"));
+    let overlay_config =
+        env_path("STREAMSYNC_OVERLAY_CONFIG").unwrap_or_else(|| root.join("overlay-config.json"));
     let events_overlay_config = env_path("STREAMSYNC_EVENTS_OVERLAY_CONFIG")
         .unwrap_or_else(|| root.join("events-overlay-config.json"));
-    let twitch_tokens = env_path("STREAMSYNC_TOKENS_FILE")
-        .unwrap_or_else(|| root.join("twitch-tokens.json"));
-    let kick_tokens = env_path("STREAMSYNC_KICK_TOKENS_FILE")
-        .unwrap_or_else(|| root.join("kick-tokens.json"));
+    let twitch_tokens =
+        env_path("STREAMSYNC_TOKENS_FILE").unwrap_or_else(|| root.join("twitch-tokens.json"));
+    let kick_tokens =
+        env_path("STREAMSYNC_KICK_TOKENS_FILE").unwrap_or_else(|| root.join("kick-tokens.json"));
     let twitch_delegated = root.join("twitch-delegated.json");
     let twitch_active_mode = root.join("twitch-active-mode.json");
     let fonts_dir = env_path("STREAMSYNC_FONTS_DIR").unwrap_or_else(|| root.join("fonts"));
     let events_media_dir =
         env_path("STREAMSYNC_EVENTS_MEDIA_DIR").unwrap_or_else(|| root.join("events-media"));
+    let control_token = root.join("control-token.txt");
 
     let tokens_dir = root.join("tokens");
     fs::create_dir_all(&tokens_dir).ok();
@@ -204,6 +207,7 @@ pub fn get_paths() -> Result<StoragePaths> {
         twitch_active_mode,
         fonts_dir,
         events_media_dir,
+        control_token,
     })
 }
 

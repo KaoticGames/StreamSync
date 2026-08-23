@@ -102,7 +102,8 @@ async fn ws_ping_pong_contract() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let mut saw_pong = false;
     while std::time::Instant::now() < deadline {
-        let msg = match tokio::time::timeout(std::time::Duration::from_millis(500), ws.next()).await {
+        let msg = match tokio::time::timeout(std::time::Duration::from_millis(500), ws.next()).await
+        {
             Ok(Some(Ok(m))) => m,
             _ => break,
         };

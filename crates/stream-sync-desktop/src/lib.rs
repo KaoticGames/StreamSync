@@ -5,8 +5,8 @@ mod paths;
 use commands::AppState;
 use overlay::{spawn_overlay_server, wait_for_health};
 use paths::{legacy_user_data_dir, resolve_ui_assets_root};
-use stream_sync_core::rust_workspace_root;
 use std::time::Duration;
+use stream_sync_core::rust_workspace_root;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -18,7 +18,8 @@ use tracing_subscriber::EnvFilter;
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::from_default_env().add_directive("stream_sync_desktop_lib=info".parse().unwrap()),
+            EnvFilter::from_default_env()
+                .add_directive("stream_sync_desktop_lib=info".parse().unwrap()),
         )
         .init();
 
@@ -127,6 +128,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_overlay_base_url,
             commands::get_overlay_port,
+            commands::get_control_capability,
             commands::open_external,
             commands::open_logs_folder,
             commands::open_discord,

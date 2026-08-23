@@ -14,6 +14,27 @@
 
   let cachedPort = 4040;
   let cachedBase = "http://127.0.0.1:4040";
+  let controlTokenPromise = null;
+
+  async function ensureControlCapability(invoke) {
+    if (window.STREAMSYNC_CONTROL_TOKEN) {
+      return window.STREAMSYNC_CONTROL_TOKEN;
+    }
+    if (!controlTokenPromise) {
+      controlTokenPromise = invoke("get_control_capability")
+        .then((token) => {
+          if (token) {
+            window.STREAMSYNC_CONTROL_TOKEN = String(token);
+          }
+          return window.STREAMSYNC_CONTROL_TOKEN || "";
+        })
+        .catch((e) => {
+          console.warn("[tauri-bridge] control capability:", e);
+          return "";
+        });
+    }
+    return controlTokenPromise;
+  }
 
   function installElectronApi(invoke) {
     if (!invoke || window.electronAPI) return;
@@ -35,6 +56,7 @@
     }
 
     refreshOverlayInfo();
+    ensureControlCapability(invoke);
 
     window.streamSyncOverlay = {
       get port() {
@@ -101,6 +123,7 @@
     window.electronAPI = {
       getOverlayBaseUrl: () => cachedBase,
       getOverlayPort: () => cachedPort,
+      getControlCapability: () => ensureControlCapability(invoke),
       isExternalOverlayServer: () => false,
       openExternal: (url) => invoke("open_external", { url }),
       openLogsFolder: () => invoke("open_logs_folder"),

@@ -5,8 +5,8 @@ use crate::storage::{self, StoragePaths};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -249,7 +249,10 @@ impl SeClient {
     }
 
     pub async fn list_overlays(&self) -> Result<Vec<SeOverlaySummary>> {
-        if let Ok(list) = self.try_list_overlays_endpoint(&format!("{SE_API_BASE}overlays")).await {
+        if let Ok(list) = self
+            .try_list_overlays_endpoint(&format!("{SE_API_BASE}overlays"))
+            .await
+        {
             if !list.is_empty() {
                 return Ok(list);
             }
@@ -275,10 +278,7 @@ impl SeClient {
 
     pub async fn fetch_overlay_json(&self, overlay_id: &str) -> Result<Value> {
         let urls = [
-            format!(
-                "{SE_API_BASE}overlays/{}/{}",
-                self.account_id, overlay_id
-            ),
+            format!("{SE_API_BASE}overlays/{}/{}", self.account_id, overlay_id),
             format!("{SE_API_BASE}overlays/{}", overlay_id),
         ];
         let mut last_err = None;
@@ -369,7 +369,10 @@ fn parse_overlay_list(body: &Value) -> Vec<SeOverlaySummary> {
                             || v.get("_id").is_some()
                             || v.get("id").is_some()
                         {
-                            Some(ListItem::Keyed { key: k.as_str(), value: v })
+                            Some(ListItem::Keyed {
+                                key: k.as_str(),
+                                value: v,
+                            })
                         } else {
                             None
                         }
@@ -431,10 +434,7 @@ pub fn map_overlay_to_profile(overlay: &Value) -> (String, Value, Vec<String>) {
 
     let mut profile = default_events_overlay_profile();
     if let Some(obj) = profile.as_object_mut() {
-        obj.insert(
-            "profileName".into(),
-            json!(format!("SE: {overlay_name}")),
-        );
+        obj.insert("profileName".into(), json!(format!("SE: {overlay_name}")));
     }
 
     let stage_scale = StageScale::from_overlay(overlay);
@@ -564,7 +564,8 @@ fn map_widget(
     if let Some(host_cfg) = vars.get("host") {
         if se_event_cfg_enabled(host_cfg) {
             warnings.push(
-                "Skipped deprecated Twitch host alert (host is no longer supported by Twitch).".into(),
+                "Skipped deprecated Twitch host alert (host is no longer supported by Twitch)."
+                    .into(),
             );
         }
     }
@@ -592,7 +593,8 @@ fn map_widget(
 
     if events.is_empty() {
         warnings.push(
-            "Alert box found but no enabled SE events were mapped (check event toggles in SE).".into(),
+            "Alert box found but no enabled SE events were mapped (check event toggles in SE)."
+                .into(),
         );
     }
 }
@@ -613,7 +615,11 @@ const SE_EVENT_KEYS: &[(&str, &str)] = &[
 /// Stream Sync variation trigger: mode, numeric value, optional tier (1–3).
 type VariationTrigger = (String, Option<u64>, Option<u64>);
 
-fn push_event_variation(events: &mut serde_json::Map<String, Value>, ss_key: &str, variation: Value) {
+fn push_event_variation(
+    events: &mut serde_json::Map<String, Value>,
+    ss_key: &str,
+    variation: Value,
+) {
     let entry = events
         .entry(ss_key.to_string())
         .or_insert_with(|| json!({ "variations": [] }));
@@ -1079,14 +1085,8 @@ fn extract_visual_url(cfg: &Value) -> String {
 
 fn extract_audio(cfg: &Value) -> (String, u64) {
     if let Some(audio) = cfg.get("audio").and_then(|v| v.as_object()) {
-        let src = audio
-            .get("src")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let vol = audio
-            .get("volume")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1.0);
+        let src = audio.get("src").and_then(|v| v.as_str()).unwrap_or("");
+        let vol = audio.get("volume").and_then(|v| v.as_f64()).unwrap_or(1.0);
         let vol_pct = (vol * 100.0).round().clamp(0.0, 100.0) as u64;
         if src.starts_with("http") {
             return (src.to_string(), vol_pct);
@@ -1410,8 +1410,7 @@ fn safe_media_basename(url: &str) -> String {
 fn extension_for_media(url: &str, content_type: &str) -> &'static str {
     let path = url.split('?').next().unwrap_or(url).to_lowercase();
     for ext in [
-        ".webm", ".mp4", ".mp3", ".wav", ".ogg", ".gif", ".png", ".jpg", ".jpeg", ".webp",
-        ".svg",
+        ".webm", ".mp4", ".mp3", ".wav", ".ogg", ".gif", ".png", ".jpg", ".jpeg", ".webp", ".svg",
     ] {
         if path.ends_with(ext) {
             return ext;
@@ -1449,12 +1448,13 @@ fn uniquify_filename(dir: &Path, filename: &str) -> String {
         return filename.to_string();
     }
     let path = Path::new(filename);
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("media");
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("media");
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    let suffix = if ext.is_empty() { String::new() } else { format!(".{ext}") };
+    let suffix = if ext.is_empty() {
+        String::new()
+    } else {
+        format!(".{ext}")
+    };
     for i in 2..1000 {
         let candidate = format!("{stem}-{i}{suffix}");
         if !dir.join(&candidate).exists() {
@@ -1475,16 +1475,15 @@ mod tests {
             "https://cdn.streamelements.com/static/upload/alert.png"
         ));
         assert!(!should_localize_url("/events-media/profile/alert.png"));
-        assert!(!should_localize_url("http://127.0.0.1:4040/events-media/x.png"));
+        assert!(!should_localize_url(
+            "http://127.0.0.1:4040/events-media/x.png"
+        ));
         assert!(!should_localize_url(""));
     }
 
     #[test]
     fn se_template_replaces_placeholders() {
-        assert_eq!(
-            se_template_to_ss("{{name}} followed!"),
-            "[name] followed!"
-        );
+        assert_eq!(se_template_to_ss("{{name}} followed!"), "[name] followed!");
     }
 
     #[test]
@@ -1497,7 +1496,9 @@ mod tests {
         let overlay: Value = serde_json::from_str(&raw).expect("json");
         let (pid, profile, _) = map_overlay_to_profile(&overlay);
         assert!(pid.starts_with("se-my-alerts-"));
-        assert!(profile.pointer("/events/follow/variations/0/message").is_some());
+        assert!(profile
+            .pointer("/events/follow/variations/0/message")
+            .is_some());
     }
 
     #[test]
@@ -1534,7 +1535,9 @@ mod tests {
             profile.pointer("/stage/h").and_then(|v| v.as_u64()),
             Some(720)
         );
-        let img = profile.pointer("/events/follow/variations/0/placement/image").unwrap();
+        let img = profile
+            .pointer("/events/follow/variations/0/placement/image")
+            .unwrap();
         let x = img.get("x").and_then(|v| v.as_f64()).unwrap();
         let w = img.get("w").and_then(|v| v.as_f64()).unwrap();
         assert!(x < 1280.0, "x should be on 720p stage, got {x}");
@@ -1677,15 +1680,21 @@ mod tests {
             .expect("gift variations");
         assert_eq!(gift_vars.len(), 2);
         assert_eq!(
-            gift_vars[0].pointer("/trigger/mode").and_then(|v| v.as_str()),
+            gift_vars[0]
+                .pointer("/trigger/mode")
+                .and_then(|v| v.as_str()),
             Some("exact")
         );
         assert_eq!(
-            gift_vars[1].pointer("/trigger/mode").and_then(|v| v.as_str()),
+            gift_vars[1]
+                .pointer("/trigger/mode")
+                .and_then(|v| v.as_str()),
             Some("min")
         );
         assert_eq!(
-            gift_vars[1].pointer("/trigger/value").and_then(|v| v.as_u64()),
+            gift_vars[1]
+                .pointer("/trigger/value")
+                .and_then(|v| v.as_u64()),
             Some(5)
         );
         let raid_msg = profile
@@ -1722,7 +1731,10 @@ mod tests {
         });
         let (pid, profile, warnings) = map_overlay_to_profile(&overlay);
         assert!(pid.starts_with("se-my-alerts-"));
-        assert!(profile.get("events").and_then(|e| e.get("follow")).is_some());
+        assert!(profile
+            .get("events")
+            .and_then(|e| e.get("follow"))
+            .is_some());
         assert!(warnings.is_empty() || !warnings.is_empty());
     }
 }

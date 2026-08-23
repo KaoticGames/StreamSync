@@ -1,7 +1,7 @@
 // Twitch connect/disconnect via overlay-server HTTP API.
 // Works in Tauri (external localhost webview), Electron, and browser dev without IPC.
 (function (global) {
-  const SCRIPT_VERSION = "dual-conn-2";
+  const SCRIPT_VERSION = "control-plane-1";
   console.log("[connections-api] loaded", SCRIPT_VERSION);
 
   function overlayBase() {
@@ -14,9 +14,24 @@
     return "http://127.0.0.1:4040";
   }
 
-  async function fetchAuthUrl() {
+  function privilegedHeaders(extra) {
+    const headers = Object.assign({ "Content-Type": "application/json" }, extra || {});
+    if (global.STREAMSYNC_CONTROL_TOKEN) {
+      headers["x-streamsync-control"] = global.STREAMSYNC_CONTROL_TOKEN;
+    }
+    return headers;
+  }
+
+  async function privilegedFetch(path, options) {
     const base = overlayBase();
-    const res = await fetch(`${base}/api/twitch/auth-url`, { cache: "no-store" });
+    const opts = Object.assign({}, options || {});
+    const headers = privilegedHeaders(opts.headers || {});
+    opts.headers = headers;
+    return fetch(`${base}${path}`, opts);
+  }
+
+  async function fetchAuthUrl() {
+    const res = await privilegedFetch("/api/twitch/auth-url", { method: "GET", headers: {} });
     if (!res.ok) {
       const data = await res.json().catch(() => null);
       const detail =
@@ -56,11 +71,7 @@
   }
 
   async function disconnect() {
-    const base = overlayBase();
-    const res = await fetch(`${base}/api/twitch/disconnect`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    });
+    const res = await privilegedFetch("/api/twitch/disconnect", { method: "POST" });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       throw new Error(`Disconnect failed: HTTP ${res.status} ${text}`.trim());
@@ -68,8 +79,7 @@
   }
 
   async function kickFetchAuthUrl() {
-    const base = overlayBase();
-    const res = await fetch(`${base}/api/kick/auth-url`, { cache: "no-store" });
+    const res = await privilegedFetch("/api/kick/auth-url", { method: "GET", headers: {} });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.url) {
       throw new Error(data.error || data.message || `Kick auth URL failed: HTTP ${res.status}`);
@@ -86,11 +96,7 @@
   }
 
   async function kickDisconnect() {
-    const base = overlayBase();
-    const res = await fetch(`${base}/api/kick/disconnect`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    });
+    const res = await privilegedFetch("/api/kick/disconnect", { method: "POST" });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       throw new Error(`Kick disconnect failed: HTTP ${res.status} ${text}`.trim());
@@ -98,10 +104,8 @@
   }
 
   async function useConnection(mode) {
-    const base = overlayBase();
-    const res = await fetch(`${base}/api/twitch/use-connection`, {
+    const res = await privilegedFetch("/api/twitch/use-connection", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mode: String(mode || "").trim() }),
     });
     const data = await res.json().catch(() => ({}));
@@ -112,10 +116,8 @@
   }
 
   async function removeConnection(mode) {
-    const base = overlayBase();
-    const res = await fetch(`${base}/api/twitch/remove-connection`, {
+    const res = await privilegedFetch("/api/twitch/remove-connection", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mode: String(mode || "").trim() }),
     });
     const data = await res.json().catch(() => ({}));
@@ -128,9 +130,8 @@
   async function connectWithKey(key) {
     const base = overlayBase();
     console.log("[connections-api] POST connection-key →", base);
-    const res = await fetch(`${base}/api/twitch/connection-key`, {
+    const res = await privilegedFetch("/api/twitch/connection-key", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ key: String(key || "").trim() }),
     });
     const data = await res.json().catch(() => ({}));
@@ -197,10 +198,8 @@
   }
 
   async function seSaveSession(accountId, jwt) {
-    const base = overlayBase();
-    const res = await fetch(`${base}/api/streamelements/session`, {
+    const res = await privilegedFetch("/api/streamelements/session", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ accountId, jwt }),
     });
     const data = await res.json().catch(() => ({}));
@@ -209,8 +208,7 @@
   }
 
   async function seDisconnect() {
-    const base = overlayBase();
-    const res = await fetch(`${base}/api/streamelements/session`, { method: "DELETE" });
+    const res = await privilegedFetch("/api/streamelements/session", { method: "DELETE", headers: {} });
     if (!res.ok) throw new Error(`Disconnect failed: HTTP ${res.status}`);
     return res.json().catch(() => ({}));
   }

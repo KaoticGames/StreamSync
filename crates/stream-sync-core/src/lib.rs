@@ -6,13 +6,14 @@
 mod app_state;
 mod broadcast;
 mod config_types;
+mod control_plane;
 mod export;
+mod kick;
 mod routes;
 mod storage;
 mod streamelements;
 mod syndicate_connection;
 mod twitch;
-mod kick;
 
 pub use streamelements::{
     clear_session as se_clear_session, load_session as se_load_session, map_overlay_to_profile,
@@ -22,6 +23,10 @@ pub use streamelements::{
 
 pub use app_state::AppState;
 pub use config_types::*;
+pub use control_plane::{
+    authorize_privileged, control_plane_middleware, cors_layer, route_policy, RoutePolicy,
+    CONTROL_TOKEN_HEADER, MEDIA_UPLOAD_BODY_LIMIT, PRIVILEGED_JSON_BODY_LIMIT,
+};
 pub use export::{build_backup_zip, BackupManifest};
 pub use storage::{
     bootstrap_twitch_env_from_rust, get_paths, is_stream_sync_ui_bundle, is_stream_sync_workspace,

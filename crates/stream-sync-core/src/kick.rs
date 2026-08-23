@@ -9,8 +9,8 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::{HashSet, VecDeque};
-use std::sync::{Mutex, OnceLock};
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -101,10 +101,7 @@ pub async fn maybe_autostart(state: Arc<AppState>) {
     sync_live_identity(state).await;
 }
 
-pub async fn apply_personal_bundle(
-    state: Arc<AppState>,
-    tokens: KickTokenFile,
-) -> Result<()> {
+pub async fn apply_personal_bundle(state: Arc<AppState>, tokens: KickTokenFile) -> Result<()> {
     if !tokens.is_linked() {
         return Err(anyhow!("Kick bundle missing access token or user id"));
     }
@@ -147,7 +144,9 @@ pub async fn redeem_stream_sync_code(state: Arc<AppState>, code: &str) -> Result
 }
 
 fn kick_file_from_redeem(body: &Value) -> Result<KickTokenFile> {
-    let kick = body.get("kick").ok_or_else(|| anyhow!("missing kick blob"))?;
+    let kick = body
+        .get("kick")
+        .ok_or_else(|| anyhow!("missing kick blob"))?;
     let access = kick
         .get("access_token")
         .and_then(|v| v.as_str())
@@ -155,7 +154,11 @@ fn kick_file_from_redeem(body: &Value) -> Result<KickTokenFile> {
         .ok_or_else(|| anyhow!("missing access_token"))?;
     let kick_id = kick
         .get("kick_id")
-        .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|n| n.to_string())))
+        .and_then(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+        })
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow!("missing kick_id"))?;
     let scopes = kick.get("scopes").and_then(|v| v.as_array()).map(|arr| {
@@ -407,12 +410,7 @@ async fn fanout_kick_event(state: &AppState, raw: Value) {
         }
         "sub_gift" => {
             let count = raw.get("count").cloned().unwrap_or(json!(1));
-            emit_alert(
-                state,
-                "gift",
-                json!({ "name": user, "amount": count }),
-            )
-            .await;
+            emit_alert(state, "gift", json!({ "name": user, "amount": count })).await;
             state
                 .feed
                 .broadcast_all(&make_platform_dock_event(
@@ -426,12 +424,7 @@ async fn fanout_kick_event(state: &AppState, raw: Value) {
         }
         "kicks" => {
             let amount = raw.get("amount").cloned().unwrap_or(json!(0));
-            emit_alert(
-                state,
-                "bits",
-                json!({ "name": user, "amount": amount }),
-            )
-            .await;
+            emit_alert(state, "bits", json!({ "name": user, "amount": amount })).await;
             state
                 .feed
                 .broadcast_all(&make_platform_dock_event(
@@ -444,7 +437,10 @@ async fn fanout_kick_event(state: &AppState, raw: Value) {
                 .await;
         }
         "redemption" => {
-            let title = raw.get("title").and_then(|v| v.as_str()).unwrap_or("Reward");
+            let title = raw
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Reward");
             let input = raw.get("user_input").and_then(|v| v.as_str()).unwrap_or("");
             let mut detail = format!("{title} — {user}");
             if !input.is_empty() {

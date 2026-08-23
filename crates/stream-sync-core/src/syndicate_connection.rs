@@ -112,11 +112,7 @@ async fn redeem(key: &str, action: &str) -> Result<ExchangeSuccess> {
         .into());
     }
 
-    let url = format!(
-        "{}/api/stream-sync/connection-keys/{}",
-        api_base(),
-        action
-    );
+    let url = format!("{}/api/stream-sync/connection-keys/{}", api_base(), action);
     let client = reqwest::Client::new();
     let res = client
         .post(&url)
@@ -133,7 +129,9 @@ async fn redeem(key: &str, action: &str) -> Result<ExchangeSuccess> {
         let parsed: ExchangeSuccess = serde_json::from_value(body)
             .map_err(|e| anyhow!("Invalid Syndicate exchange response: {e}"))?;
         if parsed.twitch.client_id.is_empty() || parsed.twitch.access_token.is_empty() {
-            return Err(anyhow!("Syndicate exchange missing client_id or access_token"));
+            return Err(anyhow!(
+                "Syndicate exchange missing client_id or access_token"
+            ));
         }
         return Ok(parsed);
     }
@@ -231,7 +229,10 @@ mod tests {
         let parsed: ExchangeSuccess = serde_json::from_value(body).unwrap();
         assert_eq!(parsed.channel.login, "channelname");
         assert_eq!(parsed.twitch.client_id, "cid");
-        assert_eq!(parsed.connection.label.as_deref(), Some("Saturday takeover"));
+        assert_eq!(
+            parsed.connection.label.as_deref(),
+            Some("Saturday takeover")
+        );
     }
 
     #[tokio::test]

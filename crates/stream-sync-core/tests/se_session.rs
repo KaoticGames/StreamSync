@@ -1,8 +1,6 @@
 //! StreamElements session file I/O (no live SE API).
 
-use stream_sync_core::{
-    get_paths, se_clear_session, se_load_session, se_save_session, SeSession,
-};
+use stream_sync_core::{get_paths, se_clear_session, se_load_session, se_save_session, SeSession};
 
 #[test]
 fn se_session_save_load_clear() {
@@ -23,7 +21,10 @@ fn se_session_save_load_clear() {
     };
     se_save_session(&paths, &session).expect("save");
     let loaded = se_load_session(&paths).expect("load");
-    assert_eq!(loaded.as_ref().map(|s| s.account_id.as_str()), Some("account123"));
+    assert_eq!(
+        loaded.as_ref().map(|s| s.account_id.as_str()),
+        Some("account123")
+    );
     se_clear_session(&paths).expect("clear");
     assert!(se_load_session(&paths).expect("load2").is_none());
 

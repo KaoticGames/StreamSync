@@ -45,6 +45,49 @@ pub fn get_overlay_port(state: State<'_, AppState>) -> u16 {
 }
 
 #[tauri::command]
+pub fn get_control_capability() -> Result<String, String> {
+    let paths = get_paths().map_err(|e| e.to_string())?;
+    let token = std::fs::read_to_string(&paths.control_token).map_err(|e| e.to_string())?;
+    let token = token.trim().to_string();
+    if token.len() < 32 {
+        return Err("control capability unavailable".into());
+    }
+    Ok(token)
+}
+
+fn read_control_token() -> Result<String, String> {
+    get_control_capability()
+}
+
+fn trusted_local_origin(port: u16) -> String {
+    format!("http://127.0.0.1:{port}")
+}
+
+async fn privileged_get(port: u16, path: &str) -> Result<reqwest::Response, String> {
+    let token = read_control_token()?;
+    reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}{path}"))
+        .header("Origin", trusted_local_origin(port))
+        .header("x-streamsync-control", token)
+        .send()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn privileged_post(port: u16, path: &str) -> Result<reqwest::Response, String> {
+    let token = read_control_token()?;
+    reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}{path}"))
+        .header("Origin", trusted_local_origin(port))
+        .header("x-streamsync-control", token)
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn open_external(app: AppHandle, url: String) -> Result<(), String> {
     app.opener()
         .open_url(url, None::<&str>)
@@ -80,9 +123,7 @@ async fn twitch_open_auth_url(port: u16) -> Result<(), String> {
 }
 
 async fn open_overlay_auth_url(port: u16, path: &str) -> Result<(), String> {
-    let res = reqwest::get(format!("http://127.0.0.1:{port}{path}"))
-        .await
-        .map_err(|e| e.to_string())?;
+    let res = privileged_get(port, path).await?;
     if !res.status().is_success() {
         return Err(format!("HTTP {}", res.status()));
     }
@@ -101,14 +142,7 @@ pub async fn kick_connect(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn twitch_disconnect(state: State<'_, AppState>) -> Result<(), String> {
-    let res = reqwest::Client::new()
-        .post(format!(
-            "http://127.0.0.1:{}/api/twitch/disconnect",
-            state.overlay_port
-        ))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let res = privileged_post(state.inner().overlay_port, "/api/twitch/disconnect").await?;
     if !res.status().is_success() {
         return Err(format!("HTTP {}", res.status()));
     }
@@ -130,10 +164,7 @@ pub fn purge_logs(state: State<'_, AppState>) -> Result<PurgeLogsResult, String>
             deleted += 1;
         }
     }
-    Ok(PurgeLogsResult {
-        ok: true,
-        deleted,
-    })
+    Ok(PurgeLogsResult { ok: true, deleted })
 }
 
 /// Opens StreamElements Account → Channels so the user can copy Account ID + JWT.
@@ -231,9 +262,10 @@ pub fn check_for_updates(app: AppHandle) -> Result<serde_json::Value, String> {
     let p = base64_url_json(&payload);
     let sig = sign_hmac_sha256(&secret, &p);
 
-    let mut url =
-        reqwest::Url::parse(&update_page).map_err(|e| e.to_string())?;
-    url.query_pairs_mut().append_pair("p", &p).append_pair("sig", &sig);
+    let mut url = reqwest::Url::parse(&update_page).map_err(|e| e.to_string())?;
+    url.query_pairs_mut()
+        .append_pair("p", &p)
+        .append_pair("sig", &sig);
 
     app.opener()
         .open_url(url.as_str(), None::<&str>)

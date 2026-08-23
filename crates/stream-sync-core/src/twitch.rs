@@ -67,7 +67,9 @@ pub fn token_expired(tokens: &TwitchTokenFile) -> bool {
 pub async fn ensure_valid_token(state: &AppState) -> Result<()> {
     let tw = state.twitch.read().await;
     if tw.tokens.access_token.is_none() {
-        return Err(anyhow!("No Twitch accessToken. Please connect Twitch first."));
+        return Err(anyhow!(
+            "No Twitch accessToken. Please connect Twitch first."
+        ));
     }
     if token_expired(&tw.tokens) {
         return Err(anyhow!("Twitch token expired. Please reconnect Twitch."));
@@ -122,7 +124,14 @@ pub async fn helix_get(state: &AppState, path: &str) -> Result<Value> {
 pub async fn helix_patch(state: &AppState, path: &str, body: Value) -> Result<Value> {
     ensure_valid_token(state).await?;
     let client_id = state.helix_client_id().await;
-    let token = state.twitch.read().await.tokens.access_token.clone().unwrap();
+    let token = state
+        .twitch
+        .read()
+        .await
+        .tokens
+        .access_token
+        .clone()
+        .unwrap();
     let res = reqwest::Client::new()
         .patch(format!("https://api.twitch.tv/helix{path}"))
         .header("Client-Id", &client_id)
@@ -142,7 +151,14 @@ pub async fn helix_patch(state: &AppState, path: &str, body: Value) -> Result<Va
 pub async fn helix_post(state: &AppState, path: &str, body: Value) -> Result<Value> {
     ensure_valid_token(state).await?;
     let client_id = state.helix_client_id().await;
-    let token = state.twitch.read().await.tokens.access_token.clone().unwrap();
+    let token = state
+        .twitch
+        .read()
+        .await
+        .tokens
+        .access_token
+        .clone()
+        .unwrap();
     let res = reqwest::Client::new()
         .post(format!("https://api.twitch.tv/helix{path}"))
         .header("Client-Id", &client_id)
@@ -171,9 +187,7 @@ pub async fn update_chat_settings(state: &AppState, partial: Value) -> Result<()
         .user_id
         .clone()
         .ok_or_else(|| anyhow!("Missing userId"))?;
-    let path = format!(
-        "/chat/settings?broadcaster_id={user_id}&moderator_id={user_id}"
-    );
+    let path = format!("/chat/settings?broadcaster_id={user_id}&moderator_id={user_id}");
     let _ = helix_patch(state, &path, partial).await?;
     Ok(())
 }
@@ -262,7 +276,9 @@ pub async fn get_merged_emotes(state: &AppState, services: &TwitchServices) -> R
             &user_id,
         );
     }
-    let user_emotes = fetch_all_user_emotes(state, &user_id).await.unwrap_or_default();
+    let user_emotes = fetch_all_user_emotes(state, &user_id)
+        .await
+        .unwrap_or_default();
     // User emotes carry Helix `owner_id` for subscribed / followed channels.
     add_emote_batch(
         &mut by_id,
@@ -333,14 +349,11 @@ fn add_emote_batch(
         let emote_type = emote.get("emote_type").and_then(|v| v.as_str());
         // Helix may return owner_id as "" or "0" for emotes without an owner — those
         // must not be queried via /users (they 400 the whole batch and wipe avatars).
-        let owner_id = emote
-            .get("owner_id")
-            .and_then(json_id_string)
-            .or_else(|| {
-                default_owner_id
-                    .filter(|id| is_usable_owner_id(id))
-                    .map(|s| s.to_string())
-            });
+        let owner_id = emote.get("owner_id").and_then(json_id_string).or_else(|| {
+            default_owner_id
+                .filter(|id| is_usable_owner_id(id))
+                .map(|s| s.to_string())
+        });
 
         let mut owner_type = default_owner_type.unwrap_or("unknown");
         if emote_type == Some("globals") {
@@ -494,7 +507,11 @@ async fn fetch_all_user_emotes(state: &AppState, user_id: &str) -> Result<Vec<Va
     Ok(all)
 }
 
-pub async fn apply_set_token(state: Arc<AppState>, services: Arc<TwitchServices>, body: Value) -> Result<()> {
+pub async fn apply_set_token(
+    state: Arc<AppState>,
+    services: Arc<TwitchServices>,
+    body: Value,
+) -> Result<()> {
     // Personal OAuth — keep any saved takeover session; just activate local.
     let access_token = body
         .get("accessToken")
@@ -517,14 +534,11 @@ pub async fn apply_set_token(state: Arc<AppState>, services: Arc<TwitchServices>
         obtainment_timestamp: Some(chrono::Utc::now().timestamp_millis()),
         login: login.clone(),
         user_id: user_id.clone(),
-        scopes: body
-            .get("scope")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
-                    .collect()
-            }),
+        scopes: body.get("scope").and_then(|v| v.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        }),
     };
     {
         *state.personal_tokens.write().await = tokens.clone();
@@ -551,7 +565,9 @@ pub async fn use_connection(
         TwitchActiveMode::Local => {
             let personal = state.personal_tokens.read().await.clone();
             if personal.access_token.is_none() || personal.login.is_none() {
-                return Err(anyhow!("No personal Twitch account saved. Connect with Twitch first."));
+                return Err(anyhow!(
+                    "No personal Twitch account saved. Connect with Twitch first."
+                ));
             }
             {
                 let mut tw = state.twitch.write().await;
@@ -565,12 +581,10 @@ pub async fn use_connection(
             crate::kick::sync_live_identity(state).await;
         }
         TwitchActiveMode::Delegated => {
-            let session = state
-                .delegated
-                .read()
-                .await
-                .clone()
-                .ok_or_else(|| anyhow!("No takeover connection key saved. Paste a key first."))?;
+            let session =
+                state.delegated.read().await.clone().ok_or_else(|| {
+                    anyhow!("No takeover connection key saved. Paste a key first.")
+                })?;
             {
                 let mut tw = state.twitch.write().await;
                 clear_live_runtime_fields(&mut tw);
@@ -982,10 +996,7 @@ async fn consume_connection_key_events(
         return Ok(true);
     }
     if !res.status().is_success() {
-        return Err(anyhow!(
-            "connection key watch HTTP {}",
-            res.status()
-        ));
+        return Err(anyhow!("connection key watch HTTP {}", res.status()));
     }
     let mut stream = res.bytes_stream();
     let mut buf = String::new();
@@ -1114,8 +1125,7 @@ async fn start_irc(state: Arc<AppState>, services: Arc<TwitchServices>) -> Resul
                     );
                 }
                 ServerMessage::Privmsg(msg) => {
-                    let is_self =
-                        msg.sender.login.eq_ignore_ascii_case(&broadcaster_login);
+                    let is_self = msg.sender.login.eq_ignore_ascii_case(&broadcaster_login);
                     if is_self {
                         store_broadcaster_user_state(
                             &state_irc,
@@ -1279,10 +1289,7 @@ async fn broadcast_outgoing_chat(state: &AppState, services: &TwitchServices, me
 
     let tw = state.twitch.read().await;
     let login = tw.tokens.login.clone().unwrap_or_default();
-    let display = tw
-        .display_name
-        .clone()
-        .unwrap_or_else(|| login.clone());
+    let display = tw.display_name.clone().unwrap_or_else(|| login.clone());
     let color = tw.name_color.clone();
     let badges: Vec<String> = tw.badges_raw.keys().cloned().collect();
     let badges_raw = tw
@@ -1318,8 +1325,7 @@ async fn resolve_outgoing_emotes(
     message: &str,
 ) -> Option<Value> {
     let list = get_merged_emotes(state, services).await.ok()?;
-    let mut by_name: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut by_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for emote in &list {
         let Some(name) = emote.get("name").and_then(|v| v.as_str()) else {
             continue;
@@ -1327,7 +1333,9 @@ async fn resolve_outgoing_emotes(
         let Some(id) = emote.get("id").and_then(|v| v.as_str()) else {
             continue;
         };
-        by_name.entry(name.to_string()).or_insert_with(|| id.to_string());
+        by_name
+            .entry(name.to_string())
+            .or_insert_with(|| id.to_string());
     }
     emotes_from_message_text(message, &by_name)
 }
@@ -1369,11 +1377,7 @@ fn emotes_from_message_text(
     }
 }
 
-async fn send_plain_chat(
-    state: &AppState,
-    services: &TwitchServices,
-    trimmed: &str,
-) -> Result<()> {
+async fn send_plain_chat(state: &AppState, services: &TwitchServices, trimmed: &str) -> Result<()> {
     let channel = state
         .twitch
         .read()
@@ -1391,11 +1395,7 @@ async fn send_plain_chat(
     Ok(())
 }
 
-async fn send_dock_privmsg(
-    state: &AppState,
-    services: &TwitchServices,
-    text: &str,
-) -> Result<()> {
+async fn send_dock_privmsg(state: &AppState, services: &TwitchServices, text: &str) -> Result<()> {
     let channel = state
         .twitch
         .read()
@@ -1426,7 +1426,9 @@ async fn handle_dock_command(
             if raw.is_none()
                 || raw == Some("0")
                 || raw.map(|r| r.eq_ignore_ascii_case("off")).unwrap_or(false)
-                || raw.map(|r| r.eq_ignore_ascii_case("disable")).unwrap_or(false)
+                || raw
+                    .map(|r| r.eq_ignore_ascii_case("disable"))
+                    .unwrap_or(false)
             {
                 update_chat_settings(&state, json!({ "slow_mode": false })).await?;
             } else {
@@ -1525,11 +1527,9 @@ pub fn format_gift_dock_detail(
     recipient: &str,
 ) -> String {
     let tn = twitch_tier_display_number(tier);
-    let qty = total.as_u64().or_else(|| {
-        total
-            .as_str()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-    });
+    let qty = total
+        .as_u64()
+        .or_else(|| total.as_str().and_then(|s| s.trim().parse::<u64>().ok()));
     if let Some(q) = qty {
         if let Some(n) = tn {
             return format!("{gifter} gifted {q} Tier {n} subs");
@@ -1558,8 +1558,16 @@ fn value_display_string(v: &Value) -> String {
 }
 
 pub fn normalize_event_variables(vars: &Value) -> Value {
-    let name = vars.get("name").or(vars.get("user")).and_then(|v| v.as_str()).unwrap_or("");
-    let user = vars.get("user").or(vars.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+    let name = vars
+        .get("name")
+        .or(vars.get("user"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let user = vars
+        .get("user")
+        .or(vars.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     json!({
         "user": user,
         "name": name,
@@ -1577,18 +1585,29 @@ pub fn normalize_event_variables(vars: &Value) -> Value {
 async fn handle_eventsub_notification(feed: &FeedHub, sub_type: &str, event: &Value) {
     match sub_type {
         "channel.follow" => {
-            let user = event.get("user_name").and_then(|v| v.as_str()).unwrap_or("");
-            feed
-                .broadcast_all(&json!({
-                    "type": "event-alert",
-                    "eventType": "follow",
-                    "data": { "variables": normalize_event_variables(&json!({ "name": user })) },
-                }))
-                .await;
-            feed.broadcast_all(&make_dock_event("follow", &format!("{user} followed"), Some("Follow"), None)).await;
+            let user = event
+                .get("user_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            feed.broadcast_all(&json!({
+                "type": "event-alert",
+                "eventType": "follow",
+                "data": { "variables": normalize_event_variables(&json!({ "name": user })) },
+            }))
+            .await;
+            feed.broadcast_all(&make_dock_event(
+                "follow",
+                &format!("{user} followed"),
+                Some("Follow"),
+                None,
+            ))
+            .await;
         }
         "channel.subscribe" => {
-            let user = event.get("user_name").and_then(|v| v.as_str()).unwrap_or("");
+            let user = event
+                .get("user_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let tier = event.get("tier").cloned().unwrap_or(Value::Null);
             feed
                 .broadcast_all(&json!({
@@ -1602,10 +1621,14 @@ async fn handle_eventsub_notification(feed: &FeedHub, sub_type: &str, event: &Va
                 &format_sub_dock_detail(user, &tier),
                 Some("Sub"),
                 None,
-            )).await;
+            ))
+            .await;
         }
         "channel.cheer" => {
-            let user = event.get("user_name").and_then(|v| v.as_str()).unwrap_or("");
+            let user = event
+                .get("user_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let bits = event.get("bits").cloned().unwrap_or(Value::Null);
             feed
                 .broadcast_all(&json!({
@@ -1619,16 +1642,23 @@ async fn handle_eventsub_notification(feed: &FeedHub, sub_type: &str, event: &Va
                 &format!("{user} cheered {bits}"),
                 Some("Bits"),
                 None,
-            )).await;
+            ))
+            .await;
         }
         "channel.subscription.message" => {
-            let user = event.get("user_name").and_then(|v| v.as_str()).unwrap_or("");
+            let user = event
+                .get("user_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let months = event
                 .get("cumulative_months")
                 .or_else(|| event.get("streak_months"))
                 .cloned()
                 .unwrap_or(Value::Null);
-            let msg = event.pointer("/message/text").and_then(|v| v.as_str()).unwrap_or("");
+            let msg = event
+                .pointer("/message/text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let tier = event.get("tier").cloned().unwrap_or(Value::Null);
             let vars = normalize_event_variables(&json!({
                 "name": user,
@@ -1636,13 +1666,12 @@ async fn handle_eventsub_notification(feed: &FeedHub, sub_type: &str, event: &Va
                 "input": msg,
                 "amount": tier,
             }));
-            feed
-                .broadcast_all(&json!({
-                    "type": "event-alert",
-                    "eventType": "resub",
-                    "data": { "variables": vars },
-                }))
-                .await;
+            feed.broadcast_all(&json!({
+                "type": "event-alert",
+                "eventType": "resub",
+                "data": { "variables": vars },
+            }))
+            .await;
             feed.broadcast_all(&make_dock_event(
                 "resub",
                 &format_resub_dock_detail(user, &months, &tier, msg),
@@ -1652,7 +1681,10 @@ async fn handle_eventsub_notification(feed: &FeedHub, sub_type: &str, event: &Va
             .await;
         }
         "channel.subscription.gift" => {
-            let gifter = event.get("user_name").and_then(|v| v.as_str()).unwrap_or("Anonymous");
+            let gifter = event
+                .get("user_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Anonymous");
             let recipient = event
                 .get("recipient_user_name")
                 .and_then(|v| v.as_str())
@@ -1665,13 +1697,12 @@ async fn handle_eventsub_notification(feed: &FeedHub, sub_type: &str, event: &Va
                 "amount": total,
                 "tier": tier,
             }));
-            feed
-                .broadcast_all(&json!({
-                    "type": "event-alert",
-                    "eventType": "gift",
-                    "data": { "variables": vars },
-                }))
-                .await;
+            feed.broadcast_all(&json!({
+                "type": "event-alert",
+                "eventType": "gift",
+                "data": { "variables": vars },
+            }))
+            .await;
             feed.broadcast_all(&make_dock_event(
                 "gift",
                 &format_gift_dock_detail(gifter, &total, &tier, recipient),
@@ -1709,7 +1740,10 @@ async fn handle_eventsub_notification(feed: &FeedHub, sub_type: &str, event: &Va
             .await;
         }
         "channel.channel_points_custom_reward_redemption.add" => {
-            let user = event.get("user_name").and_then(|v| v.as_str()).unwrap_or("");
+            let user = event
+                .get("user_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let title = event
                 .pointer("/reward/title")
                 .and_then(|v| v.as_str())
@@ -1777,21 +1811,13 @@ async fn eventsub_session(state: Arc<AppState>, feed: FeedHub) -> Result<()> {
         let message_type = parsed.metadata.message_type.as_str();
         match message_type {
             "session_welcome" => {
-                session_id = parsed
-                    .payload
-                    .session
-                    .as_ref()
-                    .and_then(|s| s.id.clone());
+                session_id = parsed.payload.session.as_ref().and_then(|s| s.id.clone());
                 if let Some(ref sid) = session_id {
                     subscribe_topics(&state, sid).await;
                 }
             }
             "session_reconnect" => {
-                session_id = parsed
-                    .payload
-                    .session
-                    .as_ref()
-                    .and_then(|s| s.id.clone());
+                session_id = parsed.payload.session.as_ref().and_then(|s| s.id.clone());
                 if let Some(ref sid) = session_id {
                     subscribe_topics(&state, sid).await;
                 }
@@ -1934,8 +1960,7 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
                             };
                             if has_delegated_tokens {
                                 restart_twitch_clients(state.clone(), services.clone()).await;
-                                start_delegated_refresh_loop(state.clone(), services.clone())
-                                    .await;
+                                start_delegated_refresh_loop(state.clone(), services.clone()).await;
                                 return;
                             }
                         }
@@ -1953,7 +1978,9 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
                             }
                         }
                         _ => {
-                            warn!("delegated refresh on launch failed: {api} — trying stored token");
+                            warn!(
+                                "delegated refresh on launch failed: {api} — trying stored token"
+                            );
                             if active == TwitchActiveMode::Delegated {
                                 let has_delegated_tokens = {
                                     let tw = state.twitch.read().await;

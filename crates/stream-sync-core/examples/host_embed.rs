@@ -4,7 +4,7 @@
 //! cargo run --example host_embed -p stream-sync-core
 //! ```
 
-use stream_sync_core::{OverlayConfig, OverlayServer, rust_workspace_root};
+use stream_sync_core::{rust_workspace_root, OverlayConfig, OverlayServer};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

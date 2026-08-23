@@ -717,6 +717,12 @@
       }
 
       let ws = null;
+      let controlWs = null;
+      let controlAuthenticated = false;
+      const controlToken = (() => {
+        const m = (window.location.hash || "").match(/^#control=(.+)$/);
+        return m ? decodeURIComponent(m[1]) : "";
+      })();
       const MAX_ITEMS = 500;
 
       let badgeImages = {};
@@ -1331,7 +1337,7 @@
         }
       }
 
-      function getWebSocketUrl() {
+      function getFeedWebSocketUrl() {
         const loc = window.location;
         const isSecure = loc.protocol === "https:";
         const wsProto = isSecure ? "wss:" : "ws:";
@@ -1340,8 +1346,17 @@
         return wsProto + "//" + host + "/ws/feed" + query;
       }
 
+      function getControlWebSocketUrl() {
+        const loc = window.location;
+        const isSecure = loc.protocol === "https:";
+        const wsProto = isSecure ? "wss:" : "ws:";
+        const host = loc.host;
+        const query = "?profile=" + encodeURIComponent(profileId);
+        return wsProto + "//" + host + "/ws/control" + query;
+      }
+
       function connectWebSocket() {
-        const url = getWebSocketUrl();
+        const url = getFeedWebSocketUrl();
         let socket;
         try {
           socket = new WebSocket(url);
@@ -1400,14 +1415,65 @@
         });
       }
 
+      function connectControlWebSocket() {
+        if (!controlToken) {
+          console.warn("[chat-dock] No control capability; chat send disabled (read-only feed).");
+          return;
+        }
+
+        const url = getControlWebSocketUrl();
+        let socket;
+        try {
+          socket = new WebSocket(url);
+        } catch (err) {
+          console.error("[chat-dock] Failed to open control WebSocket:", err);
+          return;
+        }
+
+        controlWs = socket;
+
+        socket.addEventListener("open", () => {
+          console.log("[chat-dock] Control WebSocket connected:", url);
+          socket.send(JSON.stringify({ type: "auth", token: controlToken }));
+        });
+
+        socket.addEventListener("message", (event) => {
+          try {
+            const payload = JSON.parse(event.data);
+            if (payload && payload.type === "auth-ok") {
+              controlAuthenticated = true;
+              console.log("[chat-dock] Control socket authenticated");
+              return;
+            }
+            if (payload && payload.type === "auth-failed") {
+              controlAuthenticated = false;
+              console.error("[chat-dock] Control socket auth failed");
+              socket.close();
+            }
+          } catch (err) {
+            console.error("[chat-dock] Failed to parse control WS message:", err);
+          }
+        });
+
+        socket.addEventListener("close", () => {
+          controlAuthenticated = false;
+          controlWs = null;
+          setTimeout(connectControlWebSocket, 2000);
+        });
+
+        socket.addEventListener("error", (err) => {
+          console.error("[chat-dock] Control WebSocket error:", err);
+        });
+      }
+
       function sendChatMessageFromDock(text) {
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        if (!controlWs || !controlAuthenticated || controlWs.readyState !== WebSocket.OPEN) return;
         const payload = {
           type: "chat-send",
           platform: DOCK_PLATFORM,
           message: text,
         };
-        ws.send(JSON.stringify(payload));
+        controlWs.send(JSON.stringify(payload));
       }
 
       function resetSuggestions() {
@@ -2216,6 +2282,7 @@
         await loadDockConfig(profileId);          // initial settings
         await Promise.all([loadBadges(), loadEmotes()]);
         connectWebSocket();                       // listen for chat + dock-config-updated
+        connectControlWebSocket();                // send chat when privileged URL provided
       }
 
       main().catch((err) => {
