@@ -1761,12 +1761,10 @@ async fn handle_eventsub_notification(feed: &FeedHub, sub_type: &str, event: &Va
                 detail.push_str(&format!(" ({c} pts)"));
             }
             // Channel points are dock-only — not routed through events overlays.
-            feed.broadcast_all(&make_dock_event(
-                "redeem",
-                &detail,
-                Some("Channel Points"),
-                None,
-            ))
+            feed.broadcast_profile(
+                "default",
+                &make_dock_event("redeem", &detail, Some("Channel Points"), None),
+            )
             .await;
         }
         _ => {}

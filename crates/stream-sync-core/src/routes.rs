@@ -34,6 +34,66 @@ pub struct ServerContext {
     pub twitch: Arc<TwitchServices>,
 }
 
+/// Route registrations maintained beside build_router, independently of security policy.
+pub const BUILD_ROUTER_ROUTE_IDS: &[(&str, &str)] = &[
+    ("GET", "/"),
+    ("GET", "/health"),
+    ("GET", "/api/status"),
+    ("GET", "/overlay/chat"),
+    ("GET", "/overlay/events"),
+    ("GET", "/overlay/kick-chat"),
+    ("GET", "/overlay/kick-events"),
+    ("GET", "/events-studio.html"),
+    ("GET", "/dock/chat"),
+    ("GET", "/dock/events"),
+    ("GET", "/dock/kick-chat"),
+    ("GET", "/dock/kick-events"),
+    ("GET", "/auth/twitch/callback"),
+    ("GET", "/auth/kick/callback"),
+    ("GET", "/auth/streamelements/callback"),
+    ("GET", "/config/:profile_id.json"),
+    ("POST", "/api/chat/dock-config"),
+    ("GET", "/api/events/dock-config"),
+    ("POST", "/api/events/dock-config"),
+    ("GET", "/api/chat/overlay-profiles"),
+    ("GET", "/api/chat/overlay-config"),
+    ("POST", "/api/chat/overlay-config"),
+    ("DELETE", "/api/chat/overlay-config"),
+    ("GET", "/api/twitch/auth-url"),
+    ("POST", "/api/twitch/set-token"),
+    ("POST", "/api/twitch/connection-key"),
+    ("POST", "/api/twitch/use-connection"),
+    ("POST", "/api/twitch/remove-connection"),
+    ("POST", "/api/twitch/disconnect"),
+    ("GET", "/api/kick/auth-url"),
+    ("POST", "/api/kick/redeem"),
+    ("POST", "/api/kick/disconnect"),
+    ("POST", "/api/kick/chat"),
+    ("GET", "/api/twitch/badges/all"),
+    ("GET", "/api/twitch/emotes/all"),
+    ("GET", "/api/events/overlay-profiles"),
+    ("GET", "/api/events/overlay-config"),
+    ("POST", "/api/events/overlay-config"),
+    ("DELETE", "/api/events/overlay-config"),
+    ("POST", "/api/events/test-alert"),
+    ("GET", "/api/streamelements/session"),
+    ("POST", "/api/streamelements/session"),
+    ("DELETE", "/api/streamelements/session"),
+    ("GET", "/api/streamelements/begin-login"),
+    ("GET", "/api/streamelements/overlays"),
+    ("POST", "/api/streamelements/import"),
+    ("POST", "/api/dock/issue-credential"),
+    ("POST", "/api/dock/revoke-credential"),
+    ("GET", "/ws/feed"),
+    ("GET", "/ws/control"),
+    ("GET", "/google-fonts.css"),
+    ("GET", "/google-fonts/file"),
+    ("GET", "/fonts/*"),
+    ("GET", "/events-media/*"),
+    ("POST", "/api/chat/upload-font"),
+    ("POST", "/api/events/upload-media"),
+];
+
 pub fn build_router(ctx: ServerContext) -> Router {
     let repo = ctx.state.repo_root.clone();
     let fonts = ctx.state.paths.fonts_dir.clone();
@@ -131,11 +191,49 @@ pub fn build_router(ctx: ServerContext) -> Router {
         ))
         .layer(middleware::from_fn_with_state(
             ctx.state.clone(),
+            csp_response_headers,
+        ))
+        .layer(middleware::from_fn_with_state(
+            ctx.state.clone(),
             control_plane::control_plane_middleware,
         ))
         .layer(DefaultBodyLimit::max(PRIVILEGED_JSON_BODY_LIMIT))
         .layer(cors_layer(ctx.state.port))
         .with_state(ctx)
+}
+
+async fn csp_response_headers(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+    let mut response = next.run(request).await;
+    let policy = if path.starts_with("/auth/") {
+        Some(
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+             connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+                .to_string(),
+        )
+    } else if !path.starts_with("/api/") && !path.starts_with("/ws/") {
+        Some(format!(
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; \
+             connect-src 'self' ws://127.0.0.1:{0} ws://localhost:{0}; \
+             img-src 'self' data: https:; font-src 'self' data:; media-src 'self'; \
+             object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+            state.port
+        ))
+    } else {
+        None
+    };
+    if let Some(policy) = policy {
+        if let Ok(value) = header::HeaderValue::from_str(&policy) {
+            response
+                .headers_mut()
+                .insert(header::CONTENT_SECURITY_POLICY, value);
+        }
+    }
+    response
 }
 
 async fn overlay_chat(State(ctx): State<ServerContext>) -> Response {
@@ -1187,14 +1285,42 @@ async fn get_auth_url(State(ctx): State<ServerContext>) -> Response {
     Json(json!({ "ok": true, "url": url, "flowNonce": flow_nonce })).into_response()
 }
 
-fn oauth_completion_allowed(
-    state: &AppState,
+struct OAuthCompletionReservation<'a> {
+    store: &'a crate::oauth_pending::PendingLoginStore,
+    provider: crate::oauth_pending::OAuthProvider,
+    nonce: String,
+    committed: bool,
+}
+
+impl OAuthCompletionReservation<'_> {
+    fn commit(mut self) -> Result<(), (StatusCode, Json<Value>)> {
+        self.store.commit(self.provider, &self.nonce).map_err(|e| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "ok": false, "error": e.as_str() })),
+            )
+        })?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for OAuthCompletionReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.store.release(self.provider, &self.nonce);
+        }
+    }
+}
+
+fn oauth_completion_allowed<'a>(
+    state: &'a AppState,
     headers: &HeaderMap,
     provider: crate::oauth_pending::OAuthProvider,
     body_nonce: Option<&str>,
-) -> Result<(), (StatusCode, Json<Value>)> {
+) -> Result<Option<OAuthCompletionReservation<'a>>, (StatusCode, Json<Value>)> {
     if control_plane::authorize_privileged(state, headers) {
-        return Ok(());
+        return Ok(None);
     }
     if !control_plane::origin_allowed_for_privileged(headers, state.port) {
         return Err((
@@ -1205,12 +1331,18 @@ fn oauth_completion_allowed(
     let nonce = control_plane::login_nonce_from_headers(headers)
         .or(body_nonce)
         .unwrap_or("");
-    state.pending_logins.consume(provider, nonce).map_err(|e| {
+    state.pending_logins.reserve(provider, nonce).map_err(|e| {
         (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "ok": false, "error": e.as_str() })),
         )
-    })
+    })?;
+    Ok(Some(OAuthCompletionReservation {
+        store: &state.pending_logins,
+        provider,
+        nonce: nonce.to_string(),
+        committed: false,
+    }))
 }
 
 async fn post_set_token(
@@ -1219,7 +1351,7 @@ async fn post_set_token(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let body_nonce = body.get("flowNonce").and_then(|v| v.as_str());
-    oauth_completion_allowed(
+    let reservation = oauth_completion_allowed(
         &ctx.state,
         &headers,
         crate::oauth_pending::OAuthProvider::Twitch,
@@ -1233,6 +1365,9 @@ async fn post_set_token(
                 Json(json!({ "ok": false, "error": e.to_string() })),
             )
         })?;
+    if let Some(reservation) = reservation {
+        reservation.commit()?;
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1358,21 +1493,29 @@ async fn post_kick_redeem(
     headers: HeaderMap,
     Json(body): Json<kick::KickRedeemBody>,
 ) -> Response {
-    if let Err(err) = oauth_completion_allowed(
+    let reservation = match oauth_completion_allowed(
         &ctx.state,
         &headers,
         crate::oauth_pending::OAuthProvider::Kick,
         body.flow_nonce.as_deref(),
     ) {
-        return err.into_response();
-    }
+        Ok(reservation) => reservation,
+        Err(err) => return err.into_response(),
+    };
     match kick::redeem_stream_sync_code(ctx.state.clone(), &body.code).await {
-        Ok(tokens) => Json(json!({
-            "ok": true,
-            "login": tokens.login,
-            "kickId": tokens.kick_id,
-        }))
-        .into_response(),
+        Ok(tokens) => {
+            if let Some(reservation) = reservation {
+                if let Err(err) = reservation.commit() {
+                    return err.into_response();
+                }
+            }
+            Json(json!({
+                "ok": true,
+                "login": tokens.login,
+                "kickId": tokens.kick_id,
+            }))
+            .into_response()
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "ok": false, "error": e.to_string() })),
@@ -1573,7 +1716,7 @@ async fn post_se_session(
     headers: HeaderMap,
     Json(body): Json<SeSessionBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    oauth_completion_allowed(
+    let reservation = oauth_completion_allowed(
         &ctx.state,
         &headers,
         crate::oauth_pending::OAuthProvider::StreamElements,
@@ -1608,6 +1751,9 @@ async fn post_se_session(
             Json(json!({ "ok": false, "error": "save_failed" })),
         )
     })?;
+    if let Some(reservation) = reservation {
+        reservation.commit()?;
+    }
     Ok(Json(json!({
         "ok": true,
         "connected": true,
@@ -1972,7 +2118,9 @@ async fn handle_ws_control(
     let sender = Arc::new(tokio::sync::RwLock::new(sender));
     let mut authenticated = false;
     let mut auth_platform = String::from("twitch");
-    let mut dock_mode = false;
+    let mut auth_token = String::new();
+    let mut registry_id = None;
+    let mut revocation_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>> = None;
 
     let auth_deadline = tokio::time::Instant::now()
         + std::time::Duration::from_millis(control_plane::WS_CONTROL_AUTH_TIMEOUT_MS);
@@ -1983,7 +2131,14 @@ async fn handle_ws_control(
             break;
         }
         let next = if authenticated {
-            receiver.next().await
+            tokio::select! {
+                message = receiver.next() => message,
+                _ = revocation_rx.as_mut().expect("authenticated socket has revocation receiver").recv() => {
+                    let mut s = sender.write().await;
+                    let _ = s.send(axum::extract::ws::Message::Close(None)).await;
+                    break;
+                }
+            }
         } else {
             match tokio::time::timeout(remaining, receiver.next()).await {
                 Ok(v) => v,
@@ -2006,32 +2161,22 @@ async fn handle_ws_control(
                     .get("platform")
                     .and_then(|v| v.as_str())
                     .unwrap_or("twitch");
-                let ok = if crate::dock_capability::DockCredentialStore::is_dock_token(token) {
-                    dock_mode = true;
-                    auth_platform = platform.to_string();
-                    ctx.state
+                let ok = crate::dock_capability::DockCredentialStore::is_dock_token(token)
+                    && ctx
+                        .state
                         .dock_credentials
-                        .authorize_chat_send(token, platform, &profile_id)
-                } else {
-                    dock_mode = false;
-                    // Master token on control socket is allowed only for same-install docks
-                    // that still use legacy until rotated; prefer dock credentials.
-                    control_plane::control_token_matches(ctx.state.control_token(), token)
-                };
+                        .authorize_chat_send(token, platform, &profile_id);
                 if ok {
                     authenticated = true;
-                    // Feed registration only after auth (and only for master-token sockets
-                    // that also want live feed). Dock-scoped sockets are send-only.
-                    if !dock_mode {
-                        ctx.state
-                            .feed
-                            .register(profile_id.clone(), sender.clone())
-                            .await;
-                    }
+                    auth_platform = platform.to_string();
+                    auth_token = token.to_string();
+                    let (id, rx) = ctx.state.dock_controls.register(token);
+                    registry_id = Some(id);
+                    revocation_rx = Some(rx);
                     let mut s = sender.write().await;
                     let _ = s
                         .send(axum::extract::ws::Message::Text(
-                            json!({ "type": "auth-ok", "dockScoped": dock_mode }).to_string(),
+                            json!({ "type": "auth-ok", "dockScoped": true }).to_string(),
                         ))
                         .await;
                 } else {
@@ -2059,7 +2204,7 @@ async fn handle_ws_control(
                         .get("platform")
                         .and_then(|v| v.as_str())
                         .unwrap_or(auth_platform.as_str());
-                    if dock_mode && platform != auth_platform {
+                    if platform != auth_platform {
                         let mut s = sender.write().await;
                         let _ = s
                             .send(axum::extract::ws::Message::Text(
@@ -2068,6 +2213,15 @@ async fn handle_ws_control(
                             ))
                             .await;
                         continue;
+                    }
+                    if !ctx.state.dock_credentials.authorize_chat_send(
+                        &auth_token,
+                        platform,
+                        &profile_id,
+                    ) {
+                        let mut s = sender.write().await;
+                        let _ = s.send(axum::extract::ws::Message::Close(None)).await;
+                        break;
                     }
                     let result = if platform == "kick" {
                         kick::send_chat_from_dock(ctx.state.clone(), text).await
@@ -2099,8 +2253,8 @@ async fn handle_ws_control(
             _ => {}
         }
     }
-    if authenticated && !dock_mode {
-        ctx.state.feed.unregister(&profile_id, &sender).await;
+    if let Some(id) = registry_id {
+        ctx.state.dock_controls.unregister(&auth_token, id);
     }
 }
 
@@ -2112,12 +2266,20 @@ struct DockCredentialBody {
     profile_id: Option<String>,
     #[serde(default)]
     token: Option<String>,
+    #[serde(default)]
+    all: bool,
 }
 
 async fn post_issue_dock_credential(
     State(ctx): State<ServerContext>,
     Json(body): Json<DockCredentialBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if ctx.state.readonly {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "readonly" })),
+        ));
+    }
     let platform = body.platform.as_deref().unwrap_or("twitch");
     let profile_id = body.profile_id.as_deref().unwrap_or("chat-default");
     let cred = ctx
@@ -2142,6 +2304,22 @@ async fn post_revoke_dock_credential(
     State(ctx): State<ServerContext>,
     Json(body): Json<DockCredentialBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if ctx.state.readonly {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "readonly" })),
+        ));
+    }
+    if body.all {
+        ctx.state.dock_credentials.revoke_all().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "ok": false, "error": e.to_string() })),
+            )
+        })?;
+        ctx.state.dock_controls.revoke_all();
+        return Ok(Json(json!({ "ok": true, "revokedAll": true })));
+    }
     let token = body.token.as_deref().unwrap_or("").trim();
     if token.is_empty() {
         return Err((
@@ -2155,5 +2333,8 @@ async fn post_revoke_dock_credential(
             Json(json!({ "ok": false, "error": e.to_string() })),
         )
     })?;
+    if revoked {
+        ctx.state.dock_controls.revoke(token);
+    }
     Ok(Json(json!({ "ok": true, "revoked": revoked })))
 }

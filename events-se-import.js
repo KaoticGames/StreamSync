@@ -398,6 +398,17 @@
     if (nav) nav.click();
   }
 
+  async function beginStreamElementsLogin() {
+    const flow = await api("/api/streamelements/begin-login");
+    const nonce = String(flow.flowNonce || "");
+    if (!nonce.startsWith("ssl_")) throw new Error("Invalid StreamElements login flow");
+    if (window.electronAPI?.openSeAccountPage) {
+      await window.electronAPI.openSeAccountPage(nonce);
+      return;
+    }
+    throw new Error("StreamElements login requires the Stream Sync desktop app");
+  }
+
   async function startImportFlow() {
     openModal();
     setStatus("Checking StreamElements connection…");
@@ -405,10 +416,9 @@
       const sess = await api("/api/streamelements/session");
       const connected = !!(sess && (sess.connected || sess.accountId));
       if (!connected) {
-        setStatus(
-          "Connect StreamElements first: open Connections, paste Account ID and JWT, then Save connection."
-        );
-        goToConnectionsTab();
+        setStatus("Opening StreamElements login…");
+        await beginStreamElementsLogin();
+        setStatus("Finish signing in to StreamElements. This window will refresh after connection.");
         return;
       }
       await loadOverlayList();

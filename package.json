@@ -8,7 +8,7 @@
     "dev:watch": "node scripts/dev.js --watch",
     "prepare-release": "node scripts/prepare-release.js",
     "build": "npm run prepare-release && node scripts/build.js",
-    "test": "cargo test --workspace"
+    "test": "node scripts/check-privileged-fetch.js && cargo test --workspace"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

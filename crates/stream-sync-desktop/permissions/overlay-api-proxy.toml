@@ -1,0 +1,6 @@
+[[permission]]
+identifier = "allow-overlay-api-proxy"
+description = "Narrow native proxy for privileged overlay HTTP (main window only)"
+commands.allow = [
+  "overlay_api_request",
+]

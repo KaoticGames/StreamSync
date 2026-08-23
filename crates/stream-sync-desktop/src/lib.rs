@@ -1,5 +1,6 @@
 mod commands;
 mod overlay;
+mod overlay_proxy;
 mod paths;
 
 use commands::AppState;
@@ -128,7 +129,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_overlay_base_url,
             commands::get_overlay_port,
-            commands::get_control_capability,
+            commands::overlay_api_request,
             commands::open_external,
             commands::open_logs_folder,
             commands::open_discord,

@@ -1,11 +1,12 @@
 //! Tauri commands — replaces Electron `electronAPI` / IPC.
 
+use crate::overlay_proxy;
 use crate::paths::legacy_user_data_dir;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use stream_sync_core::{build_backup_zip, get_paths};
-use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt;
 
 static SE_IMPORT_WINDOW: Mutex<()> = Mutex::new(());
@@ -45,46 +46,12 @@ pub fn get_overlay_port(state: State<'_, AppState>) -> u16 {
 }
 
 #[tauri::command]
-pub fn get_control_capability() -> Result<String, String> {
-    let paths = get_paths().map_err(|e| e.to_string())?;
-    let token = std::fs::read_to_string(&paths.control_token).map_err(|e| e.to_string())?;
-    let token = token.trim().to_string();
-    if token.len() < 32 {
-        return Err("control capability unavailable".into());
-    }
-    Ok(token)
-}
-
-fn read_control_token() -> Result<String, String> {
-    get_control_capability()
-}
-
-fn trusted_local_origin(port: u16) -> String {
-    format!("http://127.0.0.1:{port}")
-}
-
-async fn privileged_get(port: u16, path: &str) -> Result<reqwest::Response, String> {
-    let token = read_control_token()?;
-    reqwest::Client::new()
-        .get(format!("http://127.0.0.1:{port}{path}"))
-        .header("Origin", trusted_local_origin(port))
-        .header("x-streamsync-control", token)
-        .send()
-        .await
-        .map_err(|e| e.to_string())
-}
-
-async fn privileged_post(port: u16, path: &str) -> Result<reqwest::Response, String> {
-    let token = read_control_token()?;
-    reqwest::Client::new()
-        .post(format!("http://127.0.0.1:{port}{path}"))
-        .header("Origin", trusted_local_origin(port))
-        .header("x-streamsync-control", token)
-        .header("Content-Type", "application/json")
-        .body("{}")
-        .send()
-        .await
-        .map_err(|e| e.to_string())
+pub async fn overlay_api_request(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    request: overlay_proxy::OverlayApiRequest,
+) -> Result<overlay_proxy::OverlayApiResponse, String> {
+    overlay_proxy::execute_overlay_api_request(&window, state.overlay_port, request).await
 }
 
 #[tauri::command]
@@ -123,7 +90,20 @@ async fn twitch_open_auth_url(port: u16) -> Result<(), String> {
 }
 
 async fn open_overlay_auth_url(port: u16, path: &str) -> Result<(), String> {
-    let res = privileged_get(port, path).await?;
+    let paths = get_paths().map_err(|e| e.to_string())?;
+    let token = std::fs::read_to_string(&paths.control_token).map_err(|e| e.to_string())?;
+    let token = token.trim();
+    if token.len() < 32 {
+        return Err("control capability unavailable".into());
+    }
+    let origin = format!("http://127.0.0.1:{port}");
+    let res = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}{path}"))
+        .header("Origin", &origin)
+        .header("x-streamsync-control", token)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     if !res.status().is_success() {
         return Err(format!("HTTP {}", res.status()));
     }
@@ -142,7 +122,19 @@ pub async fn kick_connect(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn twitch_disconnect(state: State<'_, AppState>) -> Result<(), String> {
-    let res = privileged_post(state.inner().overlay_port, "/api/twitch/disconnect").await?;
+    let paths = get_paths().map_err(|e| e.to_string())?;
+    let token = std::fs::read_to_string(&paths.control_token).map_err(|e| e.to_string())?;
+    let port = state.overlay_port;
+    let origin = format!("http://127.0.0.1:{port}");
+    let res = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/api/twitch/disconnect"))
+        .header("Origin", &origin)
+        .header("x-streamsync-control", token.trim())
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     if !res.status().is_success() {
         return Err(format!("HTTP {}", res.status()));
     }
@@ -169,15 +161,29 @@ pub fn purge_logs(state: State<'_, AppState>) -> Result<PurgeLogsResult, String>
 
 /// Opens StreamElements Account → Channels so the user can copy Account ID + JWT.
 #[tauri::command]
-pub async fn open_se_account_page(app: AppHandle) -> Result<(), String> {
+pub async fn open_se_account_page(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    flow: String,
+) -> Result<(), String> {
+    if !flow.starts_with("ssl_")
+        || flow.len() < 40
+        || !flow.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err("invalid_login_flow".into());
+    }
     let _guard = SE_IMPORT_WINDOW.lock().map_err(|e| e.to_string())?;
 
     if let Some(w) = app.get_webview_window("se-import") {
-        let _ = w.show();
-        let _ = w.set_focus();
-        return Ok(());
+        let _ = w.close();
     }
 
+    let initialization_script = format!(
+        "window.__STREAMSYNC_OVERLAY_PORT__={};window.__STREAMSYNC_SE_FLOW__={};\n{}",
+        state.overlay_port,
+        serde_json::to_string(&flow).map_err(|e| e.to_string())?,
+        include_str!("../../../streamelements-auth-inject.js")
+    );
     WebviewWindowBuilder::new(
         &app,
         "se-import",
@@ -188,6 +194,7 @@ pub async fn open_se_account_page(app: AppHandle) -> Result<(), String> {
     )
     .title("StreamElements — Account / Channels")
     .inner_size(1100.0, 780.0)
+    .initialization_script(&initialization_script)
     .build()
     .map_err(|e| e.to_string())?;
 

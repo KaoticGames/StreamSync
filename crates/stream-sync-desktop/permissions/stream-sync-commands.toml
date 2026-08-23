@@ -16,10 +16,3 @@ commands.allow = [
   "open_se_account_page",
   "export_backup",
 ]
-
-[[permission]]
-identifier = "allow-control-capability"
-description = "Allow main window to retrieve the localhost control capability once for privileged HTTP"
-commands.allow = [
-  "get_control_capability",
-]

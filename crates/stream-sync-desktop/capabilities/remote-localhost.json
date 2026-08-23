@@ -11,6 +11,7 @@
   },
   "permissions": [
     "allow-stream-sync-commands",
+    "allow-overlay-api-proxy",
     "opener:default",
     "shell:allow-open",
     "core:default",

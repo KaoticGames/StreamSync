@@ -5,6 +5,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -12,6 +13,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use crate::app_state::AppState;
 use crate::dock_capability::DockCredentialStore;
 use crate::oauth_pending::LOGIN_NONCE_HEADER;
+pub use crate::route_manifest::RoutePolicy;
 
 pub const CONTROL_TOKEN_HEADER: &str = "x-streamsync-control";
 
@@ -23,79 +25,9 @@ pub const MEDIA_UPLOAD_BODY_LIMIT: usize = 64 * 1024 * 1024;
 /// Control socket must authenticate within this window after upgrade.
 pub const WS_CONTROL_AUTH_TIMEOUT_MS: u64 = 5_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoutePolicy {
-    /// OBS/browser read-only assets and feed rendering.
-    PublicReadOnly,
-    /// OAuth callback pages (GET HTML only) — never embed master capability.
-    OAuthCallbackPage,
-    /// OAuth completion endpoints authorized only by a one-time login nonce.
-    OAuthCompletion,
-    /// Privileged control plane — origin + master capability required.
-    Privileged,
-}
-
-/// Explicit inventory of every `build_router` registration. Fail closed for unknowns.
+/// Explicit security manifest. Router registration is independently listed in routes.rs.
 pub fn route_inventory() -> &'static [(&'static str, &'static str, RoutePolicy)] {
-    use RoutePolicy::*;
-    &[
-        ("GET", "/", PublicReadOnly),
-        ("GET", "/health", PublicReadOnly),
-        ("GET", "/api/status", Privileged),
-        ("GET", "/overlay/chat", PublicReadOnly),
-        ("GET", "/overlay/events", PublicReadOnly),
-        ("GET", "/overlay/kick-chat", PublicReadOnly),
-        ("GET", "/overlay/kick-events", PublicReadOnly),
-        ("GET", "/events-studio.html", PublicReadOnly),
-        ("GET", "/dock/chat", PublicReadOnly),
-        ("GET", "/dock/events", PublicReadOnly),
-        ("GET", "/dock/kick-chat", PublicReadOnly),
-        ("GET", "/dock/kick-events", PublicReadOnly),
-        ("GET", "/auth/twitch/callback", OAuthCallbackPage),
-        ("GET", "/auth/kick/callback", OAuthCallbackPage),
-        ("GET", "/auth/streamelements/callback", OAuthCallbackPage),
-        ("GET", "/config/:profile_id.json", PublicReadOnly),
-        ("POST", "/api/chat/dock-config", Privileged),
-        ("GET", "/api/events/dock-config", PublicReadOnly),
-        ("POST", "/api/events/dock-config", Privileged),
-        ("GET", "/api/chat/overlay-profiles", PublicReadOnly),
-        ("GET", "/api/chat/overlay-config", PublicReadOnly),
-        ("POST", "/api/chat/overlay-config", Privileged),
-        ("DELETE", "/api/chat/overlay-config", Privileged),
-        ("GET", "/api/twitch/auth-url", Privileged),
-        ("POST", "/api/twitch/set-token", OAuthCompletion),
-        ("POST", "/api/twitch/connection-key", Privileged),
-        ("POST", "/api/twitch/use-connection", Privileged),
-        ("POST", "/api/twitch/remove-connection", Privileged),
-        ("POST", "/api/twitch/disconnect", Privileged),
-        ("GET", "/api/kick/auth-url", Privileged),
-        ("POST", "/api/kick/redeem", OAuthCompletion),
-        ("POST", "/api/kick/disconnect", Privileged),
-        ("POST", "/api/kick/chat", Privileged),
-        ("GET", "/api/twitch/badges/all", PublicReadOnly),
-        ("GET", "/api/twitch/emotes/all", PublicReadOnly),
-        ("GET", "/api/events/overlay-profiles", PublicReadOnly),
-        ("GET", "/api/events/overlay-config", PublicReadOnly),
-        ("POST", "/api/events/overlay-config", Privileged),
-        ("DELETE", "/api/events/overlay-config", Privileged),
-        ("POST", "/api/events/test-alert", Privileged),
-        ("GET", "/api/streamelements/session", Privileged),
-        ("POST", "/api/streamelements/session", OAuthCompletion),
-        ("DELETE", "/api/streamelements/session", Privileged),
-        ("GET", "/api/streamelements/begin-login", Privileged),
-        ("GET", "/api/streamelements/overlays", Privileged),
-        ("POST", "/api/streamelements/import", Privileged),
-        ("GET", "/ws/feed", PublicReadOnly),
-        ("GET", "/ws/control", PublicReadOnly),
-        ("GET", "/google-fonts.css", PublicReadOnly),
-        ("GET", "/google-fonts/file", PublicReadOnly),
-        ("GET", "/fonts/*", PublicReadOnly),
-        ("GET", "/events-media/*", PublicReadOnly),
-        ("POST", "/api/chat/upload-font", Privileged),
-        ("POST", "/api/events/upload-media", Privileged),
-        ("POST", "/api/dock/issue-credential", Privileged),
-        ("POST", "/api/dock/revoke-credential", Privileged),
-    ]
+    crate::route_manifest::ROUTE_MANIFEST
 }
 
 fn path_matches(pattern: &str, path: &str) -> bool {
@@ -256,7 +188,9 @@ pub async fn control_plane_middleware(
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     match route_policy(&method, &path) {
-        RoutePolicy::PublicReadOnly | RoutePolicy::OAuthCallbackPage => next.run(request).await,
+        RoutePolicy::PublicReadOnly
+        | RoutePolicy::OAuthCallbackPage
+        | RoutePolicy::AuthenticatedControl => next.run(request).await,
         RoutePolicy::OAuthCompletion => {
             // Master capability OR valid same-origin login nonce (validated in handler).
             // Middleware only enforces trusted origin; nonce/master checked by handler helpers.
@@ -330,23 +264,32 @@ pub fn load_or_create_control_token(path: &Path) -> anyhow::Result<String> {
 
 struct PathLock {
     path: std::path::PathBuf,
+    owner: String,
     _file: File,
 }
 
 impl Drop for PathLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if std::fs::read_to_string(&self.path)
+            .map(|owner| owner == self.owner)
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
 fn acquire_path_lock(lock_path: &Path) -> anyhow::Result<PathLock> {
+    let owner = format!("{} {}", std::process::id(), uuid::Uuid::new_v4());
     for attempt in 0..200 {
         match OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(lock_path)
         {
-            Ok(file) => {
+            Ok(mut file) => {
+                file.write_all(owner.as_bytes())?;
+                file.flush()?;
                 let _ = file.sync_all();
                 #[cfg(unix)]
                 {
@@ -356,18 +299,33 @@ fn acquire_path_lock(lock_path: &Path) -> anyhow::Result<PathLock> {
                 }
                 return Ok(PathLock {
                     path: lock_path.to_path_buf(),
+                    owner,
                     _file: file,
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Stale lock recovery after 5s.
+                // Recover only an unchanged lock whose owning process is no longer alive.
                 if attempt > 50 {
                     if let Ok(meta) = std::fs::metadata(lock_path) {
                         if let Ok(modified) = meta.modified() {
                             if modified.elapsed().unwrap_or_default()
                                 > std::time::Duration::from_secs(5)
                             {
-                                let _ = std::fs::remove_file(lock_path);
+                                if let Ok(stale_owner) = std::fs::read_to_string(lock_path) {
+                                    if !lock_owner_is_alive(&stale_owner)
+                                        && std::fs::read_to_string(lock_path)
+                                            .map(|current| current == stale_owner)
+                                            .unwrap_or(false)
+                                    {
+                                        let quarantine = lock_path.with_extension(format!(
+                                            "stale-{}",
+                                            uuid::Uuid::new_v4().simple()
+                                        ));
+                                        if std::fs::rename(lock_path, &quarantine).is_ok() {
+                                            let _ = std::fs::remove_file(quarantine);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -378,6 +336,38 @@ fn acquire_path_lock(lock_path: &Path) -> anyhow::Result<PathLock> {
         }
     }
     anyhow::bail!("timed out waiting for control-token lock")
+}
+
+fn lock_owner_is_alive(owner: &str) -> bool {
+    let Some(pid) = owner
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        std::path::Path::new("/proc").join(pid.to_string()).exists()
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .map(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -438,5 +428,18 @@ mod tests {
             route_policy(&Method::DELETE, "/health"),
             RoutePolicy::Privileged
         );
+    }
+
+    #[test]
+    fn old_lock_owner_cannot_unlink_successor() {
+        let path = std::env::temp_dir().join(format!(
+            "streamsync-lock-successor-{}.lock",
+            uuid::Uuid::new_v4()
+        ));
+        let old = acquire_path_lock(&path).unwrap();
+        std::fs::write(&path, "successor-owner").unwrap();
+        drop(old);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "successor-owner");
+        let _ = std::fs::remove_file(path);
     }
 }

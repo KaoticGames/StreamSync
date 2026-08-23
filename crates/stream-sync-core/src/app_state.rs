@@ -11,6 +11,62 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+#[derive(Clone, Default)]
+pub struct DockControlRegistry {
+    inner: Arc<
+        std::sync::Mutex<
+            HashMap<String, HashMap<uuid::Uuid, tokio::sync::mpsc::UnboundedSender<()>>>,
+        >,
+    >,
+}
+
+impl DockControlRegistry {
+    pub fn register(&self, token: &str) -> (uuid::Uuid, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let id = uuid::Uuid::new_v4();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.inner
+            .lock()
+            .expect("dock control registry lock")
+            .entry(token.to_string())
+            .or_default()
+            .insert(id, tx);
+        (id, rx)
+    }
+
+    pub fn unregister(&self, token: &str, id: uuid::Uuid) {
+        let mut guard = self.inner.lock().expect("dock control registry lock");
+        if let Some(sockets) = guard.get_mut(token) {
+            sockets.remove(&id);
+            if sockets.is_empty() {
+                guard.remove(token);
+            }
+        }
+    }
+
+    pub fn revoke(&self, token: &str) {
+        if let Some(sockets) = self
+            .inner
+            .lock()
+            .expect("dock control registry lock")
+            .remove(token)
+        {
+            for sender in sockets.into_values() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    pub fn revoke_all(&self) {
+        let sockets = std::mem::take(&mut *self.inner.lock().expect("dock control registry lock"));
+        for sender in sockets
+            .into_values()
+            .flat_map(|entries| entries.into_values())
+        {
+            let _ = sender.send(());
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TwitchRuntime {
     pub tokens: TwitchTokenFile,
@@ -76,6 +132,8 @@ pub struct AppState {
     pub pending_logins: crate::oauth_pending::PendingLoginStore,
     /// Scoped OBS chat-dock credentials.
     pub dock_credentials: crate::dock_capability::DockCredentialStore,
+    /// Active dock control sockets, fenced immediately when credentials are revoked.
+    pub dock_controls: DockControlRegistry,
 }
 
 impl AppState {
@@ -209,6 +267,7 @@ impl AppState {
             control_token,
             pending_logins: crate::oauth_pending::PendingLoginStore::new(),
             dock_credentials,
+            dock_controls: DockControlRegistry::default(),
         }))
     }
 

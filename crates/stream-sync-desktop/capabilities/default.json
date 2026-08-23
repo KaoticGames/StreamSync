@@ -5,7 +5,7 @@
   "windows": ["main"],
   "permissions": [
     "allow-stream-sync-commands",
-    "allow-control-capability",
+    "allow-overlay-api-proxy",
     "core:default",
     "core:window:allow-create",
     "core:window:allow-close",

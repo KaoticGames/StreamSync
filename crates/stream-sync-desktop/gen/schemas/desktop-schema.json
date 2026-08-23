@@ -555,10 +555,10 @@
       "description": "Permission identifier",
       "oneOf": [
         {
-          "description": "Allow main window to retrieve the localhost control capability once for privileged HTTP",
+          "description": "Narrow native proxy for privileged overlay HTTP (main window only)",
           "type": "string",
-          "const": "allow-control-capability",
-          "markdownDescription": "Allow main window to retrieve the localhost control capability once for privileged HTTP"
+          "const": "allow-overlay-api-proxy",
+          "markdownDescription": "Narrow native proxy for privileged overlay HTTP (main window only)"
         },
         {
           "description": "StreamElements auth webview invoke commands",

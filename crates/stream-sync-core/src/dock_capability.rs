@@ -35,7 +35,8 @@ impl DockCredentialStore {
             inner: Mutex::new(HashMap::new()),
         };
         if path.is_file() {
-            let raw = std::fs::read_to_string(path).unwrap_or_default();
+            crate::storage::ensure_secret_file_permissions(path)?;
+            let raw = std::fs::read_to_string(path)?;
             if let Ok(file) = serde_json::from_str::<DockCredentialFile>(&raw) {
                 let mut guard = store.inner.lock().expect("dock cred lock");
                 for c in file.credentials {
@@ -68,39 +69,43 @@ impl DockCredentialStore {
             active: true,
             created_at_ms: chrono::Utc::now().timestamp_millis(),
         };
-        {
-            let mut guard = self.inner.lock().expect("dock cred lock");
-            guard.insert(token, cred.clone());
-        }
-        self.persist()?;
+        let mut guard = self.inner.lock().expect("dock cred lock");
+        let mut next = guard.clone();
+        next.insert(token, cred.clone());
+        self.persist_snapshot(&next)?;
+        *guard = next;
         Ok(cred)
     }
 
     pub fn revoke(&self, token: &str) -> anyhow::Result<bool> {
-        let mut changed = false;
-        {
-            let mut guard = self.inner.lock().expect("dock cred lock");
-            if let Some(c) = guard.get_mut(token) {
-                if c.active {
-                    c.active = false;
-                    changed = true;
-                }
+        let mut guard = self.inner.lock().expect("dock cred lock");
+        let mut next = guard.clone();
+        let changed = if let Some(c) = next.get_mut(token) {
+            if c.active {
+                c.active = false;
+                true
+            } else {
+                false
             }
-        }
+        } else {
+            false
+        };
         if changed {
-            self.persist()?;
+            self.persist_snapshot(&next)?;
+            *guard = next;
         }
         Ok(changed)
     }
 
     pub fn revoke_all(&self) -> anyhow::Result<()> {
-        {
-            let mut guard = self.inner.lock().expect("dock cred lock");
-            for c in guard.values_mut() {
-                c.active = false;
-            }
+        let mut guard = self.inner.lock().expect("dock cred lock");
+        let mut next = guard.clone();
+        for c in next.values_mut() {
+            c.active = false;
         }
-        self.persist()
+        self.persist_snapshot(&next)?;
+        *guard = next;
+        Ok(())
     }
 
     /// Validate chat-send authority for platform/profile. Never authorizes HTTP control.
@@ -128,12 +133,22 @@ impl DockCredentialStore {
         token.trim().starts_with(DOCK_TOKEN_PREFIX)
     }
 
-    fn persist(&self) -> anyhow::Result<()> {
-        let guard = self.inner.lock().expect("dock cred lock");
+    pub fn active_count(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("dock cred lock")
+            .values()
+            .filter(|credential| credential.active)
+            .count()
+    }
+
+    fn persist_snapshot(
+        &self,
+        credentials: &HashMap<String, DockCredential>,
+    ) -> anyhow::Result<()> {
         let file = DockCredentialFile {
-            credentials: guard.values().cloned().collect(),
+            credentials: credentials.values().cloned().collect(),
         };
-        drop(guard);
         let data = serde_json::to_vec_pretty(&file)?;
         crate::storage::write_secret_file(&self.path, &data)?;
         Ok(())
@@ -191,5 +206,43 @@ mod tests {
         assert!(!store.authorize_chat_send(&c.token, "kick", "chat-default"));
         assert!(!store.authorize_chat_send(&c.token, "twitch", "other"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn concurrent_issues_all_survive_reload() {
+        let path = tmp_path();
+        let _ = std::fs::remove_file(&path);
+        let store = std::sync::Arc::new(DockCredentialStore::load_or_create(&path).unwrap());
+        let mut threads = Vec::new();
+        for n in 0..32 {
+            let store = store.clone();
+            threads.push(std::thread::spawn(move || {
+                store.issue("twitch", &format!("profile-{n}")).unwrap()
+            }));
+        }
+        let issued: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        let reloaded = DockCredentialStore::load_or_create(&path).unwrap();
+        for credential in issued {
+            assert!(
+                reloaded.authorize_chat_send(
+                    &credential.token,
+                    &credential.platform,
+                    &credential.profile_id
+                ),
+                "successful issue was lost during concurrent persistence"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failed_persist_does_not_publish_memory_mutation() {
+        let dir = tmp_path();
+        let _ = std::fs::remove_file(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = DockCredentialStore::load_or_create(&dir).unwrap();
+        assert!(store.issue("twitch", "chat-default").is_err());
+        assert_eq!(store.active_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

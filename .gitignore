@@ -1,5 +1,10 @@
 /target/
 **/*.rs.bk
 .env
-config/bundled.env
+# Keep the checked-in file non-secret so clean Tauri builds can validate resources.
+!config/bundled.env
 node_modules/
+crates/stream-sync-desktop/icons/icon.png
+crates/stream-sync-desktop/icons/icon.ico
+*.md
+*.txt

@@ -4,6 +4,7 @@
   if (!/streamelements\.com/i.test(location.hostname || "")) return;
 
   const PORT = Number(window.__STREAMSYNC_OVERLAY_PORT__) || 4040;
+  const FLOW = String(window.__STREAMSYNC_SE_FLOW__ || "");
   const CHANNELS_URL = "https://streamelements.com/dashboard/account/channels";
   const POLL_MS = 1200;
   const MAX_ATTEMPTS = 300;
@@ -121,8 +122,18 @@
       "&accountId=" +
       encodeURIComponent(accountId);
     showBanner("Stream Sync: connected — finishing…");
+    if (!FLOW.startsWith("ssl_")) {
+      showBanner("Stream Sync: login flow expired. Start Connect again.");
+      done = false;
+      return;
+    }
     location.href =
-      "http://127.0.0.1:" + PORT + "/auth/streamelements/callback#" + hash;
+      "http://127.0.0.1:" +
+      PORT +
+      "/auth/streamelements/callback?flow=" +
+      encodeURIComponent(FLOW) +
+      "#" +
+      hash;
   }
 
   function isLoggedInDashboard() {

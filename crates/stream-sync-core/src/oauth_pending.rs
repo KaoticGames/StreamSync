@@ -39,6 +39,7 @@ struct PendingLogin {
     provider: OAuthProvider,
     created_at: Instant,
     consumed: bool,
+    reserved: bool,
 }
 
 /// In-memory single-use login nonces for OAuth callback completion.
@@ -66,13 +67,14 @@ impl PendingLoginStore {
                 provider,
                 created_at: Instant::now(),
                 consumed: false,
+                reserved: false,
             },
         );
         nonce
     }
 
-    /// Atomically validate and consume a nonce for the expected provider.
-    pub fn consume(&self, provider: OAuthProvider, nonce: &str) -> Result<(), PendingLoginError> {
+    /// Atomically validate and reserve a nonce while completion is in progress.
+    pub fn reserve(&self, provider: OAuthProvider, nonce: &str) -> Result<(), PendingLoginError> {
         let nonce = nonce.trim();
         if nonce.is_empty() {
             return Err(PendingLoginError::Missing);
@@ -85,6 +87,9 @@ impl PendingLoginStore {
         if entry.consumed {
             return Err(PendingLoginError::Replayed);
         }
+        if entry.reserved {
+            return Err(PendingLoginError::Reserved);
+        }
         if entry.created_at.elapsed() > LOGIN_NONCE_TTL {
             guard.remove(nonce);
             return Err(PendingLoginError::Expired);
@@ -92,8 +97,44 @@ impl PendingLoginStore {
         if entry.provider != provider {
             return Err(PendingLoginError::WrongProvider);
         }
+        entry.reserved = true;
+        Ok(())
+    }
+
+    /// Commit a successful completion. The nonce remains as a replay tombstone until TTL.
+    pub fn commit(&self, provider: OAuthProvider, nonce: &str) -> Result<(), PendingLoginError> {
+        let mut guard = self.inner.lock().expect("pending login lock");
+        let Some(entry) = guard.get_mut(nonce.trim()) else {
+            return Err(PendingLoginError::Unknown);
+        };
+        if entry.provider != provider {
+            return Err(PendingLoginError::WrongProvider);
+        }
+        if entry.consumed {
+            return Err(PendingLoginError::Replayed);
+        }
+        if !entry.reserved {
+            return Err(PendingLoginError::Unknown);
+        }
+        entry.reserved = false;
         entry.consumed = true;
         Ok(())
+    }
+
+    /// Release a reservation after validation, provider, or persistence failure.
+    pub fn release(&self, provider: OAuthProvider, nonce: &str) {
+        let mut guard = self.inner.lock().expect("pending login lock");
+        if let Some(entry) = guard.get_mut(nonce.trim()) {
+            if entry.provider == provider && !entry.consumed {
+                entry.reserved = false;
+            }
+        }
+    }
+
+    /// Back-compatible one-shot helper for callers that have no fallible completion work.
+    pub fn consume(&self, provider: OAuthProvider, nonce: &str) -> Result<(), PendingLoginError> {
+        self.reserve(provider, nonce)?;
+        self.commit(provider, nonce)
     }
 
     /// Constant-time membership probe without consuming (for tests / diagnostics).
@@ -101,7 +142,7 @@ impl PendingLoginStore {
         let guard = self.inner.lock().expect("pending login lock");
         guard
             .get(nonce)
-            .map(|e| !e.consumed && e.created_at.elapsed() <= LOGIN_NONCE_TTL)
+            .map(|e| !e.consumed && !e.reserved && e.created_at.elapsed() <= LOGIN_NONCE_TTL)
             .unwrap_or(false)
     }
 
@@ -118,6 +159,7 @@ pub enum PendingLoginError {
     Unknown,
     Expired,
     Replayed,
+    Reserved,
     WrongProvider,
 }
 
@@ -128,6 +170,7 @@ impl PendingLoginError {
             Self::Unknown => "invalid_login_nonce",
             Self::Expired => "expired_login_nonce",
             Self::Replayed => "replayed_login_nonce",
+            Self::Reserved => "login_nonce_in_progress",
             Self::WrongProvider => "wrong_provider_login_nonce",
         }
     }
@@ -161,6 +204,24 @@ mod tests {
         assert_eq!(
             store.consume(OAuthProvider::Twitch, &n),
             Err(PendingLoginError::WrongProvider)
+        );
+    }
+
+    #[test]
+    fn reservation_blocks_concurrent_completion_and_can_be_released() {
+        let store = PendingLoginStore::new();
+        let n = store.create(OAuthProvider::StreamElements);
+        store.reserve(OAuthProvider::StreamElements, &n).unwrap();
+        assert_eq!(
+            store.reserve(OAuthProvider::StreamElements, &n),
+            Err(PendingLoginError::Reserved)
+        );
+        store.release(OAuthProvider::StreamElements, &n);
+        assert!(store.reserve(OAuthProvider::StreamElements, &n).is_ok());
+        store.commit(OAuthProvider::StreamElements, &n).unwrap();
+        assert_eq!(
+            store.reserve(OAuthProvider::StreamElements, &n),
+            Err(PendingLoginError::Replayed)
         );
     }
 }

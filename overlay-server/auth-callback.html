@@ -100,13 +100,14 @@
         const scope = params.get("scope");
         const tokenType = params.get("token_type");
         const expiresIn = params.get("expires_in");
+        const flowNonce = params.get("state");
 
-        return { accessToken, scope, tokenType, expiresIn };
+        return { accessToken, scope, tokenType, expiresIn, flowNonce };
       }
 
       async function main() {
         const parsed = parseAccessTokenFromHash();
-        if (!parsed || !parsed.accessToken) {
+        if (!parsed || !parsed.accessToken || !parsed.flowNonce) {
           setStatus("Unable to read access token from Twitch.", true);
           setDetails("Try closing this window and clicking Connect in Stream Sync again.");
           return;
@@ -117,8 +118,14 @@
         try {
           const res = await fetch("/api/twitch/set-token", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ accessToken: parsed.accessToken }),
+            headers: {
+              "Content-Type": "application/json",
+              "x-streamsync-login-nonce": parsed.flowNonce,
+            },
+            body: JSON.stringify({
+              accessToken: parsed.accessToken,
+              flowNonce: parsed.flowNonce,
+            }),
           });
 
           if (!res.ok) {

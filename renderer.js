@@ -89,27 +89,15 @@ document.addEventListener("DOMContentLoaded", () => {
         return;
       }
       if (kind === "events-dock") {
-        tasks.push(
-          privilegedDockUrl(
-            "/dock/events",
-            "twitch",
-            el.getAttribute("data-overlay-profile") || "default"
-          ).then((url) => {
-            el.value = url;
-          })
-        );
+        el.value = `${base}/dock/events?profile=${encodeURIComponent(
+          el.getAttribute("data-overlay-profile") || "default"
+        )}`;
         return;
       }
       if (kind === "kick-events-dock") {
-        tasks.push(
-          privilegedDockUrl(
-            "/dock/kick-events",
-            "kick",
-            el.getAttribute("data-overlay-profile") || "default"
-          ).then((url) => {
-            el.value = url;
-          })
-        );
+        el.value = `${base}/dock/kick-events?profile=${encodeURIComponent(
+          el.getAttribute("data-overlay-profile") || "default"
+        )}`;
         return;
       }
       if (kind === "chat-overlay") {
@@ -862,7 +850,14 @@ document.addEventListener("DOMContentLoaded", () => {
     async function openSeAccountPageAction() {
       if (window.electronAPI?.openSeAccountPage) {
         try {
-          return await window.electronAPI.openSeAccountPage();
+          const response = await window.streamSyncControlApi.privilegedFetch(
+            "/api/streamelements/begin-login"
+          );
+          const login = await response.json().catch(() => ({}));
+          if (!response.ok || !String(login.flowNonce || "").startsWith("ssl_")) {
+            throw new Error(login.error || "Unable to begin StreamElements login");
+          }
+          return await window.electronAPI.openSeAccountPage(login.flowNonce);
         } catch (err) {
           console.warn("[Connections] openSeAccountPage IPC failed:", err);
         }

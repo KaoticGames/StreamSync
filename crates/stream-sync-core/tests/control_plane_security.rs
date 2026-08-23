@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use stream_sync_core::{
     route_inventory, route_policy, DockCredentialStore, OverlayConfig, OverlayServer, RoutePolicy,
-    CONTROL_TOKEN_HEADER, LOGIN_NONCE_HEADER, PRIVILEGED_JSON_BODY_LIMIT,
+    BUILD_ROUTER_ROUTE_IDS, CONTROL_TOKEN_HEADER, LOGIN_NONCE_HEADER, PRIVILEGED_JSON_BODY_LIMIT,
 };
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
@@ -28,6 +28,13 @@ fn test_userdata_dir() -> PathBuf {
 }
 
 async fn test_app(port: u16) -> (axum::Router, std::sync::Arc<stream_sync_core::AppState>) {
+    test_app_mode(port, true).await
+}
+
+async fn test_app_mode(
+    port: u16,
+    readonly: bool,
+) -> (axum::Router, std::sync::Arc<stream_sync_core::AppState>) {
     let _guard = TEST_SETUP_LOCK.lock().expect("test setup lock");
     let userdata = test_userdata_dir();
     std::env::set_var("STREAMSYNC_USERDATA", userdata.display().to_string());
@@ -39,7 +46,7 @@ async fn test_app(port: u16) -> (axum::Router, std::sync::Arc<stream_sync_core::
     let config = OverlayConfig {
         port,
         repo_root,
-        readonly: true,
+        readonly,
     };
     let (router, state, _) = OverlayServer::new(config)
         .build_app()
@@ -54,7 +61,17 @@ async fn spawn_test_server(
     std::sync::Arc<stream_sync_core::AppState>,
     tokio::task::JoinHandle<()>,
 ) {
-    let (router, state) = test_app(port).await;
+    spawn_test_server_mode(port, true).await
+}
+
+async fn spawn_test_server_mode(
+    port: u16,
+    readonly: bool,
+) -> (
+    std::sync::Arc<stream_sync_core::AppState>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (router, state) = test_app_mode(port, readonly).await;
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
         .await
         .expect("bind test port");
@@ -498,6 +515,177 @@ async fn ws_control_auth_timeout_and_dock_token() {
 }
 
 #[tokio::test]
+async fn ws_control_rejects_master_token_and_revocation_closes_active_socket() {
+    let port = 14155;
+    let (state, _handle) = spawn_test_server_mode(port, false).await;
+
+    let mut master_req = format!("ws://127.0.0.1:{port}/ws/control?profile=chat-default")
+        .into_client_request()
+        .unwrap();
+    master_req
+        .headers_mut()
+        .insert(header::ORIGIN, trusted_origin(port).parse().unwrap());
+    let (mut master_ws, _) = tokio_tungstenite::connect_async(master_req).await.unwrap();
+    master_ws
+        .send(Message::Text(
+            json!({ "type": "auth", "token": state.control_token(), "platform": "twitch" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let master_reply = tokio::time::timeout(Duration::from_secs(1), master_ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(master_reply.to_text().unwrap().contains("auth-failed"));
+
+    let dock = state
+        .dock_credentials
+        .issue("twitch", "chat-default")
+        .unwrap();
+    let mut dock_req = format!("ws://127.0.0.1:{port}/ws/control?profile=chat-default")
+        .into_client_request()
+        .unwrap();
+    dock_req
+        .headers_mut()
+        .insert(header::ORIGIN, trusted_origin(port).parse().unwrap());
+    let (mut dock_ws, _) = tokio_tungstenite::connect_async(dock_req).await.unwrap();
+    dock_ws
+        .send(Message::Text(
+            json!({ "type": "auth", "token": dock.token, "platform": "twitch" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let auth_reply = tokio::time::timeout(Duration::from_secs(1), dock_ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(auth_reply.to_text().unwrap().contains("auth-ok"));
+
+    let revoke = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{port}/api/dock/revoke-credential"
+        ))
+        .header(header::ORIGIN.as_str(), trusted_origin(port))
+        .header(CONTROL_TOKEN_HEADER, state.control_token())
+        .json(&json!({ "token": dock.token }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), StatusCode::OK);
+    let closed = tokio::time::timeout(Duration::from_secs(1), dock_ws.next())
+        .await
+        .expect("socket should be fenced promptly");
+    assert!(
+        matches!(closed, None | Some(Ok(Message::Close(_)))),
+        "revoked socket remained active: {closed:?}"
+    );
+}
+
+#[tokio::test]
+async fn revoke_all_closes_every_active_dock_socket() {
+    let port = 14158;
+    let (state, _handle) = spawn_test_server_mode(port, false).await;
+    let mut sockets = Vec::new();
+    for platform in ["twitch", "kick"] {
+        let dock = state
+            .dock_credentials
+            .issue(platform, "chat-default")
+            .unwrap();
+        let mut req = format!("ws://127.0.0.1:{port}/ws/control?profile=chat-default")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert(header::ORIGIN, trusted_origin(port).parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        ws.send(Message::Text(
+            json!({ "type": "auth", "token": dock.token, "platform": platform })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(1), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(reply.to_text().unwrap().contains("auth-ok"));
+        sockets.push(ws);
+    }
+
+    let revoke = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{port}/api/dock/revoke-credential"
+        ))
+        .header(header::ORIGIN.as_str(), trusted_origin(port))
+        .header(CONTROL_TOKEN_HEADER, state.control_token())
+        .json(&json!({ "all": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), StatusCode::OK);
+    for mut socket in sockets {
+        let closed = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("revoke-all should close every socket");
+        assert!(matches!(closed, None | Some(Ok(Message::Close(_)))));
+    }
+}
+
+#[tokio::test]
+async fn readonly_rejects_dock_credential_mutation() {
+    let port = 14156;
+    let (router, state) = test_app(port).await;
+    let before = state.dock_credentials.active_count();
+    let (status, _, _) = request_json(
+        &router,
+        Method::POST,
+        "/api/dock/issue-credential",
+        Some(&trusted_origin(port)),
+        Some(state.control_token()),
+        None,
+        Some(json!({ "platform": "twitch", "profileId": "chat-default" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(state.dock_credentials.active_count(), before);
+}
+
+#[tokio::test]
+async fn ui_and_callback_responses_send_csp_headers() {
+    let port = 14157;
+    let (router, _) = test_app(port).await;
+    for path in ["/shell.html", "/auth/streamelements/callback"] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(header::ORIGIN, trusted_origin(port))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let csp = response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .expect("CSP response header");
+        assert!(csp.contains("default-src"));
+        if path.contains("/auth/") {
+            assert!(csp.contains("default-src 'none'"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn concurrent_control_token_initialization_converges() {
     let dir = test_userdata_dir();
     let path = dir.join("control-token.txt");
@@ -523,6 +711,17 @@ async fn concurrent_control_token_initialization_converges() {
 
 #[test]
 fn route_inventory_is_exhaustive_and_fail_closed() {
+    let registered: std::collections::BTreeSet<_> =
+        BUILD_ROUTER_ROUTE_IDS.iter().copied().collect();
+    let manifested: std::collections::BTreeSet<_> = route_inventory()
+        .iter()
+        .map(|(method, path, _)| (*method, *path))
+        .collect();
+    assert_eq!(
+        registered, manifested,
+        "router and security manifest differ"
+    );
+
     for (method, path, policy) in route_inventory() {
         let m = Method::from_bytes(method.as_bytes()).unwrap();
         let resolved = if path.contains(':') || path.ends_with("/*") {
@@ -549,4 +748,48 @@ fn route_inventory_is_exhaustive_and_fail_closed() {
         route_policy(&Method::POST, "/api/unknown-new-route"),
         RoutePolicy::Privileged
     );
+    assert_eq!(
+        route_policy(&Method::GET, "/ws/control"),
+        RoutePolicy::AuthenticatedControl
+    );
+}
+
+#[test]
+fn frontend_dock_and_login_wiring_is_scoped() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .unwrap();
+    let renderer = std::fs::read_to_string(root.join("renderer.js")).unwrap();
+    let events_section = renderer
+        .split("if (kind === \"events-dock\")")
+        .nth(1)
+        .unwrap()
+        .split("if (kind === \"chat-overlay\")")
+        .next()
+        .unwrap();
+    assert!(!events_section.contains("privilegedDockUrl"));
+    assert!(!events_section.contains("#control="));
+
+    let importer = std::fs::read_to_string(root.join("events-se-import.js")).unwrap();
+    let injection = std::fs::read_to_string(root.join("streamelements-auth-inject.js")).unwrap();
+    assert!(importer.contains("/api/streamelements/begin-login"));
+    assert!(importer.contains("openSeAccountPage(nonce)"));
+    assert!(injection.contains("__STREAMSYNC_SE_FLOW__"));
+    assert!(injection.contains("/auth/streamelements/callback?flow="));
+}
+
+#[test]
+fn channel_point_private_input_is_profile_scoped() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let twitch = std::fs::read_to_string(root.join("src/twitch.rs")).unwrap();
+    let redemption = twitch
+        .split("\"channel.channel_points_custom_reward_redemption.add\" =>")
+        .nth(1)
+        .unwrap()
+        .split("_ => {}")
+        .next()
+        .unwrap();
+    assert!(redemption.contains("broadcast_profile"));
+    assert!(!redemption.contains("broadcast_all"));
 }

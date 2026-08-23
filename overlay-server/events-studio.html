@@ -1327,11 +1327,9 @@
 
       for (const api of candidates) {
         try {
-          const capability =
-            typeof api.resolveCapability === "function"
-              ? await api.resolveCapability()
-              : "";
-          if (capability) return api.privilegedFetch(path, options);
+          if (typeof api.privilegedFetch === "function") {
+            return await api.privilegedFetch(path, options);
+          }
         } catch (_) {}
       }
       throw new Error("Stream Sync control capability unavailable");

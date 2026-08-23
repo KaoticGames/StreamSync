@@ -371,19 +371,23 @@ fn write_file_atomic_inner(target: &Path, data: &[u8], secret: bool) -> Result<(
     let tmp = target.with_extension(format!(
         "tmp-{}-{}",
         std::process::id(),
-        chrono::Utc::now().timestamp_millis()
+        uuid::Uuid::new_v4().simple()
     ));
-    {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
+    let write_result = (|| -> Result<()> {
+        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
     }
     if secret {
-        apply_secret_file_permissions(&tmp)?;
+        if let Err(error) = apply_secret_file_permissions(&tmp) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
         // Never leave a reusable previous secret on disk.
         let bak = target.with_extension("bak");
         let _ = fs::remove_file(&bak);

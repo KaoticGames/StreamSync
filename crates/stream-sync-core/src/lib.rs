@@ -11,6 +11,7 @@ mod dock_capability;
 mod export;
 mod kick;
 mod oauth_pending;
+mod route_manifest;
 mod routes;
 mod storage;
 mod streamelements;
@@ -33,6 +34,7 @@ pub use control_plane::{
 pub use dock_capability::{DockCredential, DockCredentialStore};
 pub use export::{build_backup_zip, BackupManifest};
 pub use oauth_pending::{OAuthProvider, PendingLoginStore, LOGIN_NONCE_HEADER};
+pub use routes::BUILD_ROUTER_ROUTE_IDS;
 pub use storage::{
     bootstrap_twitch_env_from_rust, get_paths, is_stream_sync_ui_bundle, is_stream_sync_workspace,
     legacy_electron_user_data, load_streamsync_dotenv, resolve_repo_root, resolve_ui_assets_root,
