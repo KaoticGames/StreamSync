@@ -1,0 +1,42 @@
+[package]
+name = "stream-sync-core"
+description = "Stream Sync overlay server — HTTP, WebSocket, Twitch (Rust port)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "stream_sync_core"
+path = "src/lib.rs"
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+uuid.workspace = true
+base64.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+twitch-irc.workspace = true
+dotenvy.workspace = true
+urlencoding.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
+bytes = "1"
+
+[dev-dependencies]
+tokio-tungstenite.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+
+[[example]]
+name = "host_embed"
+path = "examples/host_embed.rs"

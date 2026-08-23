@@ -1,0 +1,55 @@
+{
+  "_id": "6393ebb03de43b9273f8efa0",
+  "name": "Personalized Alerts",
+  "settings": { "width": 1920, "height": 1080 },
+  "widgets": [
+    {
+      "type": "se-widget-alert-box",
+      "css": {
+        "left": "275px",
+        "top": "189px",
+        "width": "400",
+        "height": "300"
+      },
+      "variables": {
+        "cheer": {
+          "enabled": true,
+          "duration": 7,
+          "audio": {
+            "src": "https://cdn.streamelements.com/uploads/base-cheer.mp3",
+            "volume": 0.32
+          },
+          "graphics": {
+            "src": "https://cdn.streamelements.com/uploads/base.webm",
+            "type": "video"
+          },
+          "text": {
+            "message": "{name} cheered x{amount}"
+          },
+          "animation": { "in": "fadeIn", "out": "fadeOut" },
+          "variations": [
+            {
+              "enabled": true,
+              "name": "1000 bits",
+              "condition": "EXACT",
+              "requirement": 1000,
+              "chance": 100,
+              "settings": {
+                "duration": 10,
+                "audio": {
+                  "src": "https://cdn.streamelements.com/uploads/1000bits.mp3",
+                  "volume": 0.5
+                },
+                "graphics": {
+                  "src": "https://cdn.streamelements.com/uploads/1000bits.webm",
+                  "type": "video"
+                },
+                "text": { "message": "{name} dropped 1000 bits!" }
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

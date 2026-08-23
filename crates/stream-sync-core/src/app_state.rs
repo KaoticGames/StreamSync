@@ -1,0 +1,404 @@
+//! Shared application state.
+
+use crate::broadcast::FeedHub;
+use crate::config_types::{
+    DelegatedSessionFile, DockConfigFile, EventsDockConfig, EventsOverlayConfigFile,
+    KickTokenFile, OverlayConfigFile, TwitchActiveMode, TwitchActiveModeFile, TwitchTokenFile,
+};
+use crate::storage::{self, StoragePaths};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+#[derive(Clone)]
+pub struct TwitchRuntime {
+    pub tokens: TwitchTokenFile,
+    pub connected: bool,
+    pub channel: Option<String>,
+    /// Broadcaster chat name color (#RRGGBB), from IRC GLOBALUSERSTATE or Helix /chat/color.
+    pub name_color: Option<String>,
+    /// Broadcaster display name from IRC USERSTATE / GLOBALUSERSTATE.
+    pub display_name: Option<String>,
+    /// Channel-scoped badges for the logged-in user (`name` → `version`), from IRC USERSTATE.
+    pub badges_raw: HashMap<String, String>,
+}
+
+#[derive(Clone, Default)]
+pub struct KickRuntime {
+    pub tokens: KickTokenFile,
+    pub connected: bool,
+}
+
+impl Default for TwitchRuntime {
+    fn default() -> Self {
+        Self {
+            tokens: TwitchTokenFile::default(),
+            connected: false,
+            channel: None,
+            name_color: None,
+            display_name: None,
+            badges_raw: HashMap::new(),
+        }
+    }
+}
+
+pub struct AppState {
+    pub paths: StoragePaths,
+    /// UI/static files (`shell.html`, `overlay-server/`).
+    pub repo_root: PathBuf,
+    /// Rust workspace (`rust/`) — config `.env` lives here.
+    pub rust_root: PathBuf,
+    pub overlay_server_dir: PathBuf,
+    pub port: u16,
+    pub readonly: bool,
+    /// Bundled / env Twitch Client-ID (local OAuth).
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub dock_config: RwLock<DockConfigFile>,
+    pub events_dock_config: RwLock<EventsDockConfig>,
+    pub overlay_config: RwLock<OverlayConfigFile>,
+    pub events_overlay_config: RwLock<EventsOverlayConfigFile>,
+    pub twitch: RwLock<TwitchRuntime>,
+    /// Personal Twitch OAuth tokens (always persisted separately from takeover).
+    pub personal_tokens: RwLock<TwitchTokenFile>,
+    /// Saved Syndicate takeover session (if any).
+    pub delegated: RwLock<Option<DelegatedSessionFile>>,
+    /// Which saved identity drives IRC / EventSub.
+    pub active_mode: RwLock<TwitchActiveMode>,
+    pub feed: FeedHub,
+    pub personal_kick: RwLock<KickTokenFile>,
+    pub kick: RwLock<KickRuntime>,
+    pub kick_feed_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl AppState {
+    pub fn new(
+        paths: StoragePaths,
+        repo_root: PathBuf,
+        port: u16,
+        readonly: bool,
+    ) -> anyhow::Result<Arc<Self>> {
+        let rust_root = storage::rust_workspace_root();
+        storage::load_streamsync_dotenv(&paths.root, &rust_root);
+        if let Err(e) = storage::bootstrap_twitch_env_from_rust(&paths.root, &rust_root) {
+            tracing::debug!("twitch env bootstrap skipped: {e:#}");
+        }
+
+        let client_id = std::env::var("TWITCH_CLIENT_ID").unwrap_or_default();
+        if client_id.is_empty() {
+            tracing::warn!(
+                "TWITCH_CLIENT_ID is not set — add it to {} (see rust/config/env.example) or {}",
+                rust_root.join(".env").display(),
+                paths.root.join(".env").display(),
+            );
+        }
+        let redirect_uri = redirect_uri_for_port(port);
+
+        let overlay_server_dir = repo_root.join("overlay-server");
+
+        let mut dock = storage::read_json_or_default(&paths.dock_config, &DockConfigFile::default())?;
+        dock.profiles.entry("chat-default".into()).or_insert_with(|| {
+            crate::config_types::DockProfile {
+                font_size: 13,
+                show_timestamps: true,
+                show_badges: true,
+            }
+        });
+        let mut events_dock = EventsDockConfig::default();
+        if let Some(ed) = dock.events_dock.take() {
+            events_dock.font_size = ed.font_size;
+            events_dock.show_timestamps = ed.show_timestamps;
+            events_dock.show_badges = ed.show_badges;
+            events_dock.events = ed.events;
+        } else {
+            dock.events_dock = Some(events_dock.clone());
+            if !readonly {
+                storage::write_json(&paths.dock_config, &dock)?;
+            }
+        }
+
+        let mut overlay =
+            storage::read_json_or_default(&paths.overlay_config, &OverlayConfigFile::default())?;
+        overlay
+            .profiles
+            .entry("chat-default".into())
+            .or_insert_with(crate::config_types::ChatOverlayProfile::default);
+
+        let events_overlay = storage::read_json_or_default(
+            &paths.events_overlay_config,
+            &EventsOverlayConfigFile::default(),
+        )?;
+
+        let personal = storage::read_json_or_default(
+            &paths.twitch_tokens,
+            &TwitchTokenFile::default(),
+        )?;
+        let delegated = if paths.twitch_delegated.is_file() {
+            storage::read_json_or_default(&paths.twitch_delegated, &DelegatedSessionFile::default())
+                .ok()
+                .filter(|d| !d.connection_key.is_empty() && !d.access_token.is_empty())
+        } else {
+            None
+        };
+        let saved_mode = storage::read_json_or_default(
+            &paths.twitch_active_mode,
+            &TwitchActiveModeFile::default(),
+        )
+        .map(|f| f.mode)
+        .unwrap_or_default();
+        let personal_ok = personal.access_token.is_some() && personal.login.is_some();
+        let delegated_ok = delegated.is_some();
+        let active_mode = match saved_mode {
+            TwitchActiveMode::Delegated if delegated_ok => TwitchActiveMode::Delegated,
+            TwitchActiveMode::Local if personal_ok => TwitchActiveMode::Local,
+            // Fallbacks when the preferred side is missing (e.g. pre-switcher installs).
+            _ if delegated_ok && !personal_ok => TwitchActiveMode::Delegated,
+            _ if personal_ok => TwitchActiveMode::Local,
+            _ if delegated_ok => TwitchActiveMode::Delegated,
+            _ => TwitchActiveMode::Local,
+        };
+        let live_tokens = match active_mode {
+            TwitchActiveMode::Delegated => delegated
+                .as_ref()
+                .map(tokens_from_delegated_session)
+                .unwrap_or_default(),
+            TwitchActiveMode::Local => personal.clone(),
+        };
+
+        let personal_kick = storage::read_json_or_default(
+            &paths.kick_tokens,
+            &KickTokenFile::default(),
+        )?;
+        let live_kick = live_kick_tokens(active_mode, delegated.as_ref(), &personal_kick);
+
+        Ok(Arc::new(Self {
+            paths: paths.clone(),
+            repo_root: repo_root.clone(),
+            rust_root,
+            overlay_server_dir,
+            port,
+            readonly,
+            client_id,
+            redirect_uri,
+            dock_config: RwLock::new(dock),
+            events_dock_config: RwLock::new(events_dock),
+            overlay_config: RwLock::new(overlay),
+            events_overlay_config: RwLock::new(events_overlay),
+            twitch: RwLock::new(TwitchRuntime {
+                tokens: live_tokens,
+                ..Default::default()
+            }),
+            personal_tokens: RwLock::new(personal),
+            delegated: RwLock::new(delegated),
+            active_mode: RwLock::new(active_mode),
+            feed: FeedHub::new(),
+            personal_kick: RwLock::new(personal_kick),
+            kick: RwLock::new(KickRuntime {
+                tokens: live_kick,
+                connected: false,
+            }),
+            kick_feed_handle: RwLock::new(None),
+        }))
+    }
+
+    pub async fn save_dock(&self) -> anyhow::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
+        let mut dock = self.dock_config.write().await;
+        dock.events_dock = Some(self.events_dock_config.read().await.clone());
+        storage::write_json(&self.paths.dock_config, &*dock)
+    }
+
+    pub async fn save_overlay(&self) -> anyhow::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
+        let overlay = self.overlay_config.read().await;
+        storage::write_json(&self.paths.overlay_config, &*overlay)
+    }
+
+    pub async fn save_events_overlay(&self) -> anyhow::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
+        let cfg = self.events_overlay_config.read().await;
+        storage::write_json(&self.paths.events_overlay_config, &*cfg)
+    }
+
+    pub async fn save_twitch_tokens(&self) -> anyhow::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
+        // Always persist personal OAuth separately — never write takeover tokens here.
+        let personal = self.personal_tokens.read().await;
+        storage::write_json(&self.paths.twitch_tokens, &*personal)
+    }
+
+    pub async fn save_kick_tokens(&self) -> anyhow::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
+        let personal = self.personal_kick.read().await;
+        storage::write_json(&self.paths.kick_tokens, &*personal)
+    }
+
+    pub async fn save_delegated(&self) -> anyhow::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
+        let d = self.delegated.read().await;
+        match d.as_ref() {
+            Some(sess) => storage::write_json(&self.paths.twitch_delegated, sess),
+            None => {
+                if self.paths.twitch_delegated.is_file() {
+                    let _ = std::fs::remove_file(&self.paths.twitch_delegated);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn save_active_mode(&self) -> anyhow::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
+        let mode = *self.active_mode.read().await;
+        storage::write_json(
+            &self.paths.twitch_active_mode,
+            &TwitchActiveModeFile { mode },
+        )
+    }
+
+    /// Client-Id for Helix / EventSub: Syndicate client when takeover is the active identity.
+    pub async fn helix_client_id(&self) -> String {
+        if self.is_delegated_mode().await {
+            if let Some(ref d) = *self.delegated.read().await {
+                if !d.client_id.is_empty() {
+                    return d.client_id.clone();
+                }
+            }
+        }
+        self.client_id.clone()
+    }
+
+    pub async fn is_delegated_mode(&self) -> bool {
+        *self.active_mode.read().await == TwitchActiveMode::Delegated
+            && self.delegated.read().await.is_some()
+    }
+}
+
+/// Live Kick identity: takeover Kick when delegated and the owner linked Kick, else personal.
+pub fn live_kick_tokens(
+    mode: TwitchActiveMode,
+    delegated: Option<&DelegatedSessionFile>,
+    personal: &KickTokenFile,
+) -> KickTokenFile {
+    if mode == TwitchActiveMode::Delegated {
+        if let Some(d) = delegated {
+            let tok = d.kick_access_token.as_ref().filter(|s| !s.is_empty());
+            if tok.is_some() && d.kick_id.as_ref().is_some_and(|s| !s.is_empty()) {
+                return KickTokenFile {
+                    access_token: d.kick_access_token.clone(),
+                    refresh_token: d.kick_refresh_token.clone(),
+                    expires_at: d.kick_expires_at.clone(),
+                    kick_id: d.kick_id.clone(),
+                    login: d.kick_login.clone(),
+                    display_name: d.kick_login.clone(),
+                    scopes: if d.kick_scopes.is_empty() {
+                        None
+                    } else {
+                        Some(d.kick_scopes.clone())
+                    },
+                    feed_ticket: None,
+                };
+            }
+        }
+    }
+    personal.clone()
+}
+
+/// Live token view of a saved takeover session (does not touch personal OAuth).
+pub fn tokens_from_delegated_session(d: &DelegatedSessionFile) -> TwitchTokenFile {
+    let expires_in = chrono::DateTime::parse_from_rfc3339(&d.twitch_expires_at)
+        .ok()
+        .map(|exp| (exp.timestamp() - chrono::Utc::now().timestamp()).max(0));
+    TwitchTokenFile {
+        access_token: Some(d.access_token.clone()),
+        refresh_token: None,
+        expires_in,
+        obtainment_timestamp: Some(chrono::Utc::now().timestamp_millis()),
+        login: Some(d.channel_login.clone()),
+        user_id: Some(d.channel_twitch_id.clone()),
+        scopes: Some(d.scopes.clone()),
+    }
+}
+
+/// OAuth redirect for this server instance. Uses `TWITCH_REDIRECT_URI` when set, but if it
+/// points at localhost with a different port than the server (e.g. `.env` has 4040 while
+/// Rust A/B runs on 4041), the port is aligned so Twitch callbacks reach the running server.
+fn redirect_uri_for_port(port: u16) -> String {
+    let uri = std::env::var("TWITCH_REDIRECT_URI")
+        .unwrap_or_else(|_| format!("http://localhost:{port}/auth/twitch/callback"));
+    align_localhost_redirect_port(&uri, port)
+}
+
+fn align_localhost_redirect_port(uri: &str, port: u16) -> String {
+    const PREFIXES: &[&str] = &[
+        "http://localhost:",
+        "https://localhost:",
+        "http://127.0.0.1:",
+        "https://127.0.0.1:",
+    ];
+    for prefix in PREFIXES {
+        let Some(after) = uri.strip_prefix(prefix) else {
+            continue;
+        };
+        let path = after
+            .find('/')
+            .map(|i| &after[i..])
+            .unwrap_or("/auth/twitch/callback");
+        let scheme = if prefix.starts_with("https") {
+            "https"
+        } else {
+            "http"
+        };
+        let host = if prefix.contains("127.0.0.1") {
+            "127.0.0.1"
+        } else {
+            "localhost"
+        };
+        return format!("{scheme}://{host}:{port}{path}");
+    }
+    uri.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn align_localhost_redirect_port_rewrites_port() {
+        let out = align_localhost_redirect_port(
+            "http://localhost:4040/auth/twitch/callback",
+            4041,
+        );
+        assert_eq!(out, "http://localhost:4041/auth/twitch/callback");
+    }
+
+    #[test]
+    fn align_localhost_redirect_port_leaves_custom_host() {
+        let uri = "https://example.com/auth/twitch/callback";
+        assert_eq!(align_localhost_redirect_port(uri, 4041), uri);
+    }
+}
+
+pub fn normalize_chat_profile_id(id: &str) -> String {
+    let v = id.trim();
+    if v.is_empty() || v == "default" {
+        "chat-default".to_string()
+    } else {
+        v.to_string()
+    }
+}

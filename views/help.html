@@ -1,0 +1,97 @@
+<div class="view-panel view-help">
+  <div class="section-header">
+    <h2>Help & Support</h2>
+    <p class="section-subtitle">
+      Need help getting Stream Sync set up, or want to report a bug?
+      You’re in the right place.
+    </p>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <div>
+        <div class="card-title">Join the support Discord</div>
+        <div class="card-subtitle">
+          Get real-time support, share ideas, and help shape future updates.
+        </div>
+      </div>
+    </div>
+
+    <div class="config-section">
+      <p>
+        If you run into issues, the fastest way to get help is via the
+        <strong>Syndicate AI Discord</strong>.
+      </p>
+
+      <p>When you report a bug, please include:</p>
+      <ul class="bullet-list">
+        <li>A short description of what you were doing</li>
+        <li>Your Stream Sync version</li>
+        <li>Any error popups you saw</li>
+        <li>Relevant log files (from the <code>logs</code> folder)</li>
+      </ul>
+
+      <div class="help-actions">
+        <button class="btn btn-primary" id="btn-open-discord">
+          Open support Discord
+        </button>
+        <button class="btn btn-secondary" id="btn-open-logs-folder">
+          Open logs folder
+        </button>
+        <button class="btn btn-secondary" id="btn-purge-logs">
+          Purge logs
+        </button>
+        <button class="btn btn-secondary" id="btn-check-updates">
+          Check for updates
+        </button>
+      </div>
+
+      <p class="field-help">
+        The log files only contain technical details releated to Stream Sync –
+        no personal data related to your chat content or viewer data is ever stored.
+      </p>
+
+      <p class="field-help">
+        Logs are automatically retained for <strong>7 days</strong>. Purging logs will delete all log
+        files except the current day's log.
+      </p>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top: 16px;">
+    <div class="card-header">
+      <div>
+        <div class="card-title">Export backup</div>
+        <div class="card-subtitle">
+          Save your Stream Sync settings, overlays, fonts, event media, and imports as a single .zip file.
+        </div>
+      </div>
+    </div>
+
+    <div class="config-section">
+      <p>
+        Use this before reinstalling Windows, moving to a new PC, or sharing a setup with another machine.
+        You choose where the backup is saved.
+      </p>
+
+      <ul class="bullet-list">
+        <li>Chat &amp; events overlay profiles</li>
+        <li>Uploaded fonts and localized event media</li>
+        <li>StreamElements import data and session</li>
+        <li>Twitch connection tokens and recent logs</li>
+      </ul>
+
+      <div class="help-actions">
+        <button type="button" class="btn btn-primary" id="btn-export-backup">
+          Export backup (.zip)
+        </button>
+      </div>
+
+      <p class="field-help">
+        Backups may contain sensitive tokens. Store the .zip securely and do not share it publicly.
+        Takeover keys and in-Sync host tokens are excluded from backups.
+      </p>
+    </div>
+  </div>
+
+</div>

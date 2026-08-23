@@ -1,0 +1,18 @@
+[[permission]]
+identifier = "allow-stream-sync-commands"
+description = "Stream Sync desktop invoke commands"
+commands.allow = [
+  "get_overlay_base_url",
+  "get_overlay_port",
+  "open_external",
+  "open_logs_folder",
+  "open_discord",
+  "twitch_connect",
+  "twitch_reconnect",
+  "twitch_disconnect",
+  "kick_connect",
+  "purge_logs",
+  "check_for_updates",
+  "open_se_account_page",
+  "export_backup",
+]

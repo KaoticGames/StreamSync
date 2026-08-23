@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.tauri.app/config/2/capability",
+  "identifier": "default",
+  "description": "Default Stream Sync desktop capabilities",
+  "windows": ["main"],
+  "permissions": [
+    "allow-stream-sync-commands",
+    "core:default",
+    "core:window:allow-create",
+    "core:window:allow-close",
+    "core:event:allow-emit",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "core:tray:default",
+    "opener:default",
+    "shell:allow-open"
+  ]
+}

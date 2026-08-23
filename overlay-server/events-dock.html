@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Stream Sync – Events Dock</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <style>
+    :root {
+      --bg: #111111;
+      --bg-panel: #181818;
+      --border-subtle: #2a2a2a;
+      --border-strong: #3f3f46;
+      --text-main: #e5e7eb;
+      --text-soft: #9ca3af;
+      --accent: #69bd45;
+      --accent-soft: rgba(105, 189, 69, 0.16);
+      --accent-strong: rgba(105, 189, 69, 0.32);
+
+      --font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --font-size: 13px;
+      --line-height: 1.35;
+
+      --chip: rgba(255,255,255,0.06);
+
+      /* per-event colors */
+      --c-follow: #22c55e;
+      --c-sub: #a855f7;
+      --c-resub: #c084fc;
+      --c-gift: #f59e0b;
+      --c-bits: #06b6d4;
+      --c-raid: #ef4444;
+      --c-redeem: #60a5fa;
+      --c-hypetrain: #f97316;
+      --c-announce: #eab308;
+      --c-default: #9ca3af;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: var(--bg);
+      color: var(--text-main);
+      font-family: var(--font-family);
+      overflow: hidden;
+    }
+
+    body {
+      display: flex;
+      flex-direction: column;
+      background:
+        radial-gradient(circle at top left, rgba(105, 189, 69, 0.10) 0, transparent 55%),
+        linear-gradient(135deg, #1a1a1a, #050505);
+    }
+
+    .dock-header {
+      padding: 6px 8px;
+      border-bottom: 1px solid var(--border-subtle);
+      font-size: 12px;
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      background:
+        radial-gradient(circle at top left, rgba(105, 189, 69, 0.12) 0, transparent 60%),
+        linear-gradient(135deg, #1b1b1b, #080808);
+    }
+
+    .dock-title { font-weight: 700; font-size: 13px; line-height: 1.2; }
+    .dock-subtitle { font-size: 11px; color: var(--text-soft); margin-top: 2px; }
+    .profile-label { font-size: 10px; color: var(--text-soft); margin-top: 2px; }
+
+    .dock-status {
+      font-size: 11px;
+      color: var(--text-soft);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: #4b5563;
+    }
+    .status-dot.connected {
+      background: var(--accent);
+      box-shadow: 0 0 8px rgba(105, 189, 69, 0.7);
+    }
+
+    .dock-body {
+      flex: 1;
+      min-height: 0;
+      padding: 8px;
+      overflow-y: auto;
+      background:
+        radial-gradient(circle at top left, rgba(105, 189, 69, 0.10) 0, transparent 60%),
+        linear-gradient(135deg, #161616, #050505);
+    }
+
+    .dock-body::-webkit-scrollbar { width: 8px; }
+    .dock-body::-webkit-scrollbar-thumb { background: #18181b; border-radius: 999px; }
+
+    .empty-state {
+      font-size: 12px;
+      color: var(--text-soft);
+      padding: 8px 0;
+    }
+
+    .event-card {
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(0,0,0,0.25);
+      border-radius: 10px;
+      padding: 8px 10px;
+      margin: 8px 0;
+      box-shadow: 0 8px 20px rgba(0,0,0,0.25);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .event-card::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 4px;
+      background: var(--c-default);
+      opacity: 0.95;
+    }
+
+    .event-row {
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+      flex-wrap: wrap;
+      font-size: var(--font-size);
+      line-height: var(--line-height);
+    }
+
+    .event-ts {
+      font-size: 11px;
+      color: var(--text-soft);
+      padding: 2px 6px;
+      border-radius: 999px;
+      background: var(--chip);
+    }
+
+    .event-type {
+      font-weight: 800;
+      letter-spacing: 0.2px;
+    }
+
+    .event-detail {
+      color: var(--text-main);
+      white-space: pre-wrap;
+      word-break: break-word;
+      flex: 1 1 auto;
+      min-width: 140px;
+    }
+
+  </style>
+</head>
+
+<body>
+  <div class="dock-header">
+    <div>
+      <div class="dock-title">Events Dock</div>
+      <div class="dock-subtitle">Follows, subs, gifts, bits, raids, channel points, etc.</div>
+      <div class="profile-label" id="profileLabel">Profile: …</div>
+    </div>
+
+    <div class="dock-status" title="WebSocket status">
+      <span class="status-dot" id="wsDot"></span>
+      <span id="wsText">Disconnected</span>
+    </div>
+  </div>
+
+  <div class="dock-body" id="eventList">
+    <div class="empty-state" id="emptyState">Waiting for events…</div>
+  </div>
+
+<script>
+  const DOCK_PLATFORM = window.STREAMSYNC_DOCK_PLATFORM || "twitch";
+  function eventPlatform(payload) {
+    return payload && payload.platform ? String(payload.platform) : "twitch";
+  }
+  if (DOCK_PLATFORM === "kick") {
+    document.title = "Stream Sync – Kick Events Dock";
+    const titleEl = document.querySelector(".dock-title");
+    if (titleEl) titleEl.textContent = "Kick Events Dock";
+    const sub = document.querySelector(".dock-subtitle");
+    if (sub) sub.textContent = "Follows, subs, gifts, Kicks, rewards, and live status.";
+  }
+  const profileId = new URLSearchParams(location.search).get("profile") || "events-default";
+  document.getElementById("profileLabel").textContent = "Profile: " + profileId;
+
+  const eventList = document.getElementById("eventList"); // this is the scroll container
+  const emptyState = document.getElementById("emptyState");
+  const wsDot = document.getElementById("wsDot");
+  const wsText = document.getElementById("wsText");
+
+  let ws = null;
+
+  // Dedupe (avoid double events if server echoes / reconnects)
+  const seenIds = new Set();
+  const seenQueue = [];
+
+  // live config (server pushes updates; REST fallback also seeds it)
+  let dockCfg = {
+    fontSize: 13,
+    showTimestamps: true,
+    showBadges: false,
+    autoScroll: true,
+    density: "comfortable",
+    maxItems: 150,
+    events: {
+      follow: true, sub: true, resub: true, gift: true, bits: true, raid: true, redeem: true, hypetrain: true, announce: true
+    }
+  };
+
+  function setWsStatus(connected, label) {
+    wsText.textContent = label || (connected ? "Connected" : "Disconnected");
+    if (connected) wsDot.classList.add("connected");
+    else wsDot.classList.remove("connected");
+  }
+
+  function formatTime(ts) {
+    try {
+      const d = new Date(ts || Date.now());
+      let hh = d.getHours();
+      const mm = String(d.getMinutes()).padStart(2, "0");
+      const ss = String(d.getSeconds()).padStart(2, "0");
+      const ampm = hh >= 12 ? "PM" : "AM";
+      hh = hh % 12;
+      if (hh === 0) hh = 12;
+      return `${hh}:${mm}:${ss} ${ampm}`;
+    } catch {
+      return "";
+    }
+  }
+
+  function cssColorForType(t) {
+    const k = String(t || "").toLowerCase();
+    const map = {
+      follow: "var(--c-follow)",
+      sub: "var(--c-sub)",
+      resub: "var(--c-resub)",
+      gift: "var(--c-gift)",
+      bits: "var(--c-bits)",
+      kicks: "var(--c-bits)",
+      cheer: "var(--c-bits)",      // alias
+      raid: "var(--c-raid)",
+      redeem: "var(--c-redeem)",
+      hypetrain: "var(--c-hypetrain)",
+      announce: "var(--c-announce)",
+    };
+    return map[k] || "var(--c-default)";
+  }
+
+  function noteSeen(id) {
+    if (!id) return false;
+    if (seenIds.has(id)) return true;
+    seenIds.add(id);
+    seenQueue.push(id);
+    if (seenQueue.length > 300) {
+      const old = seenQueue.shift();
+      if (old) seenIds.delete(old);
+    }
+    return false;
+  }
+
+  function updateEmptyState() {
+    const count = eventList.querySelectorAll(".event-card:not([data-hidden='1'])").length;
+    emptyState.style.display = count === 0 ? "block" : "none";
+  }
+
+  function scrollToBottomIfNearBottom() {
+    if (dockCfg.autoScroll === false) return;
+
+    const threshold = 80;
+    const nearBottom =
+      eventList.scrollHeight - eventList.scrollTop - eventList.clientHeight < threshold;
+
+    if (nearBottom) eventList.scrollTop = eventList.scrollHeight;
+  }
+
+  function applyConfig(cfg) {
+    if (!cfg || typeof cfg !== "object") return;
+
+    // merge defensively
+    dockCfg = {
+      ...dockCfg,
+      ...cfg,
+      events: { ...(dockCfg.events || {}), ...((cfg.events || {}) ) },
+    };
+
+    // font sizing: CSS variable drives rendered cards immediately
+    const px = Number(dockCfg.fontSize) || 13;
+    document.documentElement.style.setProperty("--font-size", px + "px");
+
+    // apply timestamp visibility to EXISTING cards
+    const showTs = dockCfg.showTimestamps !== false;
+    for (const el of eventList.querySelectorAll(".event-ts")) {
+      el.style.display = showTs ? "" : "none";
+    }
+
+    // apply filtering to EXISTING cards
+    for (const card of eventList.querySelectorAll(".event-card")) {
+      const t = (card.getAttribute("data-event-type") || "").toLowerCase();
+      const enabled = !(dockCfg.events && dockCfg.events[t] === false);
+      card.setAttribute("data-hidden", enabled ? "0" : "1");
+      card.style.display = enabled ? "" : "none";
+    }
+
+    // enforce maxItems after config change
+    enforceMaxItems();
+
+    updateEmptyState();
+  }
+
+  function enforceMaxItems() {
+    const max = Math.min(Math.max(parseInt(dockCfg.maxItems || 150, 10) || 150, 5), 300);
+    const cards = Array.from(eventList.querySelectorAll(".event-card"));
+    while (cards.length > max) {
+      const first = cards.shift();
+      if (!first) break;
+      first.remove();
+    }
+  }
+
+  // Expected: { type:"dock-event", id, ts, eventType, detail, label }
+  function appendDockEvent(evt) {
+    if (!evt) return;
+
+    const eventType = (evt.eventType || "").toString().toLowerCase();
+    if (!eventType) return;
+
+    // filter
+    if (dockCfg?.events && dockCfg.events[eventType] === false) return;
+
+    // dedupe
+    if (evt.id && noteSeen(evt.id)) return;
+
+    const card = document.createElement("div");
+    card.className = "event-card";
+    card.setAttribute("data-event-type", eventType);
+
+    // left color bar
+    const bar = document.createElement("div");
+    bar.style.position = "absolute";
+    bar.style.left = "0";
+    bar.style.top = "0";
+    bar.style.bottom = "0";
+    bar.style.width = "4px";
+    bar.style.background = cssColorForType(eventType);
+    bar.style.opacity = "0.95";
+    card.appendChild(bar);
+
+    const row = document.createElement("div");
+    row.className = "event-row";
+
+    const showTs = dockCfg.showTimestamps !== false;
+    const ts = document.createElement("span");
+    ts.className = "event-ts";
+    ts.textContent = formatTime(evt.ts);
+    if (!showTs) ts.style.display = "none";
+    row.appendChild(ts);
+
+    const type = document.createElement("span");
+    type.className = "event-type";
+    type.style.color = cssColorForType(eventType);
+    type.textContent = (evt.label || evt.eventType || "event").toString();
+    row.appendChild(type);
+
+    const detail = document.createElement("span");
+    detail.className = "event-detail";
+    detail.textContent = (evt.detail || "").toString();
+    row.appendChild(detail);
+
+    card.appendChild(row);
+
+    eventList.appendChild(card);
+
+    enforceMaxItems();
+    updateEmptyState();
+    scrollToBottomIfNearBottom();
+  }
+
+  function getWebSocketUrl() {
+    const loc = window.location;
+    const wsProto = loc.protocol === "https:" ? "wss:" : "ws:";
+    return wsProto + "//" + loc.host + "/ws/feed?profile=" + encodeURIComponent(profileId);
+  }
+
+  async function fetchInitialConfig() {
+    try {
+      const res = await fetch("/api/events/dock-config", { cache: "no-store" });
+      if (!res.ok) return;
+      const json = await res.json().catch(() => null);
+      const cfg = json?.config || json?.data || json;
+      if (cfg && typeof cfg === "object") applyConfig(cfg);
+    } catch {
+      // ignore
+    }
+  }
+
+  function connectWebSocket() {
+    const url = getWebSocketUrl();
+    let socket;
+
+    try {
+      socket = new WebSocket(url);
+    } catch (err) {
+      console.error("[events-dock] Failed to open WebSocket:", err);
+      setWsStatus(false, "Error");
+      return;
+    }
+
+    ws = socket;
+    setWsStatus(false, "Connecting…");
+
+    socket.addEventListener("open", () => {
+      setWsStatus(true, "Connected");
+    });
+
+    socket.addEventListener("message", (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        if (!payload || typeof payload !== "object") return;
+
+        // Accept both (in case something else emits a different type)
+        if (payload.type === "events-dock-config" || payload.type === "events-dock-config-updated") {
+          applyConfig(payload.config || payload.data || payload);
+          return;
+        }
+
+        if (payload.type === "dock-event") {
+          if (eventPlatform(payload) !== DOCK_PLATFORM) return;
+          appendDockEvent(payload);
+          return;
+        }
+      } catch (err) {
+        console.error("[events-dock] Failed to parse WS message:", err);
+      }
+    });
+
+    socket.addEventListener("close", () => {
+      setWsStatus(false, "Disconnected");
+      ws = null;
+      setTimeout(connectWebSocket, 2000);
+    });
+
+    socket.addEventListener("error", () => {
+      setWsStatus(false, "Error");
+    });
+  }
+
+  updateEmptyState();
+  fetchInitialConfig().finally(() => {
+    connectWebSocket();
+  });
+</script>
+
+</body>
+</html>

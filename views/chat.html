@@ -1,0 +1,738 @@
+<div class="view-panel view-chat">
+
+  <!-- Chat sub-tabs -->
+  <div class="subnav subnav-chat">
+    <button class="subnav-btn active" data-subview="chat-integrations">
+      Integrations
+    </button>
+    <button class="subnav-btn" data-subview="chat-dock">
+      Dock
+    </button>
+    <button class="subnav-btn" data-subview="chat-overlay">
+      Overlay
+    </button>
+  </div>
+
+  <div class="subview-container">
+
+    <!-- INTEGRATIONS SUBVIEW -->
+    <section id="chat-integrations" class="subview active">
+      <div class="section-header">
+        <h2>Chat integrations</h2>
+        <p class="section-subtitle">
+          Connect Stream Sync chat to OBS using browser sources and docks.
+        </p>
+      </div>
+
+      <div class="card-grid">
+
+        <!-- Chat Dock URL -->
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Chat Dock</div>
+              <div class="card-subtitle">
+                Use this URL as a custom browser dock in OBS to view live chat.
+              </div>
+            </div>
+          </div>
+
+          <div class="config-section">
+            <label class="field-label">OBS Dock URL</label>
+            <div class="url-row">
+              <input
+                type="text"
+                class="url-input"
+                id="chat-dock-url"
+                data-overlay-url-kind="chat-dock"
+                value="http://localhost:4040/dock/chat"
+                readonly
+              />
+              <button class="btn btn-secondary" data-copy-target="#chat-dock-url">
+                Copy
+              </button>
+            </div>
+
+            <div class="field-help">
+              In OBS: <strong>View → Docks → Custom Browser Docks…</strong>, add this URL,
+              name it something like <em>Stream Sync Chat</em>, and dock it wherever you like.
+            </div>
+          </div>
+        </div>
+
+        <!-- Chat Overlay URL -->
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Chat Overlay</div>
+              <div class="card-subtitle">
+                Add chat directly onto your stream as a browser source.
+              </div>
+            </div>
+          </div>
+
+          <div class="config-section">
+            <label class="field-label">Profile</label>
+
+            <!-- Custom Syndicate dropdown (native <select> option highlight can't be themed on Windows) -->
+            <div
+              id="chat-overlay-url-profile"
+              class="ss-select"
+              style="max-width: 260px;"
+              data-selected="chat-default"
+            >
+              <button type="button" class="ss-select__btn" aria-haspopup="listbox">
+                Default
+              </button>
+              <span class="ss-select__chev">▾</span>
+              <div class="ss-select__menu" role="listbox" aria-label="Profile"></div>
+            </div>
+
+            <label class="field-label" style="margin-top:10px;">Browser Source URL</label>
+            <div class="url-row">
+              <input
+                type="text"
+                class="url-input"
+                id="chat-overlay-url"
+                data-overlay-url-kind="chat-overlay"
+                data-overlay-profile="chat-default"
+                value="http://localhost:4040/overlay/chat?profile=chat-default"
+                readonly
+              />
+              <button class="btn btn-secondary" data-copy-target="#chat-overlay-url">
+                Copy
+              </button>
+            </div>
+
+            <div class="field-help">
+              In OBS: add a <strong>Browser Source</strong>, paste this URL, and adjust the
+              resolution to match your layout.
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Kick Chat Dock</div>
+              <div class="card-subtitle">
+                Dedicated Kick chat dock — not a filter on the Twitch dock.
+              </div>
+            </div>
+          </div>
+          <div class="config-section">
+            <label class="field-label">OBS Dock URL</label>
+            <div class="url-row">
+              <input
+                type="text"
+                class="url-input"
+                id="kick-chat-dock-url"
+                data-overlay-url-kind="kick-chat-dock"
+                value="http://localhost:4040/dock/kick-chat"
+                readonly
+              />
+              <button class="btn btn-secondary" data-copy-target="#kick-chat-dock-url">
+                Copy
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Kick Chat Overlay</div>
+              <div class="card-subtitle">
+                On-stream Kick chat using the same Kick feed as the Kick dock.
+              </div>
+            </div>
+          </div>
+          <div class="config-section">
+            <label class="field-label">Browser Source URL</label>
+            <div class="url-row">
+              <input
+                type="text"
+                class="url-input"
+                id="kick-chat-overlay-url"
+                data-overlay-url-kind="kick-chat-overlay"
+                value="http://localhost:4040/overlay/kick-chat"
+                readonly
+              />
+              <button class="btn btn-secondary" data-copy-target="#kick-chat-overlay-url">
+                Copy
+              </button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- DOCK SUBVIEW -->
+    <section id="chat-dock" class="subview hidden">
+      <div class="section-header">
+        <h2>Chat Dock</h2>
+        <p class="section-subtitle">
+          Configure how the chat dock appears inside OBS. The layout is fixed and optimized
+          for readability, but you can control font size and what metadata is shown.
+        </p>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Dock settings</div>
+            <div class="card-subtitle">
+              These settings apply to the OBS chat dock only.
+            </div>
+          </div>
+        </div>
+
+        <div class="config-section">
+
+          <!-- Font size (no browser spinner arrows; buttons handle stepping) -->
+          <div class="field-row">
+            <div class="field-label">
+              <div class="field-title">Font size</div>
+              <div class="field-subtitle">Dock text size in pixels.</div>
+            </div>
+
+            <div class="stepper" id="chatDockStepper">
+              <button class="btn btn-mini" type="button" id="chat-dock-font-down" aria-label="Decrease font size">−</button>
+
+              <input
+                id="chat-dock-font-size"
+                type="text"
+                inputmode="numeric"
+                pattern="[0-9]*"
+                value="13"
+                aria-label="Chat dock font size"
+                style="width: 84px; text-align: center;"
+              />
+
+              <button class="btn btn-mini" type="button" id="chat-dock-font-up" aria-label="Increase font size">+</button>
+            </div>
+          </div>
+
+          <!-- Timestamps toggle -->
+          <div class="form-row form-row-inline">
+            <span class="field-label">Show timestamps</span>
+            <button
+              type="button"
+              id="chat-dock-toggle-timestamps"
+              class="toggle-switch"
+              aria-pressed="false"
+            >
+              <span class="toggle-thumb"></span>
+              <span class="toggle-label">Off</span>
+            </button>
+          </div>
+
+          <!-- Badges toggle -->
+          <div class="form-row form-row-inline">
+            <span class="field-label">Show badges</span>
+            <button
+              type="button"
+              id="chat-dock-toggle-badges"
+              class="toggle-switch"
+              aria-pressed="false"
+            >
+              <span class="toggle-thumb"></span>
+              <span class="toggle-label">Off</span>
+            </button>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <!-- OVERLAY SUBVIEW -->
+    <section id="chat-overlay" class="subview hidden">
+      <div class="section-header">
+        <h2>Chat Overlay</h2>
+        <p class="section-subtitle">
+          Configure how chat appears in your browser source. These settings control fonts, layout,
+          bubbles, background, and how long messages stay on-screen.
+        </p>
+      </div>
+
+      <div class="overlay-layout">
+        <!-- LEFT: CONFIG PANEL -->
+        <div class="overlay-config-panel">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <div class="card-title">Overlay configuration</div>
+                <div class="card-subtitle">
+                  Adjust how chat appears per profile. Changes are previewed on the right.
+                </div>
+              </div>
+            </div>
+
+            <div class="config-section">
+
+              <!-- Profile -->
+              <div class="config-group">
+                <div class="config-group-title">Profile</div>
+
+                <div class="form-row">
+                  <label class="field-label" for="chat-overlay-profile-button">
+                    Active profile
+                  </label>
+
+                  <!-- Keep the real <select> for existing JS + persistence logic, but hide it -->
+                  <select id="chat-overlay-profile-select" class="input" style="display:none;">
+                    <!-- populated by JS -->
+                  </select>
+
+                  <!-- Custom branded dropdown (matches Events pattern) -->
+                  <div class="profile-row">
+                    <div class="profile-dropdown" id="chatProfileDropdown">
+                      <button
+                        type="button"
+                        class="profile-dropdown-btn"
+                        id="chat-overlay-profile-button"
+                        aria-haspopup="listbox"
+                        aria-expanded="false"
+                      >
+                        <span class="profile-dropdown-value" id="chat-overlay-profile-value">Default</span>
+                        <span class="profile-dropdown-caret" aria-hidden="true">▾</span>
+                      </button>
+
+                      <div
+                        class="profile-dropdown-menu"
+                        id="chat-overlay-profile-menu"
+                        role="listbox"
+                        aria-label="Chat overlay profiles"
+                        hidden
+                      >
+                        <!-- populated by JS -->
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      class="btn btn-secondary"
+                      id="chat-overlay-profile-add"
+                      title="Create a new profile"
+                    >
+                      Add
+                    </button>
+                  </div>
+
+                  <div class="field-help" style="margin-top:6px;">
+                    Profiles let you maintain multiple chat overlay configurations.
+                  </div>
+                </div>
+              </div>
+
+              <!-- Visibility -->
+              <div class="config-group">
+                <div class="config-group-title">Visibility</div>
+
+                <div class="form-row form-row-inline">
+                  <span class="field-label">Show timestamps</span>
+                  <div class="toggle-row">
+                    <button
+                      id="overlay-toggle-timestamps"
+                      class="toggle-switch"
+                      type="button"
+                      aria-pressed="true"
+                    >
+                      <span class="toggle-thumb"></span>
+                      <span class="toggle-label">On</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div class="form-row form-row-inline">
+                  <span class="field-label">Show badges</span>
+                  <div class="toggle-row">
+                    <button
+                      id="overlay-toggle-badges"
+                      class="toggle-switch"
+                      type="button"
+                      aria-pressed="true"
+                    >
+                      <span class="toggle-thumb"></span>
+                      <span class="toggle-label">On</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Font & text -->
+              <div class="config-group config-group-fonts">
+                <div class="config-group-title">Font &amp; text</div>
+
+                <div class="form-row">
+                  <label class="field-label">Font source</label>
+                  <div class="radio-row">
+                    <label class="radio-option">
+                      <input
+                        type="radio"
+                        name="overlay-font-source"
+                        value="google"
+                        id="overlay-font-source-google"
+                        checked
+                      />
+                      <span>Google font</span>
+                    </label>
+                    <label class="radio-option">
+                      <input
+                        type="radio"
+                        name="overlay-font-source"
+                        value="local"
+                        id="overlay-font-source-local"
+                      />
+                      <span>Local upload</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div class="form-row" id="overlay-google-font-row">
+                  <label class="field-label" for="overlay-google-font">
+                    Google font
+                  </label>
+                  <select
+                    id="overlay-google-font"
+                    class="input overlay-google-font-select"
+                    aria-label="Google font"
+                  >
+                    <option value="Montserrat" selected>Montserrat</option>
+                    <option value="Poppins">Poppins</option>
+                    <option value="Inter">Inter</option>
+                    <option value="Roboto">Roboto</option>
+                    <option value="Roboto Condensed">Roboto Condensed</option>
+                    <option value="Open Sans">Open Sans</option>
+                    <option value="Lato">Lato</option>
+                    <option value="Nunito">Nunito</option>
+                    <option value="Raleway">Raleway</option>
+                    <option value="Oswald">Oswald</option>
+                    <option value="Bebas Neue">Bebas Neue</option>
+                    <option value="Playfair Display">Playfair Display</option>
+                    <option value="Cinzel">Cinzel</option>
+                    <option value="Merriweather">Merriweather</option>
+                    <option value="Source Sans 3">Source Sans 3</option>
+                    <option value="Noto Sans">Noto Sans</option>
+                    <option value="Noto Serif">Noto Serif</option>
+                    <option value="Ubuntu">Ubuntu</option>
+                    <option value="Rubik">Rubik</option>
+                    <option value="Work Sans">Work Sans</option>
+                    <option value="PT Sans">PT Sans</option>
+                    <option value="Fira Sans">Fira Sans</option>
+                    <option value="Josefin Sans">Josefin Sans</option>
+                    <option value="Comfortaa">Comfortaa</option>
+                  </select>
+                </div>
+
+                <div class="form-row hidden" id="overlay-local-font-row">
+                  <label class="field-label" for="overlay-font-upload">
+                    Local font file
+                  </label>
+                  <input
+                    id="overlay-font-upload"
+                    class="input"
+                    type="file"
+                    accept=".ttf,.otf,.woff,.woff2"
+                  />
+                </div>
+
+                <div class="form-row">
+                  <label class="field-label" for="overlay-font-size">
+                    Font size (px)
+                  </label>
+                  <input
+                    id="overlay-font-size"
+                    class="field-number"
+                    type="number"
+                    min="10"
+                    max="48"
+                    step="1"
+                  />
+                </div>
+
+                <div class="form-row form-row-split">
+                  <div class="form-subrow">
+                    <label class="field-label" for="overlay-text-rotate">
+                      Text rotation (°)
+                    </label>
+                    <input
+                      id="overlay-text-rotate"
+                      type="range"
+                      min="-15"
+                      max="15"
+                      step="1"
+                    />
+                  </div>
+                  <div class="form-subrow">
+                    <label class="field-label" for="overlay-text-skew">
+                      Text skew (°)
+                    </label>
+                    <input
+                      id="overlay-text-skew"
+                      type="range"
+                      min="-20"
+                      max="20"
+                      step="1"
+                    />
+                  </div>
+                </div>
+
+                <!-- Text stroke -->
+                <div class="form-row form-row-split">
+                  <div class="form-subrow">
+                    <label class="field-label" for="overlay-stroke-width">
+                      Text stroke width (px)
+                    </label>
+                    <input
+                      id="overlay-stroke-width"
+                      type="range"
+                      min="0"
+                      max="10"
+                      step="0.5"
+                    />
+                    <input
+                      id="overlay-stroke-width-value"
+                      class="field-number"
+                      type="number"
+                      min="0"
+                      max="10"
+                      step="0.5"
+                    />
+                  </div>
+                  <div class="form-subrow">
+                    <label class="field-label" for="overlay-stroke-color">
+                      Text stroke color
+                    </label>
+                    <input
+                      id="overlay-stroke-color"
+                      class="color-input"
+                      type="color"
+                      value="#000000"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <!-- Layout & bubbles -->
+              <div class="config-group">
+                <div class="config-group-title">Layout &amp; bubbles</div>
+
+                <div class="form-row">
+                  <label class="field-label" for="overlay-feed-orientation">
+                    Feed orientation
+                  </label>
+                  <select id="overlay-feed-orientation" class="input">
+                    <option value="vertical">Vertical</option>
+                    <option value="horizontal">Horizontal</option>
+                  </select>
+                </div>
+
+                <div class="form-row">
+                  <label class="field-label">Message style</label>
+                  <div class="radio-row">
+                    <label class="radio-option">
+                      <input
+                        type="radio"
+                        name="overlay-message-style"
+                        value="plain"
+                        id="overlay-style-plain"
+                      />
+                      <span>Plain text</span>
+                    </label>
+                    <label class="radio-option">
+                      <input
+                        type="radio"
+                        name="overlay-message-style"
+                        value="bubble"
+                        id="overlay-style-bubble"
+                        checked
+                      />
+                      <span>Chat bubbles</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div class="form-row" id="overlay-bubble-shape-row">
+                  <label class="field-label" for="overlay-bubble-radius">
+                    Bubble roundness
+                  </label>
+                  <input
+                    id="overlay-bubble-radius"
+                    type="range"
+                    min="0"
+                    max="24"
+                    step="2"
+                  />
+                </div>
+
+                <div class="form-row" id="overlay-bubble-color-row">
+                  <label class="field-label">Bubble color</label>
+                  <div class="radio-row">
+                    <label class="radio-option">
+                      <input
+                        type="radio"
+                        name="overlay-bubble-color-mode"
+                        value="fixed"
+                        id="overlay-bubble-color-fixed"
+                        checked
+                      />
+                      <span>Single color</span>
+                    </label>
+                    <label class="radio-option">
+                      <input
+                        type="radio"
+                        name="overlay-bubble-color-mode"
+                        value="user"
+                        id="overlay-bubble-color-user"
+                      />
+                      <span>User color</span>
+                    </label>
+                  </div>
+                  <div class="color-row">
+                    <input
+                      id="overlay-bubble-color"
+                      class="color-input"
+                      type="color"
+                      value="#1f2933"
+                    />
+                  </div>
+
+                  <!-- Bubble opacity -->
+                  <div class="form-row" style="margin-top: 8px;">
+                    <label class="field-label" for="overlay-bubble-opacity">
+                      Bubble opacity (%)
+                    </label>
+                    <input
+                      id="overlay-bubble-opacity"
+                      type="range"
+                      min="0"
+                      max="100"
+                      step="1"
+                    />
+                    <input
+                      id="overlay-bubble-opacity-value"
+                      class="field-number"
+                      type="number"
+                      min="0"
+                      max="100"
+                      step="1"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <!-- Background & timing -->
+              <div class="config-group">
+                <div class="config-group-title">Background &amp; timing</div>
+
+                <div class="form-row">
+                  <label class="field-label">Chat background</label>
+                  <div class="radio-row">
+                    <label class="radio-option">
+                      <input
+                        type="radio"
+                        name="overlay-bg-mode"
+                        value="transparent"
+                        id="overlay-bg-transparent"
+                        checked
+                      />
+                      <span>Transparent</span>
+                    </label>
+                    <label class="radio-option">
+                      <input
+                        type="radio"
+                        name="overlay-bg-mode"
+                        value="solid"
+                        id="overlay-bg-solid"
+                      />
+                      <span>Solid color</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div class="form-row" id="overlay-bg-color-row">
+                  <label class="field-label" for="overlay-bg-color">
+                    Background color
+                  </label>
+                  <input
+                    id="overlay-bg-color"
+                    class="color-input"
+                    type="color"
+                    value="#000000"
+                  />
+                </div>
+
+                <div class="form-row hidden" id="overlay-bg-gradient-row">
+                  <label class="field-label" for="overlay-bg-gradient-css">
+                    Gradient CSS
+                  </label>
+                  <input
+                    id="overlay-bg-gradient-css"
+                    class="input"
+                    type="text"
+                    placeholder="e.g. linear-gradient(90deg, #000, #0f0)"
+                  />
+                </div>
+
+                <div class="form-row">
+                  <label class="field-label">Display mode</label>
+                  <div class="radio-row">
+                    <label class="radio-option">
+                      <input
+                        type="radio"
+                        name="overlay-display-mode"
+                        value="solid"
+                        id="overlay-display-solid"
+                        checked
+                      />
+                      <span>Solid feed</span>
+                    </label>
+                    <label class="radio-option">
+                      <input
+                        type="radio"
+                        name="overlay-display-mode"
+                        value="popup"
+                        id="overlay-display-popup"
+                      />
+                      <span>Pop-up messages</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div class="form-row" id="overlay-popup-duration-row">
+                  <label class="field-label" for="overlay-popup-duration">
+                    Pop-up duration (seconds)
+                  </label>
+                  <input
+                    id="overlay-popup-duration"
+                    class="field-number"
+                    type="number"
+                    min="2"
+                    max="30"
+                    step="1"
+                  />
+                </div>
+              </div>
+
+            </div>
+          </div>
+        </div>
+
+        <!-- RIGHT: PREVIEW PANEL -->
+        <div class="overlay-preview-panel">
+          <div class="overlay-preview-stage">
+            <iframe
+              id="chat-overlay-preview-frame"
+              class="chat-overlay-preview-frame"
+              title="Overlay preview"
+              src="/overlay/chat?preview=1&profile=chat-default&v=font-preview-parity-16"
+            ></iframe>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </div>
+</div>

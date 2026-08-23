@@ -1,0 +1,148 @@
+<section class="events-subview events-integrations">
+  <div class="section-header">
+    <h2>Event integrations</h2>
+    <p class="section-subtitle">
+      Connect Stream Sync alerts and event feeds to OBS using browser sources and docks.
+    </p>
+  </div>
+
+  <div class="card-grid">
+    <!-- Events Dock URL -->
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">Events Dock</div>
+          <div class="card-subtitle">
+            Use this URL as a custom browser dock in OBS to view live events.
+          </div>
+        </div>
+      </div>
+
+      <div class="config-section">
+        <label class="field-label">OBS Dock URL</label>
+        <div class="url-row">
+          <input
+            type="text"
+            class="url-input"
+            id="events-dock-url"
+            data-overlay-url-kind="events-dock"
+            value="http://localhost:4040/dock/events"
+            readonly
+          />
+          <button class="btn btn-secondary" data-copy-target="#events-dock-url">
+            Copy
+          </button>
+        </div>
+        <div class="field-help">
+          In OBS: <strong>View → Docks → Custom Browser Docks…</strong>, add this URL,
+          name it something like <em>Stream Sync Events</em>, and dock it near chat.
+        </div>
+      </div>
+    </div>
+
+    <!-- Events Overlay URL -->
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">Events Overlay</div>
+          <div class="card-subtitle">
+            Show subscriber, follower, bits, and channel point alerts on your stream.
+          </div>
+        </div>
+      </div>
+
+      <div class="config-section">
+        <label class="field-label">Profile</label>
+
+        <!-- Custom Syndicate dropdown (native <select> option highlight can't be themed on Windows) -->
+        <div
+          id="events-overlay-url-profile"
+          class="ss-select"
+          style="max-width: 260px;"
+          data-selected="default"
+        >
+          <button type="button" class="ss-select__btn" aria-haspopup="listbox">
+            Default
+          </button>
+          <span class="ss-select__chev">▾</span>
+          <div class="ss-select__menu" role="listbox" aria-label="Profile"></div>
+        </div>
+
+        <label class="field-label" style="margin-top:10px;">Browser Source URL</label>
+        <div class="url-row">
+          <input
+            type="text"
+            class="url-input"
+            id="events-overlay-url"
+            data-overlay-url-kind="events-overlay"
+            data-overlay-profile="default"
+            value="http://localhost:4040/overlay/events?profile=default"
+            readonly
+          />
+          <button class="btn btn-secondary" data-copy-target="#events-overlay-url">
+            Copy
+          </button>
+        </div>
+        <div class="field-help">
+          In OBS: add a <strong>Browser Source</strong>, paste this URL, and set the
+          resolution to match your alert layout. The <code>profile</code> parameter will
+          update as you switch the selection above.
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">Kick Events Dock</div>
+          <div class="card-subtitle">
+            Dedicated Kick events dock (follows, subs, gifts, Kicks, rewards).
+          </div>
+        </div>
+      </div>
+      <div class="config-section">
+        <label class="field-label">OBS Dock URL</label>
+        <div class="url-row">
+          <input
+            type="text"
+            class="url-input"
+            id="kick-events-dock-url"
+            data-overlay-url-kind="kick-events-dock"
+            value="http://localhost:4040/dock/kick-events"
+            readonly
+          />
+          <button class="btn btn-secondary" data-copy-target="#kick-events-dock-url">
+            Copy
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">Kick Events Overlay</div>
+          <div class="card-subtitle">
+            On-stream Kick alerts using the same Kick feed as the Kick events dock.
+          </div>
+        </div>
+      </div>
+      <div class="config-section">
+        <label class="field-label">Browser Source URL</label>
+        <div class="url-row">
+          <input
+            type="text"
+            class="url-input"
+            id="kick-events-overlay-url"
+            data-overlay-url-kind="kick-events-overlay"
+            value="http://localhost:4040/overlay/kick-events"
+            readonly
+          />
+          <button class="btn btn-secondary" data-copy-target="#kick-events-overlay-url">
+            Copy
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <title>Stream Sync</title>
+
+  <link rel="stylesheet" href="shell.css?v=1" />
+
+</head>
+<body>
+
+  <!-- App Container -->
+  <div id="app-container">
+
+    <!-- HEADER BAR -->
+    <header id="app-header">
+      <div id="header-left">
+        <img src="./assets/StreamSync.png" id="app-logo" alt="Stream Sync Logo" />
+      </div>
+
+      <nav id="main-nav">
+        <button class="nav-btn" data-view="chat">Chat</button>
+        <button class="nav-btn" data-view="events">Events</button>
+        <button class="nav-btn" data-view="connections">Connections</button>
+        <button class="nav-btn" data-view="help">Help</button>
+        <button class="nav-btn" data-view="about">About</button>
+      </nav>
+
+      <div id="header-right">
+        <img src="./assets/KG_logo.png" id="app-brand" alt="Kaotic Games" />
+      </div>
+    </header>
+
+
+    <!-- MAIN CONTENT AREA -->
+    <main id="app-main">
+      <!-- This is where all sub-views load -->
+      <div id="app-root">
+        <!-- renderer.js will dynamically inject UI here -->
+      </div>
+    </main>
+
+    <!-- COPYRIGHT FOOTER -->
+    <footer id="app-footer">
+      <div id="footer-left">
+        <span id="footer-copy">
+          © <span id="footer-year"></span> Kaotic Games
+        </span>
+      </div>
+      <div id="footer-right">
+        <span id="footer-powered">
+          Powered by
+          <button id="powered-pill" class="pill-brand">
+            Syndicate AI
+          </button>
+        </span>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Tauri bridge (no-op in browser/Electron); must load before overlay-client-config -->
+  <script src="tauri-bridge.js"></script>
+  <!-- Overlay URL (must load before config scripts) -->
+  <script src="overlay-client-config.js"></script>
+  <!-- Twitch connect via overlay HTTP (works when Tauri IPC is unavailable) -->
+  <script src="connections-api.js?v=dual-conn-2"></script>
+
+  <!-- View-specific logic (chat dock config, etc.) -->
+  <script src="chat-dock-config.js"></script>
+  <script src="chat-overlay-config.js?v=font-preview-parity-14"></script>
+  <script src="events-dock-config.js"></script>
+  <script src="events-overlay-config.js?v=3"></script>
+  <script src="events-se-import.js?v=5"></script>
+
+  <!-- Renderer logic -->
+  <script src="renderer.js?v=1"></script>
+
+</body>
+</html>
+

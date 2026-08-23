@@ -1,0 +1,1492 @@
+/* shell.css
+   Global styling for the Stream Sync desktop shell + view partials
+*/
+
+/* ───────────────────────────────────────────────
+   Theme variables
+   ─────────────────────────────────────────────── */
+
+:root {
+  /* Syndicate / SyndiSync palette */
+  --bg: #1b1b1b;
+  --bg-elevated: #202020;
+  --bg-card: #242424;
+  --bg-header: #202020;
+  --bg-footer: #1a1a1a;
+
+  --border-subtle: #333333;
+  --border-strong: #444444;
+
+  --text-main: #f5f5f5;
+  --text-soft: #b0b0b0;
+
+  --accent: #69bd45;
+  --accent-soft: rgba(105, 189, 69, 0.18);
+  --accent-strong: rgba(105, 189, 69, 0.4);
+
+  --danger: #ef4444;
+
+  --font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+/* ───────────────────────────────────────────────
+   Reset-ish
+   ─────────────────────────────────────────────── */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text-main);
+  font-family: var(--font-family);
+  font-size: 24px;
+}
+
+body {
+  overflow: hidden;
+}
+
+/* ───────────────────────────────────────────────
+   App container layout
+   ─────────────────────────────────────────────── */
+
+#app-container {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* ───────────────────────────────────────────────
+   Header
+   ─────────────────────────────────────────────── */
+
+#app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-header);
+}
+
+#header-left,
+#header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#app-logo {
+  height: 60px;
+  display: block;
+}
+
+#app-brand {
+  height: 60px;
+}
+
+/* ───────────────────────────────────────────────
+   Main nav
+   ─────────────────────────────────────────────── */
+
+#main-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.nav-btn {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-soft);
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 18px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.nav-btn:hover {
+  color: var(--text-main);
+  border-color: var(--border-subtle);
+  background: rgba(40, 40, 40, 0.9);
+}
+
+.nav-btn.active {
+  color: #111111;
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+/* ───────────────────────────────────────────────
+   Main content
+   ─────────────────────────────────────────────── */
+
+#app-main {
+  flex: 1;
+  min-height: 0;
+  background: var(--bg);
+  padding: 12px 16px 8px;
+  overflow: hidden;
+}
+
+#app-root {
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+}
+
+/* ───────────────────────────────────────────────
+   Status bar
+   ─────────────────────────────────────────────── */
+
+#app-status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 10px;
+  border-top: 1px solid #111111;
+  border-bottom: 1px solid #111111;
+  background: #151515;
+  font-size: 11px;
+  color: var(--text-soft);
+}
+
+#status-left,
+#status-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.indicator {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  border: 1px solid #000;
+}
+
+.indicator.offline {
+  background: #991b1b;
+  box-shadow: 0 0 6px rgba(248, 113, 113, 0.6);
+}
+
+.indicator.online {
+  background: var(--accent);
+  box-shadow: 0 0 6px rgba(105, 189, 69, 0.9);
+}
+
+/* ───────────────────────────────────────────────
+   Footer
+   ─────────────────────────────────────────────── */
+
+#app-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 10px 6px;
+  background: #151515;
+  border-top: 1px solid #111111;
+  font-size: 11px;
+  color: var(--text-soft);
+}
+
+#footer-left,
+#footer-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#powered-pill {
+  border-radius: 999px;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--text-main);
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+#powered-pill:hover {
+  background: var(--accent-strong);
+}
+
+/* ───────────────────────────────────────────────
+   Generic view panel
+   ─────────────────────────────────────────────── */
+
+.view-panel {
+  max-width: none;
+  width: 100%;
+  margin: 0 auto;
+  padding-bottom: 24px;
+}
+
+.view-panel h1,
+.view-panel h2 {
+  margin: 0;
+}
+
+.section-header {
+  margin-bottom: 14px;
+}
+
+.section-header h2 {
+  font-size: 20px;
+  margin-bottom: 4px;
+}
+
+.section-subtitle {
+  font-size: 13px;
+  color: var(--text-soft);
+}
+
+/* ───────────────────────────────────────────────
+   Shared UI components (single source of truth)
+   ─────────────────────────────────────────────── */
+
+/* Subnav pills */
+.subnav {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 14px;
+  background: #1f1f1f;
+  padding: 3px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+}
+
+.subnav-btn {
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-soft);
+  font-size: 18px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.subnav-btn:hover {
+  color: var(--text-main);
+}
+
+.subnav-btn.active {
+  background: var(--accent);
+  color: #111111;
+}
+
+/* Events tab: subnav pills + far-right SE import */
+.events-tab-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+  width: 100%;
+}
+
+.events-tab-header .subnav {
+  margin-bottom: 0;
+  flex-shrink: 0;
+}
+
+.btn-import-se {
+  margin-left: auto;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.btn-import-se.is-connected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text-main);
+  box-shadow: inset 0 0 0 1px var(--accent-strong);
+}
+
+.platform-pill.platform-kick {
+  background: #53FC18;
+  color: #111;
+  font-weight: 700;
+}
+
+.platform-pill.platform-se {
+  background: #5c6bc0;
+  color: #fff;
+}
+
+.se-credential-input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* SE import modal */
+.se-import-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 20000;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.se-import-modal-backdrop.is-open {
+  display: flex;
+}
+
+.se-import-modal {
+  background: #1a1a1a;
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  width: min(560px, 100%);
+  max-height: min(80vh, 640px);
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+
+.se-import-modal__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.se-import-modal__title {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.se-import-modal__body {
+  padding: 12px 16px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.se-import-modal__footer {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.se-import-modal__footer-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.se-import-progress {
+  width: 100%;
+}
+
+.se-import-progress__label {
+  font-size: 12px;
+  color: var(--text-soft);
+  margin-bottom: 6px;
+}
+
+.se-import-progress__track {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.se-import-progress__bar {
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent, #6a6ffc), #9b7bff);
+  transition: width 220ms ease-out;
+}
+
+.se-import-progress.is-active .se-import-progress__bar {
+  transition: width 180ms ease-out;
+}
+
+.se-import-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.se-import-list li {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.se-import-list li:last-child {
+  border-bottom: none;
+}
+
+.se-import-status {
+  font-size: 14px;
+  color: var(--text-soft);
+  margin: 0 0 10px;
+}
+
+.se-import-manual {
+  margin-bottom: 14px;
+  padding: 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 14px;
+  color: var(--text-soft);
+}
+
+.se-import-manual__title {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.se-import-results {
+  margin-top: 12px;
+  font-size: 14px;
+}
+
+.se-import-result__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.se-import-result__id {
+  font-size: 12px;
+  color: var(--text-soft);
+  font-family: ui-monospace, monospace;
+}
+
+.se-import-result--error .warn {
+  color: #f5a5a5;
+}
+
+.se-import-modal [data-se-import-run].is-ready:not(.is-busy) {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #1b1b1b;
+  font-weight: 600;
+}
+
+.se-import-modal [data-se-import-run].is-ready:not(.is-busy):hover {
+  background: #7ed456;
+  border-color: #7ed456;
+}
+
+.se-import-modal [data-se-import-run].is-busy {
+  opacity: 0.65;
+  cursor: wait;
+}
+
+.se-import-results .warn {
+  color: #e8b84a;
+}
+
+/* Subviews */
+.subview-container {
+  margin-top: 4px;
+}
+
+.subview {
+  display: none;
+}
+
+.subview.active {
+  display: block;
+}
+
+/* Cards */
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px;
+}
+
+.card {
+  background: var(--bg-card);
+  border-radius: 12px;
+  border: 1px solid var(--border-subtle);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.6);
+  padding: 12px 14px;
+}
+
+.card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.card-title {
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.card-subtitle {
+  font-size: 16px;
+  color: var(--text-soft);
+}
+
+/* Config section / forms */
+.config-section {
+  font-size: 20px;
+}
+
+.field-label {
+  font-size: 12px;
+  font-weight: 500;
+  display: block;
+  margin-bottom: 4px;
+}
+
+.field-help {
+  font-size: 12px;
+  color: var(--text-soft);
+  margin-top: 4px;
+}
+
+/* Inputs */
+.input,
+.url-input,
+.field-number {
+  width: 100%;
+  padding: 5px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  background: #1c1c1c;
+  color: var(--text-main);
+  font-size: 18px;
+  outline: none;
+}
+
+.input:focus,
+.url-input:focus,
+.field-number:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-soft);
+}
+
+.input[readonly],
+.url-input[readonly] {
+  color: var(--text-soft);
+}
+
+.field-number {
+  width: 80px;
+}
+
+/* URL row */
+.url-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Buttons */
+.btn {
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  background: #262626;
+  color: var(--text-soft);
+  padding: 5px 9px;
+  font-size: 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.btn:disabled,
+.btn[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.btn:hover {
+  border-color: var(--accent);
+  color: var(--text-main);
+}
+
+.btn-secondary {
+  background: #1c1c1c;
+}
+
+.btn-primary {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text-main);
+}
+
+.btn-primary:hover {
+  background: var(--accent-strong);
+}
+
+/* Slider pill toggles */
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+/* Base track for all toggles using slider style */
+.toggle-switch,
+.pill-toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 24px;
+  padding: 0;
+  box-sizing: border-box;
+  border-radius: 999px;
+  border: 1px solid #444444;
+  background: #333333; /* OFF = gray */
+  cursor: pointer;
+  outline: none;
+  transition: background 0.18s ease, border-color 0.18s ease;
+}
+
+/* Hide the text label visually (keep it for screen readers) */
+.toggle-switch .toggle-label,
+.pill-toggle .toggle-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  border: 0;
+}
+
+/* Thumb / knob */
+.toggle-switch .toggle-thumb,
+.pill-toggle .toggle-thumb {
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+  transition: transform 0.18s ease;
+}
+
+/* ON state – green track */
+.toggle-switch.on,
+.toggle-switch[aria-pressed="true"],
+.pill-toggle.on,
+.pill-toggle[aria-pressed="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Move thumb to the right when ON */
+.toggle-switch.on .toggle-thumb,
+.toggle-switch[aria-pressed="true"] .toggle-thumb,
+.pill-toggle.on .toggle-thumb,
+.pill-toggle[aria-pressed="true"] .toggle-thumb {
+  transform: translateX(18px);
+}
+
+/* Range sliders – gray track + green thumb */
+input[type="range"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 999px;
+  background: #333333;
+  outline: none;
+  margin: 4px 0;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: #333333;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  margin-top: -5px;
+  cursor: pointer;
+}
+
+input[type="range"]::-moz-range-track {
+  height: 4px;
+  border-radius: 999px;
+  background: #333333;
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  cursor: pointer;
+}
+
+input[type="range"]::-ms-track {
+  height: 4px;
+  border-radius: 999px;
+  background: transparent;
+  border-color: transparent;
+  color: transparent;
+}
+
+input[type="range"]::-ms-fill-lower,
+input[type="range"]::-ms-fill-upper {
+  background: #333333;
+  border-radius: 999px;
+}
+
+input[type="range"]::-ms-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  cursor: pointer;
+}
+
+/* Local font upload – green pill style */
+#overlay-font-upload {
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--text-main);
+  cursor: pointer;
+  font-size: 16px;
+}
+
+#overlay-font-upload::-webkit-file-upload-button {
+  border: none;
+  border-radius: 999px;
+  padding: 6px 14px;
+  margin-right: 8px;
+  background: var(--accent);
+  color: #111111;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+#overlay-font-upload::file-selector-button {
+  border: none;
+  border-radius: 999px;
+  padding: 6px 14px;
+  margin-right: 8px;
+  background: var(--accent);
+  color: #111111;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* Scrollbars (generic for app-root) */
+#app-root::-webkit-scrollbar {
+  width: 10px;
+}
+
+#app-root::-webkit-scrollbar-thumb {
+  background: #2e2e2e;
+  border-radius: 999px;
+}
+
+/* Overlay config panel scrollbar */
+.overlay-config-panel .config-section::-webkit-scrollbar {
+  width: 8px;
+}
+
+.overlay-config-panel .config-section::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.overlay-config-panel .config-section::-webkit-scrollbar-thumb {
+  background: #2e2e2e;
+  border-radius: 999px;
+}
+
+/* ───────────────────────────────────────────────
+   Chat Profile Dropdown (branded, Events-like)
+   ─────────────────────────────────────────────── */
+
+#chat-overlay .profile-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+#chat-overlay .profile-dropdown {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+#chat-overlay .profile-dropdown-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--accent);
+  background: #1c1c1c;
+  color: var(--text-main);
+
+  cursor: pointer;
+  outline: none;
+}
+
+#chat-overlay .profile-dropdown-btn:focus {
+  box-shadow: 0 0 0 2px rgba(105, 189, 69, 0.25);
+}
+
+#chat-overlay .profile-dropdown-value {
+  font-size: 18px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#chat-overlay .profile-dropdown-caret {
+  color: var(--text-soft);
+  font-size: 14px;
+}
+
+#chat-overlay .profile-dropdown-menu {
+  position: absolute;
+  z-index: 50;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+
+  border-radius: 12px;
+  border: 1px solid var(--border-subtle);
+  background: #111111;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.65);
+  overflow: hidden;
+}
+
+#chat-overlay .profile-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+
+  padding: 8px 10px;            /* row padding, not the highlight */
+  background: transparent;       /* IMPORTANT: no full-width bar */
+  cursor: default;
+}
+
+/* Don’t paint the whole row on hover */
+#chat-overlay .profile-item:hover {
+  background: transparent;
+}
+
+/* The NAME is the clickable “pill” */
+#chat-overlay .profile-item-name {
+  flex: 1 1 auto;
+  min-width: 0;
+
+  appearance: none;
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-main);
+
+  padding: 10px 12px;
+  border-radius: 10px;
+
+  font-size: 14px;
+  font-weight: 600;
+  text-align: left;
+
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+
+  cursor: pointer;
+}
+
+#chat-overlay .profile-item-name:hover {
+  border-color: rgba(105, 189, 69, 0.35);
+  background: rgba(105, 189, 69, 0.08);
+}
+
+/* Selected state: highlight ONLY the name pill */
+#chat-overlay .profile-item.is-selected {
+  background: transparent; /* ensure row stays neutral */
+}
+
+#chat-overlay .profile-item.is-selected .profile-item-name {
+  background: rgba(105, 189, 69, 0.18);
+  border-color: rgba(105, 189, 69, 0.55);
+}
+
+/* Delete stays its own separate button on the right */
+#chat-overlay .profile-item-delete {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+
+  border-radius: 10px;
+  border: 1px solid rgba(239, 68, 68, 0.55);
+  background: rgba(239, 68, 68, 0.12);
+  color: #ef4444;
+
+  font-weight: 900;
+  line-height: 1;
+  cursor: pointer;
+}
+
+#chat-overlay .profile-item-delete:hover {
+  background: rgba(239, 68, 68, 0.18);
+  border-color: rgba(239, 68, 68, 0.75);
+}
+
+/* ───────────────────────────────────────────────
+   Chat Overlay layout & scrolling (behavior)
+   ─────────────────────────────────────────────── */
+
+.view-chat {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.view-chat .subview-container {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Chat Dock: toggles should sit directly under the option label (not right-justified) */
+.view-chat #chat-dock .form-row-inline {
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 8px;
+}
+
+/* Base: hidden like other subviews */
+#chat-overlay.subview {
+  display: none;
+  height: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#chat-overlay.subview.active {
+  display: flex;
+}
+
+.overlay-layout {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  gap: 20px;
+  align-items: stretch;
+}
+
+.overlay-config-panel {
+  flex: 0 0 420px;
+  max-width: 440px;
+  min-width: 360px;
+  min-height: 0;
+}
+
+.overlay-config-panel .card {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.overlay-config-panel .config-section {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 6px;
+}
+
+.overlay-config-panel .hidden {
+  display: none;
+}
+
+.overlay-preview-panel {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+}
+
+.overlay-preview-stage {
+  position: relative;
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  /* Checker so transparent vs solid overlay backgrounds are obvious in-app. */
+  background-color: #1a1a1a;
+  background-image:
+    linear-gradient(45deg, #242424 25%, transparent 25%),
+    linear-gradient(-45deg, #242424 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #242424 75%),
+    linear-gradient(-45deg, transparent 75%, #242424 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+}
+
+.chat-overlay-preview-frame {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0 !important;
+  outline: none;
+  border-radius: 0;
+  background: transparent;
+}
+
+/* ───────────────────────────────────────────────
+   Chat tab – cohesive with Events Studio (visual-only)
+   Scoped so it only affects chat.
+   ─────────────────────────────────────────────── */
+
+/* Subnav bar in chat: match events vibe more closely */
+.view-chat .subnav {
+  width: fit-content;
+  background: #1f1f1f;
+  border: 1px solid var(--border-subtle);
+}
+
+/* Integrations grid spacing in chat (if used) */
+.view-chat .card-grid {
+  gap: 12px;
+}
+
+/* Chat overlay config groups: make them feel like events sections */
+.view-chat .config-group {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(0, 0, 0, 0.18);
+  border-radius: 12px;
+  padding: 12px;
+  margin: 0 0 12px 0;
+}
+
+.view-chat .config-group-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-soft);
+  margin-bottom: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+/* More breathing room between options (fix “compressed” look) */
+.view-chat .form-row {
+  margin: 0 0 12px 0;
+}
+
+/* Font & text: native Google font <select> (closed state themed; open list is OS-native on Windows) */
+.view-chat .config-group-fonts {
+  position: relative;
+  overflow: visible;
+}
+
+.view-chat #overlay-google-font.overlay-google-font-select {
+  width: 100%;
+  height: 38px;
+  border-radius: 10px;
+  border: 1px solid #3a3a3a;
+  background: #1b1b1b;
+  color: #d1d5db;
+  padding: 0 36px 0 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.view-chat .form-row-inline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+}
+
+.view-chat .form-row-split {
+  display: flex;
+  gap: 12px;
+}
+
+.view-chat .form-row-split .form-subrow {
+  flex: 1 1 0;
+}
+
+/* Radio pills: match your event styling but a touch nicer */
+.view-chat .radio-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 6px;
+}
+
+.view-chat .radio-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-soft);
+  padding: 8px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.view-chat .radio-option input[type="radio"] {
+  accent-color: var(--accent);
+}
+
+.view-chat .overlay-preview-header,
+.overlay-preview-header {
+  display: none !important;
+}
+
+/* Back-compat if an older card wrapper is still present */
+.overlay-preview-card {
+  position: relative;
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  overflow: hidden;
+}
+
+
+/* ───────────────────────────────────────────────
+   Events Overlay layout & scrolling (match Chat)
+   (kept as you had it; no refactor)
+   ─────────────────────────────────────────────── */
+
+.view-events {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.view-events .subview-container {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+#events-overlay.subview {
+  display: none;
+  height: 100%;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#events-overlay.subview.active {
+  display: flex;
+}
+
+#events-overlay .events-overlay-layout {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 420px 1fr;
+  gap: 14px;
+  overflow: hidden;
+}
+
+#events-overlay .events-overlay-config {
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+#events-overlay .events-overlay-config .events-overlay-config-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+#events-overlay .events-overlay-studio {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ───────────────────────────────────────────────
+   Misc / helper
+   ─────────────────────────────────────────────── */
+
+.pill-brand {
+  border-radius: 999px;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  padding: 2px 8px;
+}
+
+.view-error {
+  max-width: 600px;
+  margin: 24px auto;
+  padding: 16px 18px;
+  border-radius: 10px;
+  border: 1px solid #7f1d1d;
+  background: #1e1e1e;
+}
+
+/* Connections */
+.connections-platforms-container {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Bullet list */
+.bullet-list {
+  padding-left: 18px;
+  margin: 6px 0;
+  font-size: 13px;
+}
+
+.bullet-list li + li {
+  margin-top: 3px;
+}
+
+/* Chat Dock config – dock-settings layout */
+.dock-settings-card {
+  max-width: 480px;
+}
+
+.field-row-inline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.field-row-inline .field-label {
+  margin-bottom: 0;
+}
+
+/* Chat Dock: Font size stepper (LIGHT gray field + SOLID green buttons) */
+#chatDockStepper {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#chatDockStepper #chat-dock-font-size {
+  background: #5a5959;
+  color: #e5e7eb;
+  border: 1px solid #2a2a2a;
+  border-radius: 10px;
+  padding: 8px 10px;
+  outline: none;
+}
+
+#chatDockStepper #chat-dock-font-size:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(105, 189, 69, 0.25);
+}
+
+#chatDockStepper .btn-mini {
+  background: var(--accent);
+  color: #0b0f0b;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 8px 12px;
+  min-width: 40px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+#chatDockStepper .btn-mini:hover {
+  filter: brightness(1.06);
+}
+
+#chatDockStepper .btn-mini:active {
+  transform: translateY(1px);
+}
+
+#chatDockStepper .btn.btn-mini {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0b0f0b;
+}
+
+/* ─────────────────────────────────────────────
+   Syndicate custom select (replaces native <select>)
+   Native option highlight cannot be reliably themed on Windows/Electron.
+   ───────────────────────────────────────────── */
+
+.ss-select {
+  position: relative;
+  width: 100%;
+}
+
+.ss-select__btn {
+  width: 100%;
+  height: 38px;
+  border-radius: 10px;
+  border: 1px solid #3a3a3a;
+  background: #1b1b1b;
+  color: #d1d5db;
+  padding: 0 36px 0 12px;
+  text-align: left;
+  cursor: pointer;
+  outline: none;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ss-select__btn:focus {
+  border-color: #69bd45;
+  box-shadow: 0 0 0 2px rgba(105, 189, 69, 0.25);
+}
+
+.ss-select__chev {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+  color: #d1d5db;
+  font-size: 14px;
+}
+
+.ss-select__menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  margin-top: 6px;
+  background: #242424;
+  border: 1px solid #3a3a3a;
+  border-radius: 12px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+  padding: 6px;
+  z-index: 1000;
+  max-height: 240px;
+  overflow: auto;
+  display: none;
+  scrollbar-width: thin;
+  scrollbar-color: #2e2e2e transparent;
+}
+
+.ss-select__menu::-webkit-scrollbar {
+  width: 8px;
+}
+
+.ss-select__menu::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.ss-select__menu::-webkit-scrollbar-thumb {
+  background: #2e2e2e;
+  border-radius: 999px;
+}
+
+.ss-select__menu::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.ss-select__menu.open {
+  display: block;
+}
+
+/* Open upward (bottom docks / cramped bottoms) */
+.ss-select--drop-up .ss-select__menu {
+  top: auto;
+  bottom: calc(100% + 6px);
+  margin-top: 0;
+}
+
+.ss-select__item {
+  padding: 10px 10px;
+  border-radius: 10px;
+  color: #d1d5db;
+  cursor: pointer;
+  user-select: none;
+  font-size: 14px;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ss-select__item:hover {
+  background: rgba(105, 189, 69, 0.18);
+}
+
+.ss-select__item.selected {
+  background: #69bd45;
+  color: #111;
+  font-weight: 800;
+}

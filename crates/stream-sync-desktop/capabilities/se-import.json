@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.tauri.app/config/2/capability",
+  "identifier": "se-import-remote",
+  "description": "StreamElements login webview",
+  "windows": ["se-import"],
+  "remote": {
+    "urls": [
+      "https://streamelements.com/*",
+      "https://*.streamelements.com/*",
+      "http://127.0.0.1:*",
+      "http://localhost:*"
+    ]
+  },
+  "permissions": ["core:default"]
+}

@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Stream Sync – Loading…</title>
+
+    <!-- Orbitron for branding only -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;800&display=swap"
+      rel="stylesheet"
+    />
+
+    <style>
+      :root {
+        --accent: #69bd45;
+        --accent-soft: #4cb036;
+        --bg-outer: #000000;
+        --text-main: #e5e7eb;
+        --text-soft: #9ca3af;
+        --panel-border: #0f172a;
+        --panel-inner: #020617;
+        --panel-highlight: #0b1220;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: radial-gradient(circle at top left, #020617, #000000);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-family: "Orbitron", system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+        color: var(--text-main);
+        overflow: hidden;
+      }
+
+      .splash-frame {
+        width: min(960px, 92vw);
+        aspect-ratio: 16 / 9;
+        border-radius: 22px;
+        background: radial-gradient(circle at top left, #0b1220, #020617 55%);
+        position: relative;
+        overflow: hidden;
+        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.9);
+        border: 1px solid var(--panel-border);
+      }
+
+      .splash-inner {
+        position: absolute;
+        inset: 0;
+        padding: 24px 32px 22px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+      }
+
+      /* Top row: Kaotic Games logo */
+      .top-row {
+        display: flex;
+        justify-content: flex-end;
+      }
+
+      .kg-logo {
+        max-height: 60px;
+        height: 60px;
+        opacity: 0.5; /* 50% as in your mockup */
+        filter: drop-shadow(0 4px 8px rgba(0, 0, 0, 0.7));
+      }
+
+      /* Middle: Stream Sync logo block */
+      .center-block {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        margin-top: 10px;
+      }
+
+      .streamsync-logo {
+        max-width: 90%;
+        max-height: 160px;
+        filter: drop-shadow(0 10px 22px rgba(0, 0, 0, 0.9));
+      }
+
+      .powered-by-row {
+        margin-top: 6px;
+        font-size: 11px;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: var(--text-soft);
+      }
+
+      .powered-by-row span.brand {
+        color: var(--accent);
+      }
+
+      /* Bottom: tagline, status lines, bar */
+      .bottom-block {
+        margin-top: 12px;
+      }
+
+      .tagline {
+        font-size: 12px;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: var(--text-soft);
+        margin-bottom: 10px;
+      }
+
+      .status-primary {
+        font-size: 12px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        margin-bottom: 6px;
+      }
+
+      .status-secondary {
+        font-size: 11px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        margin-top: 4px;
+        color: var(--text-soft);
+      }
+
+      .progress-track {
+        width: 100%;
+        height: 12px;
+        border-radius: 999px;
+        background: #020617;
+        border: 1px solid #020617;
+        box-shadow:
+          inset 0 0 8px rgba(0, 0, 0, 0.8),
+          0 0 0 1px #020617;
+        overflow: hidden;
+      }
+
+      .progress-fill {
+        width: 0%;
+        height: 100%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, var(--accent), var(--accent-soft));
+        box-shadow: 0 0 14px rgba(105, 189, 69, 0.9);
+        transition: width 0.2s ease-out;
+      }
+
+      .version-tag {
+        position: absolute;
+        right: 28px;
+        bottom: 18px;
+        font-size: 11px;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: var(--text-soft);
+        opacity: 0.8;
+        }
+
+    </style>
+  </head>
+
+  <body>
+    <div class="splash-frame">
+      <div class="splash-inner">
+        <!-- Kaotic Games logo (top right) -->
+        <div class="top-row">
+          <img
+            src="assets/KG_logo.png"
+            alt="Kaotic Games"
+            class="kg-logo"
+            onerror="this.style.display='none';"
+          />
+        </div>
+
+        <!-- Stream Sync logo centered -->
+        <div class="center-block">
+          <img
+            src="assets/StreamSync.png"
+            alt="Stream Sync"
+            class="streamsync-logo"
+          />
+          <div class="powered-by-row">
+            powered by <span class="brand">Syndicate AI</span>
+          </div>
+        </div>
+
+        <!-- Tagline + status + progress bar -->
+        <div class="bottom-block">
+          <div class="tagline">Next-gen overlay tooling for streamers</div>
+
+          <div id="status-primary" class="status-primary">
+            INITIALIZING SYSTEMS…
+          </div>
+
+          <div class="progress-track">
+            <div id="progress-fill" class="progress-fill"></div>
+          </div>
+
+          <div id="status-secondary" class="status-secondary">
+            FINALIZING STARTUP…
+          </div>
+        </div>
+      </div>
+           <!-- Version tag -->
+      <div class="version-tag">v2.0.1</div>
+    </div>
+
+    <script>
+      const fill = document.getElementById("progress-fill");
+      const primary = document.getElementById("status-primary");
+      const secondary = document.getElementById("status-secondary");
+
+      const phases = [
+        "INITIALIZING SYSTEMS…",
+        "CONNECTING TO OVERLAY SERVER…",
+        "LOADING PROFILES…",
+        "PREPARING CHAT & EVENTS FEEDS…",
+        "FINALIZING STARTUP…",
+      ];
+
+      let progress = 0;
+      let phaseIndex = 0;
+
+      function updatePhase() {
+        if (!primary) return;
+        const idx = Math.min(phaseIndex, phases.length - 1);
+        primary.textContent = phases[idx];
+
+        if (secondary) {
+          // Secondary line mirrors the last phase once we're near the end
+          if (progress > 80) {
+            secondary.textContent = "FINALIZING STARTUP…";
+          } else {
+            secondary.textContent = "INITIALIZING…";
+          }
+        }
+      }
+
+      updatePhase();
+
+      const timer = setInterval(() => {
+        if (!fill) return;
+
+        // Fake easing
+        let inc;
+        if (progress < 50) inc = 6 + Math.random() * 8;
+        else if (progress < 80) inc = 3 + Math.random() * 4;
+        else if (progress < 96) inc = 1 + Math.random() * 2;
+        else inc = 0;
+
+        progress = Math.min(progress + inc, 97);
+        fill.style.width = progress + "%";
+
+        const phaseStep = 100 / phases.length;
+        phaseIndex = Math.floor(progress / phaseStep);
+        updatePhase();
+      }, 140);
+
+      // Main process will close this window and show the main app when ready.
+    </script>
+  </body>
+</html>

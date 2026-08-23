@@ -1,0 +1,26 @@
+{
+  "_id": "abc123def456789",
+  "name": "My Alerts",
+  "settings": { "width": 1920, "height": 1080 },
+  "widgets": [
+    {
+      "type": "alertbox",
+      "x": 100,
+      "y": 200,
+      "width": 300,
+      "height": 300,
+      "variables": {
+        "follower": {
+          "message": "{{name}} just followed!",
+          "image": "https://cdn.streamelements.com/uploads/example.png",
+          "duration": 8,
+          "animation": { "in": "fadeIn", "out": "fadeOut" }
+        },
+        "subscriber": {
+          "message": "{{name}} subscribed!",
+          "duration": 6
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+<section id="events-overlay" class="subview active events-subview events-overlay">
+  <div class="section-header">
+    <h2>Events Overlay</h2>
+    <p class="section-subtitle">
+      Configure event alert templates and position elements visually in the embedded studio.
+    </p>
+  </div>
+
+  <div class="card" style="flex:1; min-height:0; display:flex; flex-direction:column;">
+    <div class="card-header">
+      <div>
+        <div class="card-title">Events Studio</div>
+        <div class="card-subtitle">
+          The editor below controls your event templates, variations, and canvas placement for this profile.
+        </div>
+      </div>
+
+      <div style="margin-left:auto; display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+        <span class="pill">
+          Profile: <span class="mono" id="profileLabel">default</span>
+        </span>
+        <button class="btn btn-secondary" id="btnReloadStudio">
+          Reload Studio
+        </button>
+      </div>
+    </div>
+
+    <!-- Single full-width iframe that hosts the entire studio (config + grid) -->
+    <div style="flex:1; min-height:0;">
+      <iframe
+        id="studioFrame"
+        title="Events Studio"
+        style="width:100%; height:100%; border:0; display:block;"
+        referrerpolicy="no-referrer"
+      ></iframe>
+    </div>
+  </div>
+</section>

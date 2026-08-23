@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Stream Sync – Events Overlay</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: transparent;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .root { position: absolute; inset: 0; pointer-events: none; }
+
+    .stage {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 1280px;
+      height: 720px;
+      transform-origin: top left;
+      background: transparent;
+    }
+
+    .el {
+      position: absolute;
+      pointer-events: none;
+      display: none;
+      opacity: 1;
+    }
+
+    .img {
+      overflow: hidden;
+      display: none;
+      align-items: center;
+      justify-content: center;
+    }
+    .img img,
+    .img video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: none;
+    }
+    .img img.show,
+    .img video.show {
+      display: block;
+    }
+
+    .text {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      white-space: pre-wrap;
+      line-height: 1.15;
+      overflow: hidden;
+      box-sizing: border-box;
+    }
+
+    /* Back-compat */
+    .fade-in { animation: fadeIn 180ms ease-out forwards; }
+    .fade-out { animation: fadeOut 180ms ease-in forwards; }
+
+    /* Configurable alert animation styles */
+    .anim-in-fade { animation: fadeIn 180ms ease-out forwards; }
+    .anim-out-fade { animation: fadeOut 180ms ease-in forwards; }
+
+    .anim-in-zoom { animation: zoomIn 180ms ease-out forwards; }
+    .anim-out-zoom { animation: zoomOut 180ms ease-in forwards; }
+
+    .anim-in-slide-viewport { animation: slideInViewport 180ms ease-out forwards; }
+    .anim-out-slide-viewport { animation: slideOutViewport 180ms ease-in forwards; }
+
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to   { opacity: 1; }
+    }
+    @keyframes fadeOut {
+      from { opacity: 1; }
+      to   { opacity: 0; }
+    }
+
+    @keyframes slideInViewport {
+      from { opacity: 1; transform: translate(var(--slide-x, 0), var(--slide-y, 0)); }
+      to   { opacity: 1; transform: translate(0, 0); }
+    }
+    @keyframes slideOutViewport {
+      from { opacity: 1; transform: translate(0, 0); }
+      to   { opacity: 1; transform: translate(var(--slide-x, 0), var(--slide-y, 0)); }
+    }
+
+    @keyframes zoomIn {
+      from { opacity: 0; transform: scale(0.6); filter: blur(1px); }
+      to   { opacity: 1; transform: scale(1); filter: blur(0); }
+    }
+
+    @keyframes zoomOut {
+      from { opacity: 1; transform: scale(1); filter: blur(0); }
+      to   { opacity: 0; transform: scale(0.6); filter: blur(1px); }
+    }
+  </style>
+</head>
+<body>
+  <div class="root">
+    <div id="stage" class="stage">
+      <div id="imgEl" class="el img">
+        <img id="imgTag" alt="" />
+        <video id="vidTag" muted playsinline></video>
+      </div>
+      <div id="textEl" class="el text"></div>
+    </div>
+  </div>
+
+  <script src="/events-variation-picker.js"></script>
+  <script src="/events-overlay.js?v=text-fit-2"></script>
+</body>
+</html>

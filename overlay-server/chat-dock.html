@@ -1,0 +1,2228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Stream Sync – Chat Dock</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+<style>
+  :root {
+    /* Syndicate-style dark gray base + green accent */
+    --bg: #111111;
+    --bg-panel: #181818;
+    --border-subtle: #2a2a2a;
+    --border-strong: #3f3f46;
+    --text-main: #e5e7eb;
+    --text-soft: #9ca3af;
+    --accent: #69bd45;
+    --accent-soft: rgba(105, 189, 69, 0.16);
+    --accent-strong: rgba(105, 189, 69, 0.32);
+    --font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --font-size: 13px;
+    --line-height: 1.35;
+    --input-bg: #181818;
+    --input-border: #3f3f46;
+    --input-focus: #69bd45;
+    --pill-bg: #181818;
+    --pill-border: #374151;
+    --tag-bg: #181818;
+    --tag-border: #4b5563;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text-main);
+    font-family: var(--font-family);
+    overflow: hidden;
+  }
+
+  body {
+    display: flex;
+    flex-direction: column;
+    background:
+      radial-gradient(circle at top left, rgba(105, 189, 69, 0.10) 0, transparent 55%),
+      linear-gradient(135deg, #1a1a1a, #050505);
+  }
+
+  .dock-header {
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border-subtle);
+    font-size: 12px;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    background:
+      radial-gradient(circle at top left, rgba(105, 189, 69, 0.12) 0, transparent 60%),
+      linear-gradient(135deg, #1b1b1b, #080808);
+  }
+
+  .dock-title {
+    font-weight: 600;
+    font-size: 13px;
+  }
+
+  .dock-subtitle {
+    font-size: 11px;
+    color: var(--text-soft);
+  }
+
+  .profile-label {
+    font-size: 10px;
+    color: var(--text-soft);
+  }
+
+  .dock-status {
+    font-size: 11px;
+    color: var(--text-soft);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: #4b5563;
+  }
+
+  .status-dot.connected {
+    background: var(--accent);
+    box-shadow: 0 0 8px rgba(105, 189, 69, 0.7);
+  }
+
+
+  .dock-body {
+    flex: 1;
+    min-height: 0;
+    padding: 6px 8px 8px;
+    overflow-y: auto;
+    background:
+      radial-gradient(circle at top left, rgba(105, 189, 69, 0.10) 0, transparent 60%),
+      linear-gradient(135deg, #161616, #050505);
+  }
+
+  .dock-body::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  .dock-body::-webkit-scrollbar-thumb {
+    background: #18181b;
+    border-radius: 999px;
+  }
+
+  .empty-state {
+    font-size: 12px;
+    color: var(--text-soft);
+    padding: 8px 0;
+  }
+
+  .chat-item {
+    padding: 3px 0;
+    font-size: var(--font-size);
+    line-height: var(--line-height);
+    word-break: break-word;
+  }
+
+  .chat-line {
+    display: inline;
+  }
+
+  .chat-timestamp {
+    font-size: 11px;
+    color: var(--text-soft);
+    margin-right: 4px;
+  }
+
+  .chat-badges-inline {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin-right: 4px;
+  }
+
+  .chat-badge-img {
+    width: 14px;
+    height: 14px;
+    display: inline-block;
+    vertical-align: text-bottom;
+  }
+
+  .chat-kick-badge-svg {
+    width: 16px;
+    height: 16px;
+    display: inline-block;
+    vertical-align: text-bottom;
+  }
+  .chat-kick-badge-pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 14px;
+    height: 14px;
+    padding: 0 3px;
+    border-radius: 3px;
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    vertical-align: text-bottom;
+    color: #fff;
+    background: #64748b;
+  }
+
+  .chat-username {
+    font-weight: 600;
+    margin-right: 4px;
+  }
+
+  .chat-message {
+    white-space: pre-wrap;
+  }
+
+  .chat-message img.chat-emote-img {
+    height: 24px;
+    vertical-align: middle;
+  }
+
+  .dock-footer {
+    border-top: 1px solid var(--border-subtle);
+    padding: 4px 6px 6px;
+    background:
+      radial-gradient(circle at top left, rgba(105, 189, 69, 0.12) 0, transparent 55%),
+      linear-gradient(135deg, #151515, #050505);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .input-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  /* Overlay stack: preview underneath, input on top (looks like one field) */
+  .chat-input-stack {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .chat-input-preview {
+    position: absolute;
+    inset: 0;
+    padding: 7px 8px;
+    border-radius: 6px;
+    background: var(--input-bg);
+    border: 1px solid var(--input-border);
+    color: var(--text-main);
+    font-size: 13px;
+    line-height: 1.3;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    pointer-events: none; /* clicks go to actual input */
+  }
+
+  .chat-input-preview .chat-message img.chat-emote-img {
+    height: 20px;
+    vertical-align: middle;
+  }
+
+  .chat-input-preview::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  .chat-input-preview::-webkit-scrollbar-thumb {
+    background: #18181b;
+    border-radius: 999px;
+  }
+
+  .chat-input {
+    position: relative;
+    width: 100%;
+    background: transparent; /* let preview show through */
+    border-radius: 6px;
+    border: 1px solid var(--input-border);
+    color: transparent; /* hide real text, caret still shows */
+    font-size: 13px;
+    padding: 7px 8px;
+    outline: none;
+    z-index: 1; /* above preview for caret & focus */
+  }
+
+  .chat-input::placeholder {
+    color: #6b7280;
+  }
+
+  .chat-input:focus {
+    border-color: var(--input-focus);
+    box-shadow: 0 0 0 1px var(--accent-soft);
+  }
+
+  .btn {
+    border-radius: 4px;
+    border: 1px solid var(--border-subtle);
+    background: #111827;
+    color: var(--text-soft);
+    padding: 5px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+
+  .btn:hover {
+    border-color: var(--accent);
+    color: var(--text-main);
+  }
+
+  .btn-primary {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--text-main);
+  }
+
+  .btn-primary:hover {
+    background: var(--accent-strong);
+  }
+
+  .toolbar-row {
+    display: flex;
+    justify-content: flex-start;
+    gap: 4px;
+  }
+
+  .toolbar-left {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .tiny-label {
+    font-size: 10px;
+    color: var(--text-soft);
+  }
+
+  .suggestions-panel {
+    position: relative;
+  }
+
+  .suggestions-list {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 100%;
+    margin-bottom: 4px;
+    max-height: 160px;
+    overflow-y: auto;
+    background: #020617;
+    border-radius: 6px;
+    border: 1px solid var(--border-strong);
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.7);
+    font-size: 11px;
+    z-index: 20;
+  }
+
+  .suggestions-list::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  .suggestions-list::-webkit-scrollbar-thumb {
+    background: #18181b;
+    border-radius: 999px;
+  }
+
+  .suggestion-header {
+    padding: 4px 6px;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-soft);
+  }
+
+  .suggestion-item {
+    padding: 4px 6px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .suggestion-item:hover,
+  .suggestion-item.active {
+    background: rgba(39, 39, 42, 0.95);
+  }
+
+  .suggestion-main {
+    font-size: 11px;
+    color: var(--text-main);
+  }
+
+  .suggestion-sub {
+    font-size: 10px;
+    color: var(--text-soft);
+  }
+
+  .suggestion-emote-img {
+    width: 20px;
+    height: 20px;
+    flex-shrink: 0;
+  }
+
+  /* Emote browser overlay */
+  .emote-browser-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 30;
+  }
+
+  .emote-browser {
+    width: 380px;
+    max-height: 440px;
+    background:
+      radial-gradient(circle at top left, rgba(105, 189, 69, 0.10) 0, transparent 55%),
+      linear-gradient(135deg, #181818, #050505);
+    border-radius: 10px;
+    border: 1px solid var(--border-strong);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .emote-browser-header {
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border-subtle);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .emote-browser-title {
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .emote-browser-search {
+    padding: 3px 5px;
+    font-size: 11px;
+    border-radius: 4px;
+    border: 1px solid var(--input-border);
+    background: #020617;
+    color: var(--text-main);
+    flex: 1;
+  }
+
+  .emote-browser-search:focus {
+    border-color: var(--accent);
+    outline: none;
+  }
+
+  /* Layout row: [emote grid][channel sidebar] */
+  .emote-browser-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 6px 8px;
+  }
+
+  /* Scrollable grid area */
+  .emote-browser-body {
+    flex: 1;
+    max-height: 360px;
+    overflow-y: auto;
+    display: block;
+    padding: 6px 8px;
+    padding-right: 4px; /* keep room for scrollbar */
+    background: transparent; /* let panel gradient show through */
+  }
+
+  .emote-browser-body::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  .emote-browser-body::-webkit-scrollbar-thumb {
+    background: #18181b;
+    border-radius: 999px;
+  }
+
+  /* Channel sidebar (right side icons) */
+  .emote-channel-sidebar {
+    width: 40px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .emote-channel-avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: 999px;
+    background: #111827;
+    border: 1px solid #374151;
+    overflow: hidden;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .emote-channel-avatar img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .emote-channel-avatar.all {
+    font-size: 16px;
+    color: #9ca3af;
+  }
+
+  .emote-channel-avatar.active {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent-soft);
+  }
+
+  /* Section header for groups */
+  .emote-section-header {
+    font-size: 11px;
+    font-weight: 600;
+    color: #9ca3af;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin: 4px 0;
+  }
+
+  /* Grid of emotes within a section */
+  .emote-section-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(32px, 1fr));
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+
+  /* Tooltip preview */
+  .emote-preview-tooltip {
+    position: fixed;
+    z-index: 40;
+    background: #020617;
+    border-radius: 8px;
+    border: 1px solid var(--border-strong);
+    padding: 6px 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8);
+    font-size: 11px;
+    color: var(--text-main);
+    pointer-events: none; /* don't steal hover/clicks */
+  }
+
+  .emote-preview-img {
+    width: 48px;
+    height: 48px;
+  }
+
+  .emote-preview-name {
+    font-weight: 600;
+  }
+
+  .emote-preview-meta {
+    font-size: 10px;
+    color: var(--text-soft);
+  }
+
+  .emote-browser-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    cursor: pointer;
+    padding: 4px 3px;
+    border-radius: 6px;
+    background: #020617;
+    border: 1px solid transparent;
+  }
+
+  .emote-browser-item:hover {
+    border-color: var(--accent);
+    background: rgba(24, 24, 27, 0.95);
+  }
+
+  .emote-browser-img {
+    width: 28px;
+    height: 28px;
+  }
+
+  .emote-browser-name {
+    font-size: 10px;
+    color: var(--text-soft);
+    text-align: center;
+    max-width: 100%;
+    word-break: break-word;
+  }
+
+  .emote-browser-footer {
+    padding: 4px 8px;
+    border-top: 1px solid var(--border-subtle);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 10px;
+    color: var(--text-soft);
+  }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--pill-bg);
+    border-radius: 999px;
+    border: 1px solid var(--pill-border);
+    padding: 2px 6px;
+    font-size: 10px;
+  }
+
+  .pill-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--accent);
+  }
+
+  .pill-label {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-soft);
+  }
+
+  /* Dynamic visibility based on body classes */
+  body.hide-timestamps .chat-timestamp {
+    display: none;
+  }
+
+  body.hide-badges .chat-badges-inline {
+    display: none;
+  }
+
+</style>
+
+</head>
+<body>
+  <header class="dock-header">
+    <div>
+      <div class="dock-title">Chat feed</div>
+      <div class="dock-subtitle">
+        Live chat via Stream Sync.
+        <div class="profile-label" id="profile-label"></div>
+      </div>
+    </div>
+    <div class="dock-status">
+      <div class="status-dot" id="ws-status-dot"></div>
+      <span id="ws-status-text">Connecting…</span>
+    </div>
+  </header>
+
+  <div class="dock-body" id="chat-list">
+    <div class="empty-state">
+      Waiting for chat messages…
+    </div>
+  </div>
+
+  <footer class="dock-footer">
+    <div class="suggestions-panel">
+      <div id="suggestions-root" class="suggestions-list" style="display: none;"></div>
+      <div class="input-row">
+        <div class="chat-input-stack">
+          <div id="chat-preview" class="chat-input-preview"></div>
+          <input
+            id="chat-input"
+            class="chat-input"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="Send a message"
+          />
+        </div>
+        <button id="btn-emotes" class="btn">Emotes</button>
+        <button id="btn-send" class="btn btn-primary">Send</button>
+      </div>
+    </div>
+
+    <div class="toolbar-row">
+      <div class="toolbar-left">
+        <span class="tiny-label">Enter to send</span>
+      </div>
+    </div>
+  </footer>
+
+  <div id="emote-browser-root" style="display: none;"></div>
+
+  <script>
+    (function () {
+      const DOCK_PLATFORM = window.STREAMSYNC_DOCK_PLATFORM || "twitch";
+      function eventPlatform(payload) {
+        return payload && payload.platform ? String(payload.platform) : "twitch";
+      }
+      if (DOCK_PLATFORM === "kick") {
+        document.title = "Stream Sync – Kick Chat Dock";
+        const titleEl = document.querySelector(".dock-title");
+        if (titleEl) titleEl.textContent = "Kick chat";
+        const sub = document.querySelector(".dock-subtitle");
+        if (sub) sub.firstChild && (sub.firstChild.textContent = "Live Kick chat via Stream Sync. ");
+        const emoteBtn = document.getElementById("btn-emotes");
+        if (emoteBtn) emoteBtn.style.display = "none";
+      }
+      const profileId = "chat-default";
+      
+      // Per-profile dock settings; loaded from API
+      let dockSettings = {
+        fontSize: 13,
+        showBadges: true,
+        showTimestamps: true,
+      };
+
+      const chatList = document.getElementById("chat-list");
+      const statusDot = document.getElementById("ws-status-dot");
+      const statusText = document.getElementById("ws-status-text");
+      const profileLabel = document.getElementById("profile-label");
+      const chatInput = document.getElementById("chat-input");
+      const chatPreview = document.getElementById("chat-preview");
+      const btnEmotes = document.getElementById("btn-emotes");
+      const btnSend = document.getElementById("btn-send");
+      const suggestionsRoot = document.getElementById("suggestions-root");
+      const emoteBrowserRoot = document.getElementById("emote-browser-root");
+
+      if (profileLabel) {
+        profileLabel.textContent = "Profile: " + profileId;
+      }
+
+      let ws = null;
+      const MAX_ITEMS = 500;
+
+      let badgeImages = {};
+      let emoteList = [];
+      let suggestionsState = {
+        type: null,
+        items: [],
+        activeIndex: -1,
+        anchorKind: null,
+        anchorText: "",
+      };
+
+      const COMMANDS = [
+        { cmd: "/ban", desc: "Permanently ban a user" },
+        { cmd: "/unban", desc: "Remove a user ban" },
+        { cmd: "/timeout", desc: "Temporarily ban a user" },
+        { cmd: "/untimeout", desc: "Remove an active timeout" },
+        { cmd: "/clear", desc: "Clear chat history" },
+        { cmd: "/slow", desc: "Enable slow mode" },
+        { cmd: "/slowoff", desc: "Disable slow mode" },
+        { cmd: "/followers", desc: "Enable followers-only chat" },
+        { cmd: "/followersoff", desc: "Disable followers-only chat" },
+        { cmd: "/subscribers", desc: "Enable subscribers-only chat" },
+        { cmd: "/subscribersoff", desc: "Disable subscribers-only chat" },
+        { cmd: "/emoteonly", desc: "Enable emote-only chat" },
+        { cmd: "/emoteonlyoff", desc: "Disable emote-only chat" },
+        { cmd: "/uniquechat", desc: "Enable unique chat (r9k)" },
+        { cmd: "/uniquechatoff", desc: "Disable unique chat" },
+        { cmd: "/raid", desc: "Start a raid to another channel" },
+        { cmd: "/unraid", desc: "Cancel an active raid" },
+        { cmd: "/mod", desc: "Grant moderator status" },
+        { cmd: "/unmod", desc: "Remove moderator status" },
+        { cmd: "/vip", desc: "Grant VIP status" },
+        { cmd: "/unvip", desc: "Remove VIP status" },
+        { cmd: "/marker", desc: "Create a stream marker" },
+        { cmd: "/commercial", desc: "Play an ad break" },
+        { cmd: "/me", desc: "Send an action message" },
+        { cmd: "/prediction", desc: "Open prediction UI" },
+        { cmd: "/announce", desc: "Send an announcement" },
+        { cmd: "/shieldmode", desc: "Toggle Shield Mode" },
+        { cmd: "/block", desc: "Block a user" },
+        { cmd: "/unblock", desc: "Unblock a user" },
+      ];
+
+      function formatTime(ts) {
+        try {
+          const d = new Date(ts || Date.now());
+          let hh = d.getHours();
+          const mm = String(d.getMinutes()).padStart(2, "0");
+          const ss = String(d.getSeconds()).padStart(2, "0");
+          const ampm = hh >= 12 ? "PM" : "AM";
+          hh = hh % 12;
+          if (hh === 0) hh = 12;
+          return `${hh}:${mm}:${ss} ${ampm}`;
+        } catch {
+          return "";
+        }
+      }
+
+      function clearEmptyState() {
+        if (!chatList) return;
+        const empty = chatList.querySelector(".empty-state");
+        if (empty) empty.remove();
+      }
+
+      function setWsStatus(connected, message) {
+        if (statusDot) {
+          statusDot.classList.toggle("connected", !!connected);
+        }
+        if (statusText) {
+          statusText.textContent = message;
+        }
+      }
+
+      /** True until the user scrolls up to read history; re-enabled when they return near the bottom. */
+      let stickToBottom = true;
+
+      function distanceFromBottom(el) {
+        return el.scrollHeight - (el.scrollTop + el.clientHeight);
+      }
+
+      function scrollChatToBottom() {
+        if (!chatList) return;
+        chatList.scrollTop = chatList.scrollHeight;
+      }
+
+      function updateStickToBottomFromScroll() {
+        if (!chatList) return;
+        stickToBottom = distanceFromBottom(chatList) < 80;
+      }
+
+      if (chatList) {
+        chatList.addEventListener("scroll", updateStickToBottomFromScroll, { passive: true });
+      }
+
+      function emoteImageUrl(emote) {
+        if (!emote) return null;
+        return emote.imageUrl || null;
+      }
+
+      function buildEmoteListIndex(data) {
+        if (!data || !Array.isArray(data.emotes)) return [];
+
+        return data.emotes.map((e) => {
+          const images = e.images || {};
+          const imageUrl =
+            images.url_2x ||
+            images.url_1x ||
+            images.url_4x ||
+            (e.id
+              ? `https://static-cdn.jtvnw.net/emoticons/v2/${encodeURIComponent(
+                  e.id
+                )}/static/dark/2.0`
+              : null);
+
+          return {
+            id: e.id,
+            name: e.name,
+            images,
+            imageUrl,
+            ownerType: e.ownerType || "unknown",
+            ownerId: e.ownerId || null,
+            ownerName: e.ownerName || null,
+            ownerLogin: e.ownerLogin || null,
+            ownerAvatar: e.ownerProfileImageUrl || null,
+            ownerIsSelf: !!e.ownerIsSelf,
+          };
+        });
+      }
+
+      /**
+       * Apply dockSettings to existing DOM elements:
+       * - Toggle visibility of timestamps and badges
+       * - Update font size via CSS var
+       */
+      function applyDockSettingsToExistingMessages() {
+        // Font size
+        if (typeof dockSettings.fontSize === "number") {
+          document.documentElement.style.setProperty(
+            "--font-size",
+            dockSettings.fontSize + "px"
+          );
+        }
+
+        if (!chatList) return;
+
+        // Timestamps
+        chatList.querySelectorAll(".chat-timestamp").forEach((el) => {
+          el.style.display = dockSettings.showTimestamps ? "" : "none";
+        });
+
+        // Badges
+        chatList.querySelectorAll(".chat-badges-inline").forEach((el) => {
+          el.style.display = dockSettings.showBadges ? "" : "none";
+        });
+      }
+
+      // Load dock config (font size, visibility toggles) from overlay server
+      async function loadDockConfig(profileId) {
+        try {
+          const res = await fetch(
+            `/config/${encodeURIComponent(profileId)}.json`,
+            { cache: "no-cache" }
+          );
+          if (!res.ok) {
+            throw new Error(
+              "HTTP " + res.status + " " + (await res.text())
+            );
+          }
+          const cfg = await res.json();
+
+          const fontSize = cfg?.font?.size || 13;
+          const chatCfg = cfg?.chat || {};
+
+          dockSettings.fontSize = fontSize;
+          dockSettings.showBadges =
+            chatCfg.showBadges === false ? false : true;
+          dockSettings.showTimestamps =
+            chatCfg.showTimestamps === false ? false : true;
+
+          // Apply font size via CSS variable so all chat lines scale
+          document.documentElement.style.setProperty(
+            "--font-size",
+            fontSize + "px"
+          );
+
+          // 🔹 Apply visibility to existing DOM via body classes
+          applyDockSettingsToDom();
+
+          console.log("[chat-dock] Loaded dock config:", dockSettings);
+        } catch (err) {
+          console.error("[chat-dock] Failed to load dock config:", err);
+        }
+      }
+
+      function applyDockSettingsToDom() {
+        // Use body classes so CSS shows/hides timestamps & badges everywhere
+        document.body.classList.toggle(
+          "hide-timestamps",
+          !dockSettings.showTimestamps
+        );
+        document.body.classList.toggle(
+          "hide-badges",
+          !dockSettings.showBadges
+        );
+      }
+
+      async function loadBadges() {
+        if (DOCK_PLATFORM === "kick") {
+          badgeImages = {};
+          return;
+        }
+        try {
+          const res = await fetch("/api/twitch/badges/all", { cache: "no-cache" });
+          if (!res.ok) {
+            throw new Error("HTTP " + res.status + " " + (await res.text()));
+          }
+          const data = await res.json();
+          const sets = data.badge_sets || {};
+
+          badgeImages = {};
+          Object.entries(sets).forEach(([setId, set]) => {
+            const versionsObj = set.versions || {};
+            Object.values(versionsObj).forEach((version) => {
+              const key = setId + "/" + version.id;
+              const url =
+                version.image_url_2x ||
+                version.image_url_1x ||
+                version.image_url_4x ||
+                null;
+              if (url) {
+                badgeImages[key] = url;
+              }
+            });
+          });
+
+          console.log(
+            "[chat-dock] Loaded badge images, count:",
+            Object.keys(badgeImages).length
+          );
+        } catch (err) {
+          console.error("[chat-dock] Failed to load badges:", err);
+        }
+      }
+
+      async function loadEmotes() {
+        if (DOCK_PLATFORM === "kick") {
+          emoteList = [];
+          console.log("[chat-dock] Kick dock: emote browser uses inline [emote:ID:NAME] tokens; no preload needed.");
+          return;
+        }
+        try {
+          const res = await fetch("/api/twitch/emotes/all", { cache: "no-cache" });
+          if (!res.ok) {
+            throw new Error("HTTP " + res.status + " " + (await res.text()));
+          }
+          const data = await res.json();
+          emoteList = buildEmoteListIndex(data);
+          console.log("[chat-dock] Loaded emotes, count:", emoteList.length);
+        } catch (err) {
+          console.error("[chat-dock] Failed to load emotes:", err);
+        }
+      }
+
+      function renderMessageWithEmotes(message, emotesMap) {
+        function resolveEmoteUrl(emote) {
+          if (!emote) return null;
+          if (emote.imageUrl) return emote.imageUrl;
+
+          // Fallback in case something slipped through without imageUrl
+          const images = emote.images || {};
+          const url =
+            images.url_2x ||
+            images.url_1x ||
+            images.url_4x ||
+            (emote.id
+              ? `https://static-cdn.jtvnw.net/emoticons/v2/${encodeURIComponent(
+                  emote.id
+                )}/static/dark/2.0`
+              : null);
+          return url || null;
+        }
+
+        // If we have a proper Twitch emotes map from IRC (best case), use it.
+        const hasMap =
+          emotesMap &&
+          typeof emotesMap === "object" &&
+          Object.keys(emotesMap).length > 0;
+
+        if (hasMap) {
+          const emoteSpans = [];
+          for (const [emoteId, ranges] of Object.entries(emotesMap)) {
+            const parts = (ranges || "").toString().split(",");
+            for (const part of parts) {
+              const [startStr, endStr] = part.split("-");
+              const start = Number(startStr);
+              const end = Number(endStr);
+              if (Number.isNaN(start) || Number.isNaN(end)) continue;
+              emoteSpans.push({ emoteId, start, end });
+            }
+          }
+
+          emoteSpans.sort((a, b) => a.start - b.start);
+
+          const wrapper = document.createElement("span");
+          wrapper.className = "chat-message";
+
+          let currentIndex = 0;
+          for (const spanInfo of emoteSpans) {
+            if (spanInfo.start > currentIndex) {
+              const textSlice = message.slice(currentIndex, spanInfo.start);
+              if (textSlice) {
+                wrapper.appendChild(document.createTextNode(textSlice));
+              }
+            }
+
+            const emoteText = message.slice(spanInfo.start, spanInfo.end + 1);
+            const emote = emoteList.find((e) => e.id === spanInfo.emoteId);
+            const imgUrl =
+              resolveEmoteUrl(emote) ||
+              (spanInfo.emoteId
+                ? `https://static-cdn.jtvnw.net/emoticons/v2/${encodeURIComponent(
+                    spanInfo.emoteId
+                  )}/static/dark/2.0`
+                : null);
+
+            if (imgUrl) {
+              const img = document.createElement("img");
+              img.className = "chat-emote-img";
+              img.src = imgUrl;
+              img.alt = emoteText;
+              img.title = emoteText;
+              wrapper.appendChild(img);
+            } else {
+              wrapper.appendChild(document.createTextNode(emoteText));
+            }
+
+            currentIndex = spanInfo.end + 1;
+          }
+
+          if (currentIndex < message.length) {
+            wrapper.appendChild(document.createTextNode(message.slice(currentIndex)));
+          }
+
+          return wrapper;
+        }
+
+        // 🔹 Fallback path: no emote metadata (common for dock/self messages).
+        const wrapper = document.createElement("span");
+        wrapper.className = "chat-message";
+
+        if (!emoteList || !emoteList.length) {
+          wrapper.textContent = message;
+          return wrapper;
+        }
+
+        const emoteByName = new Map();
+        for (const emote of emoteList) {
+          if (emote && emote.name) {
+            emoteByName.set(emote.name, emote);
+          }
+        }
+
+        const parts = message.split(/(\s+)/);
+
+        for (const part of parts) {
+          if (!part) continue;
+
+          if (/^\s+$/.test(part)) {
+            wrapper.appendChild(document.createTextNode(part));
+            continue;
+          }
+
+          const match = part.match(/^([(\[{<"]?)(.*?)([)\]}>".,!?]*)$/);
+          const leading = match ? match[1] : "";
+          const core = match ? match[2] : part;
+          const trailing = match ? match[3] : "";
+
+          const emote = emoteByName.get(core);
+          if (emote) {
+            if (leading) {
+              wrapper.appendChild(document.createTextNode(leading));
+            }
+
+            const imgUrl = resolveEmoteUrl(emote);
+            if (imgUrl) {
+              const img = document.createElement("img");
+              img.className = "chat-emote-img";
+              img.src = imgUrl;
+              img.alt = core;
+              img.title = core;
+              wrapper.appendChild(img);
+            } else {
+              wrapper.appendChild(document.createTextNode(core));
+            }
+
+            if (trailing) {
+              wrapper.appendChild(document.createTextNode(trailing));
+            }
+          } else {
+            wrapper.appendChild(document.createTextNode(part));
+          }
+        }
+
+        return wrapper;
+      }
+
+      function renderKickMessage(message, kickEmotes) {
+        const wrapper = document.createElement("span");
+        wrapper.className = "chat-message";
+        const emoteRegex = /\[emote:(\d+):([^\]]+)\]/g;
+        let lastIndex = 0;
+        let match;
+        while ((match = emoteRegex.exec(message)) !== null) {
+          if (match.index > lastIndex) {
+            wrapper.appendChild(document.createTextNode(message.slice(lastIndex, match.index)));
+          }
+          const emoteId = match[1];
+          const emoteName = match[2];
+          const img = document.createElement("img");
+          img.className = "chat-emote-img";
+          img.src = "https://files.kick.com/emotes/" + encodeURIComponent(emoteId) + "/fullsize";
+          img.alt = emoteName;
+          img.title = emoteName;
+          wrapper.appendChild(img);
+          lastIndex = match.index + match[0].length;
+        }
+        if (lastIndex < message.length) {
+          wrapper.appendChild(document.createTextNode(message.slice(lastIndex)));
+        }
+        if (lastIndex === 0 && Array.isArray(kickEmotes) && kickEmotes.length > 0) {
+          wrapper.textContent = "";
+          const positions = [];
+          for (const emote of kickEmotes) {
+            const eid = String(emote.emote_id || emote.id || "");
+            if (!eid || !Array.isArray(emote.positions)) continue;
+            for (const pos of emote.positions) {
+              positions.push({ id: eid, s: pos.s, e: pos.e });
+            }
+          }
+          if (positions.length) {
+            positions.sort((a, b) => a.s - b.s);
+            let cur = 0;
+            for (const p of positions) {
+              if (p.s > cur) {
+                wrapper.appendChild(document.createTextNode(message.slice(cur, p.s)));
+              }
+              const name = message.slice(p.s, p.e + 1);
+              const img = document.createElement("img");
+              img.className = "chat-emote-img";
+              img.src = "https://files.kick.com/emotes/" + encodeURIComponent(p.id) + "/fullsize";
+              img.alt = name;
+              img.title = name;
+              wrapper.appendChild(img);
+              cur = p.e + 1;
+            }
+            if (cur < message.length) {
+              wrapper.appendChild(document.createTextNode(message.slice(cur)));
+            }
+          } else {
+            wrapper.textContent = message;
+          }
+        }
+        return wrapper;
+      }
+
+      function hashUsernameColor(name) {
+        const s = String(name || "");
+        let hash = 0;
+        for (let i = 0; i < s.length; i += 1) {
+          hash = s.charCodeAt(i) + ((hash << 5) - hash);
+        }
+        const hue = Math.abs(hash) % 360;
+        return "hsl(" + hue + ", 72%, 62%)";
+      }
+
+      const KICK_BADGE_SVGS = {
+        broadcaster: '<svg viewBox="0 0 20 20" class="chat-kick-badge-svg"><circle cx="10" cy="10" r="9" fill="#e91916"/><path d="M10 5.5a1 1 0 0 1 1 1V10l2.1 1.3a.75.75 0 0 1-.8 1.3L10 11V6.5a1 1 0 0 1 1-1zM10 4a6 6 0 1 0 0 12A6 6 0 0 0 10 4zM7 9.5c-.6 0-1-.7-.7-1.2L8.5 5h3l2.2 3.3c.3.5-.1 1.2-.7 1.2H7z" fill="#fff"/><path d="M10 5v5.5l-3 2M10 3a1.2 1.2 0 0 0-1.2 1l-.3 1.5M10 3a1.2 1.2 0 0 1 1.2 1l.3 1.5" stroke="#fff" stroke-width=".7" fill="none" stroke-linecap="round"/><circle cx="10" cy="10" r="2.5" fill="#e91916" stroke="#fff" stroke-width=".8"/><rect x="9.25" y="5" width="1.5" height="5" rx=".5" fill="#fff"/><rect x="8" y="12" width="4" height="1.5" rx=".5" fill="#fff"/></svg>',
+        moderator: '<svg viewBox="0 0 20 20" class="chat-kick-badge-svg"><circle cx="10" cy="10" r="9" fill="#00ad03"/><path d="M10 4l-5 3v3c0 3.3 2.1 6.4 5 7 2.9-.6 5-3.7 5-7V7l-5-3z" fill="#fff" opacity=".9"/><path d="M9 10.5l-1.5-1.5L6 10.5 9 13.5l5-5L12.5 7z" fill="#00ad03"/></svg>',
+        subscriber: '<svg viewBox="0 0 20 20" class="chat-kick-badge-svg"><circle cx="10" cy="10" r="9" fill="#53fc18"/><path d="M10 4l1.8 3.6 4 .6-2.9 2.8.7 3.9L10 13l-3.6 1.9.7-3.9L4.2 8.2l4-.6z" fill="#111"/></svg>',
+        sub_gifter: '<svg viewBox="0 0 20 20" class="chat-kick-badge-svg"><circle cx="10" cy="10" r="9" fill="#9147ff"/><rect x="5" y="8" width="10" height="7" rx="1" fill="#fff"/><rect x="9" y="8" width="2" height="7" fill="#9147ff"/><rect x="5" y="10" width="10" height="2" fill="#9147ff" opacity=".3"/><path d="M10 5L7 8h6z" fill="#fff"/></svg>',
+        vip: '<svg viewBox="0 0 20 20" class="chat-kick-badge-svg"><circle cx="10" cy="10" r="9" fill="#e00585"/><path d="M5 7h2l1.5 4L10 7h2l-3 7h-1L5 7z" fill="#fff"/></svg>',
+        og: '<svg viewBox="0 0 20 20" class="chat-kick-badge-svg"><circle cx="10" cy="10" r="9" fill="#ffd700"/><text x="10" y="14" text-anchor="middle" font-size="9" font-weight="800" fill="#111" font-family="system-ui">OG</text></svg>',
+        founder: '<svg viewBox="0 0 20 20" class="chat-kick-badge-svg"><circle cx="10" cy="10" r="9" fill="#9147ff"/><path d="M6.5 12l1.5-6h4l1.5 6-3.5-2z" fill="#ffd700"/><circle cx="10" cy="7" r="1.2" fill="#ffd700"/></svg>',
+        verified: '<svg viewBox="0 0 20 20" class="chat-kick-badge-svg"><circle cx="10" cy="10" r="9" fill="#1da1f2"/><path d="M8.5 13.5l-3-3 1.4-1.4L8.5 10.7l4.6-4.6 1.4 1.4z" fill="#fff"/></svg>',
+        staff: '<svg viewBox="0 0 20 20" class="chat-kick-badge-svg"><circle cx="10" cy="10" r="9" fill="#53fc18"/><text x="10" y="13.5" text-anchor="middle" font-size="7" font-weight="800" fill="#111" font-family="system-ui">K</text></svg>',
+        sidekick: '<svg viewBox="0 0 20 20" class="chat-kick-badge-svg"><circle cx="10" cy="10" r="9" fill="#0ea5e9"/><path d="M7 8h6v5H7z" fill="#fff" rx="1"/><path d="M10 7v7" stroke="#0ea5e9" stroke-width="1.2"/></svg>',
+      };
+
+      function kickBadgeTitle(badge) {
+        if (!badge) return "";
+        const text = badge.text ? String(badge.text) : "";
+        const type = String(badge.type || badge || "").toLowerCase();
+        const label = text || type.replace(/_/g, " ");
+        return badge.count != null ? label + " (" + badge.count + ")" : label;
+      }
+
+      function createKickBadgesInline(badges) {
+        const list = Array.isArray(badges) ? badges : [];
+        if (!list.length) return null;
+
+        const container = document.createElement("span");
+        container.className = "chat-badges-inline";
+
+        for (const badge of list) {
+          const type = String((badge && badge.type) || badge || "").toLowerCase();
+          if (!type) continue;
+          const title = kickBadgeTitle(badge);
+          const svg = KICK_BADGE_SVGS[type];
+          if (svg) {
+            const wrapper = document.createElement("span");
+            wrapper.innerHTML = svg;
+            wrapper.title = title || type;
+            wrapper.style.display = "inline-block";
+            container.appendChild(wrapper);
+          } else {
+            const pill = document.createElement("span");
+            pill.className = "chat-kick-badge-pill";
+            pill.textContent = (badge.text || type).slice(0, 6);
+            pill.title = title || type;
+            container.appendChild(pill);
+          }
+        }
+
+        return container.childNodes.length ? container : null;
+      }
+
+      function createBadgeInline(badgesRaw) {
+        const container = document.createElement("span");
+        container.className = "chat-badges-inline";
+
+        const badgeEntries = Object.entries(badgesRaw || {});
+        for (const [setId, versionId] of badgeEntries) {
+          const key = setId + "/" + versionId;
+          const url = badgeImages[key];
+          if (!url) continue;
+          const img = document.createElement("img");
+          img.className = "chat-badge-img";
+          img.src = url;
+          img.alt = setId;
+          img.title = setId;
+          container.appendChild(img);
+        }
+
+        if (!container.childNodes.length) {
+          return null;
+        }
+        return container;
+      }
+
+      function appendChatMessage(evt) {
+        if (!chatList) return;
+        if (evt.type !== "chat") return;
+
+        clearEmptyState();
+
+        const item = document.createElement("div");
+        item.className = "chat-item";
+
+        const line = document.createElement("div");
+        line.className = "chat-line";
+
+        // Timestamp (always render; visibility controlled by body class)
+        const tsSpan = document.createElement("span");
+        tsSpan.className = "chat-timestamp";
+        tsSpan.textContent = `[${formatTime(evt.ts)}]`;
+        line.appendChild(tsSpan);
+
+        // Badges (always render if present; visibility via body class)
+        const badgeInline =
+          DOCK_PLATFORM === "kick"
+            ? createKickBadgesInline(evt.user && evt.user.kickBadges)
+            : createBadgeInline(evt.user && evt.user.badgesRaw);
+        if (badgeInline) {
+          line.appendChild(badgeInline);
+        }
+
+        const usernameSpan = document.createElement("span");
+        usernameSpan.className = "chat-username";
+        usernameSpan.textContent = evt.user && evt.user.displayName
+          ? evt.user.displayName
+          : evt.user && evt.user.name
+            ? evt.user.name
+            : "Unknown";
+
+        if (evt.user && evt.user.color) {
+          usernameSpan.style.color = evt.user.color;
+        } else if (DOCK_PLATFORM === "kick" && evt.user && evt.user.name) {
+          usernameSpan.style.color = hashUsernameColor(evt.user.name);
+        }
+        line.appendChild(usernameSpan);
+
+        const colonText = document.createTextNode(": ");
+        line.appendChild(colonText);
+
+        const msgNode = DOCK_PLATFORM === "kick"
+          ? renderKickMessage(evt.message || "", evt.kickEmotes)
+          : renderMessageWithEmotes(evt.message || "", evt.emotes);
+
+        line.appendChild(msgNode);
+        item.appendChild(line);
+
+        chatList.appendChild(item);
+        while (chatList.children.length > MAX_ITEMS) {
+          const first = chatList.firstElementChild;
+          if (!first) break;
+          first.remove();
+        }
+
+        if (stickToBottom) {
+          requestAnimationFrame(() => scrollChatToBottom());
+        }
+      }
+
+      function getWebSocketUrl() {
+        const loc = window.location;
+        const isSecure = loc.protocol === "https:";
+        const wsProto = isSecure ? "wss:" : "ws:";
+        const host = loc.host;
+        const query = "?profile=" + encodeURIComponent(profileId);
+        return wsProto + "//" + host + "/ws/feed" + query;
+      }
+
+      function connectWebSocket() {
+        const url = getWebSocketUrl();
+        let socket;
+        try {
+          socket = new WebSocket(url);
+        } catch (err) {
+          console.error("[chat-dock] Failed to open WebSocket:", err);
+          setWsStatus(false, "Error");
+          return;
+        }
+
+        ws = socket;
+        setWsStatus(false, "Connecting…");
+
+        socket.addEventListener("open", () => {
+          console.log("[chat-dock] WebSocket connected:", url);
+          setWsStatus(true, "Connected");
+        });
+
+        socket.addEventListener("message", (event) => {
+          try {
+            const payload = JSON.parse(event.data);
+
+            // 🔹 Normal chat events
+            if (payload && payload.type === "chat") {
+              if (eventPlatform(payload) !== DOCK_PLATFORM) return;
+              appendChatMessage(payload);
+              return;
+            }
+
+            // 🔹 Dock settings updated from the app (font size, badges, timestamps, etc.)
+            if (payload && payload.type === "dock-config-updated") {
+              // Only react if this update matches our profile
+              if (!payload.profileId || payload.profileId === profileId) {
+                console.log("[chat-dock] Received dock-config-updated; reloading config…");
+                // Re-fetch config from the server so changes apply immediately
+                loadDockConfig(profileId);
+              }
+              return;
+            }
+
+            // (Future-proofing) Ignore other event types quietly
+          } catch (err) {
+            console.error("[chat-dock] Failed to parse WS message:", err);
+          }
+        });
+
+        socket.addEventListener("close", () => {
+          console.log("[chat-dock] WebSocket closed");
+          setWsStatus(false, "Disconnected");
+          ws = null;
+          setTimeout(connectWebSocket, 2000);
+        });
+
+        socket.addEventListener("error", (err) => {
+          console.error("[chat-dock] WebSocket error:", err);
+          setWsStatus(false, "Error");
+        });
+      }
+
+      function sendChatMessageFromDock(text) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const payload = {
+          type: "chat-send",
+          platform: DOCK_PLATFORM,
+          message: text,
+        };
+        ws.send(JSON.stringify(payload));
+      }
+
+      function resetSuggestions() {
+        suggestionsState = {
+          type: null,
+          items: [],
+          activeIndex: -1,
+          anchorKind: null,
+          anchorText: "",
+        };
+        suggestionsRoot.style.display = "none";
+        suggestionsRoot.innerHTML = "";
+      }
+
+      function highlightMatch(text, query) {
+        const span = document.createElement("span");
+        const q = query.toLowerCase();
+        const lower = text.toLowerCase();
+        const idx = lower.indexOf(q);
+        if (idx === -1) {
+          span.textContent = text;
+          return span;
+        }
+        const before = text.slice(0, idx);
+        const match = text.slice(idx, idx + q.length);
+        const after = text.slice(idx + q.length);
+
+        if (before) span.appendChild(document.createTextNode(before));
+        const strong = document.createElement("span");
+        strong.style.color = "#ffffff";
+        strong.style.fontWeight = "600";
+        strong.textContent = match;
+        span.appendChild(strong);
+        if (after) span.appendChild(document.createTextNode(after));
+        return span;
+      }
+
+      function filterEmoteSuggestions(term) {
+        const q = term.trim().toLowerCase();
+        if (!q) return [];
+        return emoteList
+          .filter((e) => e.name.toLowerCase().includes(q))
+          .slice(0, 50);
+      }
+
+      function filterCommandSuggestions(term) {
+        const q = term.trim().toLowerCase();
+        if (!q) return [];
+        return COMMANDS
+          .filter(({ cmd }) => cmd.toLowerCase().includes(q))
+          .slice(0, 50);
+      }
+
+      function showEmoteSuggestions(term) {
+        const items = filterEmoteSuggestions(term);
+        if (!items.length) {
+          resetSuggestions();
+          return;
+        }
+
+        suggestionsState = {
+          type: "emote",
+          items,
+          activeIndex: 0,
+          anchorKind: "colon",
+          anchorText: term,
+        };
+
+        renderSuggestionsPanel();
+      }
+
+      function showCommandSuggestions(term) {
+        const items = filterCommandSuggestions(term);
+        if (!items.length) {
+          resetSuggestions();
+          return;
+        }
+
+        suggestionsState = {
+          type: "command",
+          items,
+          activeIndex: 0,
+          anchorKind: "slash",
+          anchorText: term,
+        };
+
+        renderSuggestionsPanel();
+      }
+
+      function renderSuggestionsPanel() {
+        suggestionsRoot.innerHTML = "";
+        const { type, items, activeIndex, anchorText } = suggestionsState;
+        if (!type || !items.length) {
+          suggestionsRoot.style.display = "none";
+          return;
+        }
+
+        const header = document.createElement("div");
+        header.className = "suggestion-header";
+        header.textContent =
+          type === "emote"
+            ? `Emotes matching "${anchorText}"`
+            : `Commands matching "${anchorText}"`;
+        suggestionsRoot.appendChild(header);
+
+        items.forEach((item, index) => {
+          const row = document.createElement("div");
+          row.className = "suggestion-item";
+          if (index === activeIndex) {
+            row.classList.add("active");
+          }
+
+          row.dataset.index = String(index);
+
+          if (type === "emote") {
+            const imgUrl = emoteImageUrl(item);
+            if (imgUrl) {
+              const img = document.createElement("img");
+              img.className = "suggestion-emote-img";
+              img.src = imgUrl;
+              img.alt = item.name;
+              row.appendChild(img);
+            }
+
+            const col = document.createElement("div");
+            col.style.display = "flex";
+            col.style.flexDirection = "column";
+
+            const main = document.createElement("div");
+            main.className = "suggestion-main";
+            main.appendChild(highlightMatch(item.name, anchorText));
+            col.appendChild(main);
+
+            const sub = document.createElement("div");
+            sub.className = "suggestion-sub";
+            sub.textContent =
+              item.ownerType === "channel"
+                ? "Channel emote"
+                : item.ownerType === "user"
+                  ? "Your emote"
+                  : item.ownerType === "global"
+                    ? "Global emote"
+                    : "Emote";
+            col.appendChild(sub);
+
+            row.appendChild(col);
+          } else {
+            const col = document.createElement("div");
+            col.style.display = "flex";
+            col.style.flexDirection = "column";
+
+            const main = document.createElement("div");
+            main.className = "suggestion-main";
+            main.appendChild(highlightMatch(item.cmd, anchorText));
+            col.appendChild(main);
+
+            const sub = document.createElement("div");
+            sub.className = "suggestion-sub";
+            sub.textContent = item.desc || "";
+            col.appendChild(sub);
+
+            row.appendChild(col);
+          }
+
+          row.addEventListener("mousedown", (ev) => {
+            ev.preventDefault();
+            const idx = Number(row.dataset.index || "0");
+            applySuggestion(idx);
+          });
+
+          suggestionsRoot.appendChild(row);
+        });
+
+        suggestionsRoot.style.display = "block";
+      }
+
+      function moveSuggestionSelection(delta) {
+        const { type, items, activeIndex } = suggestionsState;
+        if (!type || !items.length) return;
+        let next = activeIndex + delta;
+        if (next < 0) next = items.length - 1;
+        if (next >= items.length) next = 0;
+        suggestionsState.activeIndex = next;
+        renderSuggestionsPanel();
+      }
+
+      function updateChatPreview() {
+        if (!chatPreview || !chatInput) return;
+        const value = chatInput.value || "";
+        chatPreview.innerHTML = "";
+        if (!value) return;
+        const node = renderMessageWithEmotes(value, null);
+        chatPreview.appendChild(node);
+      }
+
+      function applySuggestion(indexOverride) {
+        const { type, items, activeIndex, anchorKind } = suggestionsState;
+        if (!type || !items.length || !chatInput) return;
+        const idx = typeof indexOverride === "number" ? indexOverride : activeIndex;
+        const item = items[idx];
+        if (!item) return;
+
+        const value = chatInput.value;
+        const caret = chatInput.selectionStart ?? value.length;
+
+        if (type === "emote" && anchorKind === "colon") {
+          const before = value.slice(0, caret);
+          const after = value.slice(caret);
+
+          const colonIdx = before.lastIndexOf(":");
+          if (colonIdx === -1) return;
+
+          const prefix = before.slice(0, colonIdx);
+          const emoteName = item.name;
+
+          const sep = prefix && !/\s$/.test(prefix) ? " " : "";
+          const newBefore = prefix + sep + emoteName + " ";
+
+          chatInput.value = newBefore + after;
+          const newCaret = newBefore.length;
+          chatInput.setSelectionRange(newCaret, newCaret);
+        } else if (type === "command" && anchorKind === "slash") {
+          const rest = value.slice(caret);
+          const cmd = item.cmd;
+          const strippedRest = rest.replace(/^\/?\w*/, "");
+          const newValue = cmd + strippedRest;
+          chatInput.value = newValue;
+          const newCaret = cmd.length;
+          chatInput.setSelectionRange(newCaret, newCaret);
+        }
+
+        updateChatPreview();
+        resetSuggestions();
+      }
+
+      function maybeUpdateSuggestionsFromInput() {
+        if (!chatInput) return;
+        const value = chatInput.value;
+        const caret = chatInput.selectionStart ?? value.length;
+        const before = value.slice(0, caret);
+
+        const trimmed = before.trimStart();
+
+        if (trimmed.startsWith("/")) {
+          const withoutSlash = trimmed.slice(1);
+          const firstSpace = withoutSlash.indexOf(" ");
+
+          if (firstSpace !== -1) {
+            resetSuggestions();
+            return;
+          }
+
+          const term = withoutSlash;
+          if (!term) {
+            resetSuggestions();
+            return;
+          }
+
+          showCommandSuggestions(term);
+          return;
+        }
+
+        const colonIdx = before.lastIndexOf(":");
+        if (colonIdx !== -1) {
+          const afterColon = before.slice(colonIdx + 1);
+          if (/[\s:]/.test(afterColon)) {
+            resetSuggestions();
+            return;
+          }
+          const term = afterColon;
+          if (term.length === 0) {
+            resetSuggestions();
+            return;
+          }
+          showEmoteSuggestions(term);
+          return;
+        }
+
+        resetSuggestions();
+      }
+
+      function openEmoteBrowser() {
+        if (!emoteList.length) {
+          console.log("[chat-dock] No emotes loaded yet; cannot open browser");
+          return;
+        }
+
+        emoteBrowserRoot.innerHTML = "";
+
+        const backdrop = document.createElement("div");
+        backdrop.className = "emote-browser-backdrop";
+
+        const panel = document.createElement("div");
+        panel.className = "emote-browser";
+
+        const header = document.createElement("div");
+        header.className = "emote-browser-header";
+
+        const title = document.createElement("div");
+        title.className = "emote-browser-title";
+        title.textContent = "Emote browser";
+        header.appendChild(title);
+
+        const search = document.createElement("input");
+        search.className = "emote-browser-search";
+        search.type = "text";
+        search.placeholder = "Search emotes…";
+        header.appendChild(search);
+
+        // Row: [emote body][channel sidebar]
+        const row = document.createElement("div");
+        row.className = "emote-browser-row";
+
+        const body = document.createElement("div");
+        body.className = "emote-browser-body";
+
+        const sidebar = document.createElement("div");
+        sidebar.className = "emote-channel-sidebar";
+
+        row.appendChild(body);
+        row.appendChild(sidebar);
+
+        const footer = document.createElement("div");
+        footer.className = "emote-browser-footer";
+        const left = document.createElement("div");
+        left.textContent = "Click an emote to insert.";
+        const right = document.createElement("div");
+        right.innerHTML = `<span class="pill"><span class="pill-dot"></span><span class="pill-label">Stream Sync</span></span>`;
+        footer.appendChild(left);
+        footer.appendChild(right);
+
+        panel.appendChild(header);
+        panel.appendChild(row);
+        panel.appendChild(footer);
+        backdrop.appendChild(panel);
+        emoteBrowserRoot.appendChild(backdrop);
+        emoteBrowserRoot.style.display = "block";
+
+        let hoverTooltip = null;
+        let currentQuery = "";
+        let selectedChannelId = null; // null = "All channels"
+
+        // Build channel list from emote owners (your channel + subbed channels, etc.)
+        const channelMap = new Map();
+        for (const e of emoteList) {
+          if (
+            (e.ownerType === "channel" || e.ownerType === "user") &&
+            e.ownerId
+          ) {
+            const existing = channelMap.get(e.ownerId) || {
+              id: e.ownerId,
+              name: e.ownerName || null,
+              login: e.ownerLogin || null,
+              avatar: e.ownerAvatar || null,
+              isSelf: !!e.ownerIsSelf,
+            };
+
+            if (!existing.name && e.ownerName) existing.name = e.ownerName;
+            if (!existing.login && e.ownerLogin) existing.login = e.ownerLogin;
+            if (!existing.avatar && e.ownerAvatar) existing.avatar = e.ownerAvatar;
+
+            channelMap.set(e.ownerId, existing);
+          }
+        }
+
+        const channelList = Array.from(channelMap.values()).sort((a, b) => {
+          // Put your own channel first
+          if (a.isSelf && !b.isSelf) return -1;
+          if (b.isSelf && !a.isSelf) return 1;
+
+          const aName = (a.name || a.login || "").toLowerCase();
+          const bName = (b.name || b.login || "").toLowerCase();
+          return aName.localeCompare(bName);
+        });
+
+        function hideEmoteTooltip() {
+          if (hoverTooltip && hoverTooltip.parentNode) {
+            hoverTooltip.parentNode.removeChild(hoverTooltip);
+          }
+          hoverTooltip = null;
+        }
+
+        function showEmoteTooltip(emote, clientX, clientY) {
+          const imgUrl = emoteImageUrl(emote);
+          if (!imgUrl) {
+            hideEmoteTooltip();
+            return;
+          }
+
+          if (!hoverTooltip) {
+            hoverTooltip = document.createElement("div");
+            hoverTooltip.className = "emote-preview-tooltip";
+
+            const img = document.createElement("img");
+            img.className = "emote-preview-img";
+            img.id = "emote-preview-img";
+            hoverTooltip.appendChild(img);
+
+            const textCol = document.createElement("div");
+            textCol.style.display = "flex";
+            textCol.style.flexDirection = "column";
+
+            const nameEl = document.createElement("div");
+            nameEl.className = "emote-preview-name";
+            nameEl.id = "emote-preview-name";
+            textCol.appendChild(nameEl);
+
+            const metaEl = document.createElement("div");
+            metaEl.className = "emote-preview-meta";
+            metaEl.id = "emote-preview-meta";
+            textCol.appendChild(metaEl);
+
+            hoverTooltip.appendChild(textCol);
+            document.body.appendChild(hoverTooltip);
+          }
+
+          const imgEl = hoverTooltip.querySelector("#emote-preview-img");
+          const nameEl = hoverTooltip.querySelector("#emote-preview-name");
+          const metaEl = hoverTooltip.querySelector("#emote-preview-meta");
+
+          imgEl.src = imgUrl;
+          imgEl.alt = emote.name;
+          nameEl.textContent = emote.name;
+
+          let source = "Emote";
+          if (emote.ownerType === "channel") source = emote.ownerName || emote.ownerLogin || "Channel emote";
+          else if (emote.ownerType === "user") source = emote.ownerName || emote.ownerLogin || "Your emote";
+          else if (emote.ownerType === "global") source = "Global emote";
+          metaEl.textContent = source;
+
+          const padding = 12;
+          const tooltipRect = hoverTooltip.getBoundingClientRect();
+          const viewportWidth = window.innerWidth;
+          const viewportHeight = window.innerHeight;
+
+          let left = clientX + padding;
+          let top = clientY + padding;
+
+          if (left + tooltipRect.width > viewportWidth - 4) {
+            left = viewportWidth - tooltipRect.width - 4;
+          }
+          if (top + tooltipRect.height > viewportHeight - 4) {
+            top = viewportHeight - tooltipRect.height - 4;
+          }
+
+          hoverTooltip.style.left = left + "px";
+          hoverTooltip.style.top = top + "px";
+        }
+
+        function renderChannelSidebar() {
+          sidebar.innerHTML = "";
+
+          // "All channels" button
+          const allBtn = document.createElement("div");
+          allBtn.className = "emote-channel-avatar all";
+          if (!selectedChannelId) {
+            allBtn.classList.add("active");
+          }
+          allBtn.title = "All channels";
+          allBtn.textContent = "★";
+          allBtn.addEventListener("click", () => {
+            selectedChannelId = null;
+            renderChannelSidebar();
+            renderGrid(currentQuery);
+          });
+          sidebar.appendChild(allBtn);
+
+          channelList.forEach((ch) => {
+            const btn = document.createElement("div");
+            btn.className = "emote-channel-avatar";
+            if (selectedChannelId === ch.id) {
+              btn.classList.add("active");
+            }
+            btn.title = ch.name || ch.login || "Channel";
+
+            if (ch.avatar) {
+              const img = document.createElement("img");
+              img.src = ch.avatar;
+              img.alt = ch.name || ch.login || "Channel";
+              img.referrerPolicy = "no-referrer";
+              img.addEventListener("error", () => {
+                img.remove();
+                btn.textContent =
+                  (ch.name || ch.login || "?").charAt(0).toUpperCase() || "?";
+              });
+              btn.appendChild(img);
+            } else {
+              btn.textContent =
+                (ch.name || ch.login || "?").charAt(0).toUpperCase() || "?";
+            }
+
+            btn.addEventListener("click", () => {
+              selectedChannelId = ch.id;
+              renderChannelSidebar();
+              renderGrid(currentQuery);
+            });
+
+            sidebar.appendChild(btn);
+          });
+        }
+
+        function renderGrid(query) {
+          body.innerHTML = "";
+          const q = query.trim().toLowerCase();
+
+          let list = emoteList;
+          if (q) {
+            list = emoteList.filter((e) =>
+              e.name.toLowerCase().includes(q)
+            );
+          }
+
+          // If a specific channel is selected, only show that channel's emotes
+          if (selectedChannelId) {
+            const channel = channelList.find((c) => c.id === selectedChannelId);
+            const label = channel
+              ? channel.name || channel.login || "Channel emotes"
+              : "Channel emotes";
+
+            const items = list
+              .filter(
+                (e) =>
+                  (e.ownerType === "channel" || e.ownerType === "user") &&
+                  e.ownerId === selectedChannelId
+              )
+              .sort((a, b) =>
+                a.name.localeCompare(b.name, undefined, { sensitivity: "base" })
+              );
+
+            if (!items.length) {
+              const empty = document.createElement("div");
+              empty.style.fontSize = "11px";
+              empty.style.color = "#6b7280";
+              empty.style.padding = "4px 0";
+              empty.textContent = "No emotes for this channel.";
+              body.appendChild(empty);
+              return;
+            }
+
+            const header = document.createElement("div");
+            header.className = "emote-section-header";
+            header.style.marginTop = "0";
+            header.textContent = label;
+            body.appendChild(header);
+
+            const grid = document.createElement("div");
+            grid.className = "emote-section-grid";
+
+            items.slice(0, 400).forEach((emote) => {
+              const item = document.createElement("div");
+              item.className = "emote-browser-item";
+
+              const imgUrl = emoteImageUrl(emote);
+              if (imgUrl) {
+                const img = document.createElement("img");
+                img.className = "emote-browser-img";
+                img.src = imgUrl;
+                img.alt = emote.name;
+                item.appendChild(img);
+              }
+
+              item.addEventListener("mouseenter", (ev) => {
+                showEmoteTooltip(emote, ev.clientX, ev.clientY);
+              });
+              item.addEventListener("mousemove", (ev) => {
+                showEmoteTooltip(emote, ev.clientX, ev.clientY);
+              });
+              item.addEventListener("mouseleave", () => {
+                hideEmoteTooltip();
+              });
+
+              item.addEventListener("click", () => {
+                if (!chatInput) return;
+                const current = chatInput.value;
+                const caret = chatInput.selectionStart ?? current.length;
+                const before = current.slice(0, caret);
+                const after = current.slice(caret);
+                const insert = emote.name + " ";
+                const newValue = before + insert + after;
+                chatInput.value = newValue;
+
+                const newCaret = before.length + insert.length;
+                chatInput.setSelectionRange(newCaret, newCaret);
+                chatInput.focus();
+                updateChatPreview();
+                hideEmoteTooltip();
+                close();
+              });
+
+              grid.appendChild(item);
+            });
+
+            body.appendChild(grid);
+            return;
+          }
+
+          // "All channels" view – grouped like before
+          const sections = [
+            {
+              id: "channel",
+              label: "Channel emotes",
+              filter: (e) => e.ownerType === "channel",
+            },
+            {
+              id: "user",
+              label: "Your emotes",
+              filter: (e) => e.ownerType === "user",
+            },
+            {
+              id: "global",
+              label: "Twitch global emotes",
+              filter: (e) => e.ownerType === "global",
+            },
+          ];
+
+          let visibleSectionCount = 0;
+
+          for (const section of sections) {
+            const items = list
+              .filter(section.filter)
+              .sort((a, b) =>
+                a.name.localeCompare(b.name, undefined, { sensitivity: "base" })
+              );
+
+            if (!items.length) continue;
+            visibleSectionCount++;
+
+            const header = document.createElement("div");
+            header.className = "emote-section-header";
+            header.style.marginTop = visibleSectionCount === 1 ? "0" : "8px";
+            header.textContent = section.label;
+            body.appendChild(header);
+
+            const grid = document.createElement("div");
+            grid.className = "emote-section-grid";
+
+            items.slice(0, 400).forEach((emote) => {
+              const item = document.createElement("div");
+              item.className = "emote-browser-item";
+
+              const imgUrl = emoteImageUrl(emote);
+              if (imgUrl) {
+                const img = document.createElement("img");
+                img.className = "emote-browser-img";
+                img.src = imgUrl;
+                img.alt = emote.name;
+                item.appendChild(img);
+              }
+
+              item.addEventListener("mouseenter", (ev) => {
+                showEmoteTooltip(emote, ev.clientX, ev.clientY);
+              });
+              item.addEventListener("mousemove", (ev) => {
+                showEmoteTooltip(emote, ev.clientX, ev.clientY);
+              });
+              item.addEventListener("mouseleave", () => {
+                hideEmoteTooltip();
+              });
+
+              item.addEventListener("click", () => {
+                if (!chatInput) return;
+                const current = chatInput.value;
+                const caret = chatInput.selectionStart ?? current.length;
+                const before = current.slice(0, caret);
+                const after = current.slice(caret);
+                const insert = emote.name + " ";
+                const newValue = before + insert + after;
+                chatInput.value = newValue;
+
+                const newCaret = before.length + insert.length;
+                chatInput.setSelectionRange(newCaret, newCaret);
+                chatInput.focus();
+                updateChatPreview();
+                hideEmoteTooltip();
+                close();
+              });
+
+              grid.appendChild(item);
+            });
+
+            body.appendChild(grid);
+          }
+
+          if (!visibleSectionCount) {
+            const empty = document.createElement("div");
+            empty.style.fontSize = "11px";
+            empty.style.color = "#6b7280";
+            empty.style.padding = "4px 0";
+            empty.textContent = "No emotes found for this search.";
+            body.appendChild(empty);
+          }
+        }
+
+        function close() {
+          hideEmoteTooltip();
+          emoteBrowserRoot.style.display = "none";
+          emoteBrowserRoot.innerHTML = "";
+        }
+
+        backdrop.addEventListener("click", (ev) => {
+          if (ev.target === backdrop) {
+            close();
+          }
+        });
+
+        search.addEventListener("input", () => {
+          currentQuery = search.value || "";
+          renderGrid(currentQuery);
+        });
+
+        search.addEventListener("keydown", (ev) => {
+          if (ev.key === "Escape") {
+            ev.stopPropagation();
+            ev.preventDefault();
+            close();
+          }
+        });
+
+        renderChannelSidebar();
+        renderGrid("");
+        search.focus();
+      }
+
+      function handleSend() {
+        if (!chatInput) return;
+        const text = chatInput.value.trim();
+        if (!text) return;
+        sendChatMessageFromDock(text);
+        chatInput.value = "";
+        if (chatPreview) {
+          chatPreview.innerHTML = "";
+        }
+        resetSuggestions();
+      }
+
+      if (chatInput) {
+        chatInput.addEventListener("keydown", (ev) => {
+          if (suggestionsState.type) {
+            if (ev.key === "ArrowDown") {
+              ev.preventDefault();
+              moveSuggestionSelection(1);
+              return;
+            }
+            if (ev.key === "ArrowUp") {
+              ev.preventDefault();
+              moveSuggestionSelection(-1);
+              return;
+            }
+            if (ev.key === "Tab") {
+              ev.preventDefault();
+              applySuggestion();
+              return;
+            }
+            if (ev.key === "Enter") {
+              ev.preventDefault();
+              applySuggestion();
+              return;
+            }
+            if (ev.key === "Escape") {
+              resetSuggestions();
+              return;
+            }
+          }
+
+          if (ev.key === "Enter" && !ev.shiftKey) {
+            ev.preventDefault();
+            handleSend();
+            return;
+          }
+        });
+
+        chatInput.addEventListener("input", () => {
+          updateChatPreview();
+          maybeUpdateSuggestionsFromInput();
+        });
+
+        chatInput.addEventListener("blur", () => {
+          setTimeout(() => {
+            if (!document.activeElement || document.activeElement === document.body) {
+              resetSuggestions();
+            }
+          }, 200);
+        });
+      }
+
+      if (btnEmotes) {
+        btnEmotes.addEventListener("click", () => {
+          if (!emoteList.length) {
+            console.log("[chat-dock] Emotes not ready yet; reloading…");
+            loadEmotes().then(() => {
+              openEmoteBrowser();
+            });
+          } else {
+            openEmoteBrowser();
+          }
+        });
+      }
+
+      if (btnSend) {
+        btnSend.addEventListener("click", () => {
+          handleSend();
+        });
+      }
+
+      async function main() {
+        await loadDockConfig(profileId);          // initial settings
+        await Promise.all([loadBadges(), loadEmotes()]);
+        connectWebSocket();                       // listen for chat + dock-config-updated
+      }
+
+      main().catch((err) => {
+        console.error("[chat-dock] main() failed:", err);
+      });
+
+    })();
+  </script>
+</body>
+</html>

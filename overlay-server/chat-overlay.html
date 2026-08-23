@@ -1,0 +1,1139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Stream Sync – Chat Overlay</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <style>
+  :root {
+    --font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+      sans-serif;
+    --font-size: 18px;
+    --line-height: 1.35;
+
+    --text-main: #ffffff;
+    --text-soft: #d1d5db;
+
+    --shadow-strong: 0 0 16px rgba(0, 0, 0, 0.8);
+
+    --rotate: 0deg;
+    --skew: 0deg;
+
+    --bubble-radius: 0px;
+    --bubble-color: rgba(15, 23, 42, 0.85);
+    --bg-color: transparent;
+
+    /* Stroke vars (applied to username + message) */
+    --stroke-width: 0px;
+    --stroke-color: transparent;
+  }
+
+  * { box-sizing: border-box; }
+
+  html,
+  body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    color: var(--text-main);
+    font-family: var(--font-family);
+    font-size: var(--font-size);
+    overflow: hidden;
+  }
+
+  body {
+    display: flex;
+    align-items: flex-end;       /* overlay sits at bottom by default */
+    justify-content: flex-start; /* bottom-left by default */
+    padding: 8px;
+  }
+
+  /* When in horizontal feed, anchor the overlay cluster to the right */
+  body[data-feed-direction="left-right"],
+  body[data-feed-direction="right-left"] {
+    justify-content: flex-end;
+  }
+
+  /* NEW: viewport is the scroll container */
+  .chat-overlay-viewport {
+    width: 100%;
+    height: 100%;
+    overflow: hidden; /* we will still manipulate scrollLeft/scrollTop */
+    display: flex;
+    align-items: flex-end;
+    justify-content: flex-start;
+  }
+
+  /* In horizontal mode, keep the viewport anchored right with the body */
+  body[data-feed-direction="left-right"] .chat-overlay-viewport,
+  body[data-feed-direction="right-left"] .chat-overlay-viewport {
+    justify-content: flex-end;
+  }
+
+  .chat-overlay-root {
+    width: 100%;
+    max-width: none;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: var(--font-size);
+    line-height: var(--line-height);
+    transform: rotate(var(--rotate)) skewX(var(--skew));
+    transform-origin: bottom left;
+  }
+
+  /* Horizontal mode: track is a single no-wrap row that can exceed the viewport width */
+  .chat-overlay-root[data-feed-direction="left-right"],
+  .chat-overlay-root[data-feed-direction="right-left"] {
+    width: max-content;         /* allow the track to grow wider than viewport */
+    max-width: none;
+    white-space: nowrap;
+    flex-direction: row;
+    align-items: flex-end;
+    gap: 8px;
+    flex-wrap: nowrap;          /* KEY: never wrap */
+  }
+
+  /* Feed direction (vertical stacking) */
+  .chat-overlay-root[data-feed-direction="up-down"] {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .chat-overlay-root[data-feed-direction="down-up"] {
+    flex-direction: column-reverse;
+    align-items: flex-start;
+  }
+
+  /* Chat line layout + pop-up fade transition */
+  .chat-line {
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 6px;
+    text-shadow: var(--shadow-strong);
+    opacity: 1;
+    transform: translateY(0);
+    transition: opacity 0.35s ease, transform 0.35s ease;
+  }
+
+  .chat-line.exit-fade {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  /* IMPORTANT: prevent horizontal items from shrinking/bunching */
+  .chat-overlay-root[data-feed-direction="left-right"] .chat-line,
+  .chat-overlay-root[data-feed-direction="right-left"] .chat-line {
+    flex: 0 0 auto;         /* KEY: don't shrink */
+    min-width: max-content; /* KEY: keep natural width */
+  }
+
+  /* Row that contains timestamp + badges + username (+ :) */
+  .chat-meta {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+  }
+
+  .chat-message {
+    display: block;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  /* Vertical feeds: meta on first line, message on second */
+  .chat-overlay-root[data-feed-direction="up-down"] .chat-line,
+  .chat-overlay-root[data-feed-direction="down-up"] .chat-line {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  /* Horizontal feeds: meta + message inline on one row, no wrapping */
+  .chat-overlay-root[data-feed-direction="left-right"] .chat-line,
+  .chat-overlay-root[data-feed-direction="right-left"] .chat-line {
+    flex-direction: row;
+    align-items: center;
+    white-space: nowrap;
+  }
+
+  /* In horizontal mode, prevent the message from wrapping inside the bubble */
+  .chat-overlay-root[data-feed-direction="left-right"] .chat-message,
+  .chat-overlay-root[data-feed-direction="right-left"] .chat-message {
+    white-space: nowrap;
+    word-break: normal;
+  }
+
+  /* Bubble style (base) */
+  .chat-overlay-root[data-style="bubble"] .chat-line {
+    padding: 4px 8px;
+    border-radius: var(--bubble-radius);
+    background: var(--bubble-color);
+    margin-bottom: 4px;
+  }
+
+  .chat-overlay-root[data-style="bubble"][data-bubble-color-mode="user"]
+    .chat-line.has-user-color {
+    background: transparent;
+  }
+
+  .chat-timestamp {
+    font-size: 12px;
+    color: var(--text-soft);
+    opacity: 0.9;
+    margin-right: 4px;
+  }
+
+  .chat-badges {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin-right: 4px;
+  }
+
+  .chat-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    padding: 0;
+    overflow: hidden;
+  }
+
+  .chat-badge img {
+    display: block;
+    width: 18px;
+    height: 18px;
+  }
+
+  .chat-badge-fallback {
+    font-size: 10px;
+    text-transform: uppercase;
+    padding: 1px 4px;
+    border-radius: 999px;
+    border: 1px solid rgba(148, 163, 184, 0.7);
+    background: rgba(15, 23, 42, 0.8);
+    color: #e5e7eb;
+  }
+
+  .chat-username {
+    font-weight: 600;
+    margin-right: 4px;
+  }
+
+  .chat-separator {
+    margin-right: 4px;
+  }
+
+  .chat-message img.emote {
+    vertical-align: middle;
+    width: 28px;
+    height: 28px;
+    margin: 0 1px;
+  }
+
+  .empty-state {
+    font-size: 14px;
+    color: var(--text-soft);
+    text-shadow: var(--shadow-strong);
+  }
+
+  /* Stroke applied to username + message */
+  .chat-username,
+  .chat-message {
+    -webkit-text-stroke-width: var(--stroke-width);
+    -webkit-text-stroke-color: var(--stroke-color);
+  }
+  </style>
+</head>
+
+<body>
+  <!-- NEW: scroll viewport wrapper -->
+  <div id="chat-overlay-viewport" class="chat-overlay-viewport">
+    <div id="chat-overlay-root" class="chat-overlay-root">
+      <div class="empty-state">Waiting for chat messages…</div>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const DOCK_PLATFORM = window.STREAMSYNC_DOCK_PLATFORM || "twitch";
+      function eventPlatform(payload) {
+        return payload && payload.platform ? String(payload.platform) : "twitch";
+      }
+      const params = new URLSearchParams(window.location.search);
+      const profileId = params.get("profile") || "chat-default";
+      const isPreview = params.get("preview") === "1";
+
+      const viewport = document.getElementById("chat-overlay-viewport");
+      const container = document.getElementById("chat-overlay-root");
+      const MAX_LINES = 200;
+
+      let ws = null;
+      let badgeImages = {};
+
+      // Track which font URL we've actually loaded so we don't reload constantly
+      let loadedFontUrl = null;
+
+      // Overlay settings from server
+      let overlaySettings = {
+        showTimestamps: true,
+        showBadges: true,
+        fontSize: 18,
+        fontFamily: "system-ui",
+        fontUrl: null,
+        textRotate: 0,
+        textSkew: 0,
+        feedDirection: "up-down",
+        messageStyle: "plain",
+        bubbleRadius: 0,
+        bubbleColorMode: "fixed",
+        bubbleColor: "rgba(15, 23, 42, 0.85)",
+        bubbleAlpha: 1,
+        strokeEnabled: false,
+        strokeColor: "#000000",
+        strokeWidth: 0,
+        bgMode: "transparent",
+        bgColor: "#000000",
+        displayMode: "solid",
+        popupDuration: 8,
+        popupExitStyle: "fade",
+      };
+
+      // Hardcoded sample chat events — same shape as live Twitch feed payloads.
+      // Preview mode feeds these through appendChat() on a loop.
+      const previewMessages = [
+        {
+          type: "chat",
+          user: { name: "ModUser", displayName: "ModUser", color: "#60a5fa", badgesRaw: "moderator/1" },
+          message: "Hey, this is what your chat overlay will look like.",
+        },
+        {
+          type: "chat",
+          user: { name: "SubUser", displayName: "SubUser", color: "#c4b5fd", badgesRaw: "subscriber/1" },
+          message: "Subscriber messages pick up their username color.",
+        },
+        {
+          type: "chat",
+          user: { name: "Viewer123", displayName: "Viewer123", color: "#e5e7eb", badgesRaw: "" },
+          message: "Try changing fonts, bubbles, and background to match your overlay.",
+        },
+        {
+          type: "chat",
+          user: { name: "ClipQueen", displayName: "ClipQueen", color: "#f472b6", badgesRaw: "vip/1" },
+          message: "That last play was insane 🔥",
+        },
+        {
+          type: "chat",
+          user: { name: "NightOwl", displayName: "NightOwl", color: "#34d399", badgesRaw: "" },
+          message: "Loving the new overlay look.",
+        },
+        {
+          type: "chat",
+          user: { name: "KaoticBot", displayName: "KaoticBot", color: "#fbbf24", badgesRaw: "moderator/1" },
+          message: "Reminder: follow for more updates!",
+        },
+        {
+          type: "chat",
+          user: { name: "PixelPete", displayName: "PixelPete", color: "#38bdf8", badgesRaw: "subscriber/1" },
+          message: "Can we get a hype train going?",
+        },
+        {
+          type: "chat",
+          user: { name: "AnonFan", displayName: "AnonFan", color: "#a3e635", badgesRaw: "" },
+          message: "First time here — this setup looks clean.",
+        },
+      ];
+
+      function toRgba(color, alpha) {
+        const a = typeof alpha === "number" ? Math.min(Math.max(alpha, 0), 1) : 1;
+
+        if (!color) return `rgba(0, 0, 0, ${a})`;
+
+        if (/^rgba\(/i.test(color)) {
+          return color.replace(/rgba\(([^)]+)\)/i, (_, inner) => {
+            const parts = inner.split(",").map(p => p.trim());
+            const [r, g, b] = parts;
+            return `rgba(${r}, ${g}, ${b}, ${a})`;
+          });
+        }
+
+        if (/^rgb\(/i.test(color)) {
+          return color.replace(/rgb\(([^)]+)\)/i, (_, inner) => {
+            return `rgba(${inner.trim()}, ${a})`;
+          });
+        }
+
+        if (/^#([0-9a-f]{3,8})$/i.test(color)) {
+          let hex = color.slice(1);
+          if (hex.length === 3 || hex.length === 4) {
+            hex = hex.split("").map(ch => ch + ch).join("");
+          }
+          if (hex.length === 6 || hex.length === 8) {
+            const r = parseInt(hex.slice(0, 2), 16);
+            const g = parseInt(hex.slice(2, 4), 16);
+            const b = parseInt(hex.slice(4, 6), 16);
+            return `rgba(${r}, ${g}, ${b}, ${a})`;
+          }
+        }
+
+        return color;
+      }
+
+      function parseColorRgb(color) {
+        if (!color) return null;
+
+        if (/^rgba?\(/i.test(color)) {
+          const m = color.match(/rgba?\(\s*([^)]+)\s*\)/i);
+          if (!m) return null;
+          const parts = m[1].split(",").map((p) => p.trim());
+          const r = Number(parts[0]);
+          const g = Number(parts[1]);
+          const b = Number(parts[2]);
+          if ([r, g, b].every((n) => Number.isFinite(n))) return { r, g, b };
+          return null;
+        }
+
+        if (/^#([0-9a-f]{3,8})$/i.test(color)) {
+          let hex = color.slice(1);
+          if (hex.length === 3 || hex.length === 4) {
+            hex = hex.split("").map((ch) => ch + ch).join("");
+          }
+          if (hex.length >= 6) {
+            return {
+              r: parseInt(hex.slice(0, 2), 16),
+              g: parseInt(hex.slice(2, 4), 16),
+              b: parseInt(hex.slice(4, 6), 16),
+            };
+          }
+        }
+
+        return null;
+      }
+
+      /** Darken Twitch username color for bubble background (username stays full brightness). */
+      function userColorToBubbleBackground(userColor, alpha) {
+        const rgb = parseColorRgb(userColor);
+        if (!rgb) return toRgba(userColor, alpha);
+        const shade = 0.42;
+        const r = Math.round(rgb.r * shade);
+        const g = Math.round(rgb.g * shade);
+        const b = Math.round(rgb.b * shade);
+        return toRgba(`rgb(${r}, ${g}, ${b})`, alpha);
+      }
+
+      function cssFontFamilyStack(family) {
+        const fam = String(family || "system-ui").trim() || "system-ui";
+        if (fam === "system-ui") {
+          return 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+        }
+        return `"${fam}", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+      }
+
+      function ensureGoogleFontLoaded(family) {
+        const fam = String(family || "").trim();
+        if (!fam || fam === "system-ui") return;
+        // Local uploaded fonts use OverlayLocal_* names — never load those from Google
+        if (/^OverlayLocal_/i.test(fam)) return;
+
+        const id = "gf-overlay-" + fam.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+        if (document.getElementById(id)) return;
+
+        const link = document.createElement("link");
+        link.id = id;
+        link.rel = "stylesheet";
+        link.href = isPreview
+          ? "/google-fonts.css?family=" + encodeURIComponent(fam)
+          : "https://fonts.googleapis.com/css2?family=" +
+              encodeURIComponent(fam).replace(/%20/g, "+") +
+              ":wght@300;400;500;600;700;800&display=swap";
+        document.head.appendChild(link);
+      }
+
+      function whenGoogleFontReady(family) {
+        const fam = String(family || "").trim();
+        if (!fam || fam === "system-ui" || /^OverlayLocal_/i.test(fam)) {
+          return Promise.resolve();
+        }
+        ensureGoogleFontLoaded(fam);
+        if (!document.fonts || typeof document.fonts.load !== "function") {
+          return Promise.resolve();
+        }
+        return Promise.resolve(document.fonts.load(`700 16px "${fam}"`)).catch(
+          () => {}
+        );
+      }
+
+      function isLocalOverlayFont(family, fontUrl) {
+        if (!fontUrl) return false;
+        const fam = String(family || "");
+        return /^OverlayLocal_/i.test(fam);
+      }
+
+      function applyOverlaySettingsToDocument() {
+        const root = document.documentElement;
+
+        if (overlaySettings.fontSize) {
+          root.style.setProperty("--font-size", overlaySettings.fontSize + "px");
+        }
+        if (overlaySettings.fontFamily) {
+          const fam = String(overlaySettings.fontFamily).trim() || "system-ui";
+          root.style.setProperty("--font-family", cssFontFamilyStack(fam));
+          if (!isLocalOverlayFont(fam, overlaySettings.fontUrl)) {
+            ensureGoogleFontLoaded(fam);
+          }
+        }
+
+        root.style.setProperty("--rotate", (overlaySettings.textRotate || 0) + "deg");
+        root.style.setProperty("--skew", (overlaySettings.textSkew || 0) + "deg");
+        root.style.setProperty("--bubble-radius", (overlaySettings.bubbleRadius || 0) + "px");
+
+        const alpha =
+          typeof overlaySettings.bubbleAlpha === "number"
+            ? overlaySettings.bubbleAlpha
+            : 1;
+        const bubbleColor = overlaySettings.bubbleColor || "rgba(15, 23, 42, 0.85)";
+        root.style.setProperty("--bubble-color", toRgba(bubbleColor, alpha));
+
+        const bgMode = overlaySettings.bgMode || "transparent";
+        if (bgMode === "solid") {
+          document.body.style.background = overlaySettings.bgColor || "#000000";
+        } else {
+          document.body.style.background = "transparent";
+        }
+
+        container.dataset.feedDirection = overlaySettings.feedDirection || "up-down";
+        document.body.dataset.feedDirection = overlaySettings.feedDirection || "up-down";
+        container.dataset.style = overlaySettings.messageStyle || "plain";
+        container.dataset.bubbleColorMode = overlaySettings.bubbleColorMode || "fixed";
+
+        const strokeWidthNum = Number(overlaySettings.strokeWidth) || 0;
+        const strokeEnabled = !!overlaySettings.strokeEnabled && strokeWidthNum > 0;
+        const strokeColor = overlaySettings.strokeColor || "#000000";
+
+        root.style.setProperty("--stroke-width", strokeEnabled ? strokeWidthNum + "px" : "0px");
+        root.style.setProperty("--stroke-color", strokeEnabled ? strokeColor : "transparent");
+
+        container.querySelectorAll(".chat-timestamp").forEach((el) => {
+          el.style.display = overlaySettings.showTimestamps ? "" : "none";
+        });
+        container.querySelectorAll(".chat-badges").forEach((el) => {
+          el.style.display = overlaySettings.showBadges ? "" : "none";
+        });
+
+        container.dataset.displayMode = resolvedDisplayMode();
+
+        restyleExistingChatLines();
+        applyDisplayModeToExistingLines(false);
+
+        // After applying direction changes, re-pin horizontal end if needed
+        pinToEndIfHorizontal(true);
+      }
+
+      let previewFeedTimer = null;
+      let previewFeedIndex = 0;
+
+      function stopPreviewFeed() {
+        if (previewFeedTimer) {
+          clearInterval(previewFeedTimer);
+          previewFeedTimer = null;
+        }
+      }
+
+      function emitPreviewMessage() {
+        const template = previewMessages[previewFeedIndex % previewMessages.length];
+        previewFeedIndex += 1;
+        // Clone so each emission gets a fresh timestamp through appendChat().
+        appendChat({
+          ...template,
+          user: template.user ? { ...template.user } : undefined,
+          ts: Date.now(),
+        });
+      }
+
+      function startPreviewFeed() {
+        stopPreviewFeed();
+        clearEmptyState();
+        // Seed a couple of lines so the panel isn't empty while waiting.
+        emitPreviewMessage();
+        emitPreviewMessage();
+        previewFeedTimer = setInterval(emitPreviewMessage, 2200);
+      }
+
+      const POPUP_REMOVE_DELAY_MS = 400;
+      let appliedPopupConfigKey = "";
+
+      function normalizeOverlayProfileId(id) {
+        const v = (id || "").trim();
+        return !v || v === "default" ? "chat-default" : v;
+      }
+
+      function overlayProfileMatches(eventProfile, localProfile) {
+        return normalizeOverlayProfileId(eventProfile) === normalizeOverlayProfileId(localProfile);
+      }
+
+      function resolvedDisplayMode() {
+        const mode = String(overlaySettings.displayMode || "").trim().toLowerCase();
+        return mode === "popup" ? "popup" : "solid";
+      }
+
+      function popupDurationMs() {
+        return Math.max(2000, (Number(overlaySettings.popupDuration) || 8) * 1000);
+      }
+
+      function popupConfigKey() {
+        return resolvedDisplayMode() + "|" + popupDurationMs();
+      }
+
+      function getPopupExitClass() {
+        const style = overlaySettings.popupExitStyle || "fade";
+        return style === "fade" ? "exit-fade" : "exit-fade";
+      }
+
+      function clearLinePopupTimers(line) {
+        if (!line._popupTimers) return;
+        if (line._popupTimers.fade) clearTimeout(line._popupTimers.fade);
+        if (line._popupTimers.remove) clearTimeout(line._popupTimers.remove);
+        line._popupTimers = null;
+      }
+
+      function scheduleLinePopupRemoval(line) {
+        clearLinePopupTimers(line);
+        line.classList.remove(getPopupExitClass());
+
+        const fadeId = setTimeout(() => {
+          line.classList.add(getPopupExitClass());
+          const removeId = setTimeout(() => {
+            if (line.parentElement === container) line.remove();
+          }, POPUP_REMOVE_DELAY_MS);
+          if (line._popupTimers) line._popupTimers.remove = removeId;
+        }, popupDurationMs());
+
+        line._popupTimers = { fade: fadeId, remove: null };
+      }
+
+      function applyDisplayModeToExistingLines(force) {
+        const key = popupConfigKey();
+        if (!force && key === appliedPopupConfigKey) return;
+        appliedPopupConfigKey = key;
+
+        const displayMode = resolvedDisplayMode();
+        const lines = container.querySelectorAll(".chat-line");
+        lines.forEach((line) => {
+          if (displayMode === "popup") {
+            scheduleLinePopupRemoval(line);
+          } else {
+            clearLinePopupTimers(line);
+            line.classList.remove(getPopupExitClass());
+          }
+        });
+      }
+
+      function applyIncomingOverlaySettings(incoming) {
+        const prevDirection = overlaySettings.feedDirection;
+        const prevDisplay = overlaySettings.displayMode;
+        const prevStyle = overlaySettings.messageStyle;
+
+        overlaySettings = { ...overlaySettings, ...incoming };
+        // Explicit null/empty clears a previously uploaded local font
+        if (
+          Object.prototype.hasOwnProperty.call(incoming, "fontUrl") ||
+          Object.prototype.hasOwnProperty.call(incoming, "localFontUrl")
+        ) {
+          const url = incoming.fontUrl ?? incoming.localFontUrl ?? null;
+          overlaySettings.fontUrl = url || null;
+        } else if (incoming.localFontUrl && !incoming.fontUrl) {
+          overlaySettings.fontUrl = incoming.localFontUrl;
+        }
+        // Migrate renamed Google family
+        if (overlaySettings.fontFamily === "Source Sans Pro") {
+          overlaySettings.fontFamily = "Source Sans 3";
+        }
+        if (typeof incoming.displayMode === "string") {
+          const mode = incoming.displayMode.trim().toLowerCase();
+          overlaySettings.displayMode = mode === "popup" ? "popup" : "solid";
+        }
+        applyOverlaySettingsToDocument();
+
+        // Layout-affecting changes need a clean feed so existing lines
+        // don't keep the old layout/style.
+        if (
+          isPreview &&
+          (prevDirection !== overlaySettings.feedDirection ||
+            prevDisplay !== overlaySettings.displayMode ||
+            prevStyle !== overlaySettings.messageStyle)
+        ) {
+          container.innerHTML = "";
+          clearEmptyState();
+          startPreviewFeed();
+        }
+
+        return ensureOverlayFontLoaded();
+      }
+
+      function restyleExistingChatLines() {
+        const alpha =
+          typeof overlaySettings.bubbleAlpha === "number"
+            ? overlaySettings.bubbleAlpha
+            : 1;
+        const baseBubbleColor = overlaySettings.bubbleColor || "rgba(15, 23, 42, 0.85)";
+        const styleMode = overlaySettings.messageStyle || "plain";
+        const bubbleMode = overlaySettings.bubbleColorMode || "fixed";
+
+        const lines = container.querySelectorAll(".chat-line");
+        lines.forEach((line) => {
+          const userColor = line.dataset.userColor || "";
+
+          if (styleMode === "bubble") {
+            if (bubbleMode === "user" && userColor) {
+              line.style.backgroundColor = userColorToBubbleBackground(userColor, alpha);
+            } else {
+              line.style.backgroundColor = toRgba(baseBubbleColor, alpha);
+            }
+          } else {
+            line.style.backgroundColor = "transparent";
+          }
+        });
+      }
+
+      async function ensureOverlayFontLoaded() {
+        const fontUrl = overlaySettings.fontUrl;
+        const fontFamily = overlaySettings.fontFamily;
+        // Only apply uploaded @font-face for local overlay fonts — never for Google families
+        if (!isLocalOverlayFont(fontFamily, fontUrl)) {
+          if (fontFamily) {
+            await whenGoogleFontReady(fontFamily);
+            const root = document.documentElement;
+            root.style.setProperty(
+              "--font-family",
+              cssFontFamilyStack(String(fontFamily).trim() || "system-ui")
+            );
+            document.body.style.fontFamily = cssFontFamilyStack(
+              String(fontFamily).trim() || "system-ui"
+            );
+          }
+          return;
+        }
+
+        if (loadedFontUrl === fontUrl) return;
+
+        try {
+          const styleId = "chat-overlay-local-font";
+          let styleEl = document.getElementById(styleId);
+          if (!styleEl) {
+            styleEl = document.createElement("style");
+            styleEl.id = styleId;
+            document.head.appendChild(styleEl);
+          }
+
+          styleEl.textContent = `
+            @font-face {
+              font-family: "${fontFamily}";
+              src: url("${fontUrl}") format("truetype");
+              font-weight: normal;
+              font-style: normal;
+            }
+          `;
+
+          loadedFontUrl = fontUrl;
+          console.log("[chat-overlay] Injected @font-face for font:", fontFamily, fontUrl);
+        } catch (err) {
+          console.warn("[chat-overlay] Failed to inject @font-face for font:", err);
+        }
+
+        try {
+          const fullUrl = fontUrl.startsWith("http")
+            ? fontUrl
+            : window.location.origin + fontUrl;
+          const ff = new FontFace(fontFamily, `url(${fullUrl})`);
+          await ff.load();
+          document.fonts.add(ff);
+          console.log("[chat-overlay] Loaded overlay font via FontFace:", fullUrl);
+        } catch (err) {
+          // OK if unsupported; @font-face is already injected.
+        }
+      }
+
+      // ───────────────────────────────────────────────
+      // Auto-follow end (horizontal) / bottom (vertical)
+      // ───────────────────────────────────────────────
+
+      function isHorizontal() {
+        const fd = overlaySettings.feedDirection || "up-down";
+        return fd === "left-right" || fd === "right-left";
+      }
+
+      function pinToEndIfHorizontal(force) {
+        if (!viewport) return;
+        if (!isHorizontal()) return;
+
+        const threshold = 40; // px
+        const distanceFromRight =
+          viewport.scrollWidth - viewport.clientWidth - viewport.scrollLeft;
+
+        if (force || distanceFromRight <= threshold) {
+          viewport.scrollLeft = viewport.scrollWidth;
+        }
+      }
+
+      function pinToBottomIfVertical(force) {
+        if (!viewport) return;
+        if (isHorizontal()) return;
+
+        const threshold = 40; // px
+        const distanceFromBottom =
+          viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop;
+
+        if (force || distanceFromBottom <= threshold) {
+          viewport.scrollTop = viewport.scrollHeight;
+        }
+      }
+
+      function followTail(force) {
+        if (isHorizontal()) pinToEndIfHorizontal(force);
+        else pinToBottomIfVertical(force);
+      }
+
+      // ───────────────────────────────────────────────
+      // Helpers
+      // ───────────────────────────────────────────────
+
+      function clearEmptyState() {
+        const empty = container.querySelector(".empty-state");
+        if (empty) empty.remove();
+      }
+
+      function formatTime(ts) {
+        const d = ts ? new Date(ts) : new Date();
+        const hh = String(d.getHours()).padStart(2, "0");
+        const mm = String(d.getMinutes()).padStart(2, "0");
+        return `${hh}:${mm}`;
+      }
+
+      function getWebSocketUrl() {
+        const loc = window.location;
+        const isSecure = loc.protocol === "https:";
+        const wsProto = isSecure ? "wss:" : "ws:";
+        const host = loc.host;
+        const query = "?profile=" + encodeURIComponent(profileId);
+        return wsProto + "//" + host + "/ws/feed" + query;
+      }
+
+      // ───────────────────────────────────────────────
+      // Badges
+      // ───────────────────────────────────────────────
+
+      async function loadBadges() {
+        try {
+          const res = await fetch("/api/twitch/badges/all", { cache: "no-cache" });
+          if (!res.ok) throw new Error("HTTP " + res.status + " " + (await res.text()));
+          const data = await res.json();
+          const sets = data.badge_sets || {};
+
+          const map = {};
+          Object.entries(sets).forEach(([setId, set]) => {
+            const versionsObj = set.versions || {};
+            Object.values(versionsObj).forEach((version) => {
+              const key = setId + "/" + version.id;
+              const url =
+                version.image_url_1x ||
+                version.image_url_2x ||
+                version.image_url_4x ||
+                null;
+              if (url) map[key] = url;
+            });
+          });
+
+          badgeImages = map;
+          console.log("[chat-overlay] Loaded badge images:", Object.keys(badgeImages).length);
+        } catch (err) {
+          console.error("[chat-overlay] Failed to load badges:", err);
+        }
+      }
+
+      function createBadgesFragment(badgesRaw) {
+        const frag = document.createDocumentFragment();
+        if (!badgesRaw || typeof badgesRaw !== "object") return frag;
+
+        Object.entries(badgesRaw).forEach(([setId, versionId]) => {
+          const key = setId + "/" + versionId;
+          const url = badgeImages[key];
+
+          const span = document.createElement("span");
+          span.className = "chat-badge";
+
+          if (url) {
+            const img = document.createElement("img");
+            img.src = url;
+            img.alt = setId;
+            img.loading = "lazy";
+            span.appendChild(img);
+          } else {
+            const fallback = document.createElement("span");
+            fallback.className = "chat-badge-fallback";
+            fallback.textContent = setId.toUpperCase();
+            span.appendChild(fallback);
+          }
+
+          frag.appendChild(span);
+        });
+
+        return frag;
+      }
+
+      // ───────────────────────────────────────────────
+      // Emotes
+      // ───────────────────────────────────────────────
+
+      function renderEmotesToHTML(message, emotes) {
+        if (!emotes || typeof emotes !== "object") {
+          return escapeHtml(message);
+        }
+
+        const replacements = [];
+
+        Object.entries(emotes).forEach(([emoteId, occurrences]) => {
+          if (!Array.isArray(occurrences)) return;
+          occurrences.forEach((rangeStr) => {
+            const [startStr, endStr] = rangeStr.split("-");
+            const start = parseInt(startStr, 10);
+            const end = parseInt(endStr, 10);
+            if (Number.isNaN(start) || Number.isNaN(end)) return;
+            replacements.push({ start, end, id: emoteId });
+          });
+        });
+
+        if (replacements.length === 0) return escapeHtml(message);
+
+        replacements.sort((a, b) => b.start - a.start);
+
+        let result = message;
+        for (const rep of replacements) {
+          const { start, end, id } = rep;
+          const emoteText = result.substring(start, end + 1);
+
+          const imgUrl = `https://static-cdn.jtvnw.net/emoticons/v2/${id}/default/dark/2.0`;
+          const imgTag = `<img class="emote" src="${imgUrl}" alt="${escapeHtml(emoteText)}" />`;
+
+          result = result.slice(0, start) + imgTag + result.slice(end + 1);
+        }
+
+        return result;
+      }
+
+      function escapeHtml(str) {
+        return String(str)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#039;");
+      }
+
+      // ───────────────────────────────────────────────
+      // Overlay config loading
+      // ───────────────────────────────────────────────
+
+      async function loadOverlayConfigOnce() {
+        try {
+          const res = await fetch(
+            `/api/chat/overlay-config?profile=${encodeURIComponent(profileId)}`,
+            { cache: "no-cache" }
+          );
+          if (!res.ok) return;
+
+          const data = await res.json();
+          await applyIncomingOverlaySettings(data || {});
+        } catch (err) {
+          console.error("[chat-overlay] Failed to load overlay config:", err);
+        }
+      }
+
+      function startOverlayConfigPolling() {
+        // Poll as a backup; live WS pushes are the primary path.
+        // Preview polls a bit faster in case the socket is slow to connect.
+        const ms = isPreview ? 2000 : 15000;
+        setInterval(loadOverlayConfigOnce, ms);
+      }
+
+      // ───────────────────────────────────────────────
+      // DOM: chat line
+      // ───────────────────────────────────────────────
+
+      function appendChat(evt) {
+        if (!evt || evt.type !== "chat") return;
+
+        clearEmptyState();
+
+        const line = document.createElement("div");
+        line.className = "chat-line";
+
+        const meta = document.createElement("div");
+        meta.className = "chat-meta";
+
+        // Timestamp
+        const tsEl = document.createElement("span");
+        tsEl.className = "chat-timestamp";
+        tsEl.textContent = formatTime(evt.ts || Date.now());
+        if (!overlaySettings.showTimestamps) tsEl.style.display = "none";
+        meta.appendChild(tsEl);
+
+        // Badges
+        const badgesWrap = document.createElement("span");
+        badgesWrap.className = "chat-badges";
+        badgesWrap.appendChild(createBadgesFragment(evt.user && evt.user.badgesRaw));
+        if (!overlaySettings.showBadges) badgesWrap.style.display = "none";
+        meta.appendChild(badgesWrap);
+
+        // Username
+        const nameEl = document.createElement("span");
+        nameEl.className = "chat-username";
+        const displayName =
+          (evt.user && (evt.user.displayName || evt.user.name)) || "Unknown";
+        nameEl.textContent = displayName;
+
+        const userColor = evt.user && evt.user.color;
+        if (userColor) {
+          nameEl.style.color = userColor;
+          line.classList.add("has-user-color");
+          line.dataset.userColor = userColor;
+        }
+        meta.appendChild(nameEl);
+
+        line.appendChild(meta);
+
+        // Message
+        const msgEl = document.createElement("span");
+        msgEl.className = "chat-message";
+        msgEl.innerHTML = renderEmotesToHTML(evt.message || "", evt.emotes || null);
+        line.appendChild(msgEl);
+
+        // Bubble / plain initial background
+        const alpha =
+          typeof overlaySettings.bubbleAlpha === "number"
+            ? overlaySettings.bubbleAlpha
+            : 1;
+        const baseBubbleColor =
+          overlaySettings.bubbleColor || "rgba(15, 23, 42, 0.85)";
+
+        if (overlaySettings.messageStyle === "bubble") {
+          if (overlaySettings.bubbleColorMode === "user" && userColor) {
+            line.style.backgroundColor = userColorToBubbleBackground(userColor, alpha);
+          } else {
+            line.style.backgroundColor = toRgba(baseBubbleColor, alpha);
+          }
+        } else {
+          line.style.backgroundColor = "transparent";
+        }
+
+        const feedDir = overlaySettings.feedDirection || "up-down";
+
+        if (feedDir === "down-up") {
+          container.insertBefore(line, container.firstElementChild || null);
+        } else {
+          // up-down and left-right both append to the end
+          container.appendChild(line);
+        }
+
+        if (resolvedDisplayMode() === "popup") {
+          scheduleLinePopupRemoval(line);
+        }
+
+        // Clamp total lines
+        while (container.children.length > MAX_LINES) {
+          const first = container.firstElementChild;
+          if (!first) break;
+          first.remove();
+        }
+
+        // KEY: keep the viewport pinned to the "tail"
+        followTail(false);
+      }
+
+      // ───────────────────────────────────────────────
+      // WebSocket
+      // ───────────────────────────────────────────────
+
+      function connectWebSocket() {
+        const url = getWebSocketUrl();
+        let socket;
+
+        try {
+          socket = new WebSocket(url);
+        } catch (err) {
+          console.error("[chat-overlay] Failed to open WebSocket:", err);
+          return;
+        }
+
+        ws = socket;
+
+        socket.addEventListener("open", () => {
+          console.log("[chat-overlay] WebSocket connected:", url);
+        });
+
+        socket.addEventListener("message", (event) => {
+          try {
+            const payload = JSON.parse(event.data);
+
+            if (payload && payload.type === "chat") {
+              if (eventPlatform(payload) !== DOCK_PLATFORM) return;
+              // Preview uses the looping faux feed instead of live IRC chat.
+              if (!isPreview) appendChat(payload);
+              return;
+            }
+
+            if (payload && payload.type === "overlay-config-updated") {
+              if (overlayProfileMatches(payload.profileId, profileId)) {
+                if (payload.settings && typeof payload.settings === "object") {
+                  applyIncomingOverlaySettings(payload.settings);
+                } else {
+                  loadOverlayConfigOnce();
+                }
+              }
+              return;
+            }
+          } catch (err) {
+            console.error("[chat-overlay] Failed to parse WS message:", err);
+          }
+        });
+
+        socket.addEventListener("close", () => {
+          console.log("[chat-overlay] WebSocket closed");
+          ws = null;
+          setTimeout(connectWebSocket, 2000);
+        });
+
+        socket.addEventListener("error", (err) => {
+          console.error("[chat-overlay] WebSocket error:", err);
+        });
+      }
+
+      // ───────────────────────────────────────────────
+      // Init
+      // ───────────────────────────────────────────────
+
+      async function main() {
+        await loadBadges();
+        // Same config path for live OBS and in-app preview: fetch + WS push + poll.
+        await loadOverlayConfigOnce();
+        startOverlayConfigPolling();
+        connectWebSocket();
+        if (isPreview) {
+          startPreviewFeed();
+        }
+
+        // Ensure we start pinned correctly (especially if messages already exist)
+        followTail(true);
+      }
+
+      main().catch((err) => {
+        console.error("[chat-overlay] main() failed:", err);
+      });
+    })();
+  </script>
+</body>
+</html>

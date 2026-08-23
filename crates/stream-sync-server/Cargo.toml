@@ -1,0 +1,19 @@
+[package]
+name = "stream-sync-server"
+description = "CLI binary for A/B testing the Rust overlay server (default port 4041)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "stream-sync-server"
+path = "src/main.rs"
+
+[dependencies]
+stream-sync-core = { path = "../stream-sync-core" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+anyhow.workspace = true

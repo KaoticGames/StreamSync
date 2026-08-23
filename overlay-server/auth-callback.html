@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Stream Sync – Twitch Authorization</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    :root {
+      --bg: #020617;
+      --text-main: #e5e7eb;
+      --text-soft: #9ca3af;
+      --accent: #69bd45;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: radial-gradient(circle at top left, #020617, #020617 60%);
+      color: var(--text-main);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .card {
+      background: #020617;
+      border-radius: 12px;
+      padding: 20px 24px;
+      border: 1px solid #27272f;
+      max-width: 420px;
+      width: 100%;
+      box-shadow: 0 18px 45px rgba(0,0,0,0.65);
+    }
+    .title {
+      font-size: 18px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .subtitle {
+      font-size: 13px;
+      color: var(--text-soft);
+      margin-bottom: 16px;
+    }
+    .status {
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+    .status.ok {
+      color: var(--accent);
+    }
+    .status.error {
+      color: #f97373;
+    }
+    .details {
+      font-size: 12px;
+      color: var(--text-soft);
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="title">Twitch authorization</div>
+    <div class="subtitle">
+      Stream Sync is finishing your Twitch connection. You can close this window once it says you're all set.
+    </div>
+    <div id="status" class="status">Processing Twitch response…</div>
+    <div id="details" class="details"></div>
+  </div>
+
+  <script>
+    (function () {
+      const statusEl = document.getElementById("status");
+      const detailsEl = document.getElementById("details");
+
+      function setStatus(text, isError) {
+        if (statusEl) {
+          statusEl.textContent = text;
+          statusEl.classList.toggle("ok", !isError);
+          statusEl.classList.toggle("error", !!isError);
+        }
+      }
+
+      function setDetails(text) {
+        if (detailsEl) {
+          detailsEl.textContent = text || "";
+        }
+      }
+
+      function parseAccessTokenFromHash() {
+        const hash = window.location.hash || "";
+        if (!hash.startsWith("#")) return null;
+
+        const params = new URLSearchParams(hash.slice(1));
+        const accessToken = params.get("access_token");
+        const scope = params.get("scope");
+        const tokenType = params.get("token_type");
+        const expiresIn = params.get("expires_in");
+
+        return { accessToken, scope, tokenType, expiresIn };
+      }
+
+      async function main() {
+        const parsed = parseAccessTokenFromHash();
+        if (!parsed || !parsed.accessToken) {
+          setStatus("Unable to read access token from Twitch.", true);
+          setDetails("Try closing this window and clicking Connect in Stream Sync again.");
+          return;
+        }
+
+        setStatus("Validating Twitch token…", false);
+
+        try {
+          const res = await fetch("/api/twitch/set-token", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ accessToken: parsed.accessToken }),
+          });
+
+          if (!res.ok) {
+            const text = await res.text();
+            setStatus("Failed to save Twitch token.", true);
+            setDetails(text);
+            return;
+          }
+
+          const data = await res.json();
+          if (!data.ok) {
+            setStatus("Twitch token was not accepted.", true);
+            setDetails(data.error || "Unknown error.");
+            return;
+          }
+
+          const login = data.login || "your channel";
+          setStatus("You're all set!", false);
+          setDetails(
+            "Stream Sync is now connected to Twitch as \"" +
+            login +
+            "\". You can safely close this window and return to the app."
+          );
+        } catch (err) {
+          setStatus("Unexpected error talking to Stream Sync.", true);
+          setDetails(String(err && err.message ? err.message : err));
+        }
+      }
+
+      main().catch(err => {
+        setStatus("Unexpected error during auth.", true);
+        setDetails(String(err && err.message ? err.message : err));
+      });
+    })();
+  </script>
+</body>
+</html>

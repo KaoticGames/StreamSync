@@ -1,0 +1,23 @@
+{
+  "$schema": "https://schema.tauri.app/config/2/capability",
+  "identifier": "remote-localhost",
+  "description": "Overlay UI served from local stream-sync-core (http://127.0.0.1:4040)",
+  "windows": ["main"],
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:*",
+      "http://localhost:*"
+    ]
+  },
+  "permissions": [
+    "allow-stream-sync-commands",
+    "opener:default",
+    "shell:allow-open",
+    "core:default",
+    "core:event:allow-listen",
+    "core:window:allow-create",
+    "core:window:allow-close",
+    "core:window:allow-show",
+    "core:window:allow-set-focus"
+  ]
+}

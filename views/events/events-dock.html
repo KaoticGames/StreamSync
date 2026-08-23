@@ -1,0 +1,230 @@
+<section class="events-subview events-dock" id="eventsDockPanel">
+  <div class="section-header">
+    <h2>Events Dock</h2>
+    <p class="section-subtitle">
+      Configure how your Events Dock appears in OBS and which event types it shows.
+    </p>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <div>
+        <div class="card-title">Dock Settings</div>
+        <div class="card-subtitle">
+          These settings control the Events Dock output inside OBS.
+        </div>
+      </div>
+    </div>
+
+    <div class="config-section">
+      <!-- Font size -->
+      <div class="field-row">
+        <div class="field-label">
+          <div class="field-title">Font size</div>
+          <div class="field-subtitle">Dock text size in pixels.</div>
+        </div>
+
+        <div class="stepper">
+          <button class="btn btn-mini" type="button" id="evtDock_fontDown">−</button>
+          <input
+            id="evtDock_fontSize"
+            type="text"
+            value="13"
+            inputmode="numeric"
+            autocomplete="off"
+            style="width: 84px; text-align: center;"
+          />
+          <button class="btn btn-mini" type="button" id="evtDock_fontUp">+</button>
+        </div>
+      </div>
+
+      <!-- Show timestamps -->
+      <div class="field-row" style="margin-top: 10px;">
+        <div class="field-label">
+          <div class="field-title">Show timestamps</div>
+        </div>
+
+        <label class="switch">
+          <input id="evtDock_showTimestamps" type="checkbox" />
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+      </div>
+
+      <div class="divider" style="margin: 12px 0;"></div>
+
+      <!-- Event toggles -->
+      <div class="field-row">
+        <div class="field-label">
+          <div class="field-title">Follows</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="evtDock_evt_follow" />
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+      </div>
+
+      <div class="field-row" style="margin-top: 10px;">
+        <div class="field-label">
+          <div class="field-title">Subscriptions</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="evtDock_evt_sub" />
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+      </div>
+
+      <div class="field-row" style="margin-top: 10px;">
+        <div class="field-label">
+          <div class="field-title">Resubs</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="evtDock_evt_resub" />
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+      </div>
+
+      <div class="field-row" style="margin-top: 10px;">
+        <div class="field-label">
+          <div class="field-title">Gift subs</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="evtDock_evt_gift" />
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+      </div>
+
+      <div class="field-row" style="margin-top: 10px;">
+        <div class="field-label">
+          <div class="field-title">Bits / cheers</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="evtDock_evt_bits" />
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+      </div>
+
+      <div class="field-row" style="margin-top: 10px;">
+        <div class="field-label">
+          <div class="field-title">Raids</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="evtDock_evt_raid" />
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+      </div>
+
+      <div class="field-row" style="margin-top: 10px;">
+        <div class="field-label">
+          <div class="field-title">Channel points</div>
+          <div class="field-subtitle">Shown in the events dock only — complete or reject from the dock.</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="evtDock_evt_redeem" />
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+      </div>
+
+      <div class="field-row" style="margin-top: 10px;">
+        <div class="field-label">
+          <div class="field-title">Hype Train</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="evtDock_evt_hypetrain" />
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+      </div>
+
+      <div class="field-help" style="margin-top: 12px;">
+        These toggles are used by the dock to filter which event types are displayed.
+      </div>
+    </div>
+  </div>
+
+  <style>
+    /* --- Force Chat-style slider toggles (scoped to this panel) --- */
+    #eventsDockPanel .switch {
+      position: relative;
+      display: inline-block;
+      width: 44px;
+      height: 24px;
+      flex: 0 0 auto;
+    }
+
+    #eventsDockPanel .switch input {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      opacity: 0;
+      cursor: pointer;
+      z-index: 2;
+    }
+
+    #eventsDockPanel .switch-track {
+      position: absolute;
+      inset: 0;
+      border-radius: 999px;
+      background: #2a2a2a;
+      border: 1px solid rgba(255,255,255,0.12);
+      transition: background 120ms ease, border-color 120ms ease;
+    }
+
+    #eventsDockPanel .switch-thumb {
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 18px;
+      height: 18px;
+      border-radius: 999px;
+      background: #e5e7eb;
+      transition: transform 120ms ease;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.35);
+    }
+
+    #eventsDockPanel .switch input:checked + .switch-track {
+      background: #69bd45;
+      border-color: rgba(105,189,69,0.6);
+    }
+
+    #eventsDockPanel .switch input:checked + .switch-track .switch-thumb {
+      transform: translateX(20px);
+    }
+
+    #eventsDockPanel .switch input:focus-visible + .switch-track {
+      box-shadow: 0 0 0 3px rgba(105,189,69,0.18);
+    }
+
+    /* --- Events Dock: solid Syndicate-green stepper buttons --- */
+    #eventsDockPanel .stepper button.btn.btn-mini {
+      background: #69bd45;
+      border: 1px solid #69bd45;
+      color: #000;
+      font-weight: 700;
+    }
+
+    #eventsDockPanel .stepper button.btn.btn-mini:hover {
+      filter: brightness(1.06);
+    }
+
+    #eventsDockPanel .stepper button.btn.btn-mini:active {
+      filter: brightness(0.96);
+      transform: translateY(1px);
+    }
+
+    /* Font size input */
+    #eventsDockPanel #evtDock_fontSize {
+      background: #2a2a2a;
+      border: 1px solid rgba(255,255,255,0.12);
+      color: #e5e7eb;
+      border-radius: 10px;
+      padding: 6px 8px;
+      outline: none;
+    }
+
+    #eventsDockPanel #evtDock_fontSize:focus {
+      border-color: rgba(105,189,69,0.6);
+      box-shadow: 0 0 0 3px rgba(105,189,69,0.14);
+    }
+  </style>
+</section>

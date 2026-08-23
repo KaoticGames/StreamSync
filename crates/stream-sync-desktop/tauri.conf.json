@@ -1,0 +1,52 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Stream Sync",
+  "version": "2.0.1",
+  "identifier": "com.kaoticgames.streamsync",
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
+    "frontendDist": "ui-placeholder"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": null,
+      "dangerousDisableAssetCspModification": true
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "Kaotic Games",
+    "icon": [
+      "../../assets/icon.ico"
+    ],
+    "windows": {
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com"
+    },
+    "resources": {
+      "../../config/bundled.env": "config/bundled.env",
+      "../../overlay-server": "overlay-server",
+      "../../views": "views",
+      "../../assets": "assets",
+      "../../shell.html": "shell.html",
+      "../../shell.css": "shell.css",
+      "../../boot.html": "boot.html",
+      "../../renderer.js": "renderer.js",
+      "../../overlay-client-config.js": "overlay-client-config.js",
+      "../../tauri-bridge.js": "tauri-bridge.js",
+      "../../connections-api.js": "connections-api.js",
+      "../../chat-dock-config.js": "chat-dock-config.js",
+      "../../chat-overlay-config.js": "chat-overlay-config.js",
+      "../../events-dock-config.js": "events-dock-config.js",
+      "../../events-overlay-config.js": "events-overlay-config.js",
+      "../../events-variation-picker.js": "events-variation-picker.js",
+      "../../events-overlay.js": "events-overlay.js",
+      "../../events-se-import.js": "events-se-import.js",
+      "../../streamelements-auth-inject.js": "streamelements-auth-inject.js"
+    }
+  }
+}

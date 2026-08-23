@@ -1,0 +1,147 @@
+<section class="connection-card connection-twitch">
+  <div class="card">
+    <div class="card-header">
+      <div>
+        <div class="card-title">
+          <span class="platform-pill platform-twitch">Twitch</span>
+          &nbsp;Twitch Account
+        </div>
+        <div class="card-subtitle">
+          Connect your Twitch channel so Stream Sync can pull chat, subs, gifts, bits,
+          followers, and channel point redeems — or paste a connection key for a stream takeover.
+          You can keep both saved and switch between them anytime.
+        </div>
+      </div>
+    </div>
+
+    <div class="config-section">
+      <!-- Connection status + buttons -->
+      <div class="connection-row">
+        <div class="connection-status">
+          <div class="status-label">Status:</div>
+          <div class="status-value" id="twitch-status-value">
+            Not connected
+          </div>
+        </div>
+
+        <div class="connection-controls">
+          <button type="button" class="btn btn-primary" id="btn-twitch-connect">
+            Connect
+          </button>
+          <button type="button" class="btn btn-secondary" id="btn-twitch-reconnect" disabled>
+            Reconnect
+          </button>
+          <button type="button" class="btn btn-secondary" id="btn-twitch-disconnect" disabled>
+            Disconnect
+          </button>
+        </div>
+      </div>
+
+      <div class="field-help" id="twitch-local-help">
+        Clicking <strong>Connect</strong> will open your browser to Twitch’s authorization page.
+        After granting access, you’ll see an “ok to close” confirmation and Stream Sync will
+        store your tokens locally for auto-reconnect. Connecting does not remove a saved takeover key.
+      </div>
+
+      <div class="field-help small" id="twitch-local-help-2">
+        On launch, Stream Sync reconnects using the account you last had in use. Use
+        <strong>Use</strong> below to switch between your channel and a takeover without re-authorizing.
+      </div>
+
+      <div class="field-help" id="twitch-takeover-warning" style="display: none; color: #fbbf24;">
+        <strong>Takeover mode:</strong> chat messages and mod actions from Stream Sync act as the
+        <em>channel owner</em>. Switch back to your account or remove the key when the takeover ends.
+      </div>
+
+      <div id="twitch-saved-connections" style="display: none; margin-top: 1rem;">
+        <div class="card-title" style="font-size: 0.95rem; margin-bottom: 0.35rem;">
+          Saved connections
+        </div>
+        <div class="field-help small" style="margin-bottom: 0.5rem;">
+          Switch which account Stream Sync uses for chat and events. Remove only deletes that
+          saved connection.
+        </div>
+        <div id="twitch-account-local" class="connection-row" style="display: none; margin-bottom: 0.4rem; align-items: center;">
+          <div style="flex: 1; min-width: 0;">
+            <div style="font-weight: 600;" id="twitch-account-local-title">Your Twitch account</div>
+            <div class="field-help small" id="twitch-account-local-meta" style="margin: 0;"></div>
+          </div>
+          <div class="connection-controls" style="flex-shrink: 0;">
+            <button type="button" class="btn btn-primary" id="btn-twitch-use-local" style="display: none;">
+              Use
+            </button>
+            <button type="button" class="btn btn-secondary" id="btn-twitch-remove-local">
+              Remove
+            </button>
+          </div>
+        </div>
+        <div id="twitch-account-delegated" class="connection-row" style="display: none; align-items: center;">
+          <div style="flex: 1; min-width: 0;">
+            <div style="font-weight: 600;" id="twitch-account-delegated-title">Takeover</div>
+            <div class="field-help small" id="twitch-account-delegated-meta" style="margin: 0;"></div>
+          </div>
+          <div class="connection-controls" style="flex-shrink: 0;">
+            <button type="button" class="btn btn-primary" id="btn-twitch-use-delegated" style="display: none;">
+              Use
+            </button>
+            <button type="button" class="btn btn-secondary" id="btn-twitch-remove-delegated">
+              Remove
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 1rem 0;" />
+
+      <div class="card-title" style="font-size: 0.95rem; margin-bottom: 0.35rem;">
+        Use connection key (takeover)
+      </div>
+      <div class="field-help small">
+        Paste a key from the channel owner’s Syndicate Dashboard (Settings → Stream Sync takeover keys).
+        No Syndicate login is required on this PC. Your personal Twitch login stays saved so you can
+        switch back later.
+      </div>
+      <div class="connection-row" style="margin-top: 0.5rem; align-items: stretch;">
+        <input
+          type="text"
+          id="twitch-connection-key"
+          placeholder="ssk_…"
+          autocomplete="off"
+          spellcheck="false"
+          style="flex: 1; min-width: 0; padding: 0.5rem 0.65rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12); background: rgba(0,0,0,0.35); color: inherit; font-family: ui-monospace, monospace; font-size: 0.85rem;"
+        />
+        <button
+          type="button"
+          class="btn btn-primary"
+          id="btn-twitch-connection-key"
+          style="margin-left: 0.5rem;"
+        >
+          Connect with key
+        </button>
+      </div>
+      <div class="field-help small" id="twitch-connection-key-error" style="color: #f87171; display: none;"></div>
+
+      <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 1.25rem 0 1rem;" />
+
+      <div class="card-title" style="font-size: 0.95rem; margin-bottom: 0.35rem;">
+        <span class="platform-pill platform-kick">Kick</span>
+        &nbsp;Kick Account
+      </div>
+      <div class="field-help small">
+        Connect Kick through Syndicate (OAuth 2.1). Chat and events arrive via Syndicate webhooks —
+        Kick has no EventSub WebSocket. A takeover key also brings Kick in if the channel owner linked it.
+      </div>
+      <div class="connection-row" style="margin-top: 0.65rem;">
+        <div class="connection-status">
+          <div class="status-label">Kick status:</div>
+          <div class="status-value" id="kick-status-value">Not connected</div>
+        </div>
+        <div class="connection-controls">
+          <button type="button" class="btn btn-primary" id="btn-kick-connect">Connect</button>
+          <button type="button" class="btn btn-secondary" id="btn-kick-reconnect" disabled>Reconnect</button>
+          <button type="button" class="btn btn-secondary" id="btn-kick-disconnect" disabled>Disconnect</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

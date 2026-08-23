@@ -1,0 +1,34 @@
+<div class="view-panel view-events">
+
+  <!-- Events sub-tabs + SE import -->
+  <div class="events-tab-header">
+    <div class="subnav subnav-events">
+      <button class="subnav-btn active" data-subview="events-integrations">
+        Integrations
+      </button>
+      <button class="subnav-btn" data-subview="events-dock">
+        Dock
+      </button>
+      <button class="subnav-btn" data-subview="events-overlay">
+        Overlay
+      </button>
+    </div>
+    <button
+      type="button"
+      id="btn-import-se-overlays"
+      class="btn btn-secondary btn-import-se"
+      title="Import overlays from StreamElements"
+    >
+      Import SE Overlays
+    </button>
+  </div>
+
+  <!-- Inner container for events subviews -->
+  <div class="subview-container events-subview-container">
+    <!-- renderer.js will fetch and inject:
+         - views/events/events-integrations.html
+         - views/events/events-dock.html
+         - views/events/events-overlay.html
+    -->
+  </div>
+</div>

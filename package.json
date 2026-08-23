@@ -1,0 +1,16 @@
+{
+  "name": "stream-sync",
+  "private": true,
+  "version": "2.0.1",
+  "description": "Stream Sync 2.0 — Rust/Tauri desktop and overlay server",
+  "scripts": {
+    "dev": "node scripts/dev.js",
+    "dev:watch": "node scripts/dev.js --watch",
+    "prepare-release": "node scripts/prepare-release.js",
+    "build": "npm run prepare-release && node scripts/build.js",
+    "test": "cargo test --workspace"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-se-auth-commands"
+description = "StreamElements auth webview invoke commands"
+commands.allow = ["se_auth_complete"]
