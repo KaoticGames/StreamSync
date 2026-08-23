@@ -119,12 +119,13 @@
 
     _syncInFlight = true;
     try {
-      const url = `${apiBase()}/api/events/dock-config`;
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: json,
-      });
+      const res = await window.streamSyncControlApi.privilegedFetch(
+        "/api/events/dock-config",
+        {
+          method: "POST",
+          body: json,
+        }
+      );
 
       if (!res.ok) {
         const t = await res.text().catch(() => "");

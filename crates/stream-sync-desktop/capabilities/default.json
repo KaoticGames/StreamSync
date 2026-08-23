@@ -5,6 +5,7 @@
   "windows": ["main"],
   "permissions": [
     "allow-stream-sync-commands",
+    "allow-control-capability",
     "core:default",
     "core:window:allow-create",
     "core:window:allow-close",

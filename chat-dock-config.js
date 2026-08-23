@@ -6,9 +6,6 @@ const CHAT_DOCK_STORAGE_KEY = "streamsync.chatDock.settings";
 
 // Overlay server + profile for the live dock
 const DOCK_PROFILE_ID = "chat-default";
-function dockOverlayBaseUrl() {
-  return (window.STREAMSYNC_OVERLAY && window.STREAMSYNC_OVERLAY.baseUrl) || "http://localhost:4040";
-}
 
 (function () {
   const defaultSettings = {
@@ -63,9 +60,8 @@ function dockOverlayBaseUrl() {
         showTimestamps: !!settings.showTimestamps,
       };
 
-      await fetch(`${dockOverlayBaseUrl()}/api/chat/dock-config`, {
+      await window.streamSyncControlApi.privilegedFetch("/api/chat/dock-config", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
     } catch (err) {

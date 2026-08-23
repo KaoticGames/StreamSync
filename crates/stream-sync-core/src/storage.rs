@@ -127,6 +127,8 @@ pub struct StoragePaths {
     pub events_media_dir: PathBuf,
     /// Per-installation localhost control capability.
     pub control_token: PathBuf,
+    /// Scoped OBS chat-dock credentials (not the master control token).
+    pub dock_credentials: PathBuf,
 }
 
 fn looks_like_asar(p: &Path) -> bool {
@@ -188,11 +190,18 @@ pub fn get_paths() -> Result<StoragePaths> {
     let events_media_dir =
         env_path("STREAMSYNC_EVENTS_MEDIA_DIR").unwrap_or_else(|| root.join("events-media"));
     let control_token = root.join("control-token.txt");
+    let dock_credentials = root.join("dock-credentials.json");
 
     let tokens_dir = root.join("tokens");
     fs::create_dir_all(&tokens_dir).ok();
     fs::create_dir_all(&fonts_dir).ok();
     fs::create_dir_all(&events_media_dir).ok();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(&tokens_dir, fs::Permissions::from_mode(0o700));
+    }
 
     Ok(StoragePaths {
         root: root.clone(),
@@ -208,6 +217,7 @@ pub fn get_paths() -> Result<StoragePaths> {
         fonts_dir,
         events_media_dir,
         control_token,
+        dock_credentials,
     })
 }
 
@@ -343,8 +353,20 @@ fn now_ts() -> String {
 }
 
 pub fn write_file_atomic(target: &Path, data: &[u8]) -> Result<()> {
+    write_file_atomic_inner(target, data, false)
+}
+
+/// Atomic write for secrets: restrictive permissions, no reusable `.bak`.
+pub fn write_secret_file(target: &Path, data: &[u8]) -> Result<()> {
+    write_file_atomic_inner(target, data, true)
+}
+
+fn write_file_atomic_inner(target: &Path, data: &[u8], secret: bool) -> Result<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
+        if secret {
+            apply_secret_dir_permissions(parent);
+        }
     }
     let tmp = target.with_extension(format!(
         "tmp-{}-{}",
@@ -360,22 +382,92 @@ pub fn write_file_atomic(target: &Path, data: &[u8]) -> Result<()> {
         f.write_all(data)?;
         f.sync_all()?;
     }
-    let bak = target.with_extension("bak");
-    let _ = fs::remove_file(&bak);
-    if target.exists() {
-        let _ = fs::rename(target, &bak);
+    if secret {
+        apply_secret_file_permissions(&tmp)?;
+        // Never leave a reusable previous secret on disk.
+        let bak = target.with_extension("bak");
+        let _ = fs::remove_file(&bak);
+        if target.exists() {
+            let _ = fs::remove_file(target);
+        }
+    } else {
+        let bak = target.with_extension("bak");
+        let _ = fs::remove_file(&bak);
+        if target.exists() {
+            let _ = fs::rename(target, &bak);
+        }
     }
     match fs::rename(&tmp, target) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if secret {
+                apply_secret_file_permissions(target)?;
+            }
+            Ok(())
+        }
         Err(_) => {
             let _ = fs::remove_file(target);
             if fs::rename(&tmp, target).is_err() {
                 fs::copy(&tmp, target)?;
                 let _ = fs::remove_file(&tmp);
             }
+            if secret {
+                apply_secret_file_permissions(target)?;
+            }
             Ok(())
         }
     }
+}
+
+fn apply_secret_dir_permissions(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(windows)]
+    {
+        let _ = dir;
+        // Best-effort: Windows ACL tightening is applied on the secret file itself.
+    }
+}
+
+fn apply_secret_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        let meta = fs::metadata(path)?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "secret file permissions too broad after write: {:o} ({})",
+                mode,
+                path.display()
+            );
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Restrict to the current user via icacls (no world/Everyone read).
+        let path_str = path.to_string_lossy().to_string();
+        let user = std::env::var("USERNAME").unwrap_or_else(|_| "Administrators".into());
+        let _ = std::process::Command::new("icacls")
+            .args([&path_str, "/inheritance:r"])
+            .output();
+        let grant = format!("{user}:F");
+        let _ = std::process::Command::new("icacls")
+            .args([&path_str, "/grant:r", &grant])
+            .output();
+    }
+    Ok(())
+}
+
+/// Repair overly broad permissions on an existing secret file (Unix).
+pub fn ensure_secret_file_permissions(path: &Path) -> Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    apply_secret_file_permissions(path)
 }
 
 pub fn read_json_or_default<T>(path: &Path, default: &T) -> Result<T>

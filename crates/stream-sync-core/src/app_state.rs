@@ -72,6 +72,10 @@ pub struct AppState {
     pub kick_feed_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
     /// Per-installation localhost control capability (privileged routes + control socket).
     control_token: String,
+    /// One-time OAuth completion nonces (never the master capability).
+    pub pending_logins: crate::oauth_pending::PendingLoginStore,
+    /// Scoped OBS chat-dock credentials.
+    pub dock_credentials: crate::dock_capability::DockCredentialStore,
 }
 
 impl AppState {
@@ -172,6 +176,8 @@ impl AppState {
         let live_kick = live_kick_tokens(active_mode, delegated.as_ref(), &personal_kick);
         let control_token =
             crate::control_plane::load_or_create_control_token(&paths.control_token)?;
+        let dock_credentials =
+            crate::dock_capability::DockCredentialStore::load_or_create(&paths.dock_credentials)?;
 
         Ok(Arc::new(Self {
             paths: paths.clone(),
@@ -201,6 +207,8 @@ impl AppState {
             }),
             kick_feed_handle: RwLock::new(None),
             control_token,
+            pending_logins: crate::oauth_pending::PendingLoginStore::new(),
+            dock_credentials,
         }))
     }
 

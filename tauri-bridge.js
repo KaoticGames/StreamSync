@@ -17,17 +17,9 @@
   let controlTokenPromise = null;
 
   async function ensureControlCapability(invoke) {
-    if (window.STREAMSYNC_CONTROL_TOKEN) {
-      return window.STREAMSYNC_CONTROL_TOKEN;
-    }
     if (!controlTokenPromise) {
       controlTokenPromise = invoke("get_control_capability")
-        .then((token) => {
-          if (token) {
-            window.STREAMSYNC_CONTROL_TOKEN = String(token);
-          }
-          return window.STREAMSYNC_CONTROL_TOKEN || "";
-        })
+        .then((token) => (token ? String(token) : ""))
         .catch((e) => {
           console.warn("[tauri-bridge] control capability:", e);
           return "";
@@ -130,7 +122,11 @@
       openDiscord: () => invoke("open_discord"),
       getSettings: async () => ({}),
       getTwitchStatus: async () => {
-        const res = await fetch(`${cachedBase}/api/status`, { cache: "no-store" });
+        const api = window.streamSyncControlApi;
+        if (!api || typeof api.privilegedFetch !== "function") {
+          throw new Error("Stream Sync control API unavailable");
+        }
+        const res = await api.privilegedFetch("/api/status", { cache: "no-store" });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();
       },

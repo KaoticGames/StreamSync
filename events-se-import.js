@@ -7,20 +7,13 @@
   const staleModal = document.getElementById(MODAL_ID);
   if (staleModal) staleModal.remove();
 
-  function overlayBase() {
-    return (
-      (window.STREAMSYNC_OVERLAY && window.STREAMSYNC_OVERLAY.baseUrl) ||
-      (window.electronAPI && window.electronAPI.getOverlayBaseUrl && window.electronAPI.getOverlayBaseUrl()) ||
-      "http://127.0.0.1:4040"
-    );
-  }
-
   async function api(path, options) {
-    const res = await fetch(`${overlayBase()}${path}`, {
+    const opts = {
       cache: "no-store",
-      headers: { Accept: "application/json", "Content-Type": "application/json" },
       ...options,
-    });
+      headers: { Accept: "application/json", ...((options && options.headers) || {}) },
+    };
+    const res = await window.streamSyncControlApi.privilegedFetch(path, opts);
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       const err = new Error(data.error || `HTTP ${res.status}`);

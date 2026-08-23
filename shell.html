@@ -61,6 +61,8 @@
     </footer>
   </div>
 
+  <!-- Shared privileged HTTP helper (must load before connections-api / config scripts) -->
+  <script src="control-api.js"></script>
   <!-- Tauri bridge (no-op in browser/Electron); must load before overlay-client-config -->
   <script src="tauri-bridge.js"></script>
   <!-- Overlay URL (must load before config scripts) -->

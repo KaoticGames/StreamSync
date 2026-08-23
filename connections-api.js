@@ -14,20 +14,12 @@
     return "http://127.0.0.1:4040";
   }
 
-  function privilegedHeaders(extra) {
-    const headers = Object.assign({ "Content-Type": "application/json" }, extra || {});
-    if (global.STREAMSYNC_CONTROL_TOKEN) {
-      headers["x-streamsync-control"] = global.STREAMSYNC_CONTROL_TOKEN;
-    }
-    return headers;
-  }
-
   async function privilegedFetch(path, options) {
-    const base = overlayBase();
-    const opts = Object.assign({}, options || {});
-    const headers = privilegedHeaders(opts.headers || {});
-    opts.headers = headers;
-    return fetch(`${base}${path}`, opts);
+    const api = global.streamSyncControlApi;
+    if (!api || typeof api.privilegedFetch !== "function") {
+      throw new Error("Stream Sync control API unavailable");
+    }
+    return api.privilegedFetch(path, options);
   }
 
   async function fetchAuthUrl() {
@@ -191,8 +183,9 @@
   }
 
   async function seGetSession() {
-    const base = overlayBase();
-    const res = await fetch(`${base}/api/streamelements/session`, { cache: "no-store" });
+    const res = await privilegedFetch("/api/streamelements/session", {
+      cache: "no-store",
+    });
     if (!res.ok) throw new Error(`Session check failed: HTTP ${res.status}`);
     return res.json();
   }

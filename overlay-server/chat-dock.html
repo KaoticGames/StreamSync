@@ -718,10 +718,14 @@
 
       let ws = null;
       let controlWs = null;
+      let feedConnected = false;
       let controlAuthenticated = false;
+      let controlAuthFailed = false;
+      let sendPending = false;
       const controlToken = (() => {
         const m = (window.location.hash || "").match(/^#control=(.+)$/);
-        return m ? decodeURIComponent(m[1]) : "";
+        const token = m ? decodeURIComponent(m[1]) : "";
+        return token.startsWith("ssd_") ? token : "";
       })();
       const MAX_ITEMS = 500;
 
@@ -796,6 +800,35 @@
           statusText.textContent = message;
         }
       }
+
+      function updateInputState() {
+        const enabled = controlAuthenticated && !controlAuthFailed && !sendPending;
+        if (chatInput) chatInput.disabled = !enabled;
+        if (btnSend) btnSend.disabled = !enabled;
+      }
+
+      function refreshConnectionStatus(message) {
+        if (message) {
+          setWsStatus(feedConnected && controlAuthenticated, message);
+          return;
+        }
+        if (!feedConnected) {
+          setWsStatus(false, "Feed disconnected");
+        } else if (controlAuthFailed) {
+          setWsStatus(false, "Authentication failed");
+        } else if (!controlToken) {
+          setWsStatus(false, "Connected · Read only");
+        } else if (!controlAuthenticated) {
+          setWsStatus(false, "Connected · Authenticating…");
+        } else if (sendPending) {
+          setWsStatus(true, "Connected · Sending…");
+        } else {
+          setWsStatus(true, "Connected · Ready");
+        }
+        updateInputState();
+      }
+
+      updateInputState();
 
       /** True until the user scrolls up to read history; re-enabled when they return near the bottom. */
       let stickToBottom = true;
@@ -1367,11 +1400,12 @@
         }
 
         ws = socket;
-        setWsStatus(false, "Connecting…");
+        refreshConnectionStatus("Connecting feed…");
 
         socket.addEventListener("open", () => {
           console.log("[chat-dock] WebSocket connected:", url);
-          setWsStatus(true, "Connected");
+          feedConnected = true;
+          refreshConnectionStatus();
         });
 
         socket.addEventListener("message", (event) => {
@@ -1404,22 +1438,25 @@
 
         socket.addEventListener("close", () => {
           console.log("[chat-dock] WebSocket closed");
-          setWsStatus(false, "Disconnected");
+          feedConnected = false;
+          refreshConnectionStatus();
           ws = null;
           setTimeout(connectWebSocket, 2000);
         });
 
         socket.addEventListener("error", (err) => {
           console.error("[chat-dock] WebSocket error:", err);
-          setWsStatus(false, "Error");
+          refreshConnectionStatus("Feed error");
         });
       }
 
       function connectControlWebSocket() {
         if (!controlToken) {
-          console.warn("[chat-dock] No control capability; chat send disabled (read-only feed).");
+          console.warn("[chat-dock] No dock credential; chat send disabled (read-only feed).");
+          refreshConnectionStatus();
           return;
         }
+        if (controlAuthFailed) return;
 
         const url = getControlWebSocketUrl();
         let socket;
@@ -1434,7 +1471,14 @@
 
         socket.addEventListener("open", () => {
           console.log("[chat-dock] Control WebSocket connected:", url);
-          socket.send(JSON.stringify({ type: "auth", token: controlToken }));
+          socket.send(
+            JSON.stringify({
+              type: "auth",
+              token: controlToken,
+              platform: DOCK_PLATFORM,
+            })
+          );
+          refreshConnectionStatus();
         });
 
         socket.addEventListener("message", (event) => {
@@ -1442,13 +1486,33 @@
             const payload = JSON.parse(event.data);
             if (payload && payload.type === "auth-ok") {
               controlAuthenticated = true;
+              controlAuthFailed = false;
               console.log("[chat-dock] Control socket authenticated");
+              refreshConnectionStatus();
               return;
             }
             if (payload && payload.type === "auth-failed") {
               controlAuthenticated = false;
+              controlAuthFailed = true;
               console.error("[chat-dock] Control socket auth failed");
+              refreshConnectionStatus();
               socket.close();
+              return;
+            }
+            if (payload && payload.type === "chat-send-result" && sendPending) {
+              sendPending = false;
+              if (payload.ok) {
+                if (chatInput) chatInput.value = "";
+                if (chatPreview) chatPreview.innerHTML = "";
+                resetSuggestions();
+                refreshConnectionStatus();
+              } else {
+                refreshConnectionStatus(
+                  `Send failed${payload.error ? `: ${payload.error}` : ""}`
+                );
+                updateInputState();
+                if (chatInput) chatInput.focus();
+              }
             }
           } catch (err) {
             console.error("[chat-dock] Failed to parse control WS message:", err);
@@ -1457,8 +1521,12 @@
 
         socket.addEventListener("close", () => {
           controlAuthenticated = false;
+          sendPending = false;
           controlWs = null;
-          setTimeout(connectControlWebSocket, 2000);
+          refreshConnectionStatus();
+          if (!controlAuthFailed) {
+            setTimeout(connectControlWebSocket, 2000);
+          }
         });
 
         socket.addEventListener("error", (err) => {
@@ -1467,13 +1535,23 @@
       }
 
       function sendChatMessageFromDock(text) {
-        if (!controlWs || !controlAuthenticated || controlWs.readyState !== WebSocket.OPEN) return;
+        if (
+          sendPending ||
+          !controlWs ||
+          !controlAuthenticated ||
+          controlWs.readyState !== WebSocket.OPEN
+        ) {
+          return false;
+        }
         const payload = {
           type: "chat-send",
           platform: DOCK_PLATFORM,
           message: text,
         };
         controlWs.send(JSON.stringify(payload));
+        sendPending = true;
+        refreshConnectionStatus();
+        return true;
       }
 
       function resetSuggestions() {
@@ -2202,11 +2280,6 @@
         const text = chatInput.value.trim();
         if (!text) return;
         sendChatMessageFromDock(text);
-        chatInput.value = "";
-        if (chatPreview) {
-          chatPreview.innerHTML = "";
-        }
-        resetSuggestions();
       }
 
       if (chatInput) {

@@ -889,40 +889,61 @@
       // Emotes
       // ───────────────────────────────────────────────
 
-      function renderEmotesToHTML(message, emotes) {
+      function renderEmotesToFragment(message, emotes) {
+        const frag = document.createDocumentFragment();
+        const text = String(message || "");
         if (!emotes || typeof emotes !== "object") {
-          return escapeHtml(message);
+          frag.appendChild(document.createTextNode(text));
+          return frag;
         }
 
         const replacements = [];
-
         Object.entries(emotes).forEach(([emoteId, occurrences]) => {
           if (!Array.isArray(occurrences)) return;
+          const id = String(emoteId || "");
+          if (!/^[A-Za-z0-9_]+$/.test(id)) return;
           occurrences.forEach((rangeStr) => {
-            const [startStr, endStr] = rangeStr.split("-");
+            const [startStr, endStr] = String(rangeStr).split("-");
             const start = parseInt(startStr, 10);
             const end = parseInt(endStr, 10);
-            if (Number.isNaN(start) || Number.isNaN(end)) return;
-            replacements.push({ start, end, id: emoteId });
+            if (Number.isNaN(start) || Number.isNaN(end) || start < 0 || end < start) return;
+            if (end >= text.length) return;
+            replacements.push({ start, end, id });
           });
         });
 
-        if (replacements.length === 0) return escapeHtml(message);
-
-        replacements.sort((a, b) => b.start - a.start);
-
-        let result = message;
-        for (const rep of replacements) {
-          const { start, end, id } = rep;
-          const emoteText = result.substring(start, end + 1);
-
-          const imgUrl = `https://static-cdn.jtvnw.net/emoticons/v2/${id}/default/dark/2.0`;
-          const imgTag = `<img class="emote" src="${imgUrl}" alt="${escapeHtml(emoteText)}" />`;
-
-          result = result.slice(0, start) + imgTag + result.slice(end + 1);
+        if (replacements.length === 0) {
+          frag.appendChild(document.createTextNode(text));
+          return frag;
         }
 
-        return result;
+        replacements.sort((a, b) => a.start - b.start);
+        let cursor = 0;
+        for (const rep of replacements) {
+          if (rep.start < cursor) continue; // skip overlapping
+          if (rep.start > cursor) {
+            frag.appendChild(document.createTextNode(text.slice(cursor, rep.start)));
+          }
+          const emoteText = text.slice(rep.start, rep.end + 1);
+          const imgUrl =
+            "https://static-cdn.jtvnw.net/emoticons/v2/" +
+            encodeURIComponent(rep.id) +
+            "/default/dark/2.0";
+          if (!/^https:\/\/static-cdn\.jtvnw\.net\//i.test(imgUrl)) {
+            frag.appendChild(document.createTextNode(emoteText));
+          } else {
+            const img = document.createElement("img");
+            img.className = "emote";
+            img.src = imgUrl;
+            img.alt = emoteText;
+            frag.appendChild(img);
+          }
+          cursor = rep.end + 1;
+        }
+        if (cursor < text.length) {
+          frag.appendChild(document.createTextNode(text.slice(cursor)));
+        }
+        return frag;
       }
 
       function escapeHtml(str) {
@@ -1009,7 +1030,8 @@
         // Message
         const msgEl = document.createElement("span");
         msgEl.className = "chat-message";
-        msgEl.innerHTML = renderEmotesToHTML(evt.message || "", evt.emotes || null);
+        msgEl.textContent = "";
+        msgEl.appendChild(renderEmotesToFragment(evt.message || "", evt.emotes || null));
         line.appendChild(msgEl);
 
         // Bubble / plain initial background

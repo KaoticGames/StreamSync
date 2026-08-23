@@ -1,10 +1,9 @@
 [[permission]]
 identifier = "allow-stream-sync-commands"
-description = "Stream Sync desktop invoke commands"
+description = "Stream Sync desktop invoke commands (non-secret)"
 commands.allow = [
   "get_overlay_base_url",
   "get_overlay_port",
-  "get_control_capability",
   "open_external",
   "open_logs_folder",
   "open_discord",
@@ -16,4 +15,11 @@ commands.allow = [
   "check_for_updates",
   "open_se_account_page",
   "export_backup",
+]
+
+[[permission]]
+identifier = "allow-control-capability"
+description = "Allow main window to retrieve the localhost control capability once for privileged HTTP"
+commands.allow = [
+  "get_control_capability",
 ]

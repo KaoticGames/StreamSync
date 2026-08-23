@@ -100,8 +100,17 @@ pub fn build_router(ctx: ServerContext) -> Router {
                 .post(post_se_session)
                 .delete(delete_se_session),
         )
+        .route("/api/streamelements/begin-login", get(get_se_begin_login))
         .route("/api/streamelements/overlays", get(get_se_overlays))
         .route("/api/streamelements/import", post(post_se_import))
+        .route(
+            "/api/dock/issue-credential",
+            post(post_issue_dock_credential),
+        )
+        .route(
+            "/api/dock/revoke-credential",
+            post(post_revoke_dock_credential),
+        )
         .route("/ws/feed", get(ws_feed))
         .route("/ws/control", get(ws_control))
         .route("/google-fonts.css", get(get_google_fonts_css))
@@ -375,43 +384,44 @@ async fn api_status(State(ctx): State<ServerContext>) -> Json<Value> {
     }))
 }
 
-async fn auth_callback(State(ctx): State<ServerContext>) -> impl IntoResponse {
+async fn auth_callback() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        inject_control_token(AUTH_CALLBACK_HTML, ctx.state.control_token()),
+        AUTH_CALLBACK_HTML,
     )
 }
 
-async fn auth_kick_callback(State(ctx): State<ServerContext>) -> impl IntoResponse {
+async fn auth_kick_callback() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        inject_control_token(AUTH_KICK_CALLBACK_HTML, ctx.state.control_token()),
+        AUTH_KICK_CALLBACK_HTML,
     )
 }
 
-async fn auth_streamelements_callback(State(ctx): State<ServerContext>) -> impl IntoResponse {
+async fn auth_streamelements_callback() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        inject_control_token(SE_AUTH_CALLBACK_HTML, ctx.state.control_token()),
+        SE_AUTH_CALLBACK_HTML,
     )
 }
 
-fn inject_control_token(html: &str, token: &str) -> String {
-    let token_json = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".into());
-    let script = format!("<script>window.STREAMSYNC_CONTROL_TOKEN={token_json};</script>");
-    if let Some(idx) = html.find("</head>") {
-        format!("{}{}{}", &html[..idx], script, &html[idx..])
-    } else {
-        format!("{script}{html}")
-    }
-}
-
-const SE_AUTH_CALLBACK_HTML: &str = r#"<!doctype html>
-<html><head><meta charset="utf-8"/><title>Stream Sync – StreamElements</title></head>
+const SE_AUTH_CALLBACK_HTML: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"/><title>Stream Sync – StreamElements</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'">
+</head>
 <body style="font-family:system-ui;padding:24px;background:#111;color:#eee;">
 <h2>Connecting StreamElements…</h2>
+<div id="msg"></div>
 <script>
 (function(){
+  function setMsg(text, isError){
+    var el=document.getElementById("msg");
+    el.textContent="";
+    var p=document.createElement("p");
+    if(isError) p.style.color="#f87171";
+    p.textContent=text;
+    el.appendChild(p);
+  }
   function parseHash(hash){
     const out={};
     const h=(hash||"").replace(/^#/,"");
@@ -426,36 +436,49 @@ const SE_AUTH_CALLBACK_HTML: &str = r#"<!doctype html>
     return out;
   }
   async function run(){
+    const flow=(new URLSearchParams(window.location.search)).get("flow")||"";
     const h=parseHash(window.location.hash);
     const jwt=h.jwt||"";
     const accountId=h.accountId||"";
-    if(!jwt||!accountId){
-      document.body.innerHTML+="<p style='color:#f87171;'>Missing jwt or accountId in callback.</p>";
-      return;
-    }
+    if(!flow){ setMsg("Missing login flow. Start StreamElements connect from Stream Sync.", true); return; }
+    if(!jwt||!accountId){ setMsg("Missing jwt or accountId in callback.", true); return; }
     const resp=await fetch("/api/streamelements/session",{
       method:"POST",
-      headers:Object.assign({"Content-Type":"application/json"},window.STREAMSYNC_CONTROL_TOKEN?{"x-streamsync-control":window.STREAMSYNC_CONTROL_TOKEN}:{}),
-      body:JSON.stringify({ jwt, accountId })
+      headers:{"Content-Type":"application/json","x-streamsync-login-nonce":flow},
+      body:JSON.stringify({ jwt, accountId, flowNonce: flow })
     });
     const data=await resp.json().catch(()=>({}));
     if(!resp.ok||!data.ok) throw new Error(data.error||("HTTP "+resp.status));
-    document.body.innerHTML="<h2>StreamElements connected</h2><p>You can close this window.</p>";
+    document.body.textContent="";
+    var h2=document.createElement("h2"); h2.textContent="StreamElements connected";
+    var p=document.createElement("p"); p.textContent="You can close this window.";
+    document.body.appendChild(h2); document.body.appendChild(p);
     setTimeout(()=>{ try{ window.close(); }catch(e){} }, 600);
   }
   run().catch(e=>{
     console.error(e);
-    document.body.innerHTML+="<p style='color:#f87171;'>Failed to save StreamElements session.</p>";
+    setMsg("Failed to save StreamElements session.", true);
   });
 })();
-</script></body></html>"#;
+</script></body></html>"##;
 
-const AUTH_CALLBACK_HTML: &str = r#"<!doctype html>
-<html><head><meta charset="utf-8"/><title>Stream Sync – Twitch Connect</title></head>
+const AUTH_CALLBACK_HTML: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"/><title>Stream Sync – Twitch Connect</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'">
+</head>
 <body style="font-family:system-ui;padding:24px;">
 <h2>Finishing Twitch connection…</h2>
+<div id="msg"></div>
 <script>
 (function(){
+  function setMsg(text, isError){
+    var el=document.getElementById("msg");
+    el.textContent="";
+    var p=document.createElement("p");
+    if(isError) p.style.color="#b91c1c";
+    p.textContent=text;
+    el.appendChild(p);
+  }
   function parseHash(hash){
     const out={};
     const h=(hash||"").replace(/^#/,"");
@@ -469,60 +492,79 @@ const AUTH_CALLBACK_HTML: &str = r#"<!doctype html>
   async function run(){
     const h=parseHash(window.location.hash);
     const accessToken=h.access_token||"";
-    if(!accessToken){ document.body.innerHTML+="<p style='color:#b91c1c;'>Missing access_token.</p>"; return; }
+    const flow=h.state||"";
+    if(!flow){ setMsg("Missing login flow state. Start Twitch connect from Stream Sync.", true); return; }
+    if(!accessToken){ setMsg("Missing access_token.", true); return; }
     const resp=await fetch("/api/twitch/set-token",{
       method:"POST",
-      headers:Object.assign({"Content-Type":"application/json"},window.STREAMSYNC_CONTROL_TOKEN?{"x-streamsync-control":window.STREAMSYNC_CONTROL_TOKEN}:{}),
+      headers:{"Content-Type":"application/json","x-streamsync-login-nonce":flow},
       body:JSON.stringify({
         accessToken,
         expiresIn:h.expires_in?Number(h.expires_in):null,
         scope:h.scope?h.scope.split(" "):null,
-        tokenType:h.token_type||""
+        tokenType:h.token_type||"",
+        flowNonce:flow
       })
     });
     const data=await resp.json().catch(()=>({}));
     if(!resp.ok||!data.ok) throw new Error(data.error||("HTTP "+resp.status));
-    document.body.innerHTML="<h2>Stream Sync connected to Twitch</h2>";
+    document.body.textContent="";
+    var h2=document.createElement("h2"); h2.textContent="Stream Sync connected to Twitch";
+    document.body.appendChild(h2);
     setTimeout(()=>window.close(),500);
   }
-  run().catch(e=>{ console.error(e); document.body.innerHTML+="<p style='color:#b91c1c;'>Failed to finalize connection.</p>"; });
+  run().catch(e=>{ console.error(e); setMsg("Failed to finalize connection.", true); });
 })();
-</script></body></html>"#;
+</script></body></html>"##;
 
-const AUTH_KICK_CALLBACK_HTML: &str = r#"<!doctype html>
-<html><head><meta charset="utf-8"/><title>Stream Sync – Kick Connect</title></head>
+const AUTH_KICK_CALLBACK_HTML: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"/><title>Stream Sync – Kick Connect</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'">
+</head>
 <body style="font-family:system-ui;padding:24px;background:#111;color:#eee;">
 <h2>Finishing Kick connection…</h2>
+<div id="msg"></div>
 <script>
 (function(){
+  function setMsg(text, isError){
+    var el=document.getElementById("msg");
+    el.textContent="";
+    var p=document.createElement("p");
+    if(isError) p.style.color="#f87171";
+    p.textContent=String(text||"");
+    el.appendChild(p);
+  }
   async function run(){
     const params=new URLSearchParams(window.location.search);
+    const flow=(params.get("flow")||"").trim();
     const oauthErr=params.get("error");
     if(oauthErr){
       const detail=params.get("error_description")||oauthErr;
-      throw new Error("Kick authorization failed: "+detail);
-    }
-    const code=(params.get("code")||"").trim();
-    if(!code){
-      document.body.innerHTML+="<p style='color:#f87171;'>Missing Kick authorization code.</p>";
+      setMsg("Kick authorization failed: "+detail, true);
       return;
     }
+    if(!flow){ setMsg("Missing login flow. Start Kick connect from Stream Sync.", true); return; }
+    const code=(params.get("code")||"").trim();
+    if(!code){ setMsg("Missing Kick authorization code.", true); return; }
     const resp=await fetch("/api/kick/redeem",{
       method:"POST",
-      headers:Object.assign({"Content-Type":"application/json"},window.STREAMSYNC_CONTROL_TOKEN?{"x-streamsync-control":window.STREAMSYNC_CONTROL_TOKEN}:{}),
-      body:JSON.stringify({code})
+      headers:{"Content-Type":"application/json","x-streamsync-login-nonce":flow},
+      body:JSON.stringify({code, flowNonce:flow})
     });
     const data=await resp.json().catch(()=>({}));
     if(!resp.ok||!data.ok) throw new Error(data.error||("HTTP "+resp.status));
-    document.body.innerHTML="<h2>Stream Sync connected to Kick</h2><p>You can close this window.</p>";
+    document.body.textContent="";
+    var h2=document.createElement("h2"); h2.textContent="Stream Sync connected to Kick";
+    var p=document.createElement("p"); p.textContent="You can close this window.";
+    document.body.appendChild(h2); document.body.appendChild(p);
     setTimeout(()=>{ try{ window.close(); }catch(e){} }, 600);
   }
   run().catch(e=>{
     console.error(e);
-    document.body.innerHTML="<h2>Kick connect failed</h2><p style='color:#f87171;'>"+String(e.message||e)+"</p>";
+    setMsg(e && e.message ? e.message : "Kick connect failed", true);
   });
 })();
-</script></body></html>"#;
+</script></body></html>"##;
 
 async fn config_profile_json(
     State(ctx): State<ServerContext>,
@@ -1119,6 +1161,10 @@ async fn get_auth_url(State(ctx): State<ServerContext>) -> Response {
         )
             .into_response();
     }
+    let flow_nonce = ctx
+        .state
+        .pending_logins
+        .create(crate::oauth_pending::OAuthProvider::Twitch);
     let scopes = [
         "chat:read",
         "chat:edit",
@@ -1132,18 +1178,53 @@ async fn get_auth_url(State(ctx): State<ServerContext>) -> Response {
         "moderator:manage:banned_users",
     ];
     let url = format!(
-        "https://id.twitch.tv/oauth2/authorize?client_id={}&redirect_uri={}&response_type=token&scope={}",
+        "https://id.twitch.tv/oauth2/authorize?client_id={}&redirect_uri={}&response_type=token&scope={}&state={}",
         urlencoding::encode(&ctx.state.client_id),
         urlencoding::encode(&ctx.state.redirect_uri),
         urlencoding::encode(&scopes.join(" ")),
+        urlencoding::encode(&flow_nonce),
     );
-    Json(json!({ "ok": true, "url": url })).into_response()
+    Json(json!({ "ok": true, "url": url, "flowNonce": flow_nonce })).into_response()
+}
+
+fn oauth_completion_allowed(
+    state: &AppState,
+    headers: &HeaderMap,
+    provider: crate::oauth_pending::OAuthProvider,
+    body_nonce: Option<&str>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if control_plane::authorize_privileged(state, headers) {
+        return Ok(());
+    }
+    if !control_plane::origin_allowed_for_privileged(headers, state.port) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "ok": false, "error": "unauthorized" })),
+        ));
+    }
+    let nonce = control_plane::login_nonce_from_headers(headers)
+        .or(body_nonce)
+        .unwrap_or("");
+    state.pending_logins.consume(provider, nonce).map_err(|e| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "ok": false, "error": e.as_str() })),
+        )
+    })
 }
 
 async fn post_set_token(
     State(ctx): State<ServerContext>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let body_nonce = body.get("flowNonce").and_then(|v| v.as_str());
+    oauth_completion_allowed(
+        &ctx.state,
+        &headers,
+        crate::oauth_pending::OAuthProvider::Twitch,
+        body_nonce,
+    )?;
     twitch::apply_set_token(ctx.state.clone(), ctx.twitch.clone(), body)
         .await
         .map_err(|e| {
@@ -1261,13 +1342,30 @@ async fn post_disconnect(State(ctx): State<ServerContext>) -> Json<Value> {
 }
 
 async fn get_kick_auth_url(State(ctx): State<ServerContext>) -> Json<Value> {
-    Json(json!({ "ok": true, "url": kick::auth_url(&ctx.state) }))
+    let flow_nonce = ctx
+        .state
+        .pending_logins
+        .create(crate::oauth_pending::OAuthProvider::Kick);
+    Json(json!({
+        "ok": true,
+        "url": kick::auth_url(&ctx.state, &flow_nonce),
+        "flowNonce": flow_nonce,
+    }))
 }
 
 async fn post_kick_redeem(
     State(ctx): State<ServerContext>,
+    headers: HeaderMap,
     Json(body): Json<kick::KickRedeemBody>,
 ) -> Response {
+    if let Err(err) = oauth_completion_allowed(
+        &ctx.state,
+        &headers,
+        crate::oauth_pending::OAuthProvider::Kick,
+        body.flow_nonce.as_deref(),
+    ) {
+        return err.into_response();
+    }
     match kick::redeem_stream_sync_code(ctx.state.clone(), &body.code).await {
         Ok(tokens) => Json(json!({
             "ok": true,
@@ -1418,6 +1516,8 @@ struct SeSessionBody {
     jwt: String,
     #[serde(rename = "accountId")]
     account_id: String,
+    #[serde(default, rename = "flowNonce")]
+    flow_nonce: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1456,17 +1556,42 @@ async fn get_se_session(State(ctx): State<ServerContext>) -> Json<Value> {
     }
 }
 
+async fn get_se_begin_login(State(ctx): State<ServerContext>) -> Json<Value> {
+    let flow_nonce = ctx
+        .state
+        .pending_logins
+        .create(crate::oauth_pending::OAuthProvider::StreamElements);
+    Json(json!({
+        "ok": true,
+        "flowNonce": flow_nonce,
+        "callbackPath": format!("/auth/streamelements/callback?flow={}", urlencoding::encode(&flow_nonce)),
+    }))
+}
+
 async fn post_se_session(
     State(ctx): State<ServerContext>,
+    headers: HeaderMap,
     Json(body): Json<SeSessionBody>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    oauth_completion_allowed(
+        &ctx.state,
+        &headers,
+        crate::oauth_pending::OAuthProvider::StreamElements,
+        body.flow_nonce.as_deref(),
+    )?;
     if ctx.state.readonly {
-        return Err(StatusCode::FORBIDDEN);
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "readonly" })),
+        ));
     }
     let jwt = body.jwt.trim().to_string();
     let account_id = body.account_id.trim().to_string();
     if jwt.is_empty() || account_id.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "missing_fields" })),
+        ));
     }
     let mut session = SeSession {
         jwt,
@@ -1477,8 +1602,12 @@ async fn post_se_session(
     if let Ok(profile) = streamelements::fetch_channel_profile(&session).await {
         session.username = streamelements::display_name_from_channel(&profile);
     }
-    streamelements::save_session(&ctx.state.paths, &session)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    streamelements::save_session(&ctx.state.paths, &session).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": "save_failed" })),
+        )
+    })?;
     Ok(Json(json!({
         "ok": true,
         "connected": true,
@@ -1769,9 +1898,13 @@ fn test_alert_dock_detail(et: &str, name: &str, variables: &Value) -> String {
 
 async fn ws_feed(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(ctx): State<ServerContext>,
     Query(q): Query<ProfileQuery>,
 ) -> impl IntoResponse {
+    if !control_plane::ws_origin_allowed(&headers, ctx.state.port) {
+        return control_plane::unauthorized_response();
+    }
     let profile_id = q.profile.unwrap_or_else(|| "default".into());
     ws.on_upgrade(move |socket| handle_ws_feed(socket, ctx, profile_id))
 }
@@ -1782,18 +1915,11 @@ async fn ws_control(
     State(ctx): State<ServerContext>,
     Query(q): Query<ProfileQuery>,
 ) -> impl IntoResponse {
-    if !ws_control_upgrade_allowed(&headers, ctx.state.port) {
+    if !control_plane::ws_origin_allowed(&headers, ctx.state.port) {
         return control_plane::unauthorized_response();
     }
     let profile_id = q.profile.unwrap_or_else(|| "default".into());
     ws.on_upgrade(move |socket| handle_ws_control(socket, ctx, profile_id))
-}
-
-fn ws_control_upgrade_allowed(headers: &HeaderMap, port: u16) -> bool {
-    match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        Some(origin) => control_plane::trusted_origin(origin, port),
-        None => true,
-    }
 }
 
 async fn handle_ws_feed(
@@ -1831,6 +1957,7 @@ async fn handle_ws_feed(
                     ))
                     .await;
             }
+            // Intentionally ignore chat-send and all other privileged actions.
         }
     }
     ctx.state.feed.unregister(&profile_id, &sender).await;
@@ -1844,68 +1971,189 @@ async fn handle_ws_control(
     let (sender, mut receiver) = socket.split();
     let sender = Arc::new(tokio::sync::RwLock::new(sender));
     let mut authenticated = false;
+    let mut auth_platform = String::from("twitch");
+    let mut dock_mode = false;
 
-    while let Some(Ok(msg)) = receiver.next().await {
-        if let axum::extract::ws::Message::Text(text) = msg {
-            let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            match parsed.get("type").and_then(|v| v.as_str()) {
-                Some("auth") => {
-                    let token = parsed.get("token").and_then(|v| v.as_str()).unwrap_or("");
-                    if control_plane::control_token_matches(ctx.state.control_token(), token) {
-                        authenticated = true;
+    let auth_deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(control_plane::WS_CONTROL_AUTH_TIMEOUT_MS);
+
+    loop {
+        let remaining = auth_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if !authenticated && remaining.is_zero() {
+            break;
+        }
+        let next = if authenticated {
+            receiver.next().await
+        } else {
+            match tokio::time::timeout(remaining, receiver.next()).await {
+                Ok(v) => v,
+                Err(_) => break,
+            }
+        };
+        let Some(Ok(msg)) = next else {
+            break;
+        };
+        let axum::extract::ws::Message::Text(text) = msg else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        match parsed.get("type").and_then(|v| v.as_str()) {
+            Some("auth") => {
+                let token = parsed.get("token").and_then(|v| v.as_str()).unwrap_or("");
+                let platform = parsed
+                    .get("platform")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("twitch");
+                let ok = if crate::dock_capability::DockCredentialStore::is_dock_token(token) {
+                    dock_mode = true;
+                    auth_platform = platform.to_string();
+                    ctx.state
+                        .dock_credentials
+                        .authorize_chat_send(token, platform, &profile_id)
+                } else {
+                    dock_mode = false;
+                    // Master token on control socket is allowed only for same-install docks
+                    // that still use legacy until rotated; prefer dock credentials.
+                    control_plane::control_token_matches(ctx.state.control_token(), token)
+                };
+                if ok {
+                    authenticated = true;
+                    // Feed registration only after auth (and only for master-token sockets
+                    // that also want live feed). Dock-scoped sockets are send-only.
+                    if !dock_mode {
                         ctx.state
                             .feed
                             .register(profile_id.clone(), sender.clone())
                             .await;
-                        let mut s = sender.write().await;
-                        let _ = s
-                            .send(axum::extract::ws::Message::Text(
-                                json!({ "type": "auth-ok" }).to_string(),
-                            ))
-                            .await;
-                    } else {
-                        let mut s = sender.write().await;
-                        let _ = s
-                            .send(axum::extract::ws::Message::Text(
-                                json!({ "type": "auth-failed" }).to_string(),
-                            ))
-                            .await;
-                        break;
                     }
-                }
-                Some("ping") if authenticated => {
                     let mut s = sender.write().await;
                     let _ = s
                         .send(axum::extract::ws::Message::Text(
-                            json!({ "type": "pong", "ts": chrono::Utc::now().timestamp_millis() })
-                                .to_string(),
+                            json!({ "type": "auth-ok", "dockScoped": dock_mode }).to_string(),
                         ))
                         .await;
+                } else {
+                    let mut s = sender.write().await;
+                    let _ = s
+                        .send(axum::extract::ws::Message::Text(
+                            json!({ "type": "auth-failed" }).to_string(),
+                        ))
+                        .await;
+                    break;
                 }
-                Some("chat-send") if authenticated => {
-                    if let Some(text) = parsed.get("message").and_then(|v| v.as_str()) {
-                        let platform = parsed
-                            .get("platform")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("twitch");
-                        let result = if platform == "kick" {
-                            kick::send_chat_from_dock(ctx.state.clone(), text).await
-                        } else {
-                            twitch::send_chat_from_dock(ctx.state.clone(), ctx.twitch.clone(), text)
-                                .await
-                        };
-                        if let Err(e) = result {
+            }
+            Some("ping") if authenticated => {
+                let mut s = sender.write().await;
+                let _ = s
+                    .send(axum::extract::ws::Message::Text(
+                        json!({ "type": "pong", "ts": chrono::Utc::now().timestamp_millis() })
+                            .to_string(),
+                    ))
+                    .await;
+            }
+            Some("chat-send") if authenticated => {
+                if let Some(text) = parsed.get("message").and_then(|v| v.as_str()) {
+                    let platform = parsed
+                        .get("platform")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(auth_platform.as_str());
+                    if dock_mode && platform != auth_platform {
+                        let mut s = sender.write().await;
+                        let _ = s
+                            .send(axum::extract::ws::Message::Text(
+                                json!({ "type": "chat-send-result", "ok": false, "error": "platform_mismatch" })
+                                    .to_string(),
+                            ))
+                            .await;
+                        continue;
+                    }
+                    let result = if platform == "kick" {
+                        kick::send_chat_from_dock(ctx.state.clone(), text).await
+                    } else {
+                        twitch::send_chat_from_dock(ctx.state.clone(), ctx.twitch.clone(), text)
+                            .await
+                    };
+                    let mut s = sender.write().await;
+                    match result {
+                        Ok(()) => {
+                            let _ = s
+                                .send(axum::extract::ws::Message::Text(
+                                    json!({ "type": "chat-send-result", "ok": true }).to_string(),
+                                ))
+                                .await;
+                        }
+                        Err(e) => {
                             tracing::warn!("chat-send failed: {e:#}");
+                            let _ = s
+                                .send(axum::extract::ws::Message::Text(
+                                    json!({ "type": "chat-send-result", "ok": false, "error": "send_failed" })
+                                        .to_string(),
+                                ))
+                                .await;
                         }
                     }
                 }
-                _ => {}
             }
+            _ => {}
         }
     }
-    if authenticated {
+    if authenticated && !dock_mode {
         ctx.state.feed.unregister(&profile_id, &sender).await;
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct DockCredentialBody {
+    #[serde(default)]
+    platform: Option<String>,
+    #[serde(default, rename = "profileId")]
+    profile_id: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+async fn post_issue_dock_credential(
+    State(ctx): State<ServerContext>,
+    Json(body): Json<DockCredentialBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let platform = body.platform.as_deref().unwrap_or("twitch");
+    let profile_id = body.profile_id.as_deref().unwrap_or("chat-default");
+    let cred = ctx
+        .state
+        .dock_credentials
+        .issue(platform, profile_id)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "ok": false, "error": e.to_string() })),
+            )
+        })?;
+    Ok(Json(json!({
+        "ok": true,
+        "token": cred.token,
+        "platform": cred.platform,
+        "profileId": cred.profile_id,
+    })))
+}
+
+async fn post_revoke_dock_credential(
+    State(ctx): State<ServerContext>,
+    Json(body): Json<DockCredentialBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let token = body.token.as_deref().unwrap_or("").trim();
+    if token.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "missing_token" })),
+        ));
+    }
+    let revoked = ctx.state.dock_credentials.revoke(token).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        )
+    })?;
+    Ok(Json(json!({ "ok": true, "revoked": revoked })))
 }

@@ -605,9 +605,8 @@ const CHAT_OVERLAY_SETTINGS_PREFIX = "streamsync.chatOverlay.settings.v1.";
         popupExitStyle: settings.popupExitStyle || "fade",
       };
 
-      fetch(`${overlayBaseUrl()}/api/chat/overlay-config`, {
+      window.streamSyncControlApi.privilegedFetch("/api/chat/overlay-config", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       }).catch((err) => {
         console.warn("[ChatOverlayConfig] Failed to sync overlay settings:", err);
@@ -1011,15 +1010,17 @@ const CHAT_OVERLAY_SETTINGS_PREFIX = "streamsync.chatOverlay.settings.v1.";
         reader.readAsDataURL(file);
       });
 
-      const uploadRes = await fetch(`${overlayBaseUrl()}/api/chat/upload-font`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          profileId: normalizeOverlayProfileId(profileId),
-          fileName: file.name || "font.ttf",
-          contentBase64,
-        }),
-      });
+      const uploadRes = await window.streamSyncControlApi.privilegedFetch(
+        "/api/chat/upload-font",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            profileId: normalizeOverlayProfileId(profileId),
+            fileName: file.name || "font.ttf",
+            contentBase64,
+          }),
+        }
+      );
 
       if (!uploadRes.ok) throw new Error(`upload-failed:${uploadRes.status}`);
 

@@ -211,6 +211,7 @@ mod tests {
             fonts_dir: root.join("fonts"),
             events_media_dir: root.join("events-media"),
             control_token: root.join("control-token.txt"),
+            dock_credentials: root.join("dock-credentials.json"),
         };
         (root, paths)
     }

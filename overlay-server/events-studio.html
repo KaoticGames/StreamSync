@@ -1291,6 +1291,7 @@
 
   <div class="toast" id="toast"></div>
 
+  <script src="control-api.js"></script>
   <script src="/events-variation-picker.js"></script>
   <script>
     if (!window.StreamSyncVariationPicker) {
@@ -1300,6 +1301,42 @@
     }
   </script>
   <script>
+    async function privilegedFetch(path, options) {
+      const candidates = [];
+      const addCandidate = (candidate) => {
+        if (
+          candidate &&
+          typeof candidate.privilegedFetch === "function" &&
+          !candidates.includes(candidate)
+        ) {
+          candidates.push(candidate);
+        }
+      };
+
+      addCandidate(window.streamSyncControlApi);
+      try {
+        if (window.parent && window.parent !== window) {
+          addCandidate(window.parent.streamSyncControlApi);
+        }
+      } catch (_) {}
+      try {
+        if (window.opener && !window.opener.closed) {
+          addCandidate(window.opener.streamSyncControlApi);
+        }
+      } catch (_) {}
+
+      for (const api of candidates) {
+        try {
+          const capability =
+            typeof api.resolveCapability === "function"
+              ? await api.resolveCapability()
+              : "";
+          if (capability) return api.privilegedFetch(path, options);
+        } catch (_) {}
+      }
+      throw new Error("Stream Sync control capability unavailable");
+    }
+
     // =========================
     // Defaults / Schema
     // =========================
@@ -1827,9 +1864,8 @@ async function ensureProfilesPersistedToServer(profileIds) {
     }
 
     async function saveConfigToServer(profileId, cfg) {
-      const res = await fetch(`/api/events/overlay-config?profile=${encodeURIComponent(profileId)}`, {
+      const res = await privilegedFetch(`/api/events/overlay-config?profile=${encodeURIComponent(profileId)}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ config: cfg })
       });
       if (!res.ok) {
@@ -1840,7 +1876,7 @@ async function ensureProfilesPersistedToServer(profileIds) {
     }
 
     async function deleteProfileOnServer(profileId) {
-      const res = await fetch(`/api/events/overlay-config?profile=${encodeURIComponent(profileId)}`, {
+      const res = await privilegedFetch(`/api/events/overlay-config?profile=${encodeURIComponent(profileId)}`, {
         method: "DELETE",
       });
       if (!res.ok) {
@@ -3237,9 +3273,8 @@ async function ensureProfilesPersistedToServer(profileIds) {
 
             const base64 = await fileToBase64(f);
 
-            const res = await fetch("/api/chat/upload-font", {
+            const res = await privilegedFetch("/api/chat/upload-font", {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
                 profileId: `events-${profile}`,
                 fileName: f.name,
@@ -3659,7 +3694,7 @@ async function ensureProfilesPersistedToServer(profileIds) {
       const fd = new FormData();
       fd.append("profileId", profileId || "default");
       fd.append("file", file, file.name);
-      const res = await fetch("/api/events/upload-media", {
+      const res = await privilegedFetch("/api/events/upload-media", {
         method: "POST",
         body: fd,
       });
@@ -5010,9 +5045,8 @@ async function ensureProfilesPersistedToServer(profileIds) {
 
         const base64 = await fileToBase64(f);
 
-        const res = await fetch("/api/chat/upload-font", {
+        const res = await privilegedFetch("/api/chat/upload-font", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             profileId: `events-${profile}`,
             fileName: f.name,
@@ -5355,9 +5389,8 @@ async function ensureProfilesPersistedToServer(profileIds) {
 
       console.log("[Events Studio] Live test broadcast:", payload);
 
-      const res = await fetch("/api/events/test-alert", {
+      const res = await privilegedFetch("/api/events/test-alert", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
 

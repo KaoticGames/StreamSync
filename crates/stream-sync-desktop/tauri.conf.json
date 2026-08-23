@@ -12,8 +12,8 @@
     "withGlobalTauri": true,
     "windows": [],
     "security": {
-      "csp": null,
-      "dangerousDisableAssetCspModification": true
+      "csp": "default-src 'self' http://127.0.0.1:* http://localhost:*; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* https:; img-src 'self' data: https: http://127.0.0.1:* http://localhost:*; style-src 'self' 'unsafe-inline' http://127.0.0.1:* http://localhost:*; script-src 'self' 'unsafe-inline' http://127.0.0.1:* http://localhost:*; font-src 'self' data: http://127.0.0.1:* http://localhost:*; media-src 'self' http://127.0.0.1:* http://localhost:*; frame-src 'none'; object-src 'none'; base-uri 'none'",
+      "dangerousDisableAssetCspModification": false
     }
   },
   "bundle": {
@@ -38,6 +38,7 @@
       "../../renderer.js": "renderer.js",
       "../../overlay-client-config.js": "overlay-client-config.js",
       "../../tauri-bridge.js": "tauri-bridge.js",
+      "../../control-api.js": "control-api.js",
       "../../connections-api.js": "connections-api.js",
       "../../chat-dock-config.js": "chat-dock-config.js",
       "../../chat-overlay-config.js": "chat-overlay-config.js",

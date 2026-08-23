@@ -7,8 +7,10 @@ mod app_state;
 mod broadcast;
 mod config_types;
 mod control_plane;
+mod dock_capability;
 mod export;
 mod kick;
+mod oauth_pending;
 mod routes;
 mod storage;
 mod streamelements;
@@ -24,14 +26,17 @@ pub use streamelements::{
 pub use app_state::AppState;
 pub use config_types::*;
 pub use control_plane::{
-    authorize_privileged, control_plane_middleware, cors_layer, route_policy, RoutePolicy,
-    CONTROL_TOKEN_HEADER, MEDIA_UPLOAD_BODY_LIMIT, PRIVILEGED_JSON_BODY_LIMIT,
+    authorize_privileged, control_plane_middleware, cors_layer, load_or_create_control_token,
+    route_inventory, route_policy, RoutePolicy, CONTROL_TOKEN_HEADER, MEDIA_UPLOAD_BODY_LIMIT,
+    PRIVILEGED_JSON_BODY_LIMIT, WS_CONTROL_AUTH_TIMEOUT_MS,
 };
+pub use dock_capability::{DockCredential, DockCredentialStore};
 pub use export::{build_backup_zip, BackupManifest};
+pub use oauth_pending::{OAuthProvider, PendingLoginStore, LOGIN_NONCE_HEADER};
 pub use storage::{
     bootstrap_twitch_env_from_rust, get_paths, is_stream_sync_ui_bundle, is_stream_sync_workspace,
     legacy_electron_user_data, load_streamsync_dotenv, resolve_repo_root, resolve_ui_assets_root,
-    rust_dotenv_path, rust_workspace_root, StoragePaths,
+    rust_dotenv_path, rust_workspace_root, write_secret_file, StoragePaths,
 };
 
 /// Back-compat alias.

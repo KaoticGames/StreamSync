@@ -34,19 +34,37 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   showAbBannerIfNeeded();
 
+  const dockCredentialPromises = new Map();
+
   function patchIntegrationUrlInputs() {
     const base = OVERLAY_BASE_URL;
 
-    async function privilegedDockUrl(path) {
-      let token = window.STREAMSYNC_CONTROL_TOKEN || "";
-      if (!token && window.electronAPI?.getControlCapability) {
-        try {
-          token = await window.electronAPI.getControlCapability();
-          if (token) window.STREAMSYNC_CONTROL_TOKEN = token;
-        } catch (_) {}
+    async function privilegedDockUrl(path, platform, profileId) {
+      const key = `${platform}:${profileId}`;
+      if (!dockCredentialPromises.has(key)) {
+        dockCredentialPromises.set(
+          key,
+          window.streamSyncControlApi
+            .privilegedFetch("/api/dock/issue-credential", {
+              method: "POST",
+              body: JSON.stringify({ platform, profileId }),
+            })
+            .then(async (res) => {
+              const data = await res.json().catch(() => ({}));
+              const dockToken = String(data.token || "");
+              if (!res.ok || !data.ok || !dockToken.startsWith("ssd_")) {
+                throw new Error(data.error || `Dock credential failed: HTTP ${res.status}`);
+              }
+              return dockToken;
+            })
+            .catch((err) => {
+              dockCredentialPromises.delete(key);
+              throw err;
+            })
+        );
       }
-      if (!token) return `${base}${path}`;
-      return `${base}${path}#control=${encodeURIComponent(token)}`;
+      const dockToken = await dockCredentialPromises.get(key);
+      return `${base}${path}#control=${encodeURIComponent(dockToken)}`;
     }
 
     const tasks = [];
@@ -55,24 +73,54 @@ document.addEventListener("DOMContentLoaded", () => {
       const profile =
         el.getAttribute("data-overlay-profile") || "chat-default";
       if (kind === "chat-dock") {
-        tasks.push(privilegedDockUrl("/dock/chat").then((url) => { el.value = url; }));
+        tasks.push(
+          privilegedDockUrl("/dock/chat", "twitch", "chat-default").then((url) => {
+            el.value = url;
+          })
+        );
         return;
       }
       if (kind === "kick-chat-dock") {
-        tasks.push(privilegedDockUrl("/dock/kick-chat").then((url) => { el.value = url; }));
+        tasks.push(
+          privilegedDockUrl("/dock/kick-chat", "kick", "chat-default").then((url) => {
+            el.value = url;
+          })
+        );
+        return;
+      }
+      if (kind === "events-dock") {
+        tasks.push(
+          privilegedDockUrl(
+            "/dock/events",
+            "twitch",
+            el.getAttribute("data-overlay-profile") || "default"
+          ).then((url) => {
+            el.value = url;
+          })
+        );
+        return;
+      }
+      if (kind === "kick-events-dock") {
+        tasks.push(
+          privilegedDockUrl(
+            "/dock/kick-events",
+            "kick",
+            el.getAttribute("data-overlay-profile") || "default"
+          ).then((url) => {
+            el.value = url;
+          })
+        );
         return;
       }
       if (kind === "chat-overlay") {
         el.value = `${base}/overlay/chat?profile=${encodeURIComponent(profile)}`;
       }
-      if (kind === "events-dock") el.value = `${base}/dock/events`;
       if (kind === "events-overlay") {
         el.value = `${base}/overlay/events?profile=${encodeURIComponent(
           el.getAttribute("data-overlay-profile") || "default"
         )}`;
       }
       if (kind === "kick-chat-overlay") el.value = `${base}/overlay/kick-chat`;
-      if (kind === "kick-events-dock") el.value = `${base}/dock/kick-events`;
       if (kind === "kick-events-overlay") el.value = `${base}/overlay/kick-events`;
     });
     return Promise.all(tasks);
@@ -569,7 +617,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function fetchTwitchStatusOnce() {
       try {
-        const res = await fetch(`${OVERLAY_BASE_URL}/api/status`, {
+        const res = await window.streamSyncControlApi.privilegedFetch("/api/status", {
           cache: "no-cache",
         });
         if (!res.ok) {
@@ -785,9 +833,12 @@ document.addEventListener("DOMContentLoaded", () => {
           applySeStatus(sess);
           return;
         }
-        const res = await fetch(`${OVERLAY_BASE_URL}/api/streamelements/session`, {
-          cache: "no-cache",
-        });
+        const res = await window.streamSyncControlApi.privilegedFetch(
+          "/api/streamelements/session",
+          {
+            cache: "no-cache",
+          }
+        );
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         applySeStatus(await res.json());
       } catch (err) {
@@ -846,11 +897,13 @@ document.addEventListener("DOMContentLoaded", () => {
           if (window.streamSyncConnections?.seSaveSession) {
             return window.streamSyncConnections.seSaveSession(accountId, jwt);
           }
-          return fetch(`${OVERLAY_BASE_URL}/api/streamelements/session`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ accountId, jwt }),
-          }).then((res) => {
+          return window.streamSyncControlApi.privilegedFetch(
+            "/api/streamelements/session",
+            {
+              method: "POST",
+              body: JSON.stringify({ accountId, jwt }),
+            }
+          ).then((res) => {
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
           });
         });
@@ -865,11 +918,13 @@ document.addEventListener("DOMContentLoaded", () => {
           if (window.streamSyncConnections?.seDisconnect) {
             return window.streamSyncConnections.seDisconnect();
           }
-          return fetch(`${OVERLAY_BASE_URL}/api/streamelements/session`, {
-            method: "DELETE",
-          }).then((res) => {
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          });
+          return window.streamSyncControlApi
+            .privilegedFetch("/api/streamelements/session", {
+              method: "DELETE",
+            })
+            .then((res) => {
+              if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            });
         });
       });
     }

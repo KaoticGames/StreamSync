@@ -57,8 +57,12 @@ fn kick_from_exchange(exchange: &ExchangeSuccess) -> Option<KickTokenFile> {
     })
 }
 
-pub fn auth_url(state: &AppState) -> String {
-    let return_url = format!("http://localhost:{}/auth/kick/callback", state.port);
+pub fn auth_url(state: &AppState, flow_nonce: &str) -> String {
+    let return_url = format!(
+        "http://localhost:{}/auth/kick/callback?flow={}",
+        state.port,
+        urlencoding::encode(flow_nonce)
+    );
     format!(
         "{}/api/auth/kick/stream-sync?return={}",
         syndicate_connection::api_base(),
@@ -596,6 +600,8 @@ fn mark_kick_message_seen(message_id: &str) -> bool {
 #[derive(Debug, Deserialize)]
 pub struct KickRedeemBody {
     pub code: String,
+    #[serde(default, alias = "flowNonce")]
+    pub flow_nonce: Option<String>,
 }
 
 #[cfg(test)]

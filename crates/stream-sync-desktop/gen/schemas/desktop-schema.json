@@ -555,16 +555,22 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Allow main window to retrieve the localhost control capability once for privileged HTTP",
+          "type": "string",
+          "const": "allow-control-capability",
+          "markdownDescription": "Allow main window to retrieve the localhost control capability once for privileged HTTP"
+        },
+        {
           "description": "StreamElements auth webview invoke commands",
           "type": "string",
           "const": "allow-se-auth-commands",
           "markdownDescription": "StreamElements auth webview invoke commands"
         },
         {
-          "description": "Stream Sync desktop invoke commands",
+          "description": "Stream Sync desktop invoke commands (non-secret)",
           "type": "string",
           "const": "allow-stream-sync-commands",
-          "markdownDescription": "Stream Sync desktop invoke commands"
+          "markdownDescription": "Stream Sync desktop invoke commands (non-secret)"
         },
         {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
