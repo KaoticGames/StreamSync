@@ -1,7 +1,7 @@
 //! HTTP routes (port of overlay-server/server.js Express routes).
 
 use crate::app_state::{normalize_chat_profile_id, AppState};
-use crate::broadcast::make_dock_event;
+use crate::broadcast::{make_dock_event, FeedAudience};
 use crate::config_types::{
     normalize_display_mode, normalize_popup_duration, resolve_events_overlay_profile,
     ChatOverlayProfile,
@@ -32,6 +32,17 @@ use tower_http::set_header::SetResponseHeaderLayer;
 pub struct ServerContext {
     pub state: Arc<AppState>,
     pub twitch: Arc<TwitchServices>,
+}
+
+fn readonly_status() -> StatusCode {
+    StatusCode::FORBIDDEN
+}
+
+fn readonly_json() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "ok": false, "error": "readonly" })),
+    )
 }
 
 /// Route registrations maintained beside build_router, independently of security policy.
@@ -216,11 +227,16 @@ async fn csp_response_headers(
                 .to_string(),
         )
     } else if !path.starts_with("/api/") && !path.starts_with("/ws/") {
+        let frame_policy = if path.starts_with("/overlay/") {
+            "frame-ancestors 'self'"
+        } else {
+            "frame-ancestors 'none'"
+        };
         Some(format!(
             "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; \
              connect-src 'self' ws://127.0.0.1:{0} ws://localhost:{0}; \
              img-src 'self' data: https:; font-src 'self' data:; media-src 'self'; \
-             object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+             object-src 'none'; frame-src 'self'; base-uri 'none'; form-action 'self'; {frame_policy}",
             state.port
         ))
     } else {
@@ -694,6 +710,9 @@ async fn post_chat_dock_config(
     State(ctx): State<ServerContext>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
+    if ctx.state.readonly {
+        return Err(readonly_status());
+    }
     let profile_id = body
         .get("profileId")
         .and_then(|v| v.as_str())
@@ -748,6 +767,9 @@ async fn post_events_dock_config(
     State(ctx): State<ServerContext>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
+    if ctx.state.readonly {
+        return Err(readonly_status());
+    }
     let mut cfg = ctx.state.events_dock_config.write().await;
     if let Some(fs) = body.get("fontSize").and_then(|v| v.as_u64()) {
         cfg.font_size = fs as u32;
@@ -793,6 +815,9 @@ async fn post_upload_font(
     State(ctx): State<ServerContext>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
+    if ctx.state.readonly {
+        return Err(readonly_status());
+    }
     let profile_id = normalize_chat_profile_id(
         body.get("profileId")
             .and_then(|v| v.as_str())
@@ -908,6 +933,9 @@ async fn post_upload_events_media(
     State(ctx): State<ServerContext>,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if ctx.state.readonly {
+        return Err(readonly_json());
+    }
     let mut profile_id = String::from("default");
     let mut file_name = String::from("asset.bin");
     let mut bytes: Option<Vec<u8>> = None;
@@ -1045,6 +1073,7 @@ async fn get_overlay_profiles(State(ctx): State<ServerContext>) -> Json<Value> {
 #[derive(Deserialize)]
 struct ProfileQuery {
     profile: Option<String>,
+    audience: Option<String>,
 }
 
 fn overlay_profile_api_json(profile_id: &str, p: &ChatOverlayProfile) -> Value {
@@ -1094,6 +1123,9 @@ async fn post_overlay_config(
     State(ctx): State<ServerContext>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
+    if ctx.state.readonly {
+        return Err(readonly_status());
+    }
     let profile_id = normalize_chat_profile_id(
         body.get("profileId")
             .and_then(|v| v.as_str())
@@ -1229,6 +1261,9 @@ async fn delete_overlay_config(
     State(ctx): State<ServerContext>,
     Query(q): Query<ProfileQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if ctx.state.readonly {
+        return Err(readonly_json());
+    }
     let profile_id = normalize_chat_profile_id(q.profile.as_deref().unwrap_or("chat-default"));
     if profile_id == "chat-default" {
         return Err((
@@ -1350,6 +1385,9 @@ async fn post_set_token(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if ctx.state.readonly {
+        return Err(readonly_json());
+    }
     let body_nonce = body.get("flowNonce").and_then(|v| v.as_str());
     let reservation = oauth_completion_allowed(
         &ctx.state,
@@ -1375,6 +1413,9 @@ async fn post_connection_key(
     State(ctx): State<ServerContext>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if ctx.state.readonly {
+        return Err(readonly_json());
+    }
     let key = body
         .get("key")
         .and_then(|v| v.as_str())
@@ -1437,6 +1478,9 @@ async fn post_use_connection(
     State(ctx): State<ServerContext>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if ctx.state.readonly {
+        return Err(readonly_json());
+    }
     let mode = parse_connection_mode(&body)?;
     twitch::use_connection(ctx.state.clone(), ctx.twitch.clone(), mode)
         .await
@@ -1459,6 +1503,9 @@ async fn post_remove_connection(
     State(ctx): State<ServerContext>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if ctx.state.readonly {
+        return Err(readonly_json());
+    }
     let mode = parse_connection_mode(&body)?;
     twitch::remove_connection(ctx.state.clone(), ctx.twitch.clone(), mode)
         .await
@@ -1472,6 +1519,9 @@ async fn post_remove_connection(
 }
 
 async fn post_disconnect(State(ctx): State<ServerContext>) -> Json<Value> {
+    if ctx.state.readonly {
+        return Json(json!({ "ok": false, "error": "readonly" }));
+    }
     let _ = twitch::disconnect_twitch(ctx.state.clone(), ctx.twitch.clone()).await;
     Json(json!({ "ok": true }))
 }
@@ -1493,6 +1543,13 @@ async fn post_kick_redeem(
     headers: HeaderMap,
     Json(body): Json<kick::KickRedeemBody>,
 ) -> Response {
+    if ctx.state.readonly {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "readonly" })),
+        )
+            .into_response();
+    }
     let reservation = match oauth_completion_allowed(
         &ctx.state,
         &headers,
@@ -1525,6 +1582,9 @@ async fn post_kick_redeem(
 }
 
 async fn post_kick_disconnect(State(ctx): State<ServerContext>) -> Json<Value> {
+    if ctx.state.readonly {
+        return Json(json!({ "ok": false, "error": "readonly" }));
+    }
     let _ = kick::disconnect_personal(ctx.state.clone()).await;
     Json(json!({ "ok": true }))
 }
@@ -1538,6 +1598,13 @@ async fn post_kick_chat(
     State(ctx): State<ServerContext>,
     Json(body): Json<KickChatBody>,
 ) -> Response {
+    if ctx.state.readonly {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "readonly" })),
+        )
+            .into_response();
+    }
     match kick::send_chat_from_dock(ctx.state.clone(), &body.message).await {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(e) => (
@@ -1620,6 +1687,9 @@ async fn post_events_overlay_config(
     Query(q): Query<ProfileQuery>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
+    if ctx.state.readonly {
+        return Err(readonly_status());
+    }
     let profile_id = q
         .profile
         .as_deref()
@@ -1763,9 +1833,10 @@ async fn post_se_session(
 }
 
 async fn delete_se_session(State(ctx): State<ServerContext>) -> Json<Value> {
-    if !ctx.state.readonly {
-        let _ = streamelements::clear_session(&ctx.state.paths);
+    if ctx.state.readonly {
+        return Json(json!({ "ok": false, "error": "readonly" }));
     }
+    let _ = streamelements::clear_session(&ctx.state.paths);
     Json(json!({ "ok": true, "connected": false }))
 }
 
@@ -1903,6 +1974,9 @@ async fn delete_events_overlay_config(
     State(ctx): State<ServerContext>,
     Query(q): Query<ProfileQuery>,
 ) -> Json<Value> {
+    if ctx.state.readonly {
+        return Json(json!({ "ok": false, "error": "readonly" }));
+    }
     let id = q.profile.as_deref().unwrap_or("default");
     if id != "default" {
         ctx.state
@@ -1921,6 +1995,9 @@ async fn post_test_alert(
     Query(q): Query<ProfileQuery>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
+    if ctx.state.readonly {
+        return Json(json!({ "ok": false, "error": "readonly" }));
+    }
     let profile_id = q
         .profile
         .as_deref()
@@ -2052,7 +2129,8 @@ async fn ws_feed(
         return control_plane::unauthorized_response();
     }
     let profile_id = q.profile.unwrap_or_else(|| "default".into());
-    ws.on_upgrade(move |socket| handle_ws_feed(socket, ctx, profile_id))
+    let audience = FeedAudience::parse(q.audience.as_deref());
+    ws.on_upgrade(move |socket| handle_ws_feed(socket, ctx, profile_id, audience))
 }
 
 async fn ws_control(
@@ -2072,12 +2150,13 @@ async fn handle_ws_feed(
     socket: axum::extract::ws::WebSocket,
     ctx: ServerContext,
     profile_id: String,
+    audience: FeedAudience,
 ) {
     let (sender, mut receiver) = socket.split();
     let sender = Arc::new(tokio::sync::RwLock::new(sender));
     ctx.state
         .feed
-        .register(profile_id.clone(), sender.clone())
+        .register(profile_id.clone(), audience, sender.clone())
         .await;
 
     let events_cfg = ctx.state.events_dock_config.read().await.clone();
@@ -2167,10 +2246,24 @@ async fn handle_ws_control(
                         .dock_credentials
                         .authorize_chat_send(token, platform, &profile_id);
                 if ok {
+                    let (id, rx) = ctx.state.dock_controls.register(token);
+                    if !ctx
+                        .state
+                        .dock_credentials
+                        .authorize_chat_send(token, platform, &profile_id)
+                    {
+                        ctx.state.dock_controls.unregister(token, id);
+                        let mut s = sender.write().await;
+                        let _ = s
+                            .send(axum::extract::ws::Message::Text(
+                                json!({ "type": "auth-failed" }).to_string(),
+                            ))
+                            .await;
+                        break;
+                    }
                     authenticated = true;
                     auth_platform = platform.to_string();
                     auth_token = token.to_string();
-                    let (id, rx) = ctx.state.dock_controls.register(token);
                     registry_id = Some(id);
                     revocation_rx = Some(rx);
                     let mut s = sender.write().await;

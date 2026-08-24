@@ -474,6 +474,110 @@ pub fn ensure_secret_file_permissions(path: &Path) -> Result<()> {
     apply_secret_file_permissions(path)
 }
 
+/// Cross-process advisory lock using an exclusive lock file (held open for lifetime).
+pub struct CrossProcessLock {
+    path: PathBuf,
+    owner: String,
+    _file: std::fs::File,
+}
+
+impl Drop for CrossProcessLock {
+    fn drop(&mut self) {
+        if std::fs::read_to_string(&self.path)
+            .map(|current| current == self.owner)
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+pub fn acquire_cross_process_lock(lock_path: &Path) -> Result<CrossProcessLock> {
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let owner = format!("{} {}", std::process::id(), uuid::Uuid::new_v4());
+    for attempt in 0..800 {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
+            Ok(mut file) => {
+                file.write_all(owner.as_bytes())?;
+                file.sync_all()?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(lock_path, fs::Permissions::from_mode(0o600));
+                }
+                return Ok(CrossProcessLock {
+                    path: lock_path.to_path_buf(),
+                    owner,
+                    _file: file,
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if attempt > 80 {
+                    if let Ok(stale_owner) = fs::read_to_string(lock_path) {
+                        if !lock_owner_is_alive(&stale_owner)
+                            && fs::read_to_string(lock_path)
+                                .map(|current| current == stale_owner)
+                                .unwrap_or(false)
+                        {
+                            let quarantine = lock_path
+                                .with_extension(format!("stale-{}", uuid::Uuid::new_v4().simple()));
+                            let _ = fs::rename(lock_path, &quarantine);
+                            let _ = fs::remove_file(quarantine);
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    anyhow::bail!(
+        "timed out waiting for cross-process lock at {}",
+        lock_path.display()
+    )
+}
+
+fn lock_owner_is_alive(owner: &str) -> bool {
+    let Some(pid) = owner
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::process::Command;
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        use std::process::Command;
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}")])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|line| line.contains(&pid.to_string()))
+            })
+            .unwrap_or(false)
+    }
+}
+
 pub fn read_json_or_default<T>(path: &Path, default: &T) -> Result<T>
 where
     T: Serialize + DeserializeOwned + Clone,

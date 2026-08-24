@@ -46,56 +46,32 @@
       externalServer: false,
     };
 
-    async function twitchViaIpc(cmd) {
-      return invoke(cmd);
-    }
-
     async function twitchConnect() {
-      try {
-        await twitchViaIpc("twitch_connect");
-      } catch (e) {
-        console.warn("[tauri-bridge] IPC twitch_connect failed, using HTTP:", e);
-        if (window.streamSyncConnections?.connect) {
-          return window.streamSyncConnections.connect();
-        }
-        throw e;
+      if (window.streamSyncConnections?.connect) {
+        return window.streamSyncConnections.connect();
       }
+      throw new Error("Stream Sync connections API unavailable");
     }
 
     async function twitchReconnect() {
-      try {
-        await twitchViaIpc("twitch_reconnect");
-      } catch (e) {
-        console.warn("[tauri-bridge] IPC twitch_reconnect failed, using HTTP:", e);
-        if (window.streamSyncConnections?.reconnect) {
-          return window.streamSyncConnections.reconnect();
-        }
-        throw e;
+      if (window.streamSyncConnections?.reconnect) {
+        return window.streamSyncConnections.reconnect();
       }
+      throw new Error("Stream Sync connections API unavailable");
     }
 
     async function twitchDisconnect() {
-      try {
-        await twitchViaIpc("twitch_disconnect");
-      } catch (e) {
-        console.warn("[tauri-bridge] IPC twitch_disconnect failed, using HTTP:", e);
-        if (window.streamSyncConnections?.disconnect) {
-          return window.streamSyncConnections.disconnect();
-        }
-        throw e;
+      if (window.streamSyncConnections?.disconnect) {
+        return window.streamSyncConnections.disconnect();
       }
+      throw new Error("Stream Sync connections API unavailable");
     }
 
     async function kickConnect() {
-      try {
-        await invoke("kick_connect");
-      } catch (e) {
-        console.warn("[tauri-bridge] IPC kick_connect failed, using HTTP:", e);
-        if (window.streamSyncConnections?.kickConnect) {
-          return window.streamSyncConnections.kickConnect();
-        }
-        throw e;
+      if (window.streamSyncConnections?.kickConnect) {
+        return window.streamSyncConnections.kickConnect();
       }
+      throw new Error("Stream Sync connections API unavailable");
     }
 
     window.electronAPI = {

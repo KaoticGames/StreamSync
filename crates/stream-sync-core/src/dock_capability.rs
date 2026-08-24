@@ -1,6 +1,7 @@
 //! Scoped, revocable chat-dock credentials (not the master control capability).
 
 use crate::control_plane::constant_time_eq;
+use crate::storage::{self, acquire_cross_process_lock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -35,16 +36,8 @@ impl DockCredentialStore {
             inner: Mutex::new(HashMap::new()),
         };
         if path.is_file() {
-            crate::storage::ensure_secret_file_permissions(path)?;
-            let raw = std::fs::read_to_string(path)?;
-            if let Ok(file) = serde_json::from_str::<DockCredentialFile>(&raw) {
-                let mut guard = store.inner.lock().expect("dock cred lock");
-                for c in file.credentials {
-                    if c.token.starts_with(DOCK_TOKEN_PREFIX) {
-                        guard.insert(c.token.clone(), c);
-                    }
-                }
-            }
+            storage::ensure_secret_file_permissions(path)?;
+            store.reload_locked()?;
         }
         Ok(store)
     }
@@ -69,43 +62,46 @@ impl DockCredentialStore {
             active: true,
             created_at_ms: chrono::Utc::now().timestamp_millis(),
         };
-        let mut guard = self.inner.lock().expect("dock cred lock");
-        let mut next = guard.clone();
-        next.insert(token, cred.clone());
-        self.persist_snapshot(&next)?;
-        *guard = next;
-        Ok(cred)
+        self.with_locked_mut(|map| {
+            let mut next = map.clone();
+            next.insert(token.clone(), cred.clone());
+            self.persist_map(&next)?;
+            *map = next;
+            Ok(cred)
+        })
     }
 
     pub fn revoke(&self, token: &str) -> anyhow::Result<bool> {
-        let mut guard = self.inner.lock().expect("dock cred lock");
-        let mut next = guard.clone();
-        let changed = if let Some(c) = next.get_mut(token) {
-            if c.active {
-                c.active = false;
-                true
+        self.with_locked_mut(|map| {
+            let mut next = map.clone();
+            let changed = if let Some(c) = next.get_mut(token) {
+                if c.active {
+                    c.active = false;
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
+            };
+            if changed {
+                self.persist_map(&next)?;
+                *map = next;
             }
-        } else {
-            false
-        };
-        if changed {
-            self.persist_snapshot(&next)?;
-            *guard = next;
-        }
-        Ok(changed)
+            Ok(changed)
+        })
     }
 
     pub fn revoke_all(&self) -> anyhow::Result<()> {
-        let mut guard = self.inner.lock().expect("dock cred lock");
-        let mut next = guard.clone();
-        for c in next.values_mut() {
-            c.active = false;
-        }
-        self.persist_snapshot(&next)?;
-        *guard = next;
-        Ok(())
+        self.with_locked_mut(|map| {
+            let mut next = map.clone();
+            for c in next.values_mut() {
+                c.active = false;
+            }
+            self.persist_map(&next)?;
+            *map = next;
+            Ok(())
+        })
     }
 
     /// Validate chat-send authority for platform/profile. Never authorizes HTTP control.
@@ -142,15 +138,45 @@ impl DockCredentialStore {
             .count()
     }
 
-    fn persist_snapshot(
+    fn lock_path(&self) -> std::path::PathBuf {
+        self.path.with_extension("store.lock")
+    }
+
+    fn with_locked_mut<T>(
         &self,
-        credentials: &HashMap<String, DockCredential>,
-    ) -> anyhow::Result<()> {
+        f: impl FnOnce(&mut HashMap<String, DockCredential>) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let _lock = acquire_cross_process_lock(&self.lock_path())?;
+        self.reload_locked()?;
+        let mut guard = self.inner.lock().expect("dock cred lock");
+        let result = f(&mut guard)?;
+        Ok(result)
+    }
+
+    fn reload_locked(&self) -> anyhow::Result<()> {
+        let mut guard = self.inner.lock().expect("dock cred lock");
+        guard.clear();
+        if !self.path.is_file() {
+            return Ok(());
+        }
+        storage::ensure_secret_file_permissions(&self.path)?;
+        let raw = std::fs::read_to_string(&self.path)?;
+        if let Ok(file) = serde_json::from_str::<DockCredentialFile>(&raw) {
+            for c in file.credentials {
+                if c.token.starts_with(DOCK_TOKEN_PREFIX) {
+                    guard.insert(c.token.clone(), c);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_map(&self, credentials: &HashMap<String, DockCredential>) -> anyhow::Result<()> {
         let file = DockCredentialFile {
             credentials: credentials.values().cloned().collect(),
         };
         let data = serde_json::to_vec_pretty(&file)?;
-        crate::storage::write_secret_file(&self.path, &data)?;
+        storage::write_secret_file(&self.path, &data)?;
         Ok(())
     }
 }
@@ -171,7 +197,7 @@ mod tests {
 
     fn tmp_path() -> std::path::PathBuf {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("streamsync-dock-cred-{n}.json"))
+        std::env::temp_dir().join(format!("streamsync-dock-cred-{}-{}", std::process::id(), n))
     }
 
     #[test]
@@ -183,6 +209,7 @@ mod tests {
         assert!(c.token.starts_with(DOCK_TOKEN_PREFIX));
         assert!(!c.token.starts_with("ssc_"));
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("store.lock"));
     }
 
     #[test]
@@ -195,6 +222,7 @@ mod tests {
         store.revoke(&c.token).unwrap();
         assert!(!store.authorize_chat_send(&c.token, "kick", "chat-default"));
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("store.lock"));
     }
 
     #[test]
@@ -206,6 +234,7 @@ mod tests {
         assert!(!store.authorize_chat_send(&c.token, "kick", "chat-default"));
         assert!(!store.authorize_chat_send(&c.token, "twitch", "other"));
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("store.lock"));
     }
 
     #[test]
@@ -233,6 +262,28 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("store.lock"));
+    }
+
+    #[test]
+    fn stale_store_cannot_resurrect_revoked_credential() {
+        let path = tmp_path();
+        let _ = std::fs::remove_file(&path);
+        let store_a = DockCredentialStore::load_or_create(&path).unwrap();
+        let cred = store_a.issue("twitch", "chat-default").unwrap();
+        store_a.revoke(&cred.token).unwrap();
+        assert!(!store_a.authorize_chat_send(&cred.token, "twitch", "chat-default"));
+
+        let store_b = DockCredentialStore::load_or_create(&path).unwrap();
+        let stale = store_b.issue("kick", "other-profile").unwrap();
+        assert!(store_b.authorize_chat_send(&stale.token, "kick", "other-profile"));
+
+        let reloaded = DockCredentialStore::load_or_create(&path).unwrap();
+        assert!(!reloaded.authorize_chat_send(&cred.token, "twitch", "chat-default"));
+        assert!(reloaded.authorize_chat_send(&stale.token, "kick", "other-profile"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("store.lock"));
     }
 
     #[test]

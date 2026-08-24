@@ -26,6 +26,8 @@
     return null;
   }
 
+  const standaloneReadOnly = !getInvoke();
+
   function validateRelativeApiPath(path) {
     const p = String(path || "").trim();
     if (!p || !p.startsWith("/api/")) {
@@ -44,6 +46,26 @@
     return p;
   }
 
+  async function readFormDataUpload(formData) {
+    const profileId = formData.get("profile") || formData.get("profileId") || "default";
+    const file = formData.get("file");
+    if (!file || typeof file.arrayBuffer !== "function") {
+      throw new Error("missing_upload_file");
+    }
+    const buffer = await file.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += 1) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return {
+      profile_id: String(profileId),
+      file_name: file.name || "asset.bin",
+      content_type: file.type || "application/octet-stream",
+      data_base64: btoa(binary),
+    };
+  }
+
   async function privilegedFetch(path, options) {
     const safePath = validateRelativeApiPath(path);
     const opts = Object.assign({}, options || {});
@@ -51,12 +73,35 @@
     const invoke = getInvoke();
 
     if (invoke) {
+      if (typeof FormData !== "undefined" && opts.body instanceof FormData) {
+        if (safePath === "/api/events/upload-media" && method === "POST") {
+          const upload = await readFormDataUpload(opts.body);
+          const result = await invoke("overlay_media_upload", { request: upload });
+          const status = Number(result && result.status) || 0;
+          const text = (result && result.body) || "";
+          const res = {
+            ok: status >= 200 && status < 300,
+            status,
+            async text() {
+              return text;
+            },
+            async json() {
+              return JSON.parse(text || "null");
+            },
+          };
+          if (status === 401) {
+            const err = new Error("unauthorized");
+            err.code = "unauthorized";
+            err.status = 401;
+            throw err;
+          }
+          return res;
+        }
+        throw new Error("multipart_requires_native_handling");
+      }
       let body = undefined;
       let body_base64 = false;
       if (opts.body != null) {
-        if (typeof FormData !== "undefined" && opts.body instanceof FormData) {
-          throw new Error("multipart_requires_native_handling");
-        }
         if (typeof opts.body === "string") {
           body = opts.body;
         } else {
@@ -87,7 +132,12 @@
       return res;
     }
 
-    // Non-Tauri dev fallback: same-origin relative fetch only (no capability header).
+    if (standaloneReadOnly && method !== "GET" && method !== "HEAD") {
+      const err = new Error("desktop_required_for_mutation");
+      err.code = "desktop_required";
+      throw err;
+    }
+
     const url = `${overlayBase()}${safePath}`;
     const headers = Object.assign({}, opts.headers || {});
     if (opts.body && !headers["Content-Type"] && !headers["content-type"]) {
@@ -106,5 +156,8 @@
   global.streamSyncControlApi = {
     overlayBase,
     privilegedFetch,
+    standaloneReadOnly,
+    desktopRequiredMessage:
+      "Saving and uploads require the Stream Sync desktop app. Read-only preview remains available in the browser.",
   };
 })(typeof window !== "undefined" ? window : globalThis);

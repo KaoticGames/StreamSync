@@ -1754,18 +1754,26 @@ async fn handle_eventsub_notification(feed: &FeedHub, sub_type: &str, event: &Va
                 .unwrap_or("");
             let cost = event.pointer("/reward/cost").and_then(|v| v.as_u64());
             let mut detail = format!("{title} — {user}");
-            if !input.is_empty() {
-                detail.push_str(&format!(": {input}"));
-            }
             if let Some(c) = cost {
                 detail.push_str(&format!(" ({c} pts)"));
             }
-            // Channel points are dock-only — not routed through events overlays.
-            feed.broadcast_profile(
+            // Channel points are dock-only — never reach public overlays.
+            feed.broadcast_readonly_dock(
                 "default",
                 &make_dock_event("redeem", &detail, Some("Channel Points"), None),
             )
             .await;
+            if !input.is_empty() {
+                let mut private = format!("{title} — {user}: {input}");
+                if let Some(c) = cost {
+                    private.push_str(&format!(" ({c} pts)"));
+                }
+                feed.broadcast_private_dock(
+                    "default",
+                    &make_dock_event("redeem", &private, Some("Channel Points"), None),
+                )
+                .await;
+            }
         }
         _ => {}
     }

@@ -130,6 +130,7 @@ pub fn run() {
             commands::get_overlay_base_url,
             commands::get_overlay_port,
             commands::overlay_api_request,
+            commands::overlay_media_upload,
             commands::open_external,
             commands::open_logs_folder,
             commands::open_discord,

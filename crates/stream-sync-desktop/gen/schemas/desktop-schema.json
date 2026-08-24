@@ -561,6 +561,12 @@
           "markdownDescription": "Narrow native proxy for privileged overlay HTTP (main window only)"
         },
         {
+          "description": "Narrow native commands for the external main StreamSync webview (validated in Rust)",
+          "type": "string",
+          "const": "allow-remote-main-ui",
+          "markdownDescription": "Narrow native commands for the external main StreamSync webview (validated in Rust)"
+        },
+        {
           "description": "StreamElements auth webview invoke commands",
           "type": "string",
           "const": "allow-se-auth-commands",

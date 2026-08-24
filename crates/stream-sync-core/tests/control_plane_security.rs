@@ -21,7 +21,10 @@ static TEST_SETUP_LOCK: Mutex<()> = Mutex::new(());
 
 fn test_userdata_dir() -> PathBuf {
     let n = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("streamsync-control-plane-test-{n}"));
+    let dir = std::env::temp_dir().join(format!(
+        "streamsync-control-plane-test-{}-{n}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create test userdata dir");
     dir
@@ -281,7 +284,7 @@ async fn login_nonce_cannot_call_disconnect() {
 #[tokio::test]
 async fn login_nonce_replay_and_wrong_provider_fail() {
     let port = 14147;
-    let (router, state) = test_app(port).await;
+    let (router, state) = test_app_mode(port, false).await;
     let nonce = state
         .pending_logins
         .create(stream_sync_core::OAuthProvider::Kick);
@@ -790,6 +793,8 @@ fn channel_point_private_input_is_profile_scoped() {
         .split("_ => {}")
         .next()
         .unwrap();
-    assert!(redemption.contains("broadcast_profile"));
+    assert!(redemption.contains("broadcast_readonly_dock"));
+    assert!(redemption.contains("broadcast_private_dock"));
     assert!(!redemption.contains("broadcast_all"));
+    assert!(!redemption.contains("broadcast_profile"));
 }

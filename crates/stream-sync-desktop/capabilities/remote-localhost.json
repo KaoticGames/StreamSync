@@ -10,7 +10,7 @@
     ]
   },
   "permissions": [
-    "allow-stream-sync-commands",
+    "allow-remote-main-ui",
     "allow-overlay-api-proxy",
     "opener:default",
     "shell:allow-open",

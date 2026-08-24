@@ -1,0 +1,14 @@
+[[permission]]
+identifier = "allow-remote-main-ui"
+description = "Narrow native commands for the external main StreamSync webview (validated in Rust)"
+commands.allow = [
+  "get_overlay_base_url",
+  "get_overlay_port",
+  "open_external",
+  "open_logs_folder",
+  "open_discord",
+  "open_se_account_page",
+  "export_backup",
+  "check_for_updates",
+  "purge_logs",
+]

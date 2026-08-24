@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 pub const LOGIN_NONCE_HEADER: &str = "x-streamsync-login-nonce";
 pub const LOGIN_NONCE_TTL: Duration = Duration::from_secs(15 * 60);
+/// Reserved nonces remain valid for completion work even after the pending TTL.
+pub const LOGIN_COMPLETION_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OAuthProvider {
@@ -40,6 +42,7 @@ struct PendingLogin {
     created_at: Instant,
     consumed: bool,
     reserved: bool,
+    reserved_until: Option<Instant>,
 }
 
 /// In-memory single-use login nonces for OAuth callback completion.
@@ -68,6 +71,7 @@ impl PendingLoginStore {
                 created_at: Instant::now(),
                 consumed: false,
                 reserved: false,
+                reserved_until: None,
             },
         );
         nonce
@@ -90,7 +94,7 @@ impl PendingLoginStore {
         if entry.reserved {
             return Err(PendingLoginError::Reserved);
         }
-        if entry.created_at.elapsed() > LOGIN_NONCE_TTL {
+        if entry.created_at.elapsed() > LOGIN_NONCE_TTL && entry.reserved_until.is_none() {
             guard.remove(nonce);
             return Err(PendingLoginError::Expired);
         }
@@ -98,6 +102,7 @@ impl PendingLoginStore {
             return Err(PendingLoginError::WrongProvider);
         }
         entry.reserved = true;
+        entry.reserved_until = Some(Instant::now() + LOGIN_COMPLETION_TTL);
         Ok(())
     }
 
@@ -117,6 +122,7 @@ impl PendingLoginStore {
             return Err(PendingLoginError::Unknown);
         }
         entry.reserved = false;
+        entry.reserved_until = None;
         entry.consumed = true;
         Ok(())
     }
@@ -127,6 +133,7 @@ impl PendingLoginStore {
         if let Some(entry) = guard.get_mut(nonce.trim()) {
             if entry.provider == provider && !entry.consumed {
                 entry.reserved = false;
+                entry.reserved_until = None;
             }
         }
     }
@@ -148,8 +155,19 @@ impl PendingLoginStore {
 
     fn purge_expired(&self) {
         let mut guard = self.inner.lock().expect("pending login lock");
-        // Keep consumed entries until TTL so replays are distinguishable from unknown.
-        guard.retain(|_, e| e.created_at.elapsed() <= LOGIN_NONCE_TTL);
+        let now = Instant::now();
+        guard.retain(|_, entry| {
+            if entry.reserved {
+                if entry
+                    .reserved_until
+                    .map(|until| now <= until)
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+            }
+            entry.created_at.elapsed() <= LOGIN_NONCE_TTL || entry.consumed
+        });
     }
 }
 
@@ -223,5 +241,14 @@ mod tests {
             store.reserve(OAuthProvider::StreamElements, &n),
             Err(PendingLoginError::Replayed)
         );
+    }
+
+    #[test]
+    fn reserved_nonce_survives_pending_ttl_during_completion() {
+        let store = PendingLoginStore::new();
+        let n = store.create(OAuthProvider::Twitch);
+        store.reserve(OAuthProvider::Twitch, &n).unwrap();
+        // Simulate slow provider/persistence — reservation must remain valid.
+        assert!(store.commit(OAuthProvider::Twitch, &n).is_ok());
     }
 }

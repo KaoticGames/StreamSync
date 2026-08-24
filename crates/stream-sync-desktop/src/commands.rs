@@ -35,6 +35,10 @@ pub struct ExportBackupResult {
     pub error: Option<String>,
 }
 
+fn require_main_window(window: &WebviewWindow, port: u16) -> Result<(), String> {
+    overlay_proxy::validate_caller_window(window, port)
+}
+
 #[tauri::command]
 pub fn get_overlay_base_url(state: State<'_, AppState>) -> String {
     format!("http://127.0.0.1:{}", state.overlay_port)
@@ -55,21 +59,43 @@ pub async fn overlay_api_request(
 }
 
 #[tauri::command]
-pub fn open_external(app: AppHandle, url: String) -> Result<(), String> {
-    app.opener()
-        .open_url(url, None::<&str>)
-        .map_err(|e| e.to_string())
+pub async fn overlay_media_upload(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    request: overlay_proxy::OverlayMediaUploadRequest,
+) -> Result<overlay_proxy::OverlayApiResponse, String> {
+    overlay_proxy::execute_overlay_media_upload(&window, state.overlay_port, request).await
 }
 
 #[tauri::command]
-pub fn open_logs_folder(state: State<'_, AppState>) -> Result<(), String> {
+pub fn open_external(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<(), String> {
+    require_main_window(&window, state.overlay_port)?;
+    let trimmed = url.trim();
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return Err("invalid_external_url".into());
+    }
+    open::that(trimmed).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn open_logs_folder(window: WebviewWindow, state: State<'_, AppState>) -> Result<(), String> {
+    require_main_window(&window, state.overlay_port)?;
     let logs = &state.logs_dir;
     std::fs::create_dir_all(logs).map_err(|e| e.to_string())?;
     open::that(logs).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn open_discord(app: AppHandle) -> Result<(), String> {
+pub fn open_discord(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    require_main_window(&window, state.overlay_port)?;
     app.opener()
         .open_url("https://discord.gg/MR2W3gtvpw", None::<&str>)
         .map_err(|e| e.to_string())
@@ -142,7 +168,11 @@ pub async fn twitch_disconnect(state: State<'_, AppState>) -> Result<(), String>
 }
 
 #[tauri::command]
-pub fn purge_logs(state: State<'_, AppState>) -> Result<PurgeLogsResult, String> {
+pub fn purge_logs(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<PurgeLogsResult, String> {
+    require_main_window(&window, state.overlay_port)?;
     let logs_dir = &state.logs_dir;
     std::fs::create_dir_all(logs_dir).map_err(|e| e.to_string())?;
     let mut deleted = 0usize;
@@ -162,10 +192,12 @@ pub fn purge_logs(state: State<'_, AppState>) -> Result<PurgeLogsResult, String>
 /// Opens StreamElements Account → Channels so the user can copy Account ID + JWT.
 #[tauri::command]
 pub async fn open_se_account_page(
+    window: WebviewWindow,
     app: AppHandle,
     state: State<'_, AppState>,
     flow: String,
 ) -> Result<(), String> {
+    require_main_window(&window, state.overlay_port)?;
     if !flow.starts_with("ssl_")
         || flow.len() < 40
         || !flow.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -203,7 +235,11 @@ pub async fn open_se_account_page(
 
 /// Bundle user data into a ZIP and save via the system file picker.
 #[tauri::command]
-pub fn export_backup(state: State<'_, AppState>) -> Result<ExportBackupResult, String> {
+pub fn export_backup(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<ExportBackupResult, String> {
+    require_main_window(&window, state.overlay_port)?;
     let paths = get_paths().map_err(|e| e.to_string())?;
     let logs_dir = legacy_user_data_dir().join("logs");
     let zip_bytes = build_backup_zip(&paths, Some(&logs_dir)).map_err(|e| e.to_string())?;
@@ -236,8 +272,6 @@ pub fn export_backup(state: State<'_, AppState>) -> Result<ExportBackupResult, S
 
     std::fs::write(&save_path, &zip_bytes).map_err(|e| e.to_string())?;
 
-    let _ = &state;
-
     Ok(ExportBackupResult {
         ok: true,
         cancelled: false,
@@ -248,7 +282,12 @@ pub fn export_backup(state: State<'_, AppState>) -> Result<ExportBackupResult, S
 }
 
 #[tauri::command]
-pub fn check_for_updates(app: AppHandle) -> Result<serde_json::Value, String> {
+pub fn check_for_updates(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<serde_json::Value, String> {
+    require_main_window(&window, state.overlay_port)?;
     let secret = std::env::var("STREAMSYNC_UPDATE_SECRET")
         .or_else(|_| std::env::var("STREAM_SYNC_UPDATE_SECRET"))
         .unwrap_or_default();
@@ -292,7 +331,6 @@ fn sign_hmac_sha256(secret: &str, msg: &str) -> String {
 }
 
 fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
-    // minimal: use reqwest doesn't help. Add `hmac` and `sha2` to workspace
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
