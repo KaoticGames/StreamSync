@@ -30,7 +30,7 @@ twitch-irc.workspace = true
 dotenvy.workspace = true
 urlencoding.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate"] }
-bytes = "1"
+fs2 = "0.4"
 
 [dev-dependencies]
 tokio-tungstenite.workspace = true

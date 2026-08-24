@@ -32,6 +32,8 @@ const OVERLAY_API_ALLOWLIST: &[(&str, &str)] = &[
     ("POST", "/api/events/overlay-config"),
     ("POST", "/api/events/test-alert"),
     ("POST", "/api/chat/upload-font"),
+    ("POST", "/api/events/upload-media"),
+    ("POST", "/api/streamelements/session"),
     ("POST", "/api/streamelements/import"),
     ("POST", "/api/dock/issue-credential"),
     ("POST", "/api/dock/revoke-credential"),
@@ -253,7 +255,7 @@ pub async fn execute_overlay_media_upload(
         .mime_str(content_type)
         .map_err(|_| "invalid_content_type".to_string())?;
     let form = reqwest::multipart::Form::new()
-        .text("profile", profile.to_string())
+        .text("profileId", profile.to_string())
         .part("file", part);
 
     let client = reqwest::Client::new();
@@ -310,6 +312,8 @@ mod tests {
     fn allowlist_permits_ui_routes_and_rejects_admin() {
         assert!(validate_allowlisted_api("GET", "/api/status").is_ok());
         assert!(validate_allowlisted_api("POST", "/api/events/test-alert").is_ok());
+        assert!(validate_allowlisted_api("POST", "/api/events/upload-media").is_ok());
+        assert!(validate_allowlisted_api("POST", "/api/streamelements/session").is_ok());
         assert!(validate_allowlisted_api("POST", "/api/twitch/set-token").is_err());
         assert!(validate_allowlisted_api("GET", "/api/admin/secret").is_err());
     }

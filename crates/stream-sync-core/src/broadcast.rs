@@ -18,7 +18,8 @@ pub enum FeedAudience {
 }
 
 impl FeedAudience {
-    pub fn parse(raw: Option<&str>) -> Self {
+    /// Public feed query may select overlay or read-only dock audiences only.
+    pub fn parse_public_query(raw: Option<&str>) -> Self {
         match raw
             .unwrap_or("overlay")
             .trim()
@@ -26,7 +27,6 @@ impl FeedAudience {
             .as_str()
         {
             "dock" | "readonly-dock" => Self::ReadOnlyDock,
-            "control-dock" | "private-dock" | "private-control-dock" => Self::PrivateControlDock,
             _ => Self::PublicOverlay,
         }
     }
@@ -89,6 +89,22 @@ impl FeedHub {
             event,
         )
         .await;
+    }
+
+    pub async fn set_client_audience(
+        &self,
+        profile_id: &str,
+        target: &Arc<RwLock<WsSender>>,
+        audience: FeedAudience,
+    ) {
+        let mut map = self.inner.write().await;
+        if let Some(clients) = map.get_mut(profile_id) {
+            for client in clients.iter_mut() {
+                if Arc::ptr_eq(&client.sender, target) {
+                    client.audience = audience;
+                }
+            }
+        }
     }
 
     pub async fn broadcast_public_overlay(&self, profile_id: &str, event: &serde_json::Value) {

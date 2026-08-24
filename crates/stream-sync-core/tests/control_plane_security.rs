@@ -798,3 +798,237 @@ fn channel_point_private_input_is_profile_scoped() {
     assert!(!redemption.contains("broadcast_all"));
     assert!(!redemption.contains("broadcast_profile"));
 }
+
+async fn connect_feed_ws(
+    port: u16,
+    profile: &str,
+    audience: Option<&str>,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let mut url = format!("ws://127.0.0.1:{port}/ws/feed?profile={profile}");
+    if let Some(audience) = audience {
+        url.push_str(&format!("&audience={audience}"));
+    }
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert(header::ORIGIN, trusted_origin(port).parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("feed connect");
+    ws
+}
+
+async fn recv_json_of_type(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    timeout_ms: u64,
+    message_type: &str,
+) -> Option<Value> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    while std::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let msg = match tokio::time::timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(m))) => m,
+            _ => return None,
+        };
+        if let Message::Text(t) = msg {
+            if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                if v.get("type").and_then(|x| x.as_str()) == Some(message_type) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn drain_feed_bootstrap(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) {
+    let _ = recv_json_of_type(ws, 1000, "events-dock-config").await;
+}
+
+#[tokio::test]
+async fn ws_feed_private_audience_query_without_auth_stays_public() {
+    let port = 14160;
+    let (state, _handle) = spawn_test_server_mode(port, false).await;
+    let profile = "chat-default";
+    let mut bypass = connect_feed_ws(port, profile, Some("private-control-dock")).await;
+    let mut overlay = connect_feed_ws(port, profile, None).await;
+    drain_feed_bootstrap(&mut bypass).await;
+    drain_feed_bootstrap(&mut overlay).await;
+
+    let secret = json!({ "type": "user_input", "text": "channel-point-secret" });
+    state.feed.broadcast_private_dock(profile, &secret).await;
+
+    assert!(
+        recv_json_of_type(&mut bypass, 400, "user_input")
+            .await
+            .is_none(),
+        "query-declared private feed must not receive private input without credential"
+    );
+    assert!(
+        recv_json_of_type(&mut overlay, 400, "user_input")
+            .await
+            .is_none(),
+        "public overlay must not receive private input"
+    );
+}
+
+#[tokio::test]
+async fn ws_feed_private_audience_requires_valid_dock_credential() {
+    let port = 14161;
+    let (state, _handle) = spawn_test_server_mode(port, false).await;
+    let profile = "chat-default";
+    let dock = state.dock_credentials.issue("twitch", profile).unwrap();
+    let mut private = connect_feed_ws(port, profile, Some("private-control-dock")).await;
+    drain_feed_bootstrap(&mut private).await;
+    private
+        .send(Message::Text(
+            json!({ "type": "auth", "token": "ssd_invalid_token_xxxxxxxxxxxxxxxx", "platform": "twitch" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let failed = recv_json_of_type(&mut private, 1000, "auth-failed")
+        .await
+        .expect("auth-failed response");
+    assert_eq!(failed.get("type"), Some(&json!("auth-failed")));
+
+    let mut authorized = connect_feed_ws(port, profile, None).await;
+    drain_feed_bootstrap(&mut authorized).await;
+    authorized
+        .send(Message::Text(
+            json!({ "type": "auth", "token": dock.token, "platform": "twitch" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let ok = recv_json_of_type(&mut authorized, 1000, "auth-ok")
+        .await
+        .expect("auth-ok response");
+    assert_eq!(ok.get("type"), Some(&json!("auth-ok")));
+    assert_eq!(ok.get("privateFeed"), Some(&json!(true)));
+
+    let secret = json!({ "type": "user_input", "text": "authorized-private" });
+    state.feed.broadcast_private_dock(profile, &secret).await;
+    let received = recv_json_of_type(&mut authorized, 1000, "user_input")
+        .await
+        .expect("private payload");
+    assert_eq!(received.get("type"), Some(&json!("user_input")));
+}
+
+#[tokio::test]
+async fn ws_feed_revocation_closes_private_subscription() {
+    let port = 14162;
+    let (state, _handle) = spawn_test_server_mode(port, false).await;
+    let profile = "chat-default";
+    let dock = state.dock_credentials.issue("twitch", profile).unwrap();
+    let mut private = connect_feed_ws(port, profile, None).await;
+    drain_feed_bootstrap(&mut private).await;
+    private
+        .send(Message::Text(
+            json!({ "type": "auth", "token": dock.token, "platform": "twitch" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    recv_json_of_type(&mut private, 1000, "auth-ok")
+        .await
+        .expect("auth-ok");
+
+    let revoke = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{port}/api/dock/revoke-credential"
+        ))
+        .header(header::ORIGIN.as_str(), trusted_origin(port))
+        .header(CONTROL_TOKEN_HEADER, state.control_token())
+        .json(&json!({ "token": dock.token }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), StatusCode::OK);
+
+    let closed = tokio::time::timeout(Duration::from_secs(1), private.next())
+        .await
+        .expect("private feed socket should close on revocation");
+    assert!(matches!(closed, None | Some(Ok(Message::Close(_)))));
+}
+
+#[tokio::test]
+async fn cross_process_revoke_blocks_chat_send_before_platform() {
+    let port = 14163;
+    let (state, _handle) = spawn_test_server_mode(port, false).await;
+    let dock = state
+        .dock_credentials
+        .issue("twitch", "chat-default")
+        .unwrap();
+    let mut req = format!("ws://127.0.0.1:{port}/ws/control?profile=chat-default")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert(header::ORIGIN, trusted_origin(port).parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    ws.send(Message::Text(
+        json!({ "type": "auth", "token": dock.token, "platform": "twitch" })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let auth = recv_json_of_type(&mut ws, 1000, "auth-ok")
+        .await
+        .expect("auth-ok");
+    assert_eq!(auth.get("type"), Some(&json!("auth-ok")));
+
+    let external = DockCredentialStore::load_or_create(&state.paths.dock_credentials).unwrap();
+    external.revoke(&dock.token).unwrap();
+
+    ws.send(Message::Text(
+        json!({ "type": "chat-send", "message": "must-not-send", "platform": "twitch" })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let result = recv_json_of_type(&mut ws, 1000, "chat-send-result")
+        .await
+        .expect("chat-send result");
+    assert_eq!(result.get("type"), Some(&json!("chat-send-result")));
+    assert_eq!(result.get("ok"), Some(&json!(false)));
+    assert_eq!(result.get("error"), Some(&json!("revoked")));
+
+    let closed = tokio::time::timeout(Duration::from_secs(1), ws.next())
+        .await
+        .expect("revoked socket should close");
+    assert!(matches!(closed, None | Some(Ok(Message::Close(_)))));
+}
+
+#[tokio::test]
+async fn events_studio_csp_allows_same_origin_embed() {
+    let port = 14164;
+    let (router, _) = test_app(port).await;
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/events-studio.html")
+                .header(header::ORIGIN, trusted_origin(port))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let csp = response
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .expect("CSP response header");
+    assert!(csp.contains("frame-ancestors 'self'"));
+    assert!(!csp.contains("frame-ancestors 'none'"));
+}

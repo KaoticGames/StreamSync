@@ -1,7 +1,8 @@
 //! Scoped, revocable chat-dock credentials (not the master control capability).
 
 use crate::control_plane::constant_time_eq;
-use crate::storage::{self, acquire_cross_process_lock};
+use crate::storage;
+use crate::store_lock::acquire_cross_process_lock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -30,6 +31,17 @@ pub struct DockCredentialStore {
 }
 
 impl DockCredentialStore {
+    pub fn empty_in_memory() -> Self {
+        Self {
+            path: std::env::temp_dir().join(format!(
+                "streamsync-dock-ephemeral-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            )),
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
     pub fn load_or_create(path: &Path) -> anyhow::Result<Self> {
         let store = Self {
             path: path.to_path_buf(),
@@ -105,7 +117,14 @@ impl DockCredentialStore {
     }
 
     /// Validate chat-send authority for platform/profile. Never authorizes HTTP control.
+    /// Read-through under the shared store lock so cross-process revocations are observed.
     pub fn authorize_chat_send(&self, token: &str, platform: &str, profile_id: &str) -> bool {
+        let Ok(_lock) = acquire_cross_process_lock(&self.lock_path()) else {
+            return false;
+        };
+        if self.reload_locked().is_err() {
+            return false;
+        }
         let platform = normalize_platform(platform);
         let profile_id = if profile_id.trim().is_empty() {
             "chat-default".to_string()
@@ -281,6 +300,28 @@ mod tests {
         let reloaded = DockCredentialStore::load_or_create(&path).unwrap();
         assert!(!reloaded.authorize_chat_send(&cred.token, "twitch", "chat-default"));
         assert!(reloaded.authorize_chat_send(&stale.token, "kick", "other-profile"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("store.lock"));
+    }
+
+    #[test]
+    fn stale_store_revocation_visible_to_other_process() {
+        let path = tmp_path();
+        let _ = std::fs::remove_file(&path);
+        let store_a = DockCredentialStore::load_or_create(&path).unwrap();
+        let cred = store_a.issue("twitch", "chat-default").unwrap();
+        assert!(store_a.authorize_chat_send(&cred.token, "twitch", "chat-default"));
+
+        let store_b = DockCredentialStore::load_or_create(&path).unwrap();
+        assert!(store_b.authorize_chat_send(&cred.token, "twitch", "chat-default"));
+
+        store_a.revoke(&cred.token).unwrap();
+        assert!(!store_a.authorize_chat_send(&cred.token, "twitch", "chat-default"));
+        assert!(
+            !store_b.authorize_chat_send(&cred.token, "twitch", "chat-default"),
+            "revocation in another store must invalidate authorization read-through"
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("store.lock"));

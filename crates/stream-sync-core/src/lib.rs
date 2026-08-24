@@ -14,6 +14,7 @@ mod oauth_pending;
 mod route_manifest;
 mod routes;
 mod storage;
+mod store_lock;
 mod streamelements;
 mod syndicate_connection;
 mod twitch;
@@ -91,7 +92,11 @@ impl OverlayServer {
     pub async fn build_app(
         &self,
     ) -> anyhow::Result<(axum::Router, Arc<AppState>, Arc<twitch::TwitchServices>)> {
-        let paths = storage::get_paths()?;
+        let paths = if self.config.readonly {
+            storage::get_paths_readonly()?
+        } else {
+            storage::get_paths()?
+        };
         let state = AppState::new(
             paths,
             self.config.repo_root.clone(),

@@ -1330,10 +1330,52 @@
           if (typeof api.privilegedFetch === "function") {
             return await api.privilegedFetch(path, options);
           }
-        } catch (_) {}
+        } catch (err) {
+          if (err && (err.code === "desktop_required" || String(err.message || "").includes("desktop_required"))) {
+            throw err;
+          }
+        }
+      }
+      if (window.streamSyncControlApi && window.streamSyncControlApi.standaloneReadOnly) {
+        const err = new Error("desktop_required_for_mutation");
+        err.code = "desktop_required";
+        throw err;
       }
       throw new Error("Stream Sync control capability unavailable");
     }
+
+    function applyStandaloneReadOnlyMode() {
+      const api =
+        window.streamSyncControlApi ||
+        (window.parent && window.parent.streamSyncControlApi) ||
+        null;
+      if (!api || !api.standaloneReadOnly) return;
+      const banner = document.createElement("div");
+      banner.id = "streamsync-standalone-banner";
+      banner.textContent =
+        api.desktopRequiredMessage ||
+        "Editing requires the Stream Sync desktop app. Preview remains read-only in the browser.";
+      banner.style.cssText =
+        "position:sticky;top:0;z-index:9999;padding:10px 14px;background:#3a1f1f;color:#fff;font:14px/1.4 sans-serif;border-bottom:1px solid #662626";
+      document.body.prepend(banner);
+      document.body.classList.add("streamsync-standalone-readonly");
+      const block = (el) => {
+        if (!el || el.dataset.streamsyncReadonlyBound === "1") return;
+        el.dataset.streamsyncReadonlyBound = "1";
+        el.disabled = true;
+        el.title = banner.textContent;
+        el.style.opacity = "0.55";
+        el.style.pointerEvents = "none";
+      };
+      document
+        .querySelectorAll(
+          'button, input[type="file"], [data-action="save"], [data-action="delete"], [data-action="upload"], [data-action="test-alert"]'
+        )
+        .forEach(block);
+    }
+
+    document.addEventListener("DOMContentLoaded", applyStandaloneReadOnlyMode);
+    if (document.readyState !== "loading") applyStandaloneReadOnlyMode();
 
     // =========================
     // Defaults / Schema

@@ -227,7 +227,7 @@ async fn csp_response_headers(
                 .to_string(),
         )
     } else if !path.starts_with("/api/") && !path.starts_with("/ws/") {
-        let frame_policy = if path.starts_with("/overlay/") {
+        let frame_policy = if path.starts_with("/overlay/") || path == "/events-studio.html" {
             "frame-ancestors 'self'"
         } else {
             "frame-ancestors 'none'"
@@ -2129,7 +2129,7 @@ async fn ws_feed(
         return control_plane::unauthorized_response();
     }
     let profile_id = q.profile.unwrap_or_else(|| "default".into());
-    let audience = FeedAudience::parse(q.audience.as_deref());
+    let audience = FeedAudience::parse_public_query(q.audience.as_deref());
     ws.on_upgrade(move |socket| handle_ws_feed(socket, ctx, profile_id, audience))
 }
 
@@ -2154,6 +2154,11 @@ async fn handle_ws_feed(
 ) {
     let (sender, mut receiver) = socket.split();
     let sender = Arc::new(tokio::sync::RwLock::new(sender));
+    let mut audience = audience;
+    let mut private_auth_token = String::new();
+    let mut registry_id = None;
+    let mut revocation_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>> = None;
+
     ctx.state
         .feed
         .register(profile_id.clone(), audience, sender.clone())
@@ -2168,12 +2173,71 @@ async fn handle_ws_feed(
         let _ = s.send(axum::extract::ws::Message::Text(text)).await;
     }
 
-    while let Some(Ok(msg)) = receiver.next().await {
-        if let axum::extract::ws::Message::Text(text) = msg {
-            let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            if parsed.get("type").and_then(|v| v.as_str()) == Some("ping") {
+    loop {
+        let next = if let Some(rx) = revocation_rx.as_mut() {
+            tokio::select! {
+                message = receiver.next() => message,
+                _ = rx.recv() => {
+                    let mut s = sender.write().await;
+                    let _ = s.send(axum::extract::ws::Message::Close(None)).await;
+                    break;
+                }
+            }
+        } else {
+            receiver.next().await
+        };
+        let Some(Ok(msg)) = next else {
+            break;
+        };
+        let axum::extract::ws::Message::Text(text) = msg else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        match parsed.get("type").and_then(|v| v.as_str()) {
+            Some("auth") => {
+                let token = parsed.get("token").and_then(|v| v.as_str()).unwrap_or("");
+                let platform = parsed
+                    .get("platform")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("twitch");
+                if crate::dock_capability::DockCredentialStore::is_dock_token(token)
+                    && ctx
+                        .state
+                        .dock_credentials
+                        .authorize_chat_send(token, platform, &profile_id)
+                {
+                    if let (Some(id), ref prev) = (registry_id.take(), private_auth_token) {
+                        if !prev.is_empty() {
+                            ctx.state.dock_controls.unregister(prev, id);
+                        }
+                    }
+                    let (id, rx) = ctx.state.dock_controls.register(token);
+                    registry_id = Some(id);
+                    private_auth_token = token.to_string();
+                    revocation_rx = Some(rx);
+                    audience = FeedAudience::PrivateControlDock;
+                    ctx.state
+                        .feed
+                        .set_client_audience(&profile_id, &sender, audience)
+                        .await;
+                    let mut s = sender.write().await;
+                    let _ = s
+                        .send(axum::extract::ws::Message::Text(
+                            json!({ "type": "auth-ok", "privateFeed": true }).to_string(),
+                        ))
+                        .await;
+                } else {
+                    let mut s = sender.write().await;
+                    let _ = s
+                        .send(axum::extract::ws::Message::Text(
+                            json!({ "type": "auth-failed" }).to_string(),
+                        ))
+                        .await;
+                }
+            }
+            Some("ping") => {
                 let mut s = sender.write().await;
                 let _ = s
                     .send(axum::extract::ws::Message::Text(
@@ -2182,7 +2246,12 @@ async fn handle_ws_feed(
                     ))
                     .await;
             }
-            // Intentionally ignore chat-send and all other privileged actions.
+            _ => {}
+        }
+    }
+    if let (Some(id), token) = (registry_id, private_auth_token) {
+        if !token.is_empty() {
+            ctx.state.dock_controls.unregister(&token, id);
         }
     }
     ctx.state.feed.unregister(&profile_id, &sender).await;
@@ -2313,6 +2382,12 @@ async fn handle_ws_control(
                         &profile_id,
                     ) {
                         let mut s = sender.write().await;
+                        let _ = s
+                            .send(axum::extract::ws::Message::Text(
+                                json!({ "type": "chat-send-result", "ok": false, "error": "revoked" })
+                                    .to_string(),
+                            ))
+                            .await;
                         let _ = s.send(axum::extract::ws::Message::Close(None)).await;
                         break;
                     }

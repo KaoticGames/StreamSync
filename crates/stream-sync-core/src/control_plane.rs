@@ -262,6 +262,30 @@ pub fn load_or_create_control_token(path: &Path) -> anyhow::Result<String> {
     Ok(committed)
 }
 
+/// Load the control token without creating persistent state when readonly.
+pub fn load_control_token(path: &Path, readonly: bool) -> anyhow::Result<String> {
+    if !readonly {
+        return load_or_create_control_token(path);
+    }
+    if path.is_file() {
+        let existing = std::fs::read_to_string(path)?.trim().to_string();
+        if existing.len() >= 32 && !DockCredentialStore::is_dock_token(&existing) {
+            return Ok(existing);
+        }
+    }
+    if let Ok(token) = std::env::var("STREAMSYNC_READONLY_CONTROL_TOKEN") {
+        let token = token.trim().to_string();
+        if token.len() >= 32 && !DockCredentialStore::is_dock_token(&token) {
+            return Ok(token);
+        }
+    }
+    Ok(format!(
+        "ssc_readonly_{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    ))
+}
+
 struct PathLock {
     path: std::path::PathBuf,
     owner: String,

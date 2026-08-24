@@ -12,13 +12,6 @@
   "permissions": [
     "allow-remote-main-ui",
     "allow-overlay-api-proxy",
-    "opener:default",
-    "shell:allow-open",
-    "core:default",
-    "core:event:allow-listen",
-    "core:window:allow-create",
-    "core:window:allow-close",
-    "core:window:allow-show",
-    "core:window:allow-set-focus"
+    "core:event:allow-listen"
   ]
 }

@@ -145,12 +145,14 @@ impl AppState {
     ) -> anyhow::Result<Arc<Self>> {
         let rust_root = storage::rust_workspace_root();
         storage::load_streamsync_dotenv(&paths.root, &rust_root);
-        if let Err(e) = storage::bootstrap_twitch_env_from_rust(&paths.root, &rust_root) {
-            tracing::debug!("twitch env bootstrap skipped: {e:#}");
+        if !readonly {
+            if let Err(e) = storage::bootstrap_twitch_env_from_rust(&paths.root, &rust_root) {
+                tracing::debug!("twitch env bootstrap skipped: {e:#}");
+            }
         }
 
         let client_id = std::env::var("TWITCH_CLIENT_ID").unwrap_or_default();
-        if client_id.is_empty() {
+        if client_id.is_empty() && !readonly {
             tracing::warn!(
                 "TWITCH_CLIENT_ID is not set — add it to {} (see rust/config/env.example) or {}",
                 rust_root.join(".env").display(),
@@ -162,7 +164,7 @@ impl AppState {
         let overlay_server_dir = repo_root.join("overlay-server");
 
         let mut dock =
-            storage::read_json_or_default(&paths.dock_config, &DockConfigFile::default())?;
+            read_json_for_mode(&paths.dock_config, &DockConfigFile::default(), readonly)?;
         dock.profiles
             .entry("chat-default".into())
             .or_insert_with(|| crate::config_types::DockProfile {
@@ -183,30 +185,39 @@ impl AppState {
             }
         }
 
-        let mut overlay =
-            storage::read_json_or_default(&paths.overlay_config, &OverlayConfigFile::default())?;
+        let mut overlay = read_json_for_mode(
+            &paths.overlay_config,
+            &OverlayConfigFile::default(),
+            readonly,
+        )?;
         overlay
             .profiles
             .entry("chat-default".into())
             .or_insert_with(crate::config_types::ChatOverlayProfile::default);
 
-        let events_overlay = storage::read_json_or_default(
+        let events_overlay = read_json_for_mode(
             &paths.events_overlay_config,
             &EventsOverlayConfigFile::default(),
+            readonly,
         )?;
 
         let personal =
-            storage::read_json_or_default(&paths.twitch_tokens, &TwitchTokenFile::default())?;
+            read_json_for_mode(&paths.twitch_tokens, &TwitchTokenFile::default(), readonly)?;
         let delegated = if paths.twitch_delegated.is_file() {
-            storage::read_json_or_default(&paths.twitch_delegated, &DelegatedSessionFile::default())
-                .ok()
-                .filter(|d| !d.connection_key.is_empty() && !d.access_token.is_empty())
+            read_json_for_mode(
+                &paths.twitch_delegated,
+                &DelegatedSessionFile::default(),
+                readonly,
+            )
+            .ok()
+            .filter(|d| !d.connection_key.is_empty() && !d.access_token.is_empty())
         } else {
             None
         };
-        let saved_mode = storage::read_json_or_default(
+        let saved_mode = read_json_for_mode(
             &paths.twitch_active_mode,
             &TwitchActiveModeFile::default(),
+            readonly,
         )
         .map(|f| f.mode)
         .unwrap_or_default();
@@ -230,12 +241,17 @@ impl AppState {
         };
 
         let personal_kick =
-            storage::read_json_or_default(&paths.kick_tokens, &KickTokenFile::default())?;
+            read_json_for_mode(&paths.kick_tokens, &KickTokenFile::default(), readonly)?;
         let live_kick = live_kick_tokens(active_mode, delegated.as_ref(), &personal_kick);
         let control_token =
-            crate::control_plane::load_or_create_control_token(&paths.control_token)?;
-        let dock_credentials =
-            crate::dock_capability::DockCredentialStore::load_or_create(&paths.dock_credentials)?;
+            crate::control_plane::load_control_token(&paths.control_token, readonly)?;
+        let dock_credentials = if paths.dock_credentials.is_file() {
+            crate::dock_capability::DockCredentialStore::load_or_create(&paths.dock_credentials)?
+        } else if readonly {
+            crate::dock_capability::DockCredentialStore::empty_in_memory()
+        } else {
+            crate::dock_capability::DockCredentialStore::load_or_create(&paths.dock_credentials)?
+        };
 
         Ok(Arc::new(Self {
             paths: paths.clone(),
@@ -411,6 +427,17 @@ pub fn tokens_from_delegated_session(d: &DelegatedSessionFile) -> TwitchTokenFil
 /// OAuth redirect for this server instance. Uses `TWITCH_REDIRECT_URI` when set, but if it
 /// points at localhost with a different port than the server (e.g. `.env` has 4040 while
 /// Rust A/B runs on 4041), the port is aligned so Twitch callbacks reach the running server.
+fn read_json_for_mode<T>(path: &std::path::Path, default: &T, readonly: bool) -> anyhow::Result<T>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize + Clone,
+{
+    if readonly {
+        storage::read_json_if_exists(path, default)
+    } else {
+        storage::read_json_or_default(path, default)
+    }
+}
+
 fn redirect_uri_for_port(port: u16) -> String {
     let uri = std::env::var("TWITCH_REDIRECT_URI")
         .unwrap_or_else(|_| format!("http://localhost:{port}/auth/twitch/callback"));
@@ -447,6 +474,15 @@ fn align_localhost_redirect_port(uri: &str, port: u16) -> String {
     uri.to_string()
 }
 
+pub fn normalize_chat_profile_id(id: &str) -> String {
+    let v = id.trim();
+    if v.is_empty() || v == "default" {
+        "chat-default".to_string()
+    } else {
+        v.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,13 +498,49 @@ mod tests {
         let uri = "https://example.com/auth/twitch/callback";
         assert_eq!(align_localhost_redirect_port(uri, 4041), uri);
     }
-}
 
-pub fn normalize_chat_profile_id(id: &str) -> String {
-    let v = id.trim();
-    if v.is_empty() || v == "default" {
-        "chat-default".to_string()
-    } else {
-        v.to_string()
+    fn list_tree(dir: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        if !dir.is_dir() {
+            return out;
+        }
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push(rel.clone());
+            if path.is_dir() {
+                for child in list_tree(&path) {
+                    out.push(format!("{rel}/{child}"));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn readonly_startup_does_not_create_persistent_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "streamsync-readonly-startup-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("STREAMSYNC_USERDATA", dir.display().to_string());
+        let before = list_tree(&dir);
+        let repo = storage::resolve_ui_assets_root();
+        let paths = storage::get_paths_readonly().unwrap();
+        let _state = AppState::new(paths, repo, 14201, true).expect("readonly app state");
+        let after = list_tree(&dir);
+        assert_eq!(
+            before, after,
+            "readonly startup must not mutate userdata tree"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
