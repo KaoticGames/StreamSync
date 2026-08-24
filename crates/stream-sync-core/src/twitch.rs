@@ -1423,16 +1423,16 @@ async fn handle_dock_command(
     match cmd.as_str() {
         "/slow" => {
             let raw = args.first().copied();
-            if raw.is_none()
-                || raw == Some("0")
-                || raw.map(|r| r.eq_ignore_ascii_case("off")).unwrap_or(false)
-                || raw
-                    .map(|r| r.eq_ignore_ascii_case("disable"))
-                    .unwrap_or(false)
-            {
+            let disable = match raw {
+                None => true,
+                Some(v) => {
+                    v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("disable")
+                }
+            };
+            if disable {
                 update_chat_settings(&state, json!({ "slow_mode": false })).await?;
             } else {
-                let mut wait: i64 = raw.unwrap().parse().unwrap_or(30);
+                let mut wait: i64 = raw.unwrap_or("30").parse().unwrap_or(30);
                 if wait <= 0 {
                     wait = 30;
                 }
@@ -1582,7 +1582,12 @@ pub fn normalize_event_variables(vars: &Value) -> Value {
     })
 }
 
-async fn handle_eventsub_notification(feed: &FeedHub, sub_type: &str, event: &Value) {
+async fn handle_eventsub_notification(
+    state: &AppState,
+    feed: &FeedHub,
+    sub_type: &str,
+    event: &Value,
+) {
     match sub_type {
         "channel.follow" => {
             let user = event
@@ -1771,6 +1776,7 @@ async fn handle_eventsub_notification(feed: &FeedHub, sub_type: &str, event: &Va
                 feed.broadcast_private_dock(
                     "default",
                     &make_dock_event("redeem", &private, Some("Channel Points"), None),
+                    &state.dock_credentials,
                 )
                 .await;
             }
@@ -1806,7 +1812,6 @@ async fn start_eventsub(state: Arc<AppState>, services: Arc<TwitchServices>) -> 
 async fn eventsub_session(state: Arc<AppState>, feed: FeedHub) -> Result<()> {
     let (ws, _) = connect_async("wss://eventsub.wss.twitch.tv/ws").await?;
     let (_write, mut read) = ws.split();
-    let mut session_id: Option<String> = None;
 
     while let Some(msg) = read.next().await {
         let msg = msg?;
@@ -1816,16 +1821,9 @@ async fn eventsub_session(state: Arc<AppState>, feed: FeedHub) -> Result<()> {
         let parsed: EventSubEnvelope = serde_json::from_str(msg.to_text()?)?;
         let message_type = parsed.metadata.message_type.as_str();
         match message_type {
-            "session_welcome" => {
-                session_id = parsed.payload.session.as_ref().and_then(|s| s.id.clone());
-                if let Some(ref sid) = session_id {
-                    subscribe_topics(&state, sid).await;
-                }
-            }
-            "session_reconnect" => {
-                session_id = parsed.payload.session.as_ref().and_then(|s| s.id.clone());
-                if let Some(ref sid) = session_id {
-                    subscribe_topics(&state, sid).await;
+            "session_welcome" | "session_reconnect" => {
+                if let Some(sid) = parsed.payload.session.as_ref().and_then(|s| s.id.clone()) {
+                    subscribe_topics(&state, &sid).await;
                 }
             }
             "notification" => {
@@ -1833,7 +1831,7 @@ async fn eventsub_session(state: Arc<AppState>, feed: FeedHub) -> Result<()> {
                     continue;
                 };
                 if let Some(event) = parsed.payload.event.as_ref() {
-                    handle_eventsub_notification(&feed, sub_type, event).await;
+                    handle_eventsub_notification(&state, &feed, sub_type, event).await;
                 }
             }
             _ => {}

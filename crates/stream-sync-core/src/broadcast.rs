@@ -1,5 +1,6 @@
 //! WebSocket fan-out with explicit audience classes for private event isolation.
 
+use crate::dock_capability::DockCredentialStore;
 use axum::extract::ws::Message;
 use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
@@ -32,9 +33,15 @@ impl FeedAudience {
     }
 }
 
+struct PrivateFeedAuth {
+    token: String,
+    platform: String,
+}
+
 struct FeedClient {
     sender: Arc<RwLock<WsSender>>,
     audience: FeedAudience,
+    private_auth: Option<PrivateFeedAuth>,
 }
 
 #[derive(Clone, Default)]
@@ -54,9 +61,11 @@ impl FeedHub {
         sender: Arc<RwLock<WsSender>>,
     ) {
         let mut map = self.inner.write().await;
-        map.entry(profile_id)
-            .or_default()
-            .push(FeedClient { sender, audience });
+        map.entry(profile_id).or_default().push(FeedClient {
+            sender,
+            audience,
+            private_auth: None,
+        });
     }
 
     pub async fn unregister(&self, profile_id: &str, target: &Arc<RwLock<WsSender>>) {
@@ -87,6 +96,7 @@ impl FeedHub {
                 FeedAudience::PrivateControlDock,
             ],
             event,
+            None,
         )
         .await;
     }
@@ -102,24 +112,76 @@ impl FeedHub {
             for client in clients.iter_mut() {
                 if Arc::ptr_eq(&client.sender, target) {
                     client.audience = audience;
+                    if audience != FeedAudience::PrivateControlDock {
+                        client.private_auth = None;
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn set_client_private_auth(
+        &self,
+        profile_id: &str,
+        target: &Arc<RwLock<WsSender>>,
+        token: &str,
+        platform: &str,
+    ) {
+        let mut map = self.inner.write().await;
+        if let Some(clients) = map.get_mut(profile_id) {
+            for client in clients.iter_mut() {
+                if Arc::ptr_eq(&client.sender, target) {
+                    client.audience = FeedAudience::PrivateControlDock;
+                    client.private_auth = Some(PrivateFeedAuth {
+                        token: token.to_string(),
+                        platform: platform.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    pub async fn clear_client_private_auth(
+        &self,
+        profile_id: &str,
+        target: &Arc<RwLock<WsSender>>,
+    ) {
+        let mut map = self.inner.write().await;
+        if let Some(clients) = map.get_mut(profile_id) {
+            for client in clients.iter_mut() {
+                if Arc::ptr_eq(&client.sender, target) {
+                    client.audience = FeedAudience::PublicOverlay;
+                    client.private_auth = None;
                 }
             }
         }
     }
 
     pub async fn broadcast_public_overlay(&self, profile_id: &str, event: &serde_json::Value) {
-        self.broadcast_to_audiences(profile_id, &[FeedAudience::PublicOverlay], event)
+        self.broadcast_to_audiences(profile_id, &[FeedAudience::PublicOverlay], event, None)
             .await;
     }
 
     pub async fn broadcast_readonly_dock(&self, profile_id: &str, event: &serde_json::Value) {
-        self.broadcast_to_audiences(profile_id, &[FeedAudience::ReadOnlyDock], event)
+        self.broadcast_to_audiences(profile_id, &[FeedAudience::ReadOnlyDock], event, None)
             .await;
     }
 
-    pub async fn broadcast_private_dock(&self, profile_id: &str, event: &serde_json::Value) {
-        self.broadcast_to_audiences(profile_id, &[FeedAudience::PrivateControlDock], event)
-            .await;
+    /// Private dock delivery revalidates each subscriber's credential under the shared store lock
+    /// before every payload so cross-process revocation cannot leak private input.
+    pub async fn broadcast_private_dock(
+        &self,
+        profile_id: &str,
+        event: &serde_json::Value,
+        store: &DockCredentialStore,
+    ) {
+        self.broadcast_to_audiences(
+            profile_id,
+            &[FeedAudience::PrivateControlDock],
+            event,
+            Some(store),
+        )
+        .await;
     }
 
     pub async fn broadcast_all(&self, event: &serde_json::Value) {
@@ -131,7 +193,7 @@ impl FeedHub {
         for clients in map.values() {
             for client in clients {
                 let mut guard = client.sender.write().await;
-                let _ = guard.send(Message::Text(payload.clone().into())).await;
+                let _ = guard.send(Message::Text(payload.clone())).await;
             }
         }
     }
@@ -141,19 +203,44 @@ impl FeedHub {
         profile_id: &str,
         audiences: &[FeedAudience],
         event: &serde_json::Value,
+        private_store: Option<&DockCredentialStore>,
     ) {
         let payload = match serde_json::to_string(event) {
             Ok(s) => s,
             Err(_) => return,
         };
-        let map = self.inner.read().await;
-        if let Some(clients) = map.get(profile_id) {
-            for client in clients {
-                if audiences.contains(&client.audience) {
+        let mut revoked_senders: Vec<Arc<RwLock<WsSender>>> = Vec::new();
+        {
+            let map = self.inner.read().await;
+            if let Some(clients) = map.get(profile_id) {
+                for client in clients {
+                    if !audiences.contains(&client.audience) {
+                        continue;
+                    }
+                    if client.audience == FeedAudience::PrivateControlDock {
+                        let Some(store) = private_store else {
+                            continue;
+                        };
+                        let Some(auth) = client.private_auth.as_ref() else {
+                            revoked_senders.push(client.sender.clone());
+                            continue;
+                        };
+                        if !store.authorize_chat_send(&auth.token, &auth.platform, profile_id) {
+                            revoked_senders.push(client.sender.clone());
+                            continue;
+                        }
+                    }
                     let mut guard = client.sender.write().await;
-                    let _ = guard.send(Message::Text(payload.clone().into())).await;
+                    let _ = guard.send(Message::Text(payload.clone())).await;
                 }
             }
+        }
+        for sender in revoked_senders {
+            {
+                let mut guard = sender.write().await;
+                let _ = guard.send(Message::Close(None)).await;
+            }
+            self.clear_client_private_auth(profile_id, &sender).await;
         }
     }
 }

@@ -758,6 +758,62 @@ fn route_inventory_is_exhaustive_and_fail_closed() {
 }
 
 #[test]
+fn build_router_source_must_match_route_id_list() {
+    let src = include_str!("../src/routes.rs");
+    let fn_start = src
+        .find("pub fn build_router(")
+        .expect("build_router in routes.rs");
+    let body = &src[fn_start..];
+    let body_end = body.find("\nasync fn ").unwrap_or(body.len());
+    let body = &body[..body_end];
+    let mut found: std::collections::BTreeSet<(&str, String)> = std::collections::BTreeSet::new();
+    for (idx, _) in body.match_indices(".route(") {
+        let after = &body[idx + ".route(".len()..];
+        let trimmed = after.trim_start();
+        let Some(rest) = trimmed.strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
+        let path = rest[..end].to_string();
+        let after_path = rest[end + 1..]
+            .trim_start()
+            .trim_start_matches(',')
+            .trim_start();
+        for method in ["get", "post", "delete", "put", "patch"] {
+            if after_path.contains(method) {
+                found.insert((
+                    match method {
+                        "get" => "GET",
+                        "post" => "POST",
+                        "delete" => "DELETE",
+                        "put" => "PUT",
+                        "patch" => "PATCH",
+                        _ => unreachable!(),
+                    },
+                    path.clone(),
+                ));
+            }
+        }
+    }
+    if body.contains("nest_service(\"/fonts\"") {
+        found.insert(("GET", "/fonts/*".into()));
+    }
+    if body.contains("nest_service(\"/events-media\"") {
+        found.insert(("GET", "/events-media/*".into()));
+    }
+    let listed: std::collections::BTreeSet<_> = BUILD_ROUTER_ROUTE_IDS
+        .iter()
+        .map(|(m, p)| (*m, (*p).to_string()))
+        .collect();
+    assert_eq!(
+        found, listed,
+        "build_router registrations must match BUILD_ROUTER_ROUTE_IDS"
+    );
+}
+
+#[test]
 fn frontend_dock_and_login_wiring_is_scoped() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -861,7 +917,10 @@ async fn ws_feed_private_audience_query_without_auth_stays_public() {
     drain_feed_bootstrap(&mut overlay).await;
 
     let secret = json!({ "type": "user_input", "text": "channel-point-secret" });
-    state.feed.broadcast_private_dock(profile, &secret).await;
+    state
+        .feed
+        .broadcast_private_dock(profile, &secret, &state.dock_credentials)
+        .await;
 
     assert!(
         recv_json_of_type(&mut bypass, 400, "user_input")
@@ -915,7 +974,10 @@ async fn ws_feed_private_audience_requires_valid_dock_credential() {
     assert_eq!(ok.get("privateFeed"), Some(&json!(true)));
 
     let secret = json!({ "type": "user_input", "text": "authorized-private" });
-    state.feed.broadcast_private_dock(profile, &secret).await;
+    state
+        .feed
+        .broadcast_private_dock(profile, &secret, &state.dock_credentials)
+        .await;
     let received = recv_json_of_type(&mut authorized, 1000, "user_input")
         .await
         .expect("private payload");
@@ -1031,4 +1093,106 @@ async fn events_studio_csp_allows_same_origin_embed() {
         .expect("CSP response header");
     assert!(csp.contains("frame-ancestors 'self'"));
     assert!(!csp.contains("frame-ancestors 'none'"));
+}
+
+#[tokio::test]
+async fn cross_process_revoke_fences_established_private_feed() {
+    let port = 14165;
+    let (state, _handle) = spawn_test_server_mode(port, false).await;
+    let profile = "chat-default";
+    let dock = state.dock_credentials.issue("twitch", profile).unwrap();
+    let mut private = connect_feed_ws(port, profile, None).await;
+    drain_feed_bootstrap(&mut private).await;
+    private
+        .send(Message::Text(
+            json!({ "type": "auth", "token": dock.token, "platform": "twitch" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    recv_json_of_type(&mut private, 1000, "auth-ok")
+        .await
+        .expect("auth-ok");
+
+    let external = DockCredentialStore::load_or_create(&state.paths.dock_credentials).unwrap();
+    external.revoke(&dock.token).unwrap();
+
+    let secret = json!({ "type": "user_input", "text": "must-not-leak" });
+    state
+        .feed
+        .broadcast_private_dock(profile, &secret, &state.dock_credentials)
+        .await;
+
+    let leaked = recv_json_of_type(&mut private, 400, "user_input").await;
+    assert!(
+        leaked.is_none(),
+        "revoked private feed must not receive private payload: {leaked:?}"
+    );
+    let closed = tokio::time::timeout(Duration::from_secs(1), private.next()).await;
+    assert!(
+        matches!(closed, Ok(None) | Ok(Some(Ok(Message::Close(_)))) | Err(_))
+            || closed
+                .as_ref()
+                .ok()
+                .and_then(|m| m.as_ref())
+                .map(|m| m.as_ref().ok().map(|msg| matches!(msg, Message::Close(_))))
+                .is_some(),
+        "revoked private feed should close or stop delivering: {closed:?}"
+    );
+}
+
+#[tokio::test]
+async fn cross_process_revoke_all_fences_private_feed() {
+    let port = 14166;
+    let (state, _handle) = spawn_test_server_mode(port, false).await;
+    let profile = "chat-default";
+    let dock = state.dock_credentials.issue("twitch", profile).unwrap();
+    let mut private = connect_feed_ws(port, profile, None).await;
+    drain_feed_bootstrap(&mut private).await;
+    private
+        .send(Message::Text(
+            json!({ "type": "auth", "token": dock.token, "platform": "twitch" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    recv_json_of_type(&mut private, 1000, "auth-ok")
+        .await
+        .expect("auth-ok");
+
+    let external = DockCredentialStore::load_or_create(&state.paths.dock_credentials).unwrap();
+    external.revoke_all().unwrap();
+
+    let secret = json!({ "type": "user_input", "text": "revoke-all-secret" });
+    state
+        .feed
+        .broadcast_private_dock(profile, &secret, &state.dock_credentials)
+        .await;
+    assert!(recv_json_of_type(&mut private, 400, "user_input")
+        .await
+        .is_none());
+}
+
+#[test]
+fn authorize_register_race_does_not_upgrade_after_revoke() {
+    let dir = std::env::temp_dir().join(format!(
+        "streamsync-auth-race-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dock-credentials.json");
+    let store_a = DockCredentialStore::load_or_create(&path).unwrap();
+    let cred = store_a.issue("twitch", "chat-default").unwrap();
+    assert!(store_a.authorize_chat_send(&cred.token, "twitch", "chat-default"));
+    let store_b = DockCredentialStore::load_or_create(&path).unwrap();
+    store_b.revoke(&cred.token).unwrap();
+    assert!(
+        !store_a.authorize_chat_send(&cred.token, "twitch", "chat-default"),
+        "revalidate after register must observe independent revoke"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

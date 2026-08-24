@@ -477,7 +477,7 @@ pub fn map_overlay_to_profile(overlay: &Value) -> (String, Value, Vec<String>) {
     }
 
     let profile_id = profile_id_for_overlay(overlay_name, overlay_id);
-    profile.as_object_mut().map(|o| {
+    if let Some(o) = profile.as_object_mut() {
         o.insert(
             "_seImport".into(),
             json!({
@@ -495,7 +495,7 @@ pub fn map_overlay_to_profile(overlay: &Value) -> (String, Value, Vec<String>) {
                 },
             }),
         );
-    });
+    }
 
     (profile_id, profile, warnings)
 }
@@ -1294,6 +1294,7 @@ pub async fn localize_profile_media(
     (warnings, saved)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn localize_asset_field(
     http: &reqwest::Client,
     media_dir: &Path,

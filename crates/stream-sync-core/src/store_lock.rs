@@ -1,4 +1,4 @@
-//! Cross-process and in-process store locking.
+//! Cross-process and in-process store locking (safe, no lifetime transmute).
 
 use anyhow::Result;
 use fs2::FileExt;
@@ -18,28 +18,12 @@ fn in_process_lock(lock_path: &Path) -> Arc<Mutex<()>> {
         .clone()
 }
 
-/// Holds an in-process mutex and OS advisory lock for one store path.
-pub struct CrossProcessLock {
-    _process_mtx: Arc<Mutex<()>>,
-    _in_process: std::sync::MutexGuard<'static, ()>,
-    file: std::fs::File,
-}
-
-impl Drop for CrossProcessLock {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
-pub fn acquire_cross_process_lock(lock_path: &Path) -> Result<CrossProcessLock> {
+/// Run `f` while holding both the in-process per-path mutex and an OS advisory lock.
+///
+/// Guard lifetimes stay lexical — no transmute or self-referential structs.
+pub fn with_cross_process_lock<R>(lock_path: &Path, f: impl FnOnce() -> Result<R>) -> Result<R> {
     let process_mtx = in_process_lock(lock_path);
-    let in_process_guard = process_mtx.lock().expect("in-process store mutex poisoned");
-    // Safety: `_process_mtx` is stored in the same struct and outlives `_in_process`.
-    let in_process_guard = unsafe {
-        std::mem::transmute::<std::sync::MutexGuard<'_, ()>, std::sync::MutexGuard<'static, ()>>(
-            in_process_guard,
-        )
-    };
+    let _in_process = process_mtx.lock().expect("in-process store mutex poisoned");
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -47,11 +31,10 @@ pub fn acquire_cross_process_lock(lock_path: &Path) -> Result<CrossProcessLock> 
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(lock_path)?;
     file.lock_exclusive()?;
-    Ok(CrossProcessLock {
-        _process_mtx: process_mtx,
-        _in_process: in_process_guard,
-        file,
-    })
+    let result = f();
+    let _ = file.unlock();
+    result
 }

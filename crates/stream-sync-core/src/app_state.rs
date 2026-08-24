@@ -11,13 +11,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+type DockControlSockets =
+    HashMap<String, HashMap<uuid::Uuid, tokio::sync::mpsc::UnboundedSender<()>>>;
+
 #[derive(Clone, Default)]
 pub struct DockControlRegistry {
-    inner: Arc<
-        std::sync::Mutex<
-            HashMap<String, HashMap<uuid::Uuid, tokio::sync::mpsc::UnboundedSender<()>>>,
-        >,
-    >,
+    inner: Arc<std::sync::Mutex<DockControlSockets>>,
 }
 
 impl DockControlRegistry {
@@ -67,7 +66,7 @@ impl DockControlRegistry {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct TwitchRuntime {
     pub tokens: TwitchTokenFile,
     pub connected: bool,
@@ -84,19 +83,6 @@ pub struct TwitchRuntime {
 pub struct KickRuntime {
     pub tokens: KickTokenFile,
     pub connected: bool,
-}
-
-impl Default for TwitchRuntime {
-    fn default() -> Self {
-        Self {
-            tokens: TwitchTokenFile::default(),
-            connected: false,
-            channel: None,
-            name_color: None,
-            display_name: None,
-            badges_raw: HashMap::new(),
-        }
-    }
 }
 
 pub struct AppState {
@@ -246,7 +232,7 @@ impl AppState {
         let control_token =
             crate::control_plane::load_control_token(&paths.control_token, readonly)?;
         let dock_credentials = if paths.dock_credentials.is_file() {
-            crate::dock_capability::DockCredentialStore::load_or_create(&paths.dock_credentials)?
+            crate::dock_capability::DockCredentialStore::load(&paths.dock_credentials, !readonly)?
         } else if readonly {
             crate::dock_capability::DockCredentialStore::empty_in_memory()
         } else {
@@ -542,5 +528,29 @@ mod tests {
             "readonly startup must not mutate userdata tree"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readonly_startup_does_not_create_absent_userdata_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "streamsync-readonly-absent-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!dir.exists());
+        std::env::set_var("STREAMSYNC_USERDATA", dir.display().to_string());
+        let repo = storage::resolve_ui_assets_root();
+        let paths = storage::get_paths_readonly().unwrap();
+        let built = AppState::new(paths, repo, 14202, true);
+        assert!(
+            !dir.exists(),
+            "readonly must not create absent userdata root"
+        );
+        built.expect("readonly app state with absent root");
+        assert!(
+            !dir.exists(),
+            "readonly AppState must not create userdata root"
+        );
     }
 }

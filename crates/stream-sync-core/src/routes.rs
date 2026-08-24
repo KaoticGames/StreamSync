@@ -332,7 +332,7 @@ fn rewrite_gstatic_font_urls(css: &str) -> String {
         out.push_str(&remaining[..idx]);
         let after = &remaining[idx..];
         let end = after
-            .find(|c: char| matches!(c, ')' | '\'' | '"' | ' ' | '\n' | '\r' | '\t'))
+            .find([' ', ')', '\'', '"', '\n', '\r', '\t'])
             .unwrap_or(after.len());
         let url = &after[..end];
         out.push_str("/google-fonts/file?u=");
@@ -2202,25 +2202,40 @@ async fn handle_ws_feed(
                     .get("platform")
                     .and_then(|v| v.as_str())
                     .unwrap_or("twitch");
-                if crate::dock_capability::DockCredentialStore::is_dock_token(token)
+                let prelim_ok = crate::dock_capability::DockCredentialStore::is_dock_token(token)
                     && ctx
                         .state
                         .dock_credentials
-                        .authorize_chat_send(token, platform, &profile_id)
-                {
-                    if let (Some(id), ref prev) = (registry_id.take(), private_auth_token) {
+                        .authorize_chat_send(token, platform, &profile_id);
+                if prelim_ok {
+                    if let (Some(id), ref prev) = (registry_id.take(), private_auth_token.clone()) {
                         if !prev.is_empty() {
-                            ctx.state.dock_controls.unregister(prev, id);
+                            ctx.state.dock_controls.unregister(&prev, id);
                         }
                     }
                     let (id, rx) = ctx.state.dock_controls.register(token);
+                    // Revalidate after register so revoke between authorize and upgrade cannot win.
+                    if !ctx
+                        .state
+                        .dock_credentials
+                        .authorize_chat_send(token, platform, &profile_id)
+                    {
+                        ctx.state.dock_controls.unregister(token, id);
+                        let mut s = sender.write().await;
+                        let _ = s
+                            .send(axum::extract::ws::Message::Text(
+                                json!({ "type": "auth-failed" }).to_string(),
+                            ))
+                            .await;
+                        continue;
+                    }
                     registry_id = Some(id);
                     private_auth_token = token.to_string();
                     revocation_rx = Some(rx);
                     audience = FeedAudience::PrivateControlDock;
                     ctx.state
                         .feed
-                        .set_client_audience(&profile_id, &sender, audience)
+                        .set_client_private_auth(&profile_id, &sender, token, platform)
                         .await;
                     let mut s = sender.write().await;
                     let _ = s

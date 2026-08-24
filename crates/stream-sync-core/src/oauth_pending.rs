@@ -157,14 +157,13 @@ impl PendingLoginStore {
         let mut guard = self.inner.lock().expect("pending login lock");
         let now = Instant::now();
         guard.retain(|_, entry| {
-            if entry.reserved {
-                if entry
+            if entry.reserved
+                && entry
                     .reserved_until
                     .map(|until| now <= until)
                     .unwrap_or(false)
-                {
-                    return true;
-                }
+            {
+                return true;
             }
             entry.created_at.elapsed() <= LOGIN_NONCE_TTL || entry.consumed
         });

@@ -2,7 +2,7 @@
 
 use crate::control_plane::constant_time_eq;
 use crate::storage;
-use crate::store_lock::acquire_cross_process_lock;
+use crate::store_lock::with_cross_process_lock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -43,12 +43,19 @@ impl DockCredentialStore {
     }
 
     pub fn load_or_create(path: &Path) -> anyhow::Result<Self> {
+        Self::load(path, true)
+    }
+
+    /// Load credentials from disk. When `repair_permissions` is false, never chmod/repair.
+    pub fn load(path: &Path, repair_permissions: bool) -> anyhow::Result<Self> {
         let store = Self {
             path: path.to_path_buf(),
             inner: Mutex::new(HashMap::new()),
         };
         if path.is_file() {
-            storage::ensure_secret_file_permissions(path)?;
+            if repair_permissions {
+                storage::ensure_secret_file_permissions(path)?;
+            }
             store.reload_locked()?;
         }
         Ok(store)
@@ -119,29 +126,27 @@ impl DockCredentialStore {
     /// Validate chat-send authority for platform/profile. Never authorizes HTTP control.
     /// Read-through under the shared store lock so cross-process revocations are observed.
     pub fn authorize_chat_send(&self, token: &str, platform: &str, profile_id: &str) -> bool {
-        let Ok(_lock) = acquire_cross_process_lock(&self.lock_path()) else {
-            return false;
-        };
-        if self.reload_locked().is_err() {
-            return false;
-        }
-        let platform = normalize_platform(platform);
-        let profile_id = if profile_id.trim().is_empty() {
-            "chat-default".to_string()
-        } else {
-            profile_id.trim().to_string()
-        };
-        let guard = self.inner.lock().expect("dock cred lock");
-        for c in guard.values() {
-            if !c.active {
-                continue;
+        with_cross_process_lock(&self.lock_path(), || {
+            self.reload_locked()?;
+            let platform = normalize_platform(platform);
+            let profile_id = if profile_id.trim().is_empty() {
+                "chat-default".to_string()
+            } else {
+                profile_id.trim().to_string()
+            };
+            let guard = self.inner.lock().expect("dock cred lock");
+            for c in guard.values() {
+                if !c.active {
+                    continue;
+                }
+                if !constant_time_eq(c.token.as_bytes(), token.as_bytes()) {
+                    continue;
+                }
+                return Ok(c.platform == platform && c.profile_id == profile_id);
             }
-            if !constant_time_eq(c.token.as_bytes(), token.as_bytes()) {
-                continue;
-            }
-            return c.platform == platform && c.profile_id == profile_id;
-        }
-        false
+            Ok(false)
+        })
+        .unwrap_or(false)
     }
 
     pub fn is_dock_token(token: &str) -> bool {
@@ -165,11 +170,11 @@ impl DockCredentialStore {
         &self,
         f: impl FnOnce(&mut HashMap<String, DockCredential>) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        let _lock = acquire_cross_process_lock(&self.lock_path())?;
-        self.reload_locked()?;
-        let mut guard = self.inner.lock().expect("dock cred lock");
-        let result = f(&mut guard)?;
-        Ok(result)
+        with_cross_process_lock(&self.lock_path(), || {
+            self.reload_locked()?;
+            let mut guard = self.inner.lock().expect("dock cred lock");
+            f(&mut guard)
+        })
     }
 
     fn reload_locked(&self) -> anyhow::Result<()> {
@@ -178,7 +183,6 @@ impl DockCredentialStore {
         if !self.path.is_file() {
             return Ok(());
         }
-        storage::ensure_secret_file_permissions(&self.path)?;
         let raw = std::fs::read_to_string(&self.path)?;
         if let Ok(file) = serde_json::from_str::<DockCredentialFile>(&raw) {
             for c in file.credentials {

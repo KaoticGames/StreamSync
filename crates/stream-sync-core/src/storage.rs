@@ -137,6 +137,18 @@ fn looks_like_asar(p: &Path) -> bool {
         .contains("app.asar")
 }
 
+fn configured_user_data_root() -> PathBuf {
+    std::env::var("STREAMSYNC_USERDATA")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".stream-sync")
+        })
+}
+
 fn assert_writable_root(root: &Path) -> Result<PathBuf> {
     let r = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     if looks_like_asar(&r) {
@@ -157,18 +169,33 @@ fn assert_writable_root(root: &Path) -> Result<PathBuf> {
     Ok(r)
 }
 
-/// Resolve userData root: `STREAMSYNC_USERDATA` or `~/.stream-sync`.
+/// Resolve an existing or absent userdata root without creating, probing, or chmod.
+fn resolve_readonly_root(root: &Path) -> Result<PathBuf> {
+    if looks_like_asar(root) {
+        anyhow::bail!(
+            "Storage root points inside app.asar (read-only): {}\n\
+             STREAMSYNC_USERDATA must be a user-writable directory.",
+            root.display()
+        );
+    }
+    if root.exists() {
+        if !root.is_dir() {
+            anyhow::bail!("STREAMSYNC_USERDATA is not a directory: {}", root.display());
+        }
+        return Ok(fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
+    }
+    // Absent root is allowed: callers use ephemeral in-memory defaults and must not create it.
+    Ok(root.to_path_buf())
+}
+
+/// Resolve userData root: `STREAMSYNC_USERDATA` or `~/.stream-sync` (creates/probes writable).
 pub fn user_data_root() -> Result<PathBuf> {
-    let root = std::env::var("STREAMSYNC_USERDATA")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".stream-sync")
-        });
-    assert_writable_root(&root)
+    assert_writable_root(&configured_user_data_root())
+}
+
+/// Resolve userData root for readonly mode — never create_dir_all or write probes.
+pub fn user_data_root_readonly() -> Result<PathBuf> {
+    resolve_readonly_root(&configured_user_data_root())
 }
 
 pub fn get_paths() -> Result<StoragePaths> {
@@ -180,7 +207,11 @@ pub fn get_paths_readonly() -> Result<StoragePaths> {
 }
 
 fn get_paths_for_mode(readonly: bool) -> Result<StoragePaths> {
-    let root = user_data_root()?;
+    let root = if readonly {
+        user_data_root_readonly()?
+    } else {
+        user_data_root()?
+    };
 
     let dock_config =
         env_path("STREAMSYNC_DOCK_CONFIG").unwrap_or_else(|| root.join("dock-config.json"));
