@@ -6,7 +6,6 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::Duration;
 use stream_sync_core::{
     route_inventory, route_policy, DockCredentialStore, OverlayConfig, OverlayServer, RoutePolicy,
@@ -17,7 +16,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tower::ServiceExt;
 
 static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
-static TEST_SETUP_LOCK: Mutex<()> = Mutex::new(());
+static TEST_SETUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn test_userdata_dir() -> PathBuf {
     let n = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -38,7 +37,7 @@ async fn test_app_mode(
     port: u16,
     readonly: bool,
 ) -> (axum::Router, std::sync::Arc<stream_sync_core::AppState>) {
-    let _guard = TEST_SETUP_LOCK.lock().expect("test setup lock");
+    let _guard = TEST_SETUP_LOCK.lock().await;
     let userdata = test_userdata_dir();
     std::env::set_var("STREAMSYNC_USERDATA", userdata.display().to_string());
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -434,9 +433,7 @@ async fn ws_feed_rejects_evil_origin_and_allows_trusted() {
         .insert(header::ORIGIN, trusted_origin(port).parse().unwrap());
     let (mut ws, _) = tokio_tungstenite::connect_async(ok).await.expect("feed");
     ws.send(Message::Text(
-        json!({ "type": "chat-send", "message": "nope" })
-            .to_string()
-            .into(),
+        json!({ "type": "chat-send", "message": "nope" }).to_string(),
     ))
     .await
     .unwrap();
@@ -460,9 +457,7 @@ async fn ws_control_auth_timeout_and_dock_token() {
         .insert(header::ORIGIN, trusted_origin(port).parse().unwrap());
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     ws.send(Message::Text(
-        json!({ "type": "auth", "token": dock.token, "platform": "twitch" })
-            .to_string()
-            .into(),
+        json!({ "type": "auth", "token": dock.token, "platform": "twitch" }).to_string(),
     ))
     .await
     .unwrap();
@@ -493,9 +488,7 @@ async fn ws_control_auth_timeout_and_dock_token() {
         .insert(header::ORIGIN, trusted_origin(port).parse().unwrap());
     let (mut ws2, _) = tokio_tungstenite::connect_async(req2).await.unwrap();
     ws2.send(Message::Text(
-        json!({ "type": "auth", "token": dock.token, "platform": "twitch" })
-            .to_string()
-            .into(),
+        json!({ "type": "auth", "token": dock.token, "platform": "twitch" }).to_string(),
     ))
     .await
     .unwrap();
@@ -532,8 +525,7 @@ async fn ws_control_rejects_master_token_and_revocation_closes_active_socket() {
     master_ws
         .send(Message::Text(
             json!({ "type": "auth", "token": state.control_token(), "platform": "twitch" })
-                .to_string()
-                .into(),
+                .to_string(),
         ))
         .await
         .unwrap();
@@ -557,9 +549,7 @@ async fn ws_control_rejects_master_token_and_revocation_closes_active_socket() {
     let (mut dock_ws, _) = tokio_tungstenite::connect_async(dock_req).await.unwrap();
     dock_ws
         .send(Message::Text(
-            json!({ "type": "auth", "token": dock.token, "platform": "twitch" })
-                .to_string()
-                .into(),
+            json!({ "type": "auth", "token": dock.token, "platform": "twitch" }).to_string(),
         ))
         .await
         .unwrap();
@@ -607,9 +597,7 @@ async fn revoke_all_closes_every_active_dock_socket() {
             .insert(header::ORIGIN, trusted_origin(port).parse().unwrap());
         let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
         ws.send(Message::Text(
-            json!({ "type": "auth", "token": dock.token, "platform": platform })
-                .to_string()
-                .into(),
+            json!({ "type": "auth", "token": dock.token, "platform": platform }).to_string(),
         ))
         .await
         .unwrap();
@@ -766,46 +754,62 @@ fn build_router_source_must_match_route_id_list() {
     let body = &src[fn_start..];
     let body_end = body.find("\nasync fn ").unwrap_or(body.len());
     let body = &body[..body_end];
-    let mut found: std::collections::BTreeSet<(&str, String)> = std::collections::BTreeSet::new();
-    for (idx, _) in body.match_indices(".route(") {
-        let after = &body[idx + ".route(".len()..];
-        let trimmed = after.trim_start();
-        let Some(rest) = trimmed.strip_prefix('"') else {
+    let mut found: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    let bytes = body.as_bytes();
+    let mut search_from = 0;
+    while let Some(rel) = body[search_from..].find(".route(") {
+        let start = search_from + rel + ".route(".len();
+        let mut depth = 1usize;
+        let mut i = start;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        let call = &body[start..i.saturating_sub(1)];
+        search_from = i;
+        let call_trim = call.trim_start();
+        let Some(rest) = call_trim.strip_prefix('"') else {
             continue;
         };
         let Some(end) = rest.find('"') else {
             continue;
         };
         let path = rest[..end].to_string();
-        let after_path = rest[end + 1..]
-            .trim_start()
-            .trim_start_matches(',')
-            .trim_start();
-        for method in ["get", "post", "delete", "put", "patch"] {
-            if after_path.contains(method) {
-                found.insert((
-                    match method {
-                        "get" => "GET",
-                        "post" => "POST",
-                        "delete" => "DELETE",
-                        "put" => "PUT",
-                        "patch" => "PATCH",
-                        _ => unreachable!(),
-                    },
-                    path.clone(),
-                ));
+        for (needle, method) in [
+            ("get(", "GET"),
+            ("post(", "POST"),
+            ("delete(", "DELETE"),
+            ("put(", "PUT"),
+            ("patch(", "PATCH"),
+        ] {
+            let mut scan = call;
+            while let Some(idx) = scan.find(needle) {
+                let before = &scan[..idx];
+                let ok = before
+                    .chars()
+                    .next_back()
+                    .map(|c| !c.is_ascii_alphanumeric() && c != '_')
+                    .unwrap_or(true);
+                if ok {
+                    found.insert((method.to_string(), path.clone()));
+                }
+                scan = &scan[idx + needle.len()..];
             }
         }
     }
     if body.contains("nest_service(\"/fonts\"") {
-        found.insert(("GET", "/fonts/*".into()));
+        found.insert(("GET".into(), "/fonts/*".into()));
     }
     if body.contains("nest_service(\"/events-media\"") {
-        found.insert(("GET", "/events-media/*".into()));
+        found.insert(("GET".into(), "/events-media/*".into()));
     }
     let listed: std::collections::BTreeSet<_> = BUILD_ROUTER_ROUTE_IDS
         .iter()
-        .map(|(m, p)| (*m, (*p).to_string()))
+        .map(|(m, p)| ((*m).to_string(), (*p).to_string()))
         .collect();
     assert_eq!(
         found, listed,
@@ -947,8 +951,7 @@ async fn ws_feed_private_audience_requires_valid_dock_credential() {
     private
         .send(Message::Text(
             json!({ "type": "auth", "token": "ssd_invalid_token_xxxxxxxxxxxxxxxx", "platform": "twitch" })
-                .to_string()
-                .into(),
+                .to_string(),
         ))
         .await
         .unwrap();
@@ -961,9 +964,7 @@ async fn ws_feed_private_audience_requires_valid_dock_credential() {
     drain_feed_bootstrap(&mut authorized).await;
     authorized
         .send(Message::Text(
-            json!({ "type": "auth", "token": dock.token, "platform": "twitch" })
-                .to_string()
-                .into(),
+            json!({ "type": "auth", "token": dock.token, "platform": "twitch" }).to_string(),
         ))
         .await
         .unwrap();
@@ -994,9 +995,7 @@ async fn ws_feed_revocation_closes_private_subscription() {
     drain_feed_bootstrap(&mut private).await;
     private
         .send(Message::Text(
-            json!({ "type": "auth", "token": dock.token, "platform": "twitch" })
-                .to_string()
-                .into(),
+            json!({ "type": "auth", "token": dock.token, "platform": "twitch" }).to_string(),
         ))
         .await
         .unwrap();
@@ -1037,9 +1036,7 @@ async fn cross_process_revoke_blocks_chat_send_before_platform() {
         .insert(header::ORIGIN, trusted_origin(port).parse().unwrap());
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     ws.send(Message::Text(
-        json!({ "type": "auth", "token": dock.token, "platform": "twitch" })
-            .to_string()
-            .into(),
+        json!({ "type": "auth", "token": dock.token, "platform": "twitch" }).to_string(),
     ))
     .await
     .unwrap();
@@ -1053,8 +1050,7 @@ async fn cross_process_revoke_blocks_chat_send_before_platform() {
 
     ws.send(Message::Text(
         json!({ "type": "chat-send", "message": "must-not-send", "platform": "twitch" })
-            .to_string()
-            .into(),
+            .to_string(),
     ))
     .await
     .unwrap();
@@ -1105,9 +1101,7 @@ async fn cross_process_revoke_fences_established_private_feed() {
     drain_feed_bootstrap(&mut private).await;
     private
         .send(Message::Text(
-            json!({ "type": "auth", "token": dock.token, "platform": "twitch" })
-                .to_string()
-                .into(),
+            json!({ "type": "auth", "token": dock.token, "platform": "twitch" }).to_string(),
         ))
         .await
         .unwrap();
@@ -1152,9 +1146,7 @@ async fn cross_process_revoke_all_fences_private_feed() {
     drain_feed_bootstrap(&mut private).await;
     private
         .send(Message::Text(
-            json!({ "type": "auth", "token": dock.token, "platform": "twitch" })
-                .to_string()
-                .into(),
+            json!({ "type": "auth", "token": dock.token, "platform": "twitch" }).to_string(),
         ))
         .await
         .unwrap();

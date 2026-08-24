@@ -2154,7 +2154,6 @@ async fn handle_ws_feed(
 ) {
     let (sender, mut receiver) = socket.split();
     let sender = Arc::new(tokio::sync::RwLock::new(sender));
-    let mut audience = audience;
     let mut private_auth_token = String::new();
     let mut registry_id = None;
     let mut revocation_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>> = None;
@@ -2210,7 +2209,7 @@ async fn handle_ws_feed(
                 if prelim_ok {
                     if let (Some(id), ref prev) = (registry_id.take(), private_auth_token.clone()) {
                         if !prev.is_empty() {
-                            ctx.state.dock_controls.unregister(&prev, id);
+                            ctx.state.dock_controls.unregister(prev, id);
                         }
                     }
                     let (id, rx) = ctx.state.dock_controls.register(token);
@@ -2232,7 +2231,6 @@ async fn handle_ws_feed(
                     registry_id = Some(id);
                     private_auth_token = token.to_string();
                     revocation_rx = Some(rx);
-                    audience = FeedAudience::PrivateControlDock;
                     ctx.state
                         .feed
                         .set_client_private_auth(&profile_id, &sender, token, platform)

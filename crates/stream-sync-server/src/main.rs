@@ -30,9 +30,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let mut config = OverlayConfig::default();
-    config.port = args.port;
-    config.readonly = args.readonly;
+    let mut config = OverlayConfig {
+        port: args.port,
+        readonly: args.readonly,
+        ..OverlayConfig::default()
+    };
     if let Some(root) = args.repo_root {
         config.repo_root = root;
     }

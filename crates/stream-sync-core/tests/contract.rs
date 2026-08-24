@@ -94,7 +94,7 @@ async fn ws_ping_pong_contract() {
     );
     let (mut ws, _) = connect_async(&url).await.expect("ws connect");
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        json!({ "type": "ping" }).to_string().into(),
+        json!({ "type": "ping" }).to_string(),
     ))
     .await
     .unwrap();

@@ -46,6 +46,7 @@ pub fn resolve_ui_assets_root(app: &AppHandle) -> PathBuf {
 }
 
 /// Back-compat name used by older code paths.
+#[allow(dead_code)]
 pub fn resolve_repo_root(app: &AppHandle) -> PathBuf {
     resolve_ui_assets_root(app)
 }
