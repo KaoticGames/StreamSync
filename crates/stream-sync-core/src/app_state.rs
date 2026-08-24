@@ -8,6 +8,7 @@ use crate::config_types::{
 use crate::storage::{self, StoragePaths};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -106,6 +107,8 @@ pub struct AppState {
     pub personal_tokens: RwLock<TwitchTokenFile>,
     /// Saved Syndicate takeover session (if any).
     pub delegated: RwLock<Option<DelegatedSessionFile>>,
+    /// Monotonic delegated session generation (fences stale workers).
+    pub delegated_generation: AtomicU64,
     /// Which saved identity drives IRC / EventSub.
     pub active_mode: RwLock<TwitchActiveMode>,
     pub feed: FeedHub,
@@ -189,7 +192,16 @@ impl AppState {
 
         let personal =
             read_json_for_mode(&paths.twitch_tokens, &TwitchTokenFile::default(), readonly)?;
-        let delegated = if paths.twitch_delegated.is_file() {
+        let revoked_tombstone = paths.twitch_delegated_revoked.is_file();
+        let delegated = if revoked_tombstone {
+            if paths.twitch_delegated.is_file() {
+                if let Err(e) = storage::remove_file_durable(&paths.twitch_delegated) {
+                    tracing::warn!("delegated quarantine cleanup failed: {e:#}");
+                }
+            }
+            tracing::warn!("delegated session quarantined: revoked tombstone present");
+            None
+        } else if paths.twitch_delegated.is_file() {
             read_json_for_mode(
                 &paths.twitch_delegated,
                 &DelegatedSessionFile::default(),
@@ -200,6 +212,8 @@ impl AppState {
         } else {
             None
         };
+        let delegated_generation =
+            AtomicU64::new(delegated.as_ref().map(|d| d.generation.max(1)).unwrap_or(0));
         let saved_mode = read_json_for_mode(
             &paths.twitch_active_mode,
             &TwitchActiveModeFile::default(),
@@ -209,15 +223,30 @@ impl AppState {
         .unwrap_or_default();
         let personal_ok = personal.access_token.is_some() && personal.login.is_some();
         let delegated_ok = delegated.is_some();
-        let active_mode = match saved_mode {
-            TwitchActiveMode::Delegated if delegated_ok => TwitchActiveMode::Delegated,
-            TwitchActiveMode::Local if personal_ok => TwitchActiveMode::Local,
-            // Fallbacks when the preferred side is missing (e.g. pre-switcher installs).
-            _ if delegated_ok && !personal_ok => TwitchActiveMode::Delegated,
-            _ if personal_ok => TwitchActiveMode::Local,
-            _ if delegated_ok => TwitchActiveMode::Delegated,
-            _ => TwitchActiveMode::Local,
+        let active_mode = if revoked_tombstone || !delegated_ok {
+            match saved_mode {
+                TwitchActiveMode::Delegated if personal_ok => TwitchActiveMode::Local,
+                TwitchActiveMode::Delegated => TwitchActiveMode::Local,
+                other => other,
+            }
+        } else {
+            match saved_mode {
+                TwitchActiveMode::Delegated if delegated_ok => TwitchActiveMode::Delegated,
+                TwitchActiveMode::Local if personal_ok => TwitchActiveMode::Local,
+                _ if delegated_ok && !personal_ok => TwitchActiveMode::Delegated,
+                _ if personal_ok => TwitchActiveMode::Local,
+                _ if delegated_ok => TwitchActiveMode::Delegated,
+                _ => TwitchActiveMode::Local,
+            }
         };
+        if revoked_tombstone && active_mode == TwitchActiveMode::Local && !readonly {
+            let _ = storage::write_json(
+                &paths.twitch_active_mode,
+                &TwitchActiveModeFile {
+                    mode: TwitchActiveMode::Local,
+                },
+            );
+        }
         let live_tokens = match active_mode {
             TwitchActiveMode::Delegated => delegated
                 .as_ref()
@@ -258,6 +287,7 @@ impl AppState {
             }),
             personal_tokens: RwLock::new(personal),
             delegated: RwLock::new(delegated),
+            delegated_generation,
             active_mode: RwLock::new(active_mode),
             feed: FeedHub::new(),
             personal_kick: RwLock::new(personal_kick),
@@ -326,13 +356,41 @@ impl AppState {
         let d = self.delegated.read().await;
         match d.as_ref() {
             Some(sess) => storage::write_json(&self.paths.twitch_delegated, sess),
-            None => {
-                if self.paths.twitch_delegated.is_file() {
-                    let _ = std::fs::remove_file(&self.paths.twitch_delegated);
-                }
-                Ok(())
-            }
+            None => self.durable_revoke_delegated().await,
         }
+    }
+
+    /// Persist revoked tombstone and remove delegated credential file durably.
+    pub async fn durable_revoke_delegated(&self) -> anyhow::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
+        storage::write_delegated_revoked_tombstone(&self.paths.twitch_delegated_revoked)?;
+        storage::remove_file_durable(&self.paths.twitch_delegated)?;
+        Ok(())
+    }
+
+    pub fn current_delegated_generation(&self) -> u64 {
+        self.delegated_generation.load(Ordering::SeqCst)
+    }
+
+    pub fn bump_delegated_generation(&self) -> u64 {
+        self.delegated_generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub async fn session_still_current(&self, generation: u64) -> bool {
+        if self.current_delegated_generation() != generation {
+            return false;
+        }
+        self.delegated
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|s| s.generation == generation)
+    }
+
+    pub async fn delegated_file_exists(&self) -> bool {
+        self.paths.twitch_delegated.is_file()
     }
 
     pub async fn save_active_mode(&self) -> anyhow::Result<()> {

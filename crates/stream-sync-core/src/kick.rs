@@ -276,7 +276,7 @@ pub async fn send_chat_from_dock(state: Arc<AppState>, message: &str) -> Result<
     Ok(())
 }
 
-async fn feed_url(state: &AppState) -> Option<String> {
+async fn feed_request(state: &AppState) -> Option<(String, Option<String>)> {
     let delegated_mode = state.is_delegated_mode().await;
     if delegated_mode {
         let d = state.delegated.read().await;
@@ -284,80 +284,93 @@ async fn feed_url(state: &AppState) -> Option<String> {
             if sess.kick_id.as_ref().is_some_and(|s| !s.is_empty())
                 && !sess.connection_key.is_empty()
             {
-                return Some(format!(
-                    "{}/api/stream-sync/kick-feed?key={}",
-                    syndicate_connection::api_base(),
-                    urlencoding::encode(&sess.connection_key)
+                return Some((
+                    syndicate_connection::kick_feed_url(),
+                    Some(crate::delegated_lifecycle::connection_key_authorization(
+                        &sess.connection_key,
+                    )),
                 ));
             }
         }
     }
     let tokens = state.kick.read().await.tokens.clone();
     let ticket = tokens.feed_ticket.filter(|s| !s.is_empty())?;
-    Some(format!(
-        "{}/api/stream-sync/kick-feed?ticket={}",
-        syndicate_connection::api_base(),
-        urlencoding::encode(&ticket)
+    Some((
+        format!(
+            "{}/api/stream-sync/kick-feed?ticket={}",
+            syndicate_connection::api_base(),
+            urlencoding::encode(&ticket)
+        ),
+        None,
     ))
 }
 
 async fn feed_loop(state: Arc<AppState>) {
     loop {
-        let Some(url) = feed_url(&state).await else {
+        let Some((url, auth)) = feed_request(&state).await else {
             state.kick.write().await.connected = false;
             tokio::time::sleep(Duration::from_secs(8)).await;
             continue;
         };
-        match consume_sse(state.clone(), &url).await {
+        let key_hint = state
+            .delegated
+            .read()
+            .await
+            .as_ref()
+            .map(|s| s.connection_key.clone());
+        match consume_sse(state.clone(), &url, auth.as_deref()).await {
             Ok(()) => info!("Kick feed SSE ended"),
-            Err(e) => warn!("Kick feed SSE error: {e:#}"),
+            Err(e) => {
+                let msg = key_hint
+                    .as_deref()
+                    .map(|k| {
+                        crate::delegated_lifecycle::redact_connection_key(&format!("{e:#}"), k)
+                    })
+                    .unwrap_or_else(|| format!("{e:#}"));
+                warn!("Kick feed SSE error: {msg}");
+            }
         }
         state.kick.write().await.connected = false;
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
-async fn consume_sse(state: Arc<AppState>, url: &str) -> Result<()> {
-    let res = reqwest::Client::new()
+async fn consume_sse(state: Arc<AppState>, url: &str, auth: Option<&str>) -> Result<()> {
+    let mut req = syndicate_connection::syndicate_http_client()
         .get(url)
-        .header("Accept", "text/event-stream")
-        .send()
-        .await?;
+        .header("Accept", "text/event-stream");
+    if let Some(token) = auth {
+        req = req.header("Authorization", token);
+    }
+    let res = req.send().await?;
     if !res.status().is_success() {
         return Err(anyhow!("Kick feed HTTP {}", res.status()));
     }
     state.kick.write().await.connected = true;
     let mut stream = res.bytes_stream();
     let mut buf = String::new();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let chunk = tokio::time::timeout(
+            crate::delegated_lifecycle::SYNDICATE_SSE_READ_TIMEOUT,
+            stream.next(),
+        )
+        .await
+        .map_err(|_| anyhow!("Kick feed read timeout"))?;
+        let Some(chunk) = chunk else {
+            return Err(anyhow!("Kick feed stream ended"));
+        };
         let bytes = chunk?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(idx) = buf.find("\n\n") {
-            let frame = buf[..idx].to_string();
-            buf = buf[idx + 2..].to_string();
-            if let Some(event) = parse_sse_data(&frame) {
+        let frames = crate::delegated_lifecycle::append_sse_chunk(
+            &mut buf,
+            &String::from_utf8_lossy(&bytes),
+        )
+        .map_err(|_| anyhow!("Kick feed buffer overflow"))?;
+        for frame in frames {
+            if let Some(event) = crate::delegated_lifecycle::parse_sse_json_data(&frame) {
                 fanout_kick_event(&state, event).await;
             }
         }
     }
-    Ok(())
-}
-
-fn parse_sse_data(frame: &str) -> Option<Value> {
-    let mut data = String::new();
-    for line in frame.lines() {
-        let line = line.trim_end();
-        if let Some(rest) = line.strip_prefix("data:") {
-            if !data.is_empty() {
-                data.push('\n');
-            }
-            data.push_str(rest.trim_start());
-        }
-    }
-    if data.is_empty() {
-        return None;
-    }
-    serde_json::from_str(&data).ok()
 }
 
 async fn fanout_kick_event(state: &AppState, raw: Value) {

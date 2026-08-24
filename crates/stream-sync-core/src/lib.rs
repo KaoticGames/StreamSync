@@ -20,9 +20,11 @@ mod streamelements;
 mod syndicate_connection;
 mod twitch;
 
-pub use delegated_lifecycle::MAX_DELEGATED_REVOCATION_DELAY;
+pub use delegated_lifecycle::{
+    MAX_DELEGATED_REVOCATION_DELAY, SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,
+};
 pub use syndicate_connection::connection_key_events_url;
-pub use twitch::TwitchServices;
+pub use twitch::{disconnect_twitch, TwitchServices};
 
 pub use streamelements::{
     clear_session as se_clear_session, load_session as se_load_session, map_overlay_to_profile,
@@ -39,6 +41,7 @@ pub use control_plane::{
 };
 pub use dock_capability::{DockCredential, DockCredentialStore};
 pub use export::{build_backup_zip, BackupManifest};
+pub use kick::sync_live_identity;
 pub use oauth_pending::{OAuthProvider, PendingLoginStore, LOGIN_NONCE_HEADER};
 pub use routes::BUILD_ROUTER_ROUTE_IDS;
 pub use storage::{
@@ -46,6 +49,7 @@ pub use storage::{
     legacy_electron_user_data, load_streamsync_dotenv, resolve_repo_root, resolve_ui_assets_root,
     rust_dotenv_path, rust_workspace_root, write_secret_file, StoragePaths,
 };
+pub use storage::{remove_file_durable, write_delegated_revoked_tombstone, write_json};
 
 /// Back-compat alias.
 pub use storage::bootstrap_twitch_env_from_rust as bootstrap_twitch_env_from_repo;
@@ -109,6 +113,7 @@ impl OverlayServer {
             self.config.readonly,
         )?;
         let twitch = Arc::new(twitch::TwitchServices::new());
+        twitch.init_teardown_worker();
         let ctx = ServerContext {
             state: state.clone(),
             twitch: twitch.clone(),

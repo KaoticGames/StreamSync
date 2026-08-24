@@ -120,6 +120,8 @@ pub struct StoragePaths {
     pub kick_tokens: PathBuf,
     /// Syndicate takeover session (separate from personal OAuth tokens).
     pub twitch_delegated: PathBuf,
+    /// Tombstone written when delegated authority is revoked (startup fail-closed).
+    pub twitch_delegated_revoked: PathBuf,
     /// Which saved identity is active: local vs delegated.
     pub twitch_active_mode: PathBuf,
     pub fonts_dir: PathBuf,
@@ -224,6 +226,7 @@ fn get_paths_for_mode(readonly: bool) -> Result<StoragePaths> {
     let kick_tokens =
         env_path("STREAMSYNC_KICK_TOKENS_FILE").unwrap_or_else(|| root.join("kick-tokens.json"));
     let twitch_delegated = root.join("twitch-delegated.json");
+    let twitch_delegated_revoked = root.join("twitch-delegated.revoked");
     let twitch_active_mode = root.join("twitch-active-mode.json");
     let fonts_dir = env_path("STREAMSYNC_FONTS_DIR").unwrap_or_else(|| root.join("fonts"));
     let events_media_dir =
@@ -254,6 +257,7 @@ fn get_paths_for_mode(readonly: bool) -> Result<StoragePaths> {
         twitch_tokens,
         kick_tokens,
         twitch_delegated,
+        twitch_delegated_revoked,
         twitch_active_mode,
         fonts_dir,
         events_media_dir,
@@ -561,6 +565,53 @@ where
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let data = serde_json::to_string_pretty(value)?;
     write_file_atomic(path, data.as_bytes())
+}
+
+/// Best-effort directory metadata sync after delegated credential removal.
+pub fn sync_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd;
+            let dir = fs::File::open(parent)?;
+            dir.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = parent;
+        }
+    }
+    Ok(())
+}
+
+/// Remove a file durably: rename away, sync parent, then delete the quarantine copy.
+pub fn remove_file_durable(path: &Path) -> Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let quarantine = path.with_extension(format!("revoked-{}", now_ts()));
+    match fs::rename(path, &quarantine) {
+        Ok(()) => {
+            sync_parent_dir(path)?;
+            fs::remove_file(&quarantine)?;
+            sync_parent_dir(path)?;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => {
+            fs::remove_file(path)?;
+            sync_parent_dir(path)?;
+            Ok(())
+        }
+    }
+}
+
+/// Durable revoked tombstone for delegated takeover credentials.
+pub fn write_delegated_revoked_tombstone(path: &Path) -> Result<()> {
+    let payload = serde_json::json!({
+        "revoked_at": chrono::Utc::now().to_rfc3339(),
+    });
+    write_file_atomic(path, serde_json::to_string(&payload)?.as_bytes())
 }
 
 /// Simple `dirs` helper without extra crate — home via USERPROFILE/HOME.
