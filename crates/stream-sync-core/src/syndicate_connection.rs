@@ -93,12 +93,9 @@ pub async fn refresh(key: &str) -> Result<ExchangeSuccess> {
     redeem(key, "refresh").await
 }
 
-pub fn connection_key_events_url(key: &str) -> String {
-    format!(
-        "{}/api/stream-sync/connection-keys/events?key={}",
-        api_base(),
-        urlencoding::encode(key.trim())
-    )
+/// Events URL without embedding the connection key (use Authorization: Bearer instead).
+pub fn connection_key_events_url() -> String {
+    crate::delegated_lifecycle::connection_key_events_url(&api_base())
 }
 
 async fn redeem(key: &str, action: &str) -> Result<ExchangeSuccess> {
@@ -240,5 +237,13 @@ mod tests {
         let err = exchange("not-a-key").await.unwrap_err();
         let api = err.downcast_ref::<SyndicateApiError>().expect("api err");
         assert_eq!(api.code, "invalid_key");
+    }
+
+    #[test]
+    fn events_url_does_not_include_connection_key() {
+        let url = connection_key_events_url();
+        assert!(url.ends_with("/api/stream-sync/connection-keys/events"));
+        assert!(!url.contains("?key="));
+        assert!(!url.contains("ssk_"));
     }
 }

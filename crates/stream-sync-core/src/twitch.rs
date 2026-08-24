@@ -3,6 +3,11 @@
 use crate::app_state::{tokens_from_delegated_session, AppState};
 use crate::broadcast::{make_dock_event, FeedHub};
 use crate::config_types::{DelegatedSessionFile, TwitchActiveMode, TwitchTokenFile};
+use crate::delegated_lifecycle::{
+    capped_revalidation_sleep, connection_key_authorization, connection_key_events_url,
+    redact_connection_key, stop_delegated_worker_handles, DelegatedWorker, TeardownGate,
+    MAX_DELEGATED_REVOCATION_DELAY,
+};
 use crate::syndicate_connection::{self, SyndicateApiError};
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
@@ -34,6 +39,8 @@ pub struct TwitchServices {
     eventsub_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
     refresh_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
     watch_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
+    /// Ensures simultaneous SSE revoke / refresh failure / expiration run teardown once.
+    teardown_gate: TeardownGate,
 }
 
 impl TwitchServices {
@@ -46,7 +53,14 @@ impl TwitchServices {
             eventsub_handle: RwLock::new(None),
             refresh_handle: RwLock::new(None),
             watch_handle: RwLock::new(None),
+            teardown_gate: TeardownGate::new(),
         }
+    }
+}
+
+impl Default for TwitchServices {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -617,7 +631,7 @@ pub async fn disconnect_twitch(state: Arc<AppState>, services: Arc<TwitchService
     let active = *state.active_mode.read().await;
     match active {
         TwitchActiveMode::Delegated => {
-            remove_delegated_session(&state, &services).await?;
+            remove_delegated_session(&state, &services, None).await?;
             let personal = state.personal_tokens.read().await.clone();
             if tokens_saved(&personal) {
                 {
@@ -691,7 +705,7 @@ pub async fn remove_connection(
             state.save_twitch_tokens().await?;
         }
         TwitchActiveMode::Delegated => {
-            remove_delegated_session(&state, &services).await?;
+            remove_delegated_session(&state, &services, None).await?;
         }
     }
     Ok(())
@@ -718,20 +732,20 @@ fn install_tokens_from_exchange(
     }
 }
 
-async fn remove_delegated_session(state: &AppState, services: &TwitchServices) -> Result<()> {
-    stop_delegated_tasks(services).await;
+async fn remove_delegated_session(
+    state: &AppState,
+    services: &TwitchServices,
+    except: Option<DelegatedWorker>,
+) -> Result<()> {
+    // Clear authorization first so a missed push cannot keep granting access via in-memory state.
     *state.delegated.write().await = None;
     state.save_delegated().await?;
+    stop_delegated_worker_handles(&services.refresh_handle, &services.watch_handle, except).await;
     Ok(())
 }
 
 async fn stop_delegated_tasks(services: &TwitchServices) {
-    if let Some(h) = services.refresh_handle.write().await.take() {
-        h.abort();
-    }
-    if let Some(h) = services.watch_handle.write().await.take() {
-        h.abort();
-    }
+    stop_delegated_worker_handles(&services.refresh_handle, &services.watch_handle, None).await;
 }
 
 async fn stop_refresh_task(services: &TwitchServices) {
@@ -744,10 +758,15 @@ async fn end_delegated_session_after_key_invalid(
     state: Arc<AppState>,
     services: Arc<TwitchServices>,
     code: &str,
+    caller: Option<DelegatedWorker>,
 ) {
+    if !services.teardown_gate.try_begin() {
+        return;
+    }
     warn!("delegated session ended: {}", code);
     let was_active = state.is_delegated_mode().await;
-    let _ = remove_delegated_session(&state, &services).await;
+    // Persist cleared delegated credentials before cancelling workers / restarting clients.
+    let _ = remove_delegated_session(&state, &services, caller).await;
     if was_active {
         let personal = state.personal_tokens.read().await.clone();
         if tokens_saved(&personal) {
@@ -826,6 +845,7 @@ async fn apply_exchange_session(
 
     *state.delegated.write().await = Some(session);
     state.save_delegated().await?;
+    services.teardown_gate.reset();
 
     if activate {
         {
@@ -883,8 +903,10 @@ async fn start_delegated_refresh_loop(state: Arc<AppState>, services: Arc<Twitch
                         Duration::from_secs(5)
                     }
                 }
-                Err(_) => Duration::from_secs(60 * 30),
+                Err(_) => MAX_DELEGATED_REVOCATION_DELAY,
             };
+            // Bound delegated authorization even if SSE revoke is missed.
+            let sleep_for = capped_revalidation_sleep(sleep_for);
 
             tokio::time::sleep(sleep_for).await;
 
@@ -939,6 +961,7 @@ async fn start_delegated_refresh_loop(state: Arc<AppState>, services: Arc<Twitch
                                     state2.clone(),
                                     services2.clone(),
                                     &api.code,
+                                    Some(DelegatedWorker::Refresh),
                                 )
                                 .await;
                                 break;
@@ -985,14 +1008,27 @@ async fn consume_connection_key_events(
     services: Arc<TwitchServices>,
     key: &str,
 ) -> Result<bool> {
-    let url = syndicate_connection::connection_key_events_url(key);
+    let url = connection_key_events_url(&syndicate_connection::api_base());
     let res = reqwest::Client::new()
         .get(&url)
         .header("Accept", "text/event-stream")
+        .header("Authorization", connection_key_authorization(key))
         .send()
-        .await?;
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "connection key watch request failed: {}",
+                redact_connection_key(&e.to_string(), key)
+            )
+        })?;
     if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-        end_delegated_session_after_key_invalid(state, services, "revoked").await;
+        end_delegated_session_after_key_invalid(
+            state,
+            services,
+            "revoked",
+            Some(DelegatedWorker::Watch),
+        )
+        .await;
         return Ok(true);
     }
     if !res.status().is_success() {
@@ -1001,14 +1037,25 @@ async fn consume_connection_key_events(
     let mut stream = res.bytes_stream();
     let mut buf = String::new();
     while let Some(chunk) = stream.next().await {
-        let bytes = chunk?;
+        let bytes = chunk.map_err(|e| {
+            anyhow!(
+                "connection key watch stream error: {}",
+                redact_connection_key(&e.to_string(), key)
+            )
+        })?;
         buf.push_str(&String::from_utf8_lossy(&bytes));
         while let Some(idx) = buf.find("\n\n") {
             let frame = buf[..idx].to_string();
             buf = buf[idx + 2..].to_string();
             if let Some(event) = parse_connection_key_sse_data(&frame) {
                 if event.get("type").and_then(|v| v.as_str()) == Some("revoked") {
-                    end_delegated_session_after_key_invalid(state, services, "revoked").await;
+                    end_delegated_session_after_key_invalid(
+                        state,
+                        services,
+                        "revoked",
+                        Some(DelegatedWorker::Watch),
+                    )
+                    .await;
                     return Ok(true);
                 }
             }
@@ -1027,6 +1074,7 @@ async fn start_delegated_watch_loop(state: Arc<AppState>, services: Arc<TwitchSe
     let state2 = state.clone();
     let services2 = services.clone();
     let handle = tokio::spawn(async move {
+        let mut consecutive_failures: u32 = 0;
         loop {
             let key = {
                 let d = state2.delegated.read().await;
@@ -1038,8 +1086,42 @@ async fn start_delegated_watch_loop(state: Arc<AppState>, services: Arc<TwitchSe
 
             match consume_connection_key_events(state2.clone(), services2.clone(), &key).await {
                 Ok(true) => break,
-                Ok(false) => {}
-                Err(e) => warn!("connection key watch error: {e:#}"),
+                Ok(false) => {
+                    consecutive_failures = 0;
+                }
+                Err(e) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    warn!(
+                        "connection key watch error: {}",
+                        redact_connection_key(&format!("{e:#}"), &key)
+                    );
+                    // After repeated transport failures, force a refresh revalidation so a
+                    // missed SSE revoke cannot leave delegated access open indefinitely.
+                    if consecutive_failures >= 3 {
+                        match syndicate_connection::refresh(&key).await {
+                            Ok(_) => {
+                                consecutive_failures = 0;
+                            }
+                            Err(err) => {
+                                if let Some(api) = err.downcast_ref::<SyndicateApiError>() {
+                                    match api.code.as_str() {
+                                        "revoked" | "expired" | "invalid_key" => {
+                                            end_delegated_session_after_key_invalid(
+                                                state2.clone(),
+                                                services2.clone(),
+                                                &api.code,
+                                                Some(DelegatedWorker::Watch),
+                                            )
+                                            .await;
+                                            break;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             if state2.delegated.read().await.is_none() {
@@ -1976,7 +2058,7 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
                     match api.code.as_str() {
                         "revoked" | "expired" | "invalid_key" => {
                             warn!("delegated session invalid on launch: {}", api.code);
-                            let _ = remove_delegated_session(&state, &services).await;
+                            let _ = remove_delegated_session(&state, &services, None).await;
                             if active == TwitchActiveMode::Delegated {
                                 // Fall through to personal if available.
                             }
@@ -2261,5 +2343,354 @@ mod tests {
         let mut by_name = std::collections::HashMap::new();
         by_name.insert("Kappa".into(), "25".into());
         assert!(emotes_from_message_text("hello world", &by_name).is_none());
+    }
+
+    static PHASE2_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn phase2_userdata() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "streamsync-phase2-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn phase2_app() -> (Arc<AppState>, Arc<TwitchServices>) {
+        let userdata = phase2_userdata();
+        std::env::set_var("STREAMSYNC_USERDATA", userdata.display().to_string());
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .to_path_buf();
+        let config = crate::OverlayConfig {
+            port: 0,
+            repo_root,
+            readonly: false,
+        };
+        let (_router, state, services) = crate::OverlayServer::new(config)
+            .build_app()
+            .await
+            .expect("build_app");
+        (state, services)
+    }
+
+    fn sample_delegated() -> DelegatedSessionFile {
+        DelegatedSessionFile {
+            connection_key: "ssk_phase2_test_placeholder_not_a_real_key".into(),
+            client_id: "cid".into(),
+            access_token: "delegated-access".into(),
+            channel_login: "takeover_chan".into(),
+            channel_twitch_id: "999".into(),
+            twitch_expires_at: (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            kick_access_token: Some("delegated-kick".into()),
+            kick_id: Some("k1".into()),
+            ..Default::default()
+        }
+    }
+
+    fn sample_personal() -> TwitchTokenFile {
+        TwitchTokenFile {
+            access_token: Some("personal-access".into()),
+            refresh_token: Some("personal-refresh".into()),
+            login: Some("personal_login".into()),
+            user_id: Some("111".into()),
+            ..Default::default()
+        }
+    }
+
+    async fn install_fake_platform_workers(state: &AppState, services: &TwitchServices) {
+        let forever = || {
+            tokio::spawn(async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+            })
+        };
+        *services.irc_handle.write().await = Some(forever());
+        *services.eventsub_handle.write().await = Some(forever());
+        *state.kick_feed_handle.write().await = Some(forever());
+        {
+            let mut k = state.kick.write().await;
+            k.tokens.access_token = Some("delegated-kick".into());
+            k.connected = true;
+        }
+    }
+
+    /// Task 2.1/2.2: watcher-driven teardown must finish personal fallback and stop platforms
+    /// without aborting the calling watch task mid-cleanup.
+    #[tokio::test]
+    async fn watcher_teardown_completes_personal_fallback_and_stops_platforms() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let (state, services) = phase2_app().await;
+
+        *state.delegated.write().await = Some(sample_delegated());
+        state.save_delegated().await.unwrap();
+        *state.personal_tokens.write().await = sample_personal();
+        state.save_twitch_tokens().await.unwrap();
+        {
+            let mut tw = state.twitch.write().await;
+            tw.tokens = TwitchTokenFile {
+                access_token: Some("delegated-access".into()),
+                login: Some("takeover_chan".into()),
+                user_id: Some("999".into()),
+                ..Default::default()
+            };
+            *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        }
+        state.save_active_mode().await.unwrap();
+        install_fake_platform_workers(&state, &services).await;
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done2 = done.clone();
+        let state2 = state.clone();
+        let services2 = services.clone();
+        let handle = tokio::spawn(async move {
+            let _ = ready_rx.await;
+            end_delegated_session_after_key_invalid(
+                state2,
+                services2,
+                "revoked",
+                Some(DelegatedWorker::Watch),
+            )
+            .await;
+            done2.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        *services.watch_handle.write().await = Some(handle);
+        *services.refresh_handle.write().await = Some(tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        }));
+        ready_tx.send(()).unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if done.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "watch-driven teardown must complete without self-abort"
+        );
+        assert!(state.delegated.read().await.is_none());
+        assert_eq!(*state.active_mode.read().await, TwitchActiveMode::Local);
+        assert_eq!(
+            state.twitch.read().await.tokens.login.as_deref(),
+            Some("personal_login")
+        );
+        // Delegated workers must be cleared; IRC/EventSub may restart for personal fallback.
+        assert!(services.refresh_handle.read().await.is_none());
+        assert!(services.watch_handle.read().await.is_none());
+        assert!(state.kick_feed_handle.read().await.is_none());
+        assert!(!state.kick.read().await.tokens.is_linked());
+    }
+
+    #[tokio::test]
+    async fn watcher_teardown_without_personal_stops_all_platform_workers() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let (state, services) = phase2_app().await;
+
+        *state.delegated.write().await = Some(sample_delegated());
+        *state.personal_tokens.write().await = TwitchTokenFile::default();
+        {
+            let mut tw = state.twitch.write().await;
+            tw.tokens = TwitchTokenFile {
+                access_token: Some("delegated-access".into()),
+                login: Some("takeover_chan".into()),
+                user_id: Some("999".into()),
+                ..Default::default()
+            };
+            *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        }
+        install_fake_platform_workers(&state, &services).await;
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done2 = done.clone();
+        let state2 = state.clone();
+        let services2 = services.clone();
+        let handle = tokio::spawn(async move {
+            let _ = ready_rx.await;
+            end_delegated_session_after_key_invalid(
+                state2,
+                services2,
+                "revoked",
+                Some(DelegatedWorker::Watch),
+            )
+            .await;
+            done2.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        *services.watch_handle.write().await = Some(handle);
+        ready_tx.send(()).unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if done.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(state.delegated.read().await.is_none());
+        assert_eq!(*state.active_mode.read().await, TwitchActiveMode::Local);
+        assert!(services.irc_handle.read().await.is_none());
+        assert!(services.eventsub_handle.read().await.is_none());
+        assert!(state.kick_feed_handle.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn teardown_is_idempotent_across_simultaneous_callers() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let (state, services) = phase2_app().await;
+        *state.delegated.write().await = Some(sample_delegated());
+        *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        install_fake_platform_workers(&state, &services).await;
+
+        let a = end_delegated_session_after_key_invalid(
+            state.clone(),
+            services.clone(),
+            "revoked",
+            Some(DelegatedWorker::Watch),
+        );
+        let b = end_delegated_session_after_key_invalid(
+            state.clone(),
+            services.clone(),
+            "expired",
+            Some(DelegatedWorker::Refresh),
+        );
+        tokio::join!(a, b);
+        assert!(state.delegated.read().await.is_none());
+        assert!(services.teardown_gate.is_started());
+    }
+
+    #[tokio::test]
+    async fn independent_watch_handles_per_services_instance() {
+        let a = Arc::new(TwitchServices::new());
+        let b = Arc::new(TwitchServices::new());
+        *a.watch_handle.write().await = Some(tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        }));
+        *b.watch_handle.write().await = Some(tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        }));
+        stop_delegated_worker_handles(&a.refresh_handle, &a.watch_handle, None).await;
+        assert!(a.watch_handle.read().await.is_none());
+        assert!(b.watch_handle.read().await.is_some());
+        stop_delegated_worker_handles(&b.refresh_handle, &b.watch_handle, None).await;
+        assert!(b.watch_handle.read().await.is_none());
+    }
+
+    #[test]
+    fn parse_sse_revoked_event() {
+        let frame = "event: message\ndata: {\"type\":\"revoked\"}\n";
+        let v = parse_connection_key_sse_data(frame).unwrap();
+        assert_eq!(v.get("type").and_then(|x| x.as_str()), Some("revoked"));
+    }
+
+    #[tokio::test]
+    async fn sse_401_uses_authorization_header_and_tears_down() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let saw_auth = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_auth2 = saw_auth.clone();
+        let saw_query_key = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_query_key2 = saw_query_key.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = socket.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if buf.len() > 16_384 {
+                    break;
+                }
+            }
+            let req = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+            if req.contains("authorization:") && req.contains("bearer ssk_") {
+                saw_auth2.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            if req.contains("?key=") {
+                saw_query_key2.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let body =
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(body).await;
+        });
+        std::env::set_var("SYNDICATE_API_BASE", format!("http://127.0.0.1:{port}"));
+
+        let (state, services) = phase2_app().await;
+        *state.delegated.write().await = Some(sample_delegated());
+        *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        install_fake_platform_workers(&state, &services).await;
+
+        let ended = consume_connection_key_events(
+            state.clone(),
+            services.clone(),
+            "ssk_phase2_test_placeholder_not_a_real_key",
+        )
+        .await
+        .unwrap();
+        assert!(ended);
+        assert!(
+            saw_auth.load(std::sync::atomic::Ordering::SeqCst),
+            "events request must send Authorization Bearer"
+        );
+        assert!(!saw_query_key.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(state.delegated.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_hard_fail_codes_end_delegated_session() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let (state, services) = phase2_app().await;
+        *state.delegated.write().await = Some(sample_delegated());
+        *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        install_fake_platform_workers(&state, &services).await;
+
+        for code in ["revoked", "expired", "invalid_key"] {
+            services.teardown_gate.reset();
+            *state.delegated.write().await = Some(sample_delegated());
+            *state.active_mode.write().await = TwitchActiveMode::Delegated;
+            end_delegated_session_after_key_invalid(
+                state.clone(),
+                services.clone(),
+                code,
+                Some(DelegatedWorker::Refresh),
+            )
+            .await;
+            assert!(
+                state.delegated.read().await.is_none(),
+                "code {code} must clear delegated"
+            );
+        }
+    }
+
+    #[test]
+    fn max_revocation_delay_is_documented_bound() {
+        assert_eq!(MAX_DELEGATED_REVOCATION_DELAY, Duration::from_secs(300));
+        assert_eq!(
+            capped_revalidation_sleep(Duration::from_secs(10_000)),
+            Duration::from_secs(300)
+        );
     }
 }

@@ -7,6 +7,7 @@ mod app_state;
 mod broadcast;
 mod config_types;
 mod control_plane;
+mod delegated_lifecycle;
 mod dock_capability;
 mod export;
 mod kick;
@@ -18,6 +19,10 @@ mod store_lock;
 mod streamelements;
 mod syndicate_connection;
 mod twitch;
+
+pub use delegated_lifecycle::MAX_DELEGATED_REVOCATION_DELAY;
+pub use syndicate_connection::connection_key_events_url;
+pub use twitch::TwitchServices;
 
 pub use streamelements::{
     clear_session as se_clear_session, load_session as se_load_session, map_overlay_to_profile,
