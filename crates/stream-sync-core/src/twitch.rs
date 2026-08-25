@@ -4,9 +4,10 @@ use crate::app_state::{tokens_from_delegated_session, AppState};
 use crate::broadcast::{make_dock_event, FeedHub};
 use crate::config_types::{DelegatedSessionFile, TwitchActiveMode, TwitchTokenFile};
 use crate::delegated_lifecycle::{
-    append_sse_chunk, connection_key_authorization, connection_key_events_url, parse_sse_json_data,
-    redact_connection_key, stop_delegated_worker_handles, AuthorityLease, DelegatedGeneration,
-    DelegatedWorker, SseBufferError, TeardownCoordinator, MAX_DELEGATED_REVOCATION_DELAY,
+    append_sse_chunk, connection_key_authorization, connection_key_events_url,
+    install_generation_task, parse_sse_json_data, redact_connection_key,
+    stop_delegated_worker_handles, AuthorityLease, DelegatedGeneration, DelegatedWorker,
+    GenerationTask, SseBufferError, TeardownCoordinator, MAX_DELEGATED_REVOCATION_DELAY,
     SYNDICATE_SSE_READ_TIMEOUT,
 };
 use crate::syndicate_connection::{self, SyndicateApiError};
@@ -38,10 +39,12 @@ pub struct TwitchServices {
     irc_client: RwLock<Option<StreamSyncIrcClient>>,
     irc_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
     eventsub_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
-    refresh_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
-    watch_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
-    teardown_coordinator: TeardownCoordinator,
+    refresh_handle: RwLock<Option<GenerationTask>>,
+    watch_handle: RwLock<Option<GenerationTask>>,
+    pub teardown_coordinator: TeardownCoordinator,
     authority_lease: Mutex<AuthorityLease>,
+    /// Serializes apply / durable revoke / refresh-apply / mode transitions.
+    lifecycle_lock: Mutex<()>,
     teardown_tx: OnceLock<mpsc::UnboundedSender<TeardownRequest>>,
 }
 
@@ -63,7 +66,8 @@ impl TwitchServices {
             refresh_handle: RwLock::new(None),
             watch_handle: RwLock::new(None),
             teardown_coordinator: TeardownCoordinator::new(),
-            authority_lease: Mutex::new(AuthorityLease::new_validated()),
+            authority_lease: Mutex::new(AuthorityLease::inactive()),
+            lifecycle_lock: Mutex::new(()),
             teardown_tx: OnceLock::new(),
         }
     }
@@ -96,7 +100,8 @@ impl TwitchServices {
     }
 
     pub async fn install_delegated_generation(&self, generation: DelegatedGeneration) {
-        self.teardown_coordinator
+        let _ = self
+            .teardown_coordinator
             .install_generation_async(generation)
             .await;
     }
@@ -108,22 +113,65 @@ impl TwitchServices {
         reason: &str,
     ) -> Result<(), String> {
         let Some(tx) = self.teardown_tx.get() else {
-            return execute_delegated_teardown(state, self.clone(), generation, reason).await;
+            return self
+                .teardown_coordinator
+                .run_or_join(generation, || {
+                    let state = state.clone();
+                    let services = self.clone();
+                    let reason = reason.to_string();
+                    async move {
+                        execute_delegated_teardown(state, services, generation, &reason).await
+                    }
+                })
+                .await;
         };
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = tx.send(TeardownRequest {
-            generation,
-            reason: reason.to_string(),
-            state,
-            reply: reply_tx,
-        });
-        reply_rx.await.unwrap_or(Ok(()))
+        if tx
+            .send(TeardownRequest {
+                generation,
+                reason: reason.to_string(),
+                state: state.clone(),
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            // Coordinator channel dead — fail closed via owned coordinator path.
+            return self
+                .teardown_coordinator
+                .run_or_join(generation, || {
+                    let state = state.clone();
+                    let services = self.clone();
+                    let reason = reason.to_string();
+                    async move {
+                        execute_delegated_teardown(state, services, generation, &reason).await
+                    }
+                })
+                .await;
+        }
+        reply_rx
+            .await
+            .unwrap_or_else(|_| Err("teardown coordinator reply closed".into()))
     }
 
-    async fn renew_authority_lease(&self, connection_expires_at: Option<&str>) {
+    /// Renew lease only after successful remote validation for `generation`.
+    async fn renew_after_successful_remote_validation(
+        &self,
+        generation: DelegatedGeneration,
+        connection_expires_at: Option<&str>,
+    ) {
         let mut lease = self.authority_lease.lock().await;
-        lease.renew_on_success();
-        lease.merge_connection_expiry(connection_expires_at);
+        lease.renew_after_successful_remote_validation(generation, connection_expires_at);
+    }
+
+    /// Cap lease by connection expiry without extending (local data never renews).
+    async fn cap_authority_lease_by_connection_expiry(&self, connection_expires_at: Option<&str>) {
+        let mut lease = self.authority_lease.lock().await;
+        lease.cap_by_connection_expiry(connection_expires_at);
+    }
+
+    async fn install_pending_authority_lease(&self, generation: DelegatedGeneration) {
+        let mut lease = self.authority_lease.lock().await;
+        *lease = AuthorityLease::pending_remote_validation(generation);
     }
 
     async fn authority_lease_expired(&self) -> bool {
@@ -829,11 +877,33 @@ async fn remove_delegated_session(
     except: Option<DelegatedWorker>,
     generation: DelegatedGeneration,
 ) -> Result<()> {
-    if !state.session_still_current(generation).await {
+    let _lifecycle = services.lifecycle_lock.lock().await;
+    if state.current_delegated_generation() != generation {
         return Ok(());
     }
+    {
+        let delegated = state.delegated.read().await;
+        if delegated
+            .as_ref()
+            .is_some_and(|s| s.generation != generation)
+        {
+            return Ok(());
+        }
+    }
     state.durable_revoke_delegated().await?;
-    *state.delegated.write().await = None;
+    {
+        let mut delegated = state.delegated.write().await;
+        if state.current_delegated_generation() != generation {
+            return Ok(());
+        }
+        if delegated
+            .as_ref()
+            .is_some_and(|s| s.generation != generation)
+        {
+            return Ok(());
+        }
+        *delegated = None;
+    }
     stop_delegated_worker_handles(&services.refresh_handle, &services.watch_handle, except).await;
     Ok(())
 }
@@ -843,8 +913,8 @@ async fn stop_delegated_tasks(services: &TwitchServices) {
 }
 
 async fn stop_refresh_task(services: &TwitchServices) {
-    if let Some(h) = services.refresh_handle.write().await.take() {
-        h.abort();
+    if let Some(task) = services.refresh_handle.write().await.take() {
+        task.handle.abort();
     }
 }
 
@@ -854,38 +924,70 @@ async fn execute_delegated_teardown(
     generation: DelegatedGeneration,
     code: &str,
 ) -> Result<(), String> {
-    if state.current_delegated_generation() != generation {
-        return Ok(());
-    }
-    warn!("delegated session ended: {}", code);
-    let was_active = state.is_delegated_mode().await;
-    remove_delegated_session(&state, &services, None, generation)
-        .await
-        .map_err(|e| e.to_string())?;
-    if was_active
-        && state.delegated.read().await.is_none()
-        && state.current_delegated_generation() == generation
-    {
-        let personal = state.personal_tokens.read().await.clone();
-        if tokens_saved(&personal) {
-            {
-                let mut tw = state.twitch.write().await;
-                clear_live_runtime_fields(&mut tw);
-                tw.tokens = personal;
-                *state.active_mode.write().await = TwitchActiveMode::Local;
-            }
-            state.save_active_mode().await.map_err(|e| e.to_string())?;
-            restart_twitch_clients(state.clone(), services.clone()).await;
-        } else {
-            stop_twitch_clients(&services).await;
-            let mut tw = state.twitch.write().await;
-            tw.tokens = TwitchTokenFile::default();
-            clear_live_runtime_fields(&mut tw);
-            *state.active_mode.write().await = TwitchActiveMode::Local;
-            state.save_active_mode().await.map_err(|e| e.to_string())?;
+    let was_active = {
+        let _lifecycle = services.lifecycle_lock.lock().await;
+        if state.current_delegated_generation() != generation {
+            return Ok(());
         }
-    }
-    if state.current_delegated_generation() == generation {
+        {
+            let delegated = state.delegated.read().await;
+            if delegated
+                .as_ref()
+                .is_some_and(|s| s.generation != generation)
+            {
+                return Ok(());
+            }
+        }
+        warn!("delegated session ended: {}", code);
+        let was_active = state.is_delegated_mode().await;
+        state
+            .durable_revoke_delegated()
+            .await
+            .map_err(|e| e.to_string())?;
+        {
+            let mut delegated = state.delegated.write().await;
+            if state.current_delegated_generation() != generation {
+                return Ok(());
+            }
+            if delegated
+                .as_ref()
+                .is_some_and(|s| s.generation != generation)
+            {
+                return Ok(());
+            }
+            *delegated = None;
+        }
+        stop_delegated_worker_handles(&services.refresh_handle, &services.watch_handle, None).await;
+
+        if was_active && state.current_delegated_generation() == generation {
+            let personal = state.personal_tokens.read().await.clone();
+            if tokens_saved(&personal) {
+                {
+                    let mut tw = state.twitch.write().await;
+                    clear_live_runtime_fields(&mut tw);
+                    tw.tokens = personal;
+                    *state.active_mode.write().await = TwitchActiveMode::Local;
+                }
+                state.save_active_mode().await.map_err(|e| e.to_string())?;
+            } else {
+                stop_twitch_clients(&services).await;
+                let mut tw = state.twitch.write().await;
+                tw.tokens = TwitchTokenFile::default();
+                clear_live_runtime_fields(&mut tw);
+                *state.active_mode.write().await = TwitchActiveMode::Local;
+                state.save_active_mode().await.map_err(|e| e.to_string())?;
+            }
+        }
+        was_active
+    };
+
+    if was_active && state.current_delegated_generation() == generation {
+        let personal_ok = tokens_saved(&state.personal_tokens.read().await.clone());
+        if personal_ok {
+            restart_twitch_clients(state.clone(), services.clone()).await;
+        }
+        crate::kick::sync_live_identity(state).await;
+    } else if state.current_delegated_generation() == generation {
         crate::kick::sync_live_identity(state).await;
     }
     Ok(())
@@ -896,10 +998,19 @@ async fn end_delegated_session_after_key_invalid(
     services: Arc<TwitchServices>,
     code: &str,
     generation: DelegatedGeneration,
-) {
-    let _ = services
-        .signal_delegated_teardown(state, generation, code)
-        .await;
+) -> Result<(), String> {
+    match services
+        .signal_delegated_teardown(state.clone(), generation, code)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            warn!("delegated teardown failed ({code}): {err}; retrying once");
+            services
+                .signal_delegated_teardown(state, generation, code)
+                .await
+        }
+    }
 }
 
 /// Map a connection-key failure into `(error_code, user_message, http_status)`.
@@ -939,99 +1050,162 @@ async fn apply_exchange_session(
     exchange: syndicate_connection::ExchangeSuccess,
     activate: bool,
 ) -> Result<()> {
-    stop_delegated_tasks(&services).await;
-    let generation = state.bump_delegated_generation();
-    let session = DelegatedSessionFile {
-        generation,
-        connection_key: key.trim().to_string(),
-        client_id: exchange.twitch.client_id.clone(),
-        access_token: exchange.twitch.access_token.clone(),
-        channel_login: exchange.channel.login.clone(),
-        channel_twitch_id: exchange.channel.twitch_id.clone(),
-        display_name: exchange.channel.display_name.clone(),
-        label: exchange.connection.label.clone(),
-        scopes: exchange.twitch.scopes.clone(),
-        twitch_expires_at: exchange.twitch.expires_at.clone(),
-        connection_expires_at: exchange.connection.expires_at.clone(),
-        ..Default::default()
-    };
-    let mut session = session;
-    crate::kick::apply_kick_to_delegated(&mut session, &exchange);
+    let generation = {
+        let _lifecycle = services.lifecycle_lock.lock().await;
+        stop_delegated_tasks(&services).await;
+        let generation = state.bump_delegated_generation();
+        let mut session = DelegatedSessionFile {
+            generation,
+            connection_key: key.trim().to_string(),
+            client_id: exchange.twitch.client_id.clone(),
+            access_token: exchange.twitch.access_token.clone(),
+            channel_login: exchange.channel.login.clone(),
+            channel_twitch_id: exchange.channel.twitch_id.clone(),
+            display_name: exchange.channel.display_name.clone(),
+            label: exchange.connection.label.clone(),
+            scopes: exchange.twitch.scopes.clone(),
+            twitch_expires_at: exchange.twitch.expires_at.clone(),
+            connection_expires_at: exchange.connection.expires_at.clone(),
+            ..Default::default()
+        };
+        crate::kick::apply_kick_to_delegated(&mut session, &exchange);
 
-    services
-        .teardown_coordinator
-        .install_generation_async(generation)
-        .await;
-    services
-        .renew_authority_lease(session.connection_expires_at.as_deref())
-        .await;
-
-    *state.delegated.write().await = Some(session);
-    state.save_delegated().await?;
-
-    if activate {
-        {
-            let mut tw = state.twitch.write().await;
-            clear_live_runtime_fields(&mut tw);
-            tw.tokens = install_tokens_from_exchange(&exchange);
-            *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        // Durable transaction: write new credential → persist mode → clear old tombstone → publish.
+        state.persist_delegated_session(&session)?;
+        if activate {
+            storage_write_active_mode_delegated(&state)?;
         }
-        state.save_active_mode().await?;
-        restart_twitch_clients(state.clone(), services.clone()).await;
-    }
+        state.clear_delegated_revoked_tombstone()?;
 
-    start_delegated_refresh_loop(state.clone(), services.clone()).await;
-    start_delegated_watch_loop(state.clone(), services).await;
+        services
+            .teardown_coordinator
+            .install_generation_async(generation)
+            .await
+            .map_err(|e| anyhow!(e))?;
+        services
+            .renew_after_successful_remote_validation(
+                generation,
+                session.connection_expires_at.as_deref(),
+            )
+            .await;
+
+        *state.delegated.write().await = Some(session);
+        if activate {
+            {
+                let mut tw = state.twitch.write().await;
+                clear_live_runtime_fields(&mut tw);
+                tw.tokens = install_tokens_from_exchange(&exchange);
+                *state.active_mode.write().await = TwitchActiveMode::Delegated;
+            }
+            // Mode already written durably above; keep in-memory consistent.
+            restart_twitch_clients(state.clone(), services.clone()).await;
+        }
+        generation
+    };
+
+    start_delegated_refresh_loop(state.clone(), services.clone(), generation).await;
+    start_delegated_watch_loop(state.clone(), services, generation).await;
     crate::kick::sync_live_identity(state).await;
     Ok(())
+}
+
+fn storage_write_active_mode_delegated(state: &AppState) -> Result<()> {
+    if state.readonly {
+        return Ok(());
+    }
+    state
+        .durable_fail
+        .fail(&state.durable_fail.save_active_mode, "save_active_mode")
+        .map_err(|e| anyhow!(e))?;
+    crate::storage::write_json(
+        &state.paths.twitch_active_mode,
+        &crate::config_types::TwitchActiveModeFile {
+            mode: TwitchActiveMode::Delegated,
+        },
+    )
 }
 
 async fn ensure_delegated_refresh_loop(state: Arc<AppState>, services: Arc<TwitchServices>) {
     if state.delegated.read().await.is_none() {
         return;
     }
-    let running = services.refresh_handle.read().await.is_some();
-    if !running {
-        start_delegated_refresh_loop(state.clone(), services.clone()).await;
+    let generation = state.current_delegated_generation();
+    // Restored sessions must revalidate promptly — do not grant a fresh five-minute lease.
+    {
+        let lease = services.authority_lease.lock().await;
+        if lease.generation() != generation {
+            drop(lease);
+            services.install_pending_authority_lease(generation).await;
+        }
     }
-    let watch_running = services.watch_handle.read().await.is_some();
+    let running = services
+        .refresh_handle
+        .read()
+        .await
+        .as_ref()
+        .is_some_and(|t| t.generation == generation);
+    if !running {
+        start_delegated_refresh_loop(state.clone(), services.clone(), generation).await;
+    }
+    let watch_running = services
+        .watch_handle
+        .read()
+        .await
+        .as_ref()
+        .is_some_and(|t| t.generation == generation);
     if !watch_running {
-        start_delegated_watch_loop(state, services).await;
+        start_delegated_watch_loop(state, services, generation).await;
     }
 }
 
-async fn start_delegated_refresh_loop(state: Arc<AppState>, services: Arc<TwitchServices>) {
+async fn start_delegated_refresh_loop(
+    state: Arc<AppState>,
+    services: Arc<TwitchServices>,
+    generation: DelegatedGeneration,
+) {
     stop_refresh_task(&services).await;
     let state2 = state.clone();
     let services2 = services.clone();
     let handle = tokio::spawn(async move {
         loop {
             if services2.authority_lease_expired().await {
-                let generation = state2.current_delegated_generation();
-                end_delegated_session_after_key_invalid(
+                match end_delegated_session_after_key_invalid(
                     state2.clone(),
                     services2.clone(),
                     "lease_expired",
                     generation,
                 )
-                .await;
-                break;
+                .await
+                {
+                    Ok(()) => break,
+                    Err(e) => {
+                        warn!("lease expiry teardown failed: {e}");
+                        let wait = services2
+                            .authority_sleep_budget(Duration::from_secs(1))
+                            .await
+                            .max(Duration::from_millis(200));
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                }
             }
 
-            let (generation, key, expires_at, conn_exp) = {
+            let (key, expires_at, conn_exp) = {
                 let d = state2.delegated.read().await;
                 match d.as_ref() {
-                    Some(s) => (
-                        s.generation,
+                    Some(s) if s.generation == generation => (
                         s.connection_key.clone(),
                         s.twitch_expires_at.clone(),
                         s.connection_expires_at.clone(),
                     ),
-                    None => break,
+                    _ => break,
                 }
             };
+            // Local stored expiry may only shorten — never renew — the lease.
             if let Some(ref iso) = conn_exp {
-                services2.renew_authority_lease(Some(iso.as_str())).await;
+                services2
+                    .cap_authority_lease_by_connection_expiry(Some(iso.as_str()))
+                    .await;
             }
 
             let sleep_for = match chrono::DateTime::parse_from_rfc3339(&expires_at) {
@@ -1049,15 +1223,21 @@ async fn start_delegated_refresh_loop(state: Arc<AppState>, services: Arc<Twitch
             };
             let sleep_for = services2.authority_sleep_budget(sleep_for).await;
             if sleep_for.is_zero() {
-                let generation = state2.current_delegated_generation();
-                end_delegated_session_after_key_invalid(
+                match end_delegated_session_after_key_invalid(
                     state2.clone(),
                     services2.clone(),
                     "lease_expired",
                     generation,
                 )
-                .await;
-                break;
+                .await
+                {
+                    Ok(()) => break,
+                    Err(e) => {
+                        warn!("lease expiry teardown failed: {e}");
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                }
             }
             tokio::time::sleep(sleep_for).await;
 
@@ -1067,12 +1247,10 @@ async fn start_delegated_refresh_loop(state: Arc<AppState>, services: Arc<Twitch
 
             match syndicate_connection::refresh(&key).await {
                 Ok(exchange) => {
+                    let _lifecycle = services2.lifecycle_lock.lock().await;
                     if !state2.session_still_current(generation).await {
                         break;
                     }
-                    services2
-                        .renew_authority_lease(exchange.connection.expires_at.as_deref())
-                        .await;
                     let session = {
                         let mut guard = state2.delegated.write().await;
                         let Some(ref mut s) = *guard else {
@@ -1091,7 +1269,20 @@ async fn start_delegated_refresh_loop(state: Arc<AppState>, services: Arc<Twitch
                         crate::kick::apply_kick_to_delegated(s, &exchange);
                         s.clone()
                     };
-                    state2.save_delegated().await.ok();
+                    if let Err(e) = state2.persist_delegated_session(&session) {
+                        warn!(
+                            "delegated refresh persist failed: {}",
+                            redact_connection_key(&format!("{e:#}"), &key)
+                        );
+                        // Fail closed: do not treat refreshed tokens as committed authority.
+                        continue;
+                    }
+                    services2
+                        .renew_after_successful_remote_validation(
+                            generation,
+                            exchange.connection.expires_at.as_deref(),
+                        )
+                        .await;
                     let active_delegated = state2.is_delegated_mode().await;
                     if active_delegated && state2.session_still_current(generation).await {
                         {
@@ -1102,6 +1293,7 @@ async fn start_delegated_refresh_loop(state: Arc<AppState>, services: Arc<Twitch
                             "delegated Twitch token refreshed for {}",
                             session.channel_login
                         );
+                        drop(_lifecycle);
                         restart_twitch_clients(state2.clone(), services2.clone()).await;
                     } else {
                         info!(
@@ -1117,14 +1309,20 @@ async fn start_delegated_refresh_loop(state: Arc<AppState>, services: Arc<Twitch
                     if let Some(api) = e.downcast_ref::<SyndicateApiError>() {
                         match api.code.as_str() {
                             "revoked" | "expired" | "invalid_key" => {
-                                end_delegated_session_after_key_invalid(
+                                match end_delegated_session_after_key_invalid(
                                     state2.clone(),
                                     services2.clone(),
                                     &api.code,
                                     generation,
                                 )
-                                .await;
-                                break;
+                                .await
+                                {
+                                    Ok(()) => break,
+                                    Err(err) => {
+                                        warn!("teardown after hard refresh fail: {err}");
+                                        tokio::time::sleep(Duration::from_millis(200)).await;
+                                    }
+                                }
                             }
                             "token_unavailable" | "rate_limited" => {
                                 warn!("delegated refresh soft-fail: {} — retrying", api.code);
@@ -1132,16 +1330,23 @@ async fn start_delegated_refresh_loop(state: Arc<AppState>, services: Arc<Twitch
                                     .authority_sleep_budget(Duration::from_secs(60))
                                     .await;
                                 if wait.is_zero() {
-                                    end_delegated_session_after_key_invalid(
+                                    match end_delegated_session_after_key_invalid(
                                         state2.clone(),
                                         services2.clone(),
                                         "lease_expired",
                                         generation,
                                     )
-                                    .await;
-                                    break;
+                                    .await
+                                    {
+                                        Ok(()) => break,
+                                        Err(err) => {
+                                            warn!("lease expiry teardown failed: {err}");
+                                            tokio::time::sleep(Duration::from_millis(200)).await;
+                                        }
+                                    }
+                                } else {
+                                    tokio::time::sleep(wait).await;
                                 }
-                                tokio::time::sleep(wait).await;
                             }
                             _ => {
                                 warn!("delegated refresh failed: {} — retrying", api.code);
@@ -1149,16 +1354,23 @@ async fn start_delegated_refresh_loop(state: Arc<AppState>, services: Arc<Twitch
                                     .authority_sleep_budget(Duration::from_secs(60))
                                     .await;
                                 if wait.is_zero() {
-                                    end_delegated_session_after_key_invalid(
+                                    match end_delegated_session_after_key_invalid(
                                         state2.clone(),
                                         services2.clone(),
                                         "lease_expired",
                                         generation,
                                     )
-                                    .await;
-                                    break;
+                                    .await
+                                    {
+                                        Ok(()) => break,
+                                        Err(err) => {
+                                            warn!("lease expiry teardown failed: {err}");
+                                            tokio::time::sleep(Duration::from_millis(200)).await;
+                                        }
+                                    }
+                                } else {
+                                    tokio::time::sleep(wait).await;
                                 }
-                                tokio::time::sleep(wait).await;
                             }
                         }
                     } else {
@@ -1170,22 +1382,29 @@ async fn start_delegated_refresh_loop(state: Arc<AppState>, services: Arc<Twitch
                             .authority_sleep_budget(Duration::from_secs(60))
                             .await;
                         if wait.is_zero() {
-                            end_delegated_session_after_key_invalid(
+                            match end_delegated_session_after_key_invalid(
                                 state2.clone(),
                                 services2.clone(),
                                 "lease_expired",
                                 generation,
                             )
-                            .await;
-                            break;
+                            .await
+                            {
+                                Ok(()) => break,
+                                Err(err) => {
+                                    warn!("lease expiry teardown failed: {err}");
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                }
+                            }
+                        } else {
+                            tokio::time::sleep(wait).await;
                         }
-                        tokio::time::sleep(wait).await;
                     }
                 }
             }
         }
     });
-    *services.refresh_handle.write().await = Some(handle);
+    install_generation_task(&services.refresh_handle, generation, handle).await;
 }
 
 async fn consume_connection_key_events(
@@ -1208,22 +1427,27 @@ async fn consume_connection_key_events(
             )
         })?;
     if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-        end_delegated_session_after_key_invalid(state, services, "revoked", generation).await;
+        let _ =
+            end_delegated_session_after_key_invalid(state, services, "revoked", generation).await;
         return Ok(true);
     }
     if !res.status().is_success() {
         return Err(anyhow!("connection key watch HTTP {}", res.status()));
     }
-    services
-        .renew_authority_lease(
-            state
-                .delegated
-                .read()
-                .await
-                .as_ref()
-                .and_then(|s| s.connection_expires_at.as_deref()),
-        )
-        .await;
+    // Successful remote stream open counts as validation for this generation.
+    if state.session_still_current(generation).await {
+        services
+            .renew_after_successful_remote_validation(
+                generation,
+                state
+                    .delegated
+                    .read()
+                    .await
+                    .as_ref()
+                    .and_then(|s| s.connection_expires_at.as_deref()),
+            )
+            .await;
+    }
     let mut stream = res.bytes_stream();
     let mut buf = String::new();
     loop {
@@ -1244,7 +1468,7 @@ async fn consume_connection_key_events(
         for frame in frames {
             if let Some(event) = parse_sse_json_data(&frame) {
                 if event.get("type").and_then(|v| v.as_str()) == Some("revoked") {
-                    end_delegated_session_after_key_invalid(
+                    let _ = end_delegated_session_after_key_invalid(
                         state.clone(),
                         services.clone(),
                         "revoked",
@@ -1259,16 +1483,25 @@ async fn consume_connection_key_events(
             return Ok(false);
         }
         if services.authority_lease_expired().await {
-            end_delegated_session_after_key_invalid(state, services, "lease_expired", generation)
-                .await;
+            let _ = end_delegated_session_after_key_invalid(
+                state,
+                services,
+                "lease_expired",
+                generation,
+            )
+            .await;
             return Ok(true);
         }
     }
 }
 
-async fn start_delegated_watch_loop(state: Arc<AppState>, services: Arc<TwitchServices>) {
-    if let Some(h) = services.watch_handle.write().await.take() {
-        h.abort();
+async fn start_delegated_watch_loop(
+    state: Arc<AppState>,
+    services: Arc<TwitchServices>,
+    generation: DelegatedGeneration,
+) {
+    if let Some(task) = services.watch_handle.write().await.take() {
+        task.handle.abort();
     }
     let state2 = state.clone();
     let services2 = services.clone();
@@ -1276,22 +1509,28 @@ async fn start_delegated_watch_loop(state: Arc<AppState>, services: Arc<TwitchSe
         let mut consecutive_failures: u32 = 0;
         loop {
             if services2.authority_lease_expired().await {
-                let generation = state2.current_delegated_generation();
-                end_delegated_session_after_key_invalid(
+                match end_delegated_session_after_key_invalid(
                     state2.clone(),
                     services2.clone(),
                     "lease_expired",
                     generation,
                 )
-                .await;
-                break;
+                .await
+                {
+                    Ok(()) => break,
+                    Err(e) => {
+                        warn!("lease expiry teardown failed: {e}");
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                }
             }
 
-            let (generation, key) = {
+            let key = {
                 let d = state2.delegated.read().await;
                 match d.as_ref() {
-                    Some(s) => (s.generation, s.connection_key.clone()),
-                    None => break,
+                    Some(s) if s.generation == generation => s.connection_key.clone(),
+                    _ => break,
                 }
             };
 
@@ -1310,16 +1549,12 @@ async fn start_delegated_watch_loop(state: Arc<AppState>, services: Arc<TwitchSe
                     );
                     if consecutive_failures >= 3 {
                         match syndicate_connection::refresh(&key).await {
-                            Ok(_) => {
+                            Ok(exchange) => {
                                 if state2.session_still_current(generation).await {
                                     services2
-                                        .renew_authority_lease(
-                                            state2
-                                                .delegated
-                                                .read()
-                                                .await
-                                                .as_ref()
-                                                .and_then(|s| s.connection_expires_at.as_deref()),
+                                        .renew_after_successful_remote_validation(
+                                            generation,
+                                            exchange.connection.expires_at.as_deref(),
                                         )
                                         .await;
                                     consecutive_failures = 0;
@@ -1329,14 +1564,21 @@ async fn start_delegated_watch_loop(state: Arc<AppState>, services: Arc<TwitchSe
                                 if let Some(api) = err.downcast_ref::<SyndicateApiError>() {
                                     match api.code.as_str() {
                                         "revoked" | "expired" | "invalid_key" => {
-                                            end_delegated_session_after_key_invalid(
+                                            match end_delegated_session_after_key_invalid(
                                                 state2.clone(),
                                                 services2.clone(),
                                                 &api.code,
                                                 generation,
                                             )
-                                            .await;
-                                            break;
+                                            .await
+                                            {
+                                                Ok(()) => break,
+                                                Err(e) => {
+                                                    warn!("teardown after watch revalidation: {e}");
+                                                    tokio::time::sleep(Duration::from_millis(200))
+                                                        .await;
+                                                }
+                                            }
                                         }
                                         _ => {}
                                     }
@@ -1354,19 +1596,26 @@ async fn start_delegated_watch_loop(state: Arc<AppState>, services: Arc<TwitchSe
                 .authority_sleep_budget(Duration::from_secs(5))
                 .await;
             if wait.is_zero() {
-                end_delegated_session_after_key_invalid(
+                match end_delegated_session_after_key_invalid(
                     state2.clone(),
                     services2.clone(),
                     "lease_expired",
                     generation,
                 )
-                .await;
-                break;
+                .await
+                {
+                    Ok(()) => break,
+                    Err(e) => {
+                        warn!("lease expiry teardown failed: {e}");
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                }
             }
             tokio::time::sleep(wait).await;
         }
     });
-    *services.watch_handle.write().await = Some(handle);
+    install_generation_task(&services.watch_handle, generation, handle).await;
 }
 
 pub async fn restart_twitch_clients(state: Arc<AppState>, services: Arc<TwitchServices>) {
@@ -2282,7 +2531,13 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
                             };
                             if has_delegated_tokens {
                                 restart_twitch_clients(state.clone(), services.clone()).await;
-                                start_delegated_refresh_loop(state.clone(), services.clone()).await;
+                                let generation = state.current_delegated_generation();
+                                start_delegated_refresh_loop(
+                                    state.clone(),
+                                    services.clone(),
+                                    generation,
+                                )
+                                .await;
                                 return;
                             }
                         }
@@ -2318,8 +2573,13 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
                                 };
                                 if has_delegated_tokens {
                                     restart_twitch_clients(state.clone(), services.clone()).await;
-                                    start_delegated_refresh_loop(state.clone(), services.clone())
-                                        .await;
+                                    let generation = state.current_delegated_generation();
+                                    start_delegated_refresh_loop(
+                                        state.clone(),
+                                        services.clone(),
+                                        generation,
+                                    )
+                                    .await;
                                     return;
                                 }
                             } else {
@@ -2337,7 +2597,13 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
                         };
                         if has_delegated_tokens {
                             restart_twitch_clients(state.clone(), services.clone()).await;
-                            start_delegated_refresh_loop(state.clone(), services.clone()).await;
+                            let generation = state.current_delegated_generation();
+                            start_delegated_refresh_loop(
+                                state.clone(),
+                                services.clone(),
+                                generation,
+                            )
+                            .await;
                             return;
                         }
                     } else {
@@ -2645,7 +2911,8 @@ mod tests {
         services
             .teardown_coordinator
             .install_generation_async(session.generation)
-            .await;
+            .await
+            .expect("install generation");
         *state.delegated.write().await = Some(session);
     }
 
@@ -2761,7 +3028,9 @@ mod tests {
             end_delegated_session_after_key_invalid(state.clone(), services.clone(), "revoked", 1);
         let b =
             end_delegated_session_after_key_invalid(state.clone(), services.clone(), "expired", 1);
-        tokio::join!(a, b);
+        let (ra, rb) = tokio::join!(a, b);
+        assert!(ra.is_ok());
+        assert!(rb.is_ok());
         assert!(state.delegated.read().await.is_none());
         assert_eq!(
             services.teardown_coordinator.phase_for(1).await,
@@ -2773,16 +3042,22 @@ mod tests {
     async fn independent_watch_handles_per_services_instance() {
         let a = Arc::new(TwitchServices::new());
         let b = Arc::new(TwitchServices::new());
-        *a.watch_handle.write().await = Some(tokio::spawn(async {
-            loop {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-            }
-        }));
-        *b.watch_handle.write().await = Some(tokio::spawn(async {
-            loop {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-            }
-        }));
+        *a.watch_handle.write().await = Some(GenerationTask {
+            generation: 1,
+            handle: tokio::spawn(async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+            }),
+        });
+        *b.watch_handle.write().await = Some(GenerationTask {
+            generation: 1,
+            handle: tokio::spawn(async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+            }),
+        });
         stop_delegated_worker_handles(&a.refresh_handle, &a.watch_handle, None).await;
         assert!(a.watch_handle.read().await.is_none());
         assert!(b.watch_handle.read().await.is_some());
@@ -2869,7 +3144,9 @@ mod tests {
         for code in ["revoked", "expired", "invalid_key"] {
             install_delegated_session(&state, &services).await;
             *state.active_mode.write().await = TwitchActiveMode::Delegated;
-            end_delegated_session_after_key_invalid(state.clone(), services.clone(), code, 1).await;
+            end_delegated_session_after_key_invalid(state.clone(), services.clone(), code, 1)
+                .await
+                .expect("teardown");
             assert!(
                 state.delegated.read().await.is_none(),
                 "code {code} must clear delegated"
@@ -2882,7 +3159,8 @@ mod tests {
     fn max_revocation_delay_is_documented_bound() {
         use crate::delegated_lifecycle::AuthorityLease;
         assert_eq!(MAX_DELEGATED_REVOCATION_DELAY, Duration::from_secs(300));
-        let lease = AuthorityLease::new_validated();
+        let mut lease = AuthorityLease::inactive();
+        lease.renew_after_successful_remote_validation(1, None);
         assert!(lease.sleep_budget(Duration::from_secs(10_000)) <= MAX_DELEGATED_REVOCATION_DELAY);
     }
 }

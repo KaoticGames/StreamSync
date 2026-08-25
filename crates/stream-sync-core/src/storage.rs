@@ -572,7 +572,6 @@ pub fn sync_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         #[cfg(unix)]
         {
-            use std::os::fd::AsFd;
             let dir = fs::File::open(parent)?;
             dir.sync_all()?;
         }

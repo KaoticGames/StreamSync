@@ -276,7 +276,7 @@ pub async fn send_chat_from_dock(state: Arc<AppState>, message: &str) -> Result<
     Ok(())
 }
 
-async fn feed_request(state: &AppState) -> Option<(String, Option<String>)> {
+async fn feed_request(state: &AppState) -> Option<(String, Option<String>, Option<String>)> {
     let delegated_mode = state.is_delegated_mode().await;
     if delegated_mode {
         let d = state.delegated.read().await;
@@ -284,11 +284,13 @@ async fn feed_request(state: &AppState) -> Option<(String, Option<String>)> {
             if sess.kick_id.as_ref().is_some_and(|s| !s.is_empty())
                 && !sess.connection_key.is_empty()
             {
+                let key = sess.connection_key.clone();
                 return Some((
                     syndicate_connection::kick_feed_url(),
                     Some(crate::delegated_lifecycle::connection_key_authorization(
-                        &sess.connection_key,
+                        &key,
                     )),
+                    Some(key),
                 ));
             }
         }
@@ -302,31 +304,28 @@ async fn feed_request(state: &AppState) -> Option<(String, Option<String>)> {
             urlencoding::encode(&ticket)
         ),
         None,
+        None,
     ))
 }
 
 async fn feed_loop(state: Arc<AppState>) {
     loop {
-        let Some((url, auth)) = feed_request(&state).await else {
+        let Some((url, auth, redact_key)) = feed_request(&state).await else {
             state.kick.write().await.connected = false;
             tokio::time::sleep(Duration::from_secs(8)).await;
             continue;
         };
-        let key_hint = state
-            .delegated
-            .read()
-            .await
-            .as_ref()
-            .map(|s| s.connection_key.clone());
         match consume_sse(state.clone(), &url, auth.as_deref()).await {
             Ok(()) => info!("Kick feed SSE ended"),
             Err(e) => {
-                let msg = key_hint
+                let msg = redact_key
                     .as_deref()
                     .map(|k| {
                         crate::delegated_lifecycle::redact_connection_key(&format!("{e:#}"), k)
                     })
                     .unwrap_or_else(|| format!("{e:#}"));
+                // Defense in depth: never log Authorization header values.
+                let msg = msg.replace("Bearer ", "Bearer [redacted]");
                 warn!("Kick feed SSE error: {msg}");
             }
         }

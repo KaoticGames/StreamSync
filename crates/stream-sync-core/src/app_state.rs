@@ -86,6 +86,30 @@ pub struct KickRuntime {
     pub connected: bool,
 }
 
+/// Deterministic failure injection for durable delegated-store operations (tests).
+#[derive(Default)]
+pub struct DurableFailureInject {
+    pub tombstone_write: std::sync::atomic::AtomicBool,
+    pub credential_remove: std::sync::atomic::AtomicBool,
+    pub tombstone_clear: std::sync::atomic::AtomicBool,
+    pub save_session: std::sync::atomic::AtomicBool,
+    pub save_active_mode: std::sync::atomic::AtomicBool,
+    pub parent_sync: std::sync::atomic::AtomicBool,
+}
+
+impl DurableFailureInject {
+    pub(crate) fn fail(
+        &self,
+        flag: &std::sync::atomic::AtomicBool,
+        op: &str,
+    ) -> anyhow::Result<()> {
+        if flag.load(Ordering::SeqCst) {
+            anyhow::bail!("injected durable failure: {op}");
+        }
+        Ok(())
+    }
+}
+
 pub struct AppState {
     pub paths: StoragePaths,
     /// UI/static files (`shell.html`, `overlay-server/`).
@@ -123,6 +147,8 @@ pub struct AppState {
     pub dock_credentials: crate::dock_capability::DockCredentialStore,
     /// Active dock control sockets, fenced immediately when credentials are revoked.
     pub dock_controls: DockControlRegistry,
+    /// Test-only durable failure injection hooks.
+    pub durable_fail: Arc<DurableFailureInject>,
 }
 
 impl AppState {
@@ -194,7 +220,8 @@ impl AppState {
             read_json_for_mode(&paths.twitch_tokens, &TwitchTokenFile::default(), readonly)?;
         let revoked_tombstone = paths.twitch_delegated_revoked.is_file();
         let delegated = if revoked_tombstone {
-            if paths.twitch_delegated.is_file() {
+            // Readonly must inspect/quarantine in memory only — never mutate disk.
+            if !readonly && paths.twitch_delegated.is_file() {
                 if let Err(e) = storage::remove_file_durable(&paths.twitch_delegated) {
                     tracing::warn!("delegated quarantine cleanup failed: {e:#}");
                 }
@@ -300,6 +327,7 @@ impl AppState {
             pending_logins: crate::oauth_pending::PendingLoginStore::new(),
             dock_credentials,
             dock_controls: DockControlRegistry::default(),
+            durable_fail: Arc::new(DurableFailureInject::default()),
         }))
     }
 
@@ -355,9 +383,19 @@ impl AppState {
         }
         let d = self.delegated.read().await;
         match d.as_ref() {
-            Some(sess) => storage::write_json(&self.paths.twitch_delegated, sess),
+            Some(sess) => self.persist_delegated_session(sess),
             None => self.durable_revoke_delegated().await,
         }
+    }
+
+    /// Write a delegated session credential file (does not clear tombstone).
+    pub fn persist_delegated_session(&self, sess: &DelegatedSessionFile) -> anyhow::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
+        self.durable_fail
+            .fail(&self.durable_fail.save_session, "save_session")?;
+        storage::write_json(&self.paths.twitch_delegated, sess)
     }
 
     /// Persist revoked tombstone and remove delegated credential file durably.
@@ -365,8 +403,28 @@ impl AppState {
         if self.readonly {
             return Ok(());
         }
+        self.durable_fail
+            .fail(&self.durable_fail.tombstone_write, "tombstone_write")?;
         storage::write_delegated_revoked_tombstone(&self.paths.twitch_delegated_revoked)?;
+        self.durable_fail
+            .fail(&self.durable_fail.credential_remove, "credential_remove")?;
         storage::remove_file_durable(&self.paths.twitch_delegated)?;
+        self.durable_fail
+            .fail(&self.durable_fail.parent_sync, "parent_sync")?;
+        Ok(())
+    }
+
+    /// Durably clear the revoked tombstone after a new generation credential is on disk.
+    pub fn clear_delegated_revoked_tombstone(&self) -> anyhow::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
+        if !self.paths.twitch_delegated_revoked.is_file() {
+            return Ok(());
+        }
+        self.durable_fail
+            .fail(&self.durable_fail.tombstone_clear, "tombstone_clear")?;
+        storage::remove_file_durable(&self.paths.twitch_delegated_revoked)?;
         Ok(())
     }
 
@@ -397,6 +455,8 @@ impl AppState {
         if self.readonly {
             return Ok(());
         }
+        self.durable_fail
+            .fail(&self.durable_fail.save_active_mode, "save_active_mode")?;
         let mode = *self.active_mode.read().await;
         storage::write_json(
             &self.paths.twitch_active_mode,
@@ -610,5 +670,58 @@ mod tests {
             !dir.exists(),
             "readonly AppState must not create userdata root"
         );
+    }
+
+    #[test]
+    fn readonly_startup_with_tombstone_does_not_mutate_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "streamsync-readonly-tombstone-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let delegated = dir.join("twitch-delegated.json");
+        let tombstone = dir.join("twitch-delegated.revoked");
+        std::fs::write(
+            &delegated,
+            br#"{"generation":1,"connection_key":"ssk_test_placeholder_readonly","client_id":"cid","access_token":"tok","channel_login":"chan","channel_twitch_id":"1","twitch_expires_at":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(&tombstone, br#"{"revoked_at":"2099-01-01T00:00:00Z"}"#).unwrap();
+        let before_names = list_tree(&dir);
+        let before_delegated = std::fs::metadata(&delegated).unwrap();
+        let before_tomb = std::fs::metadata(&tombstone).unwrap();
+        let before_delegated_bytes = std::fs::read(&delegated).unwrap();
+        let before_tomb_bytes = std::fs::read(&tombstone).unwrap();
+
+        std::env::set_var("STREAMSYNC_USERDATA", dir.display().to_string());
+        let repo = storage::resolve_ui_assets_root();
+        let paths = storage::get_paths_readonly().unwrap();
+        let state = AppState::new(paths, repo, 14203, true).expect("readonly with tombstone");
+
+        let after_names = list_tree(&dir);
+        assert_eq!(before_names, after_names);
+        assert_eq!(before_delegated_bytes, std::fs::read(&delegated).unwrap());
+        assert_eq!(before_tomb_bytes, std::fs::read(&tombstone).unwrap());
+        let after_delegated = std::fs::metadata(&delegated).unwrap();
+        let after_tomb = std::fs::metadata(&tombstone).unwrap();
+        assert_eq!(before_delegated.len(), after_delegated.len());
+        assert_eq!(before_tomb.len(), after_tomb.len());
+        assert_eq!(
+            before_delegated.modified().ok(),
+            after_delegated.modified().ok()
+        );
+        assert_eq!(before_tomb.modified().ok(), after_tomb.modified().ok());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            assert!(state.delegated.read().await.is_none());
+            assert_ne!(*state.active_mode.read().await, TwitchActiveMode::Delegated);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

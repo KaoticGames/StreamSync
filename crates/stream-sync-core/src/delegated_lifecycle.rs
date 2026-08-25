@@ -1,22 +1,22 @@
 //! Delegated takeover lifecycle — durable revocation, generation fencing, bounded authority lease.
 //!
 //! ## Maximum revocation delay
-//! Under push failure, delegated platform access must terminate within
-//! [`MAX_DELEGATED_REVOCATION_DELAY`] plus at most one [`SYNDICATE_HTTP_TIMEOUT`] for the
-//! in-flight validation request and up to [`SYNDICATE_SSE_READ_TIMEOUT`] for an open SSE read.
+//! The enforceable maximum delegated access window after the last successful remote validation is
+//! [`MAX_DELEGATED_REVOCATION_DELAY`] (300 seconds). Syndicate HTTP and SSE timeouts are consumed
+//! from that lease budget and must not extend it.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
 
-/// Maximum wall-clock delegated access after last successful validation when SSE push fails.
+/// Maximum wall-clock delegated access after last successful remote validation when push fails.
 pub const MAX_DELEGATED_REVOCATION_DELAY: Duration = Duration::from_secs(300);
-/// Upper bound on Syndicate exchange/refresh HTTP requests.
+/// Upper bound on Syndicate exchange/refresh HTTP requests (within the lease budget).
 pub const SYNDICATE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-/// Upper bound on a single SSE read wait (no heartbeat).
+/// Upper bound on a single SSE read wait (within the lease budget).
 pub const SYNDICATE_SSE_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// Hard cap on buffered SSE bytes before the parser fails closed.
 pub const MAX_SSE_BUFFER_BYTES: usize = 64 * 1024;
@@ -40,11 +40,14 @@ pub enum TeardownPhase {
     FailedRetryable(String),
 }
 
+type ResultWatch = watch::Sender<Option<Result<(), String>>>;
+
 #[derive(Debug)]
 struct TeardownInner {
     generation: DelegatedGeneration,
     phase: TeardownPhase,
-    waiters: Arc<Notify>,
+    /// Shared attempt result. `None` means still running; `Some` is the terminal result.
+    result_tx: Option<ResultWatch>,
 }
 
 impl Default for TeardownInner {
@@ -52,7 +55,7 @@ impl Default for TeardownInner {
         Self {
             generation: 0,
             phase: TeardownPhase::Idle,
-            waiters: Arc::new(Notify::new()),
+            result_tx: None,
         }
     }
 }
@@ -61,25 +64,57 @@ impl Default for TeardownInner {
 #[derive(Debug)]
 pub struct TeardownCoordinator {
     active_generation: AtomicU64,
-    inner: Mutex<TeardownInner>,
+    /// Sync mutex so drop guards can mark FailedRetryable without async.
+    inner: Arc<std::sync::Mutex<TeardownInner>>,
 }
 
 impl TeardownCoordinator {
     pub fn new() -> Self {
         Self {
             active_generation: AtomicU64::new(0),
-            inner: Mutex::new(TeardownInner::default()),
+            inner: Arc::new(std::sync::Mutex::new(TeardownInner::default())),
         }
     }
 
-    pub async fn install_generation_async(&self, generation: DelegatedGeneration) {
+    pub fn active_generation(&self) -> DelegatedGeneration {
+        self.active_generation.load(Ordering::SeqCst)
+    }
+
+    /// Install a newer generation. Rejects stale/lower generations (monotonic).
+    /// Resolves any in-flight waiters for the previous generation as superseded.
+    pub async fn install_generation_async(
+        &self,
+        generation: DelegatedGeneration,
+    ) -> Result<(), String> {
+        let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
+        let current = self.active_generation.load(Ordering::SeqCst);
+        if generation < current {
+            return Err(format!(
+                "stale generation install rejected: {generation} < {current}"
+            ));
+        }
+        if generation == current && generation != 0 {
+            // Re-arm after a completed/failed teardown for the same generation id.
+            if let Some(tx) = inner.result_tx.take() {
+                let _ = tx.send(Some(Err("generation reinstalled".into())));
+            }
+            inner.phase = TeardownPhase::Idle;
+            return Ok(());
+        }
+        if let Some(tx) = inner.result_tx.take() {
+            let _ = tx.send(Some(Err("superseded by newer generation".into())));
+        }
         self.active_generation.store(generation, Ordering::SeqCst);
-        let mut inner = self.inner.lock().await;
         inner.generation = generation;
         inner.phase = TeardownPhase::Idle;
+        Ok(())
     }
 
     /// Run teardown once for `generation`, or join an in-flight attempt. Stale generations no-op.
+    ///
+    /// Concurrent joiners share the owner's result via a watch channel (no lost-wakeup).
+    /// Retries only begin after an explicit FailedRetryable / Idle boundary — a joiner never
+    /// silently starts a second attempt while the owner is still Running.
     pub async fn run_or_join<F, Fut>(
         &self,
         generation: DelegatedGeneration,
@@ -93,54 +128,127 @@ impl TeardownCoordinator {
             return Ok(());
         }
 
-        loop {
-            let mut inner = self.inner.lock().await;
-            if generation != self.active_generation.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-            if inner.generation != generation {
-                inner.generation = generation;
-                inner.phase = TeardownPhase::Idle;
-            }
-            match &inner.phase {
-                TeardownPhase::Completed => return Ok(()),
-                TeardownPhase::FailedRetryable(_) => {
-                    inner.phase = TeardownPhase::Running;
-                    inner.waiters = Arc::new(Notify::new());
-                    drop(inner);
-                    break;
+        let owner_tx: Option<ResultWatch> = {
+            loop {
+                enum Step {
+                    Own(ResultWatch),
+                    Wait(watch::Receiver<Option<Result<(), String>>>),
                 }
-                TeardownPhase::Running => {
-                    let waiters = inner.waiters.clone();
-                    drop(inner);
-                    waiters.notified().await;
-                    continue;
+                let step = {
+                    let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
+                    if generation != self.active_generation.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    if inner.generation != generation {
+                        if let Some(tx) = inner.result_tx.take() {
+                            let _ = tx.send(Some(Err("superseded by newer generation".into())));
+                        }
+                        inner.generation = generation;
+                        inner.phase = TeardownPhase::Idle;
+                        inner.result_tx = None;
+                    }
+                    match &inner.phase {
+                        TeardownPhase::Completed => return Ok(()),
+                        TeardownPhase::FailedRetryable(_) | TeardownPhase::Idle => {
+                            let (tx, _rx) = watch::channel(None);
+                            inner.phase = TeardownPhase::Running;
+                            inner.result_tx = Some(tx.clone());
+                            Step::Own(tx)
+                        }
+                        TeardownPhase::Running => {
+                            let Some(tx) = inner.result_tx.clone() else {
+                                inner.phase = TeardownPhase::FailedRetryable(
+                                    "teardown channel missing".into(),
+                                );
+                                continue;
+                            };
+                            Step::Wait(tx.subscribe())
+                        }
+                    }
+                };
+                match step {
+                    Step::Own(tx) => break Some(tx),
+                    Step::Wait(mut rx) => loop {
+                        {
+                            let borrowed = rx.borrow();
+                            if let Some(result) = borrowed.as_ref() {
+                                return result.clone();
+                            }
+                        }
+                        if rx.changed().await.is_err() {
+                            if let Ok(mut inner) = self.inner.lock() {
+                                if inner.generation == generation
+                                    && matches!(inner.phase, TeardownPhase::Running)
+                                {
+                                    inner.phase = TeardownPhase::FailedRetryable(
+                                        "teardown owner cancelled".into(),
+                                    );
+                                    inner.result_tx = None;
+                                }
+                            }
+                            return Err("teardown owner cancelled".into());
+                        }
+                    },
                 }
-                TeardownPhase::Idle => {
-                    inner.phase = TeardownPhase::Running;
-                    inner.waiters = Arc::new(Notify::new());
-                    drop(inner);
-                    break;
+            }
+        };
+
+        let Some(tx) = owner_tx else {
+            return Ok(());
+        };
+
+        struct PublishOnDrop {
+            inner: Arc<std::sync::Mutex<TeardownInner>>,
+            generation: DelegatedGeneration,
+            tx: ResultWatch,
+            published: bool,
+        }
+        impl Drop for PublishOnDrop {
+            fn drop(&mut self) {
+                if self.published {
+                    return;
+                }
+                let _ = self.tx.send(Some(Err("teardown owner cancelled".into())));
+                if let Ok(mut inner) = self.inner.lock() {
+                    if inner.generation == self.generation
+                        && matches!(inner.phase, TeardownPhase::Running)
+                    {
+                        inner.phase =
+                            TeardownPhase::FailedRetryable("teardown owner cancelled".into());
+                        inner.result_tx = None;
+                    }
                 }
             }
         }
+        let mut guard = PublishOnDrop {
+            inner: self.inner.clone(),
+            generation,
+            tx: tx.clone(),
+            published: false,
+        };
 
         let result = work().await;
-        let mut inner = self.inner.lock().await;
-        if generation != self.active_generation.load(Ordering::SeqCst) {
-            return Ok(());
+
+        {
+            let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
+            if generation != self.active_generation.load(Ordering::SeqCst) {
+                let _ = tx.send(Some(Err("superseded by newer generation".into())));
+                guard.published = true;
+                return Ok(());
+            }
+            inner.phase = match &result {
+                Ok(()) => TeardownPhase::Completed,
+                Err(err) => TeardownPhase::FailedRetryable(err.clone()),
+            };
+            let _ = tx.send(Some(result.clone()));
+            guard.published = true;
         }
-        inner.phase = match &result {
-            Ok(()) => TeardownPhase::Completed,
-            Err(err) => TeardownPhase::FailedRetryable(err.clone()),
-        };
-        inner.waiters.notify_waiters();
         result
     }
 
     #[cfg(test)]
     pub async fn phase_for(&self, generation: DelegatedGeneration) -> TeardownPhase {
-        let inner = self.inner.lock().await;
+        let inner = self.inner.lock().unwrap();
         if inner.generation == generation {
             inner.phase.clone()
         } else {
@@ -155,24 +263,57 @@ impl Default for TeardownCoordinator {
     }
 }
 
-/// Monotonic authority lease — successful validation resets; backoff cannot extend past deadline.
+/// Generation-scoped monotonic authority lease.
+///
+/// Only [`AuthorityLease::renew_after_successful_remote_validation`] extends the deadline.
+/// Local stored `connection_expires_at` may only shorten it.
 #[derive(Debug, Clone)]
 pub struct AuthorityLease {
+    generation: DelegatedGeneration,
     deadline: Instant,
 }
 
 impl AuthorityLease {
-    pub fn new_validated() -> Self {
+    /// Placeholder lease (generation 0, already expired) until a session is validated.
+    pub fn inactive() -> Self {
         Self {
-            deadline: Instant::now() + MAX_DELEGATED_REVOCATION_DELAY,
+            generation: 0,
+            deadline: Instant::now(),
         }
     }
 
-    pub fn renew_on_success(&mut self) {
-        self.deadline = Instant::now() + MAX_DELEGATED_REVOCATION_DELAY;
+    /// Bootstrap after process restart with persisted delegated state: one HTTP-budget window to
+    /// revalidate. Does not grant a fresh five-minute lease.
+    pub fn pending_remote_validation(generation: DelegatedGeneration) -> Self {
+        Self {
+            generation,
+            deadline: Instant::now() + SYNDICATE_HTTP_TIMEOUT,
+        }
     }
 
-    pub fn merge_connection_expiry(&mut self, connection_expires_at: Option<&str>) {
+    pub fn generation(&self) -> DelegatedGeneration {
+        self.generation
+    }
+
+    /// Reset the lease after a successful remote Syndicate validation for this generation.
+    pub fn renew_after_successful_remote_validation(
+        &mut self,
+        generation: DelegatedGeneration,
+        connection_expires_at: Option<&str>,
+    ) {
+        if generation == 0 {
+            return;
+        }
+        if self.generation != 0 && self.generation != generation {
+            return;
+        }
+        self.generation = generation;
+        self.deadline = Instant::now() + MAX_DELEGATED_REVOCATION_DELAY;
+        self.cap_by_connection_expiry(connection_expires_at);
+    }
+
+    /// Shorten the deadline from remote/local connection expiry. Never extends.
+    pub fn cap_by_connection_expiry(&mut self, connection_expires_at: Option<&str>) {
         if let Some(iso) = connection_expires_at {
             if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(iso) {
                 let until = exp
@@ -195,32 +336,57 @@ impl AuthorityLease {
         self.deadline.saturating_duration_since(Instant::now())
     }
 
-    /// Sleep budget for the next retry/revalidation attempt.
+    /// Sleep budget for the next retry/revalidation attempt (never beyond the lease).
     pub fn sleep_budget(&self, preferred: Duration) -> Duration {
         preferred.min(self.remaining())
+    }
+
+    #[cfg(test)]
+    pub fn set_deadline_for_test(&mut self, deadline: Instant) {
+        self.deadline = deadline;
     }
 }
 
 /// Abort delegated worker handles except the caller, clearing slots so they are not restarted.
 pub async fn stop_delegated_worker_handles(
-    refresh_handle: &RwLock<Option<JoinHandle<()>>>,
-    watch_handle: &RwLock<Option<JoinHandle<()>>>,
+    refresh_handle: &RwLock<Option<GenerationTask>>,
+    watch_handle: &RwLock<Option<GenerationTask>>,
     except: Option<DelegatedWorker>,
 ) {
     if except != Some(DelegatedWorker::Refresh) {
-        if let Some(h) = refresh_handle.write().await.take() {
-            h.abort();
+        if let Some(task) = refresh_handle.write().await.take() {
+            task.handle.abort();
         }
     } else {
         let _ = refresh_handle.write().await.take();
     }
     if except != Some(DelegatedWorker::Watch) {
-        if let Some(h) = watch_handle.write().await.take() {
-            h.abort();
+        if let Some(task) = watch_handle.write().await.take() {
+            task.handle.abort();
         }
     } else {
         let _ = watch_handle.write().await.take();
     }
+}
+
+/// Worker JoinHandle tagged with the generation that owns it.
+#[derive(Debug)]
+pub struct GenerationTask {
+    pub generation: DelegatedGeneration,
+    pub handle: JoinHandle<()>,
+}
+
+/// Atomically install a generation-tagged worker, aborting any previous slot occupant.
+pub async fn install_generation_task(
+    slot: &RwLock<Option<GenerationTask>>,
+    generation: DelegatedGeneration,
+    handle: JoinHandle<()>,
+) {
+    let mut guard = slot.write().await;
+    if let Some(prev) = guard.take() {
+        prev.handle.abort();
+    }
+    *guard = Some(GenerationTask { generation, handle });
 }
 
 /// Build the Syndicate connection-key events URL without embedding the raw key.
@@ -319,12 +485,12 @@ pub fn parse_sse_json_data(frame: &str) -> Option<serde_json::Value> {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use tokio::sync::RwLock;
+    use tokio::sync::{Barrier, RwLock};
 
     #[tokio::test]
     async fn coordinator_retries_after_failure_then_completes() {
         let coord = Arc::new(TeardownCoordinator::new());
-        coord.install_generation_async(1).await;
+        coord.install_generation_async(1).await.unwrap();
         let attempts = Arc::new(AtomicU64::new(0));
         let a1 = attempts.clone();
         let c1 = coord.clone();
@@ -335,6 +501,7 @@ mod tests {
             })
             .await
         });
+        assert_eq!(first.await.unwrap(), Err("disk".into()));
         let a2 = attempts.clone();
         let c2 = coord.clone();
         let second = tokio::spawn(async move {
@@ -344,7 +511,6 @@ mod tests {
             })
             .await
         });
-        assert_eq!(first.await.unwrap(), Err("disk".into()));
         assert_eq!(second.await.unwrap(), Ok(()));
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(coord.phase_for(1).await, TeardownPhase::Completed);
@@ -353,7 +519,7 @@ mod tests {
     #[tokio::test]
     async fn coordinator_stale_generation_is_ignored() {
         let coord = TeardownCoordinator::new();
-        coord.install_generation_async(2).await;
+        coord.install_generation_async(2).await.unwrap();
         assert!(coord.run_or_join(1, || async { Ok(()) }).await.is_ok());
         assert_eq!(coord.phase_for(1).await, TeardownPhase::Idle);
     }
@@ -361,7 +527,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_callers_share_one_result() {
         let coord = Arc::new(TeardownCoordinator::new());
-        coord.install_generation_async(3).await;
+        coord.install_generation_async(3).await.unwrap();
         let started = Arc::new(AtomicU64::new(0));
         let mut handles = Vec::new();
         for _ in 0..4 {
@@ -370,10 +536,10 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 c.run_or_join(3, || async {
                     if s.fetch_add(1, Ordering::SeqCst) == 0 {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        tokio::time::sleep(Duration::from_millis(40)).await;
                         Ok(())
                     } else {
-                        Ok(())
+                        unreachable!("joiner must not run owner work");
                     }
                 })
                 .await
@@ -385,12 +551,147 @@ mod tests {
         assert_eq!(started.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn coordinator_joiner_shares_owner_failure_not_second_attempt() {
+        let coord = Arc::new(TeardownCoordinator::new());
+        coord.install_generation_async(1).await.unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let started = Arc::new(AtomicU64::new(0));
+        let c1 = coord.clone();
+        let b1 = barrier.clone();
+        let s1 = started.clone();
+        let owner = tokio::spawn(async move {
+            c1.run_or_join(1, || async {
+                s1.fetch_add(1, Ordering::SeqCst);
+                b1.wait().await;
+                Err("disk".into())
+            })
+            .await
+        });
+        // Wait until owner is Running.
+        for _ in 0..50 {
+            if matches!(coord.phase_for(1).await, TeardownPhase::Running) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let c2 = coord.clone();
+        let s2 = started.clone();
+        let joiner = tokio::spawn(async move {
+            c2.run_or_join(1, || async {
+                s2.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+        });
+        barrier.wait().await;
+        assert_eq!(owner.await.unwrap(), Err("disk".into()));
+        assert_eq!(joiner.await.unwrap(), Err("disk".into()));
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn coordinator_owner_cancel_wakes_joiners_retryable() {
+        let coord = Arc::new(TeardownCoordinator::new());
+        coord.install_generation_async(1).await.unwrap();
+        let (enter_tx, enter_rx) = oneshot_pair();
+        let c1 = coord.clone();
+        let owner = tokio::spawn(async move {
+            c1.run_or_join(1, || async {
+                let _ = enter_tx.send(());
+                std::future::pending::<Result<(), String>>().await
+            })
+            .await
+        });
+        enter_rx.await.unwrap();
+        let c2 = coord.clone();
+        let joiner = tokio::spawn(async move { c2.run_or_join(1, || async { Ok(()) }).await });
+        owner.abort();
+        let joined = tokio::time::timeout(Duration::from_secs(2), joiner)
+            .await
+            .expect("joiner must not hang")
+            .unwrap();
+        assert!(joined.is_err());
+        assert!(matches!(
+            coord.phase_for(1).await,
+            TeardownPhase::FailedRetryable(_)
+        ));
+        // Explicit retry after failure boundary succeeds.
+        assert!(coord.run_or_join(1, || async { Ok(()) }).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn install_newer_generation_wakes_old_waiters() {
+        let coord = Arc::new(TeardownCoordinator::new());
+        coord.install_generation_async(1).await.unwrap();
+        let (enter_tx, enter_rx) = oneshot_pair();
+        let (joined_tx, joined_rx) = oneshot_pair();
+        let c1 = coord.clone();
+        let owner = tokio::spawn(async move {
+            c1.run_or_join(1, || async {
+                let _ = enter_tx.send(());
+                std::future::pending::<Result<(), String>>().await
+            })
+            .await
+        });
+        enter_rx.await.unwrap();
+        let c2 = coord.clone();
+        let joiner = tokio::spawn(async move {
+            let result = c2.run_or_join(1, || async { Ok(()) }).await;
+            let _ = joined_tx.send(());
+            result
+        });
+        // Ensure joiner has subscribed before superseding generation 1.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        coord.install_generation_async(2).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), joined_rx)
+            .await
+            .expect("gen1 joiner must be woken");
+        let joined = joiner.await.unwrap();
+        assert!(
+            joined.is_err(),
+            "waiting gen1 joiner must observe supersede"
+        );
+        owner.abort();
+    }
+
+    #[tokio::test]
+    async fn install_generation_is_monotonic() {
+        let coord = TeardownCoordinator::new();
+        coord.install_generation_async(2).await.unwrap();
+        assert!(coord.install_generation_async(1).await.is_err());
+        assert_eq!(coord.active_generation(), 2);
+    }
+
     #[test]
     fn authority_lease_backoff_cannot_extend_deadline() {
-        let mut lease = AuthorityLease::new_validated();
-        lease.deadline = Instant::now() + Duration::from_millis(50);
+        let mut lease = AuthorityLease::pending_remote_validation(1);
+        lease.set_deadline_for_test(Instant::now() + Duration::from_millis(50));
         let budget = lease.sleep_budget(Duration::from_secs(60));
         assert!(budget <= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn local_connection_expiry_cannot_extend_lease() {
+        let mut lease = AuthorityLease {
+            generation: 1,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let far = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        lease.cap_by_connection_expiry(Some(&far));
+        assert!(lease.remaining() <= Duration::from_secs(10) + Duration::from_millis(50));
+        // renew without matching generation is ignored when generation already set differently
+        lease.renew_after_successful_remote_validation(2, None);
+        assert!(lease.remaining() <= Duration::from_secs(10) + Duration::from_millis(50));
+        lease.renew_after_successful_remote_validation(1, None);
+        assert!(lease.remaining() > Duration::from_secs(200));
+    }
+
+    #[test]
+    fn restart_lease_does_not_grant_full_window() {
+        let lease = AuthorityLease::pending_remote_validation(7);
+        assert!(lease.remaining() <= SYNDICATE_HTTP_TIMEOUT + Duration::from_millis(50));
+        assert!(lease.remaining() < MAX_DELEGATED_REVOCATION_DELAY);
     }
 
     #[test]
@@ -426,7 +727,7 @@ mod tests {
 
     #[test]
     fn redact_connection_key_strips_secret() {
-        let key = "ssk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let key = "ssk_test_placeholder_key_aaaaaaaa";
         let msg = format!("watch failed for {key} with timeout");
         let redacted = redact_connection_key(&msg, key);
         assert!(!redacted.contains(key));
@@ -435,8 +736,8 @@ mod tests {
 
     #[tokio::test]
     async fn stop_except_caller_does_not_abort_self() {
-        let refresh: Arc<RwLock<Option<JoinHandle<()>>>> = Arc::new(RwLock::new(None));
-        let watch: Arc<RwLock<Option<JoinHandle<()>>>> = Arc::new(RwLock::new(None));
+        let refresh: Arc<RwLock<Option<GenerationTask>>> = Arc::new(RwLock::new(None));
+        let watch: Arc<RwLock<Option<GenerationTask>>> = Arc::new(RwLock::new(None));
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let done2 = done.clone();
         let watch2 = watch.clone();
@@ -444,8 +745,18 @@ mod tests {
             stop_delegated_worker_handles(&refresh, &watch2, Some(DelegatedWorker::Watch)).await;
             done2.store(true, std::sync::atomic::Ordering::SeqCst);
         });
-        *watch.write().await = Some(handle);
+        *watch.write().await = Some(GenerationTask {
+            generation: 1,
+            handle,
+        });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    fn oneshot_pair() -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        tokio::sync::oneshot::channel()
     }
 }
