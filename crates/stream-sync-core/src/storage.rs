@@ -208,13 +208,27 @@ pub fn get_paths_readonly() -> Result<StoragePaths> {
     get_paths_for_mode(true)
 }
 
+/// Build [`StoragePaths`] for an explicit userdata root (tests / injected config).
+/// Does not read or write `STREAMSYNC_USERDATA`.
+pub fn paths_for_root(root: &Path, readonly: bool) -> Result<StoragePaths> {
+    let root = if readonly {
+        resolve_readonly_root(root)?
+    } else {
+        assert_writable_root(root)?
+    };
+    paths_under_root(root, readonly)
+}
+
 fn get_paths_for_mode(readonly: bool) -> Result<StoragePaths> {
     let root = if readonly {
         user_data_root_readonly()?
     } else {
         user_data_root()?
     };
+    paths_under_root(root, readonly)
+}
 
+fn paths_under_root(root: PathBuf, readonly: bool) -> Result<StoragePaths> {
     let dock_config =
         env_path("STREAMSYNC_DOCK_CONFIG").unwrap_or_else(|| root.join("dock-config.json"));
     let overlay_config =

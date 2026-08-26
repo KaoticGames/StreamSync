@@ -39,7 +39,6 @@ async fn test_app_mode(
 ) -> (axum::Router, std::sync::Arc<stream_sync_core::AppState>) {
     let _guard = TEST_SETUP_LOCK.lock().await;
     let userdata = test_userdata_dir();
-    std::env::set_var("STREAMSYNC_USERDATA", userdata.display().to_string());
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -49,6 +48,7 @@ async fn test_app_mode(
         port,
         repo_root,
         readonly,
+        userdata_root: Some(userdata),
     };
     let (router, state, _) = OverlayServer::new(config)
         .build_app()

@@ -21,7 +21,8 @@ mod syndicate_connection;
 mod twitch;
 
 pub use delegated_lifecycle::{
-    MAX_DELEGATED_REVOCATION_DELAY, SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,
+    redact_connection_key, TeardownPhase, MAX_DELEGATED_REVOCATION_DELAY, SYNDICATE_HTTP_TIMEOUT,
+    SYNDICATE_SSE_READ_TIMEOUT,
 };
 pub use syndicate_connection::connection_key_events_url;
 pub use twitch::{disconnect_twitch, TwitchServices};
@@ -46,8 +47,8 @@ pub use oauth_pending::{OAuthProvider, PendingLoginStore, LOGIN_NONCE_HEADER};
 pub use routes::BUILD_ROUTER_ROUTE_IDS;
 pub use storage::{
     bootstrap_twitch_env_from_rust, get_paths, is_stream_sync_ui_bundle, is_stream_sync_workspace,
-    legacy_electron_user_data, load_streamsync_dotenv, resolve_repo_root, resolve_ui_assets_root,
-    rust_dotenv_path, rust_workspace_root, write_secret_file, StoragePaths,
+    legacy_electron_user_data, load_streamsync_dotenv, paths_for_root, resolve_repo_root,
+    resolve_ui_assets_root, rust_dotenv_path, rust_workspace_root, write_secret_file, StoragePaths,
 };
 pub use storage::{remove_file_durable, write_delegated_revoked_tombstone, write_json};
 
@@ -69,6 +70,8 @@ pub struct OverlayConfig {
     pub repo_root: PathBuf,
     /// When true, refuse mutating writes (safe A/B against live userData).
     pub readonly: bool,
+    /// Optional explicit userdata root (tests). When set, ignores `STREAMSYNC_USERDATA`.
+    pub userdata_root: Option<PathBuf>,
 }
 
 impl Default for OverlayConfig {
@@ -83,6 +86,7 @@ impl Default for OverlayConfig {
                 .ok()
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            userdata_root: None,
         }
     }
 }
@@ -101,7 +105,9 @@ impl OverlayServer {
     pub async fn build_app(
         &self,
     ) -> anyhow::Result<(axum::Router, Arc<AppState>, Arc<twitch::TwitchServices>)> {
-        let paths = if self.config.readonly {
+        let paths = if let Some(root) = &self.config.userdata_root {
+            storage::paths_for_root(root, self.config.readonly)?
+        } else if self.config.readonly {
             storage::get_paths_readonly()?
         } else {
             storage::get_paths()?

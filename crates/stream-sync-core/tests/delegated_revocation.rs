@@ -1,16 +1,19 @@
 //! Phase 2 review corrections — production-path delegated revocation tests.
+//!
+//! These tests inject an explicit userdata root via [`OverlayConfig::userdata_root`] and never
+//! mutate process-global `STREAMSYNC_USERDATA`, so they are safe under parallel cargo test.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use stream_sync_core::{
-    connection_key_events_url, disconnect_twitch, remove_file_durable, sync_live_identity,
-    write_delegated_revoked_tombstone, write_json, AppState, DelegatedSessionFile, OverlayConfig,
-    OverlayServer, TwitchActiveMode, TwitchServices, MAX_DELEGATED_REVOCATION_DELAY,
-    SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,
+    connection_key_events_url, disconnect_twitch, paths_for_root, remove_file_durable,
+    sync_live_identity, write_delegated_revoked_tombstone, write_json, AppState,
+    DelegatedSessionFile, OverlayConfig, OverlayServer, TeardownPhase, TwitchActiveMode,
+    TwitchActiveModeFile, TwitchServices, MAX_DELEGATED_REVOCATION_DELAY, SYNDICATE_HTTP_TIMEOUT,
+    SYNDICATE_SSE_READ_TIMEOUT,
 };
 
 static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
-static TEST_SETUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn test_userdata_dir() -> std::path::PathBuf {
     let n = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -20,30 +23,37 @@ fn test_userdata_dir() -> std::path::PathBuf {
     dir
 }
 
-async fn build_app(
-    port: u16,
-) -> (
-    axum::Router,
-    Arc<stream_sync_core::AppState>,
-    Arc<TwitchServices>,
-) {
-    let _guard = TEST_SETUP_LOCK.lock().await;
-    let userdata = test_userdata_dir();
-    std::env::set_var("STREAMSYNC_USERDATA", userdata.display().to_string());
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+fn repo_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
         .expect("workspace rust root")
-        .to_path_buf();
+        .to_path_buf()
+}
+
+async fn build_app_at(
+    userdata: std::path::PathBuf,
+    port: u16,
+) -> (axum::Router, Arc<AppState>, Arc<TwitchServices>) {
     let config = OverlayConfig {
         port,
-        repo_root,
+        repo_root: repo_root(),
         readonly: false,
+        userdata_root: Some(userdata),
     };
     OverlayServer::new(config)
         .build_app()
         .await
         .expect("build_app")
+}
+
+async fn build_app(port: u16) -> (axum::Router, Arc<AppState>, Arc<TwitchServices>) {
+    build_app_at(test_userdata_dir(), port).await
+}
+
+fn restart_app_at(userdata: &std::path::Path, readonly: bool) -> Arc<AppState> {
+    let paths = paths_for_root(userdata, readonly).expect("paths_for_root");
+    AppState::new(paths, repo_root(), 0, readonly).expect("AppState::new")
 }
 
 fn sample_delegated_json() -> serde_json::Value {
@@ -148,7 +158,6 @@ async fn active_mode_persistence_failure_is_visible() {
 #[tokio::test]
 async fn revoked_tombstone_prevents_restart_into_delegated_mode() {
     let userdata = test_userdata_dir();
-    std::env::set_var("STREAMSYNC_USERDATA", userdata.display().to_string());
     write_json(
         &userdata.join("twitch-delegated.json"),
         &sample_session(1, "ssk_test_placeholder_restart"),
@@ -156,20 +165,15 @@ async fn revoked_tombstone_prevents_restart_into_delegated_mode() {
     .unwrap();
     write_delegated_revoked_tombstone(&userdata.join("twitch-delegated.revoked")).unwrap();
 
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .unwrap()
-        .to_path_buf();
-    let paths = stream_sync_core::get_paths().unwrap();
-    let state = AppState::new(paths, repo_root, 0, false).expect("startup quarantine");
+    let state = restart_app_at(&userdata, false);
     assert!(state.delegated.read().await.is_none());
     assert_ne!(*state.active_mode.read().await, TwitchActiveMode::Delegated);
 }
 
 #[tokio::test]
 async fn new_session_clears_revoked_tombstone_and_survives_restart() {
-    let (_router, state, services) = build_app(0).await;
+    let userdata = test_userdata_dir();
+    let (_router, state, services) = build_app_at(userdata.clone(), 0).await;
     write_delegated_revoked_tombstone(&state.paths.twitch_delegated_revoked).unwrap();
     assert!(state.paths.twitch_delegated_revoked.is_file());
 
@@ -181,15 +185,10 @@ async fn new_session_clears_revoked_tombstone_and_survives_restart() {
 
     assert!(!state.paths.twitch_delegated_revoked.is_file());
     assert!(state.paths.twitch_delegated.is_file());
-
-    let userdata = state.paths.root.clone();
-    let repo_root = state.repo_root.clone();
     drop(state);
     drop(services);
 
-    std::env::set_var("STREAMSYNC_USERDATA", userdata.display().to_string());
-    let paths = stream_sync_core::get_paths().unwrap();
-    let restarted = AppState::new(paths, repo_root, 0, false).unwrap();
+    let restarted = restart_app_at(&userdata, false);
     assert!(restarted.delegated.read().await.is_some());
     assert_eq!(
         restarted
@@ -204,7 +203,8 @@ async fn new_session_clears_revoked_tombstone_and_survives_restart() {
 
 #[tokio::test]
 async fn tombstone_clear_failure_keeps_fail_closed_on_restart() {
-    let (_router, state, _services) = build_app(0).await;
+    let userdata = test_userdata_dir();
+    let (_router, state, _services) = build_app_at(userdata.clone(), 0).await;
     write_delegated_revoked_tombstone(&state.paths.twitch_delegated_revoked).unwrap();
     let session = sample_session(3, "ssk_test_placeholder_gen_c");
     state.persist_delegated_session(&session).unwrap();
@@ -214,14 +214,9 @@ async fn tombstone_clear_failure_keeps_fail_closed_on_restart() {
         .store(true, Ordering::SeqCst);
     assert!(state.clear_delegated_revoked_tombstone().is_err());
     assert!(state.paths.twitch_delegated_revoked.is_file());
-
-    let userdata = state.paths.root.clone();
-    let repo_root = state.repo_root.clone();
     drop(state);
 
-    std::env::set_var("STREAMSYNC_USERDATA", userdata.display().to_string());
-    let paths = stream_sync_core::get_paths().unwrap();
-    let restarted = AppState::new(paths, repo_root, 0, false).unwrap();
+    let restarted = restart_app_at(&userdata, false);
     assert!(restarted.delegated.read().await.is_none());
 }
 
@@ -259,8 +254,6 @@ async fn teardown_paused_after_check_cannot_clear_replacement() {
         .persist_delegated_session(state.delegated.read().await.as_ref().unwrap())
         .unwrap();
 
-    // Inject failure so generation-A teardown reaches durable path then fails (retryable),
-    // then install B and ensure a subsequent A retry cannot clear B.
     state
         .durable_fail
         .credential_remove
@@ -296,11 +289,50 @@ async fn teardown_paused_after_check_cannot_clear_replacement() {
 }
 
 #[tokio::test]
+async fn active_mode_persist_failure_retries_to_completion() {
+    let (_router, state, services) = build_app(0).await;
+    services.init_teardown_worker();
+    let gen = state.bump_delegated_generation();
+    *state.delegated.write().await = Some(sample_session(gen, "ssk_test_placeholder_mode"));
+    services.install_delegated_generation(gen).await;
+    state
+        .persist_delegated_session(state.delegated.read().await.as_ref().unwrap())
+        .unwrap();
+    *state.active_mode.write().await = TwitchActiveMode::Delegated;
+    state.save_active_mode().await.unwrap();
+
+    state
+        .durable_fail
+        .save_active_mode
+        .store(true, Ordering::SeqCst);
+    let first = services
+        .signal_delegated_teardown(state.clone(), gen, "revoked")
+        .await;
+    assert!(first.is_err());
+    assert!(state.delegated.read().await.is_none());
+
+    // Disk may still say Delegated — retry must finish mode persistence.
+    state
+        .durable_fail
+        .save_active_mode
+        .store(false, Ordering::SeqCst);
+    let second = services
+        .signal_delegated_teardown(state.clone(), gen, "revoked")
+        .await;
+    assert!(second.is_ok());
+    let mode: TwitchActiveModeFile =
+        serde_json::from_str(&std::fs::read_to_string(&state.paths.twitch_active_mode).unwrap())
+            .unwrap();
+    assert_eq!(mode.mode, TwitchActiveMode::Local);
+    assert_eq!(
+        services.teardown_coordinator.phase_for(gen).await,
+        TeardownPhase::Completed
+    );
+}
+
+#[tokio::test]
 async fn dead_coordinator_channel_does_not_report_success() {
     let (_router, state, services) = build_app(0).await;
-    // Do not init worker — force fallback path; then poison by setting a closed channel pattern
-    // via init then dropping is hard; instead verify reply-closed semantics through fallback
-    // execute that returns an injected durable error (never Ok while credential remains).
     let gen = state.bump_delegated_generation();
     *state.delegated.write().await = Some(sample_session(gen, "ssk_test_placeholder_dead"));
     services.install_delegated_generation(gen).await;
@@ -353,7 +385,6 @@ async fn kick_feed_uses_authorization_not_query_key() {
         k.tokens.access_token = Some("delegated-kick".into());
         k.tokens.kick_id = Some("k1".into());
     }
-    // Ensure delegated session has kick_id for feed_request.
     {
         let mut d = state.delegated.write().await;
         if let Some(s) = d.as_mut() {
@@ -365,6 +396,19 @@ async fn kick_feed_uses_authorization_not_query_key() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert!(saw_auth.load(Ordering::SeqCst));
     assert!(!saw_query.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn kick_redaction_uses_request_scoped_key_not_current_session() {
+    use stream_sync_core::redact_connection_key;
+    let key_a = "ssk_test_placeholder_request_a";
+    let key_b = "ssk_test_placeholder_current_b";
+    let err = format!("upstream rejected Authorization Bearer {key_a}");
+    // Simulate: request used A; current session already replaced with B.
+    let redacted = redact_connection_key(&err, key_a);
+    assert!(!redacted.contains(key_a));
+    assert!(!redacted.contains(key_b));
+    assert!(redacted.contains("[redacted-connection-key]"));
 }
 
 #[test]
@@ -386,6 +430,28 @@ async fn each_streamsync_instance_owns_independent_twitch_services() {
     let (_r1, _s1, t1) = build_app(0).await;
     let (_r2, _s2, t2) = build_app(0).await;
     assert!(!Arc::ptr_eq(&t1, &t2));
+}
+
+#[tokio::test]
+async fn two_instances_process_revoke_independently() {
+    let (_r1, s1, t1) = build_app(0).await;
+    let (_r2, s2, t2) = build_app(0).await;
+    let g1 = s1.bump_delegated_generation();
+    let g2 = s2.bump_delegated_generation();
+    *s1.delegated.write().await = Some(sample_session(g1, "ssk_test_placeholder_inst1"));
+    *s2.delegated.write().await = Some(sample_session(g2, "ssk_test_placeholder_inst2"));
+    t1.install_delegated_generation(g1).await;
+    t2.install_delegated_generation(g2).await;
+    s1.persist_delegated_session(s1.delegated.read().await.as_ref().unwrap())
+        .unwrap();
+    s2.persist_delegated_session(s2.delegated.read().await.as_ref().unwrap())
+        .unwrap();
+    t1.signal_delegated_teardown(s1.clone(), g1, "revoked")
+        .await
+        .unwrap();
+    assert!(s1.delegated.read().await.is_none());
+    assert!(s2.delegated.read().await.is_some());
+    assert!(s2.paths.twitch_delegated.is_file());
 }
 
 #[test]

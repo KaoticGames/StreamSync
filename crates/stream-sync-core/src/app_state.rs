@@ -635,10 +635,9 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("STREAMSYNC_USERDATA", dir.display().to_string());
         let before = list_tree(&dir);
         let repo = storage::resolve_ui_assets_root();
-        let paths = storage::get_paths_readonly().unwrap();
+        let paths = storage::paths_for_root(&dir, true).unwrap();
         let _state = AppState::new(paths, repo, 14201, true).expect("readonly app state");
         let after = list_tree(&dir);
         assert_eq!(
@@ -657,9 +656,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!dir.exists());
-        std::env::set_var("STREAMSYNC_USERDATA", dir.display().to_string());
         let repo = storage::resolve_ui_assets_root();
-        let paths = storage::get_paths_readonly().unwrap();
+        let paths = storage::paths_for_root(&dir, true).unwrap();
         let built = AppState::new(paths, repo, 14202, true);
         assert!(
             !dir.exists(),
@@ -695,9 +693,8 @@ mod tests {
         let before_delegated_bytes = std::fs::read(&delegated).unwrap();
         let before_tomb_bytes = std::fs::read(&tombstone).unwrap();
 
-        std::env::set_var("STREAMSYNC_USERDATA", dir.display().to_string());
         let repo = storage::resolve_ui_assets_root();
-        let paths = storage::get_paths_readonly().unwrap();
+        let paths = storage::paths_for_root(&dir, true).unwrap();
         let state = AppState::new(paths, repo, 14203, true).expect("readonly with tombstone");
 
         let after_names = list_tree(&dir);

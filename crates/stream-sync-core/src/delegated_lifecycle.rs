@@ -45,6 +45,9 @@ type ResultWatch = watch::Sender<Option<Result<(), String>>>;
 #[derive(Debug)]
 struct TeardownInner {
     generation: DelegatedGeneration,
+    /// Monotonic teardown attempt epoch within the coordinator. Owner drop/completion may
+    /// mutate phase only when this still matches the attempt they owned.
+    attempt: u64,
     phase: TeardownPhase,
     /// Shared attempt result. `None` means still running; `Some` is the terminal result.
     result_tx: Option<ResultWatch>,
@@ -54,6 +57,7 @@ impl Default for TeardownInner {
     fn default() -> Self {
         Self {
             generation: 0,
+            attempt: 0,
             phase: TeardownPhase::Idle,
             result_tx: None,
         }
@@ -81,7 +85,10 @@ impl TeardownCoordinator {
     }
 
     /// Install a newer generation. Rejects stale/lower generations (monotonic).
-    /// Resolves any in-flight waiters for the previous generation as superseded.
+    ///
+    /// Same-generation install is idempotent: a Running teardown is left untouched.
+    /// Completed / FailedRetryable / Idle re-arms to Idle without cancelling a runner.
+    /// Strictly newer generations supersede in-flight waiters.
     pub async fn install_generation_async(
         &self,
         generation: DelegatedGeneration,
@@ -94,10 +101,13 @@ impl TeardownCoordinator {
             ));
         }
         if generation == current && generation != 0 {
-            // Re-arm after a completed/failed teardown for the same generation id.
-            if let Some(tx) = inner.result_tx.take() {
-                let _ = tx.send(Some(Err("generation reinstalled".into())));
+            // Idempotent same-gen install: never cancel a Running teardown.
+            if matches!(inner.phase, TeardownPhase::Running) {
+                return Ok(());
             }
+            // Re-arm after Completed / FailedRetryable / Idle without waking waiters
+            // (there is no Running channel to cancel).
+            inner.result_tx = None;
             inner.phase = TeardownPhase::Idle;
             return Ok(());
         }
@@ -107,6 +117,7 @@ impl TeardownCoordinator {
         self.active_generation.store(generation, Ordering::SeqCst);
         inner.generation = generation;
         inner.phase = TeardownPhase::Idle;
+        inner.result_tx = None;
         Ok(())
     }
 
@@ -128,10 +139,10 @@ impl TeardownCoordinator {
             return Ok(());
         }
 
-        let owner_tx: Option<ResultWatch> = {
+        let owner: Option<(ResultWatch, u64)> = {
             loop {
                 enum Step {
-                    Own(ResultWatch),
+                    Own(ResultWatch, u64),
                     Wait(watch::Receiver<Option<Result<(), String>>>),
                 }
                 let step = {
@@ -151,9 +162,11 @@ impl TeardownCoordinator {
                         TeardownPhase::Completed => return Ok(()),
                         TeardownPhase::FailedRetryable(_) | TeardownPhase::Idle => {
                             let (tx, _rx) = watch::channel(None);
+                            inner.attempt = inner.attempt.saturating_add(1);
+                            let my_attempt = inner.attempt;
                             inner.phase = TeardownPhase::Running;
                             inner.result_tx = Some(tx.clone());
-                            Step::Own(tx)
+                            Step::Own(tx, my_attempt)
                         }
                         TeardownPhase::Running => {
                             let Some(tx) = inner.result_tx.clone() else {
@@ -167,7 +180,7 @@ impl TeardownCoordinator {
                     }
                 };
                 match step {
-                    Step::Own(tx) => break Some(tx),
+                    Step::Own(tx, attempt) => break Some((tx, attempt)),
                     Step::Wait(mut rx) => loop {
                         {
                             let borrowed = rx.borrow();
@@ -176,9 +189,19 @@ impl TeardownCoordinator {
                             }
                         }
                         if rx.changed().await.is_err() {
+                            // Sender dropped — prefer last published value over synthesizing cancel.
+                            {
+                                let borrowed = rx.borrow();
+                                if let Some(result) = borrowed.as_ref() {
+                                    return result.clone();
+                                }
+                            }
                             if let Ok(mut inner) = self.inner.lock() {
+                                // Do not corrupt a replacement attempt that already installed a
+                                // new result channel (old sender drop wakes stale joiners).
                                 if inner.generation == generation
                                     && matches!(inner.phase, TeardownPhase::Running)
+                                    && inner.result_tx.is_none()
                                 {
                                     inner.phase = TeardownPhase::FailedRetryable(
                                         "teardown owner cancelled".into(),
@@ -193,13 +216,14 @@ impl TeardownCoordinator {
             }
         };
 
-        let Some(tx) = owner_tx else {
+        let Some((tx, my_attempt)) = owner else {
             return Ok(());
         };
 
         struct PublishOnDrop {
             inner: Arc<std::sync::Mutex<TeardownInner>>,
             generation: DelegatedGeneration,
+            attempt: u64,
             tx: ResultWatch,
             published: bool,
         }
@@ -211,6 +235,7 @@ impl TeardownCoordinator {
                 let _ = self.tx.send(Some(Err("teardown owner cancelled".into())));
                 if let Ok(mut inner) = self.inner.lock() {
                     if inner.generation == self.generation
+                        && inner.attempt == self.attempt
                         && matches!(inner.phase, TeardownPhase::Running)
                     {
                         inner.phase =
@@ -223,6 +248,7 @@ impl TeardownCoordinator {
         let mut guard = PublishOnDrop {
             inner: self.inner.clone(),
             generation,
+            attempt: my_attempt,
             tx: tx.clone(),
             published: false,
         };
@@ -236,6 +262,11 @@ impl TeardownCoordinator {
                 guard.published = true;
                 return Ok(());
             }
+            // Stale owner (ABA): a newer attempt owns the generation — do not mutate.
+            if inner.attempt != my_attempt {
+                guard.published = true;
+                return result;
+            }
             inner.phase = match &result {
                 Ok(()) => TeardownPhase::Completed,
                 Err(err) => TeardownPhase::FailedRetryable(err.clone()),
@@ -246,7 +277,6 @@ impl TeardownCoordinator {
         result
     }
 
-    #[cfg(test)]
     pub async fn phase_for(&self, generation: DelegatedGeneration) -> TeardownPhase {
         let inner = self.inner.lock().unwrap();
         if inner.generation == generation {
@@ -254,6 +284,37 @@ impl TeardownCoordinator {
         } else {
             TeardownPhase::Idle
         }
+    }
+
+    #[cfg(test)]
+    pub fn attempt_for_test(&self) -> u64 {
+        self.inner.lock().unwrap().attempt
+    }
+
+    /// Test-only: apply an owner completion as if `attempt` still owned the generation.
+    /// Returns whether the coordinator phase was mutated.
+    #[cfg(test)]
+    pub fn apply_owner_completion_for_test(
+        &self,
+        generation: DelegatedGeneration,
+        attempt: u64,
+        result: Result<(), String>,
+    ) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.generation != generation || inner.attempt != attempt {
+            return false;
+        }
+        if !matches!(inner.phase, TeardownPhase::Running) {
+            return false;
+        }
+        inner.phase = match &result {
+            Ok(()) => TeardownPhase::Completed,
+            Err(err) => TeardownPhase::FailedRetryable(err.clone()),
+        };
+        if let Some(tx) = &inner.result_tx {
+            let _ = tx.send(Some(result));
+        }
+        true
     }
 }
 
@@ -265,8 +326,9 @@ impl Default for TeardownCoordinator {
 
 /// Generation-scoped monotonic authority lease.
 ///
-/// Only [`AuthorityLease::renew_after_successful_remote_validation`] extends the deadline.
-/// Local stored `connection_expires_at` may only shorten it.
+/// Only [`AuthorityLease::renew_after_successful_remote_validation`] extends the deadline of an
+/// already-valid lease. [`AuthorityLease::install_validated_generation`] installs a fresh lease for
+/// a new/replacement session. Local stored `connection_expires_at` may only shorten the deadline.
 #[derive(Debug, Clone)]
 pub struct AuthorityLease {
     generation: DelegatedGeneration,
@@ -295,18 +357,46 @@ impl AuthorityLease {
         self.generation
     }
 
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
     /// Reset the lease after a successful remote Syndicate validation for this generation.
+    ///
+    /// Rejects an already-expired lease (late success cannot resurrect authority) and rejects
+    /// generation mismatches when a non-zero generation is already bound.
     pub fn renew_after_successful_remote_validation(
         &mut self,
         generation: DelegatedGeneration,
         connection_expires_at: Option<&str>,
-    ) {
+    ) -> Result<(), String> {
         if generation == 0 {
-            return;
+            return Err("cannot renew lease for generation 0".into());
+        }
+        if self.is_expired() {
+            return Err("lease already expired; cannot resurrect".into());
         }
         if self.generation != 0 && self.generation != generation {
-            return;
+            return Err(format!(
+                "lease generation mismatch: bound {} != {}",
+                self.generation, generation
+            ));
         }
+        self.generation = generation;
+        self.deadline = Instant::now() + MAX_DELEGATED_REVOCATION_DELAY;
+        self.cap_by_connection_expiry(connection_expires_at);
+        Ok(())
+    }
+
+    /// Install a freshly validated generation (new session apply / legitimate replacement).
+    ///
+    /// Always binds `generation` and a fresh [`MAX_DELEGATED_REVOCATION_DELAY`] deadline, then
+    /// caps by connection expiry. Does not check prior expiry (unlike renew).
+    pub fn install_validated_generation(
+        &mut self,
+        generation: DelegatedGeneration,
+        connection_expires_at: Option<&str>,
+    ) {
         self.generation = generation;
         self.deadline = Instant::now() + MAX_DELEGATED_REVOCATION_DELAY;
         self.cap_by_connection_expiry(connection_expires_at);
@@ -339,6 +429,11 @@ impl AuthorityLease {
     /// Sleep budget for the next retry/revalidation attempt (never beyond the lease).
     pub fn sleep_budget(&self, preferred: Duration) -> Duration {
         preferred.min(self.remaining())
+    }
+
+    /// Bound a connect/request/read timeout to the remaining lease budget.
+    pub fn request_timeout(&self, configured: Duration) -> Duration {
+        configured.min(self.remaining())
     }
 
     #[cfg(test)]
@@ -376,17 +471,27 @@ pub struct GenerationTask {
     pub handle: JoinHandle<()>,
 }
 
-/// Atomically install a generation-tagged worker, aborting any previous slot occupant.
+/// Atomically install a generation-tagged worker.
+///
+/// Returns `true` if `handle` was installed. If the slot already holds a newer or equal
+/// generation, aborts the incoming handle, keeps the current occupant, and returns `false`.
 pub async fn install_generation_task(
     slot: &RwLock<Option<GenerationTask>>,
     generation: DelegatedGeneration,
     handle: JoinHandle<()>,
-) {
+) -> bool {
     let mut guard = slot.write().await;
+    if let Some(prev) = guard.as_ref() {
+        if prev.generation >= generation {
+            handle.abort();
+            return false;
+        }
+    }
     if let Some(prev) = guard.take() {
         prev.handle.abort();
     }
     *guard = Some(GenerationTask { generation, handle });
+    true
 }
 
 /// Build the Syndicate connection-key events URL without embedding the raw key.
@@ -663,12 +768,138 @@ mod tests {
         assert_eq!(coord.active_generation(), 2);
     }
 
+    #[tokio::test]
+    async fn same_generation_install_does_not_cancel_running_teardown() {
+        let coord = Arc::new(TeardownCoordinator::new());
+        coord.install_generation_async(1).await.unwrap();
+        let (enter_tx, enter_rx) = oneshot_pair();
+        let (release_tx, release_rx) = oneshot_pair();
+        let c1 = coord.clone();
+        let owner = tokio::spawn(async move {
+            c1.run_or_join(1, || async {
+                let _ = enter_tx.send(());
+                let _ = release_rx.await;
+                Ok(())
+            })
+            .await
+        });
+        enter_rx.await.unwrap();
+        assert_eq!(coord.phase_for(1).await, TeardownPhase::Running);
+
+        // Concurrent same-gen install while Running must be a no-op.
+        coord.install_generation_async(1).await.unwrap();
+        assert_eq!(coord.phase_for(1).await, TeardownPhase::Running);
+
+        let c2 = coord.clone();
+        let joiner = tokio::spawn(async move { c2.run_or_join(1, || async { Ok(()) }).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let _ = release_tx.send(());
+        assert!(owner.await.unwrap().is_ok());
+        assert!(joiner.await.unwrap().is_ok());
+        assert_eq!(coord.phase_for(1).await, TeardownPhase::Completed);
+    }
+
+    #[tokio::test]
+    async fn stale_owner_completion_cannot_complete_replacement_attempt() {
+        let coord = Arc::new(TeardownCoordinator::new());
+        coord.install_generation_async(1).await.unwrap();
+
+        // Attempt 1 fails → FailedRetryable.
+        assert_eq!(
+            coord
+                .run_or_join(1, || async { Err("attempt1".into()) })
+                .await,
+            Err("attempt1".into())
+        );
+        assert!(matches!(
+            coord.phase_for(1).await,
+            TeardownPhase::FailedRetryable(_)
+        ));
+        let attempt1 = coord.attempt_for_test();
+        assert!(attempt1 >= 1);
+
+        let (enter_tx, enter_rx) = oneshot_pair();
+        let (release_tx, release_rx) = oneshot_pair();
+        let work_started = Arc::new(AtomicU64::new(0));
+        let c2 = coord.clone();
+        let started = work_started.clone();
+        let owner2 = tokio::spawn(async move {
+            c2.run_or_join(1, || async {
+                started.fetch_add(1, Ordering::SeqCst);
+                let _ = enter_tx.send(());
+                let _ = release_rx.await;
+                Err("attempt2".into())
+            })
+            .await
+        });
+        enter_rx.await.unwrap();
+        assert_eq!(coord.phase_for(1).await, TeardownPhase::Running);
+        let attempt2 = coord.attempt_for_test();
+        assert!(attempt2 > attempt1);
+
+        // Same-gen reinstall while Running is a no-op.
+        coord.install_generation_async(1).await.unwrap();
+        assert_eq!(coord.phase_for(1).await, TeardownPhase::Running);
+        assert_eq!(coord.attempt_for_test(), attempt2);
+
+        // Delayed attempt-1 completion must not mark Completed over attempt 2.
+        assert!(!coord.apply_owner_completion_for_test(1, attempt1, Ok(())));
+        assert_eq!(coord.phase_for(1).await, TeardownPhase::Running);
+
+        let c3 = coord.clone();
+        let started_j = work_started.clone();
+        let joiner = tokio::spawn(async move {
+            c3.run_or_join(1, || async {
+                started_j.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let _ = release_tx.send(());
+        assert_eq!(owner2.await.unwrap(), Err("attempt2".into()));
+        assert_eq!(joiner.await.unwrap(), Err("attempt2".into()));
+        assert_eq!(work_started.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            coord.phase_for(1).await,
+            TeardownPhase::FailedRetryable(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_generation_task_cannot_replace_newer() {
+        let slot: RwLock<Option<GenerationTask>> = RwLock::new(None);
+        let newer = tokio::spawn(async { std::future::pending::<()>().await });
+        assert!(install_generation_task(&slot, 2, newer).await);
+        assert_eq!(slot.read().await.as_ref().map(|t| t.generation), Some(2));
+
+        let stale = tokio::spawn(async { std::future::pending::<()>().await });
+        assert!(!install_generation_task(&slot, 1, stale).await);
+        assert_eq!(slot.read().await.as_ref().map(|t| t.generation), Some(2));
+
+        // Equal generation is also rejected (keep current).
+        let equal = tokio::spawn(async { std::future::pending::<()>().await });
+        assert!(!install_generation_task(&slot, 2, equal).await);
+        assert_eq!(slot.read().await.as_ref().map(|t| t.generation), Some(2));
+
+        if let Some(task) = slot.write().await.take() {
+            task.handle.abort();
+        };
+    }
+
     #[test]
     fn authority_lease_backoff_cannot_extend_deadline() {
         let mut lease = AuthorityLease::pending_remote_validation(1);
         lease.set_deadline_for_test(Instant::now() + Duration::from_millis(50));
         let budget = lease.sleep_budget(Duration::from_secs(60));
         assert!(budget <= Duration::from_millis(50));
+        let remaining = lease.remaining();
+        let timeout = lease.request_timeout(Duration::from_secs(30));
+        assert!(timeout <= remaining);
+        assert!(timeout <= Duration::from_secs(30));
+        assert!(lease.deadline() <= Instant::now() + Duration::from_millis(50));
     }
 
     #[test]
@@ -680,11 +911,65 @@ mod tests {
         let far = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
         lease.cap_by_connection_expiry(Some(&far));
         assert!(lease.remaining() <= Duration::from_secs(10) + Duration::from_millis(50));
-        // renew without matching generation is ignored when generation already set differently
-        lease.renew_after_successful_remote_validation(2, None);
+        // renew without matching generation is rejected when generation already set differently
+        assert!(lease
+            .renew_after_successful_remote_validation(2, None)
+            .is_err());
         assert!(lease.remaining() <= Duration::from_secs(10) + Duration::from_millis(50));
-        lease.renew_after_successful_remote_validation(1, None);
+        lease
+            .renew_after_successful_remote_validation(1, None)
+            .unwrap();
         assert!(lease.remaining() > Duration::from_secs(200));
+    }
+
+    #[test]
+    fn expired_renew_is_rejected() {
+        let mut lease = AuthorityLease::pending_remote_validation(1);
+        lease.set_deadline_for_test(Instant::now() - Duration::from_secs(1));
+        assert!(lease.is_expired());
+        assert!(lease
+            .renew_after_successful_remote_validation(1, None)
+            .is_err());
+        assert!(lease.is_expired());
+    }
+
+    #[test]
+    fn late_success_cannot_resurrect_expired_lease() {
+        let mut lease = AuthorityLease::pending_remote_validation(1);
+        lease
+            .renew_after_successful_remote_validation(1, None)
+            .unwrap();
+        assert!(!lease.is_expired());
+        lease.set_deadline_for_test(Instant::now() - Duration::from_millis(5));
+        assert!(lease.is_expired());
+        assert!(lease
+            .renew_after_successful_remote_validation(1, None)
+            .is_err());
+        assert!(lease.is_expired());
+        assert!(lease.remaining().is_zero());
+    }
+
+    #[test]
+    fn install_validated_generation_switches_generation() {
+        let mut lease = AuthorityLease::pending_remote_validation(1);
+        lease
+            .renew_after_successful_remote_validation(1, None)
+            .unwrap();
+        assert_eq!(lease.generation(), 1);
+        // Renew still rejects gen 2 while gen 1 is bound.
+        assert!(lease
+            .renew_after_successful_remote_validation(2, None)
+            .is_err());
+        assert_eq!(lease.generation(), 1);
+        lease.install_validated_generation(2, None);
+        assert_eq!(lease.generation(), 2);
+        assert!(lease.remaining() > Duration::from_secs(200));
+        // install_validated_generation also works after expiry (replacement session).
+        lease.set_deadline_for_test(Instant::now() - Duration::from_secs(1));
+        assert!(lease.is_expired());
+        lease.install_validated_generation(3, None);
+        assert_eq!(lease.generation(), 3);
+        assert!(!lease.is_expired());
     }
 
     #[test]

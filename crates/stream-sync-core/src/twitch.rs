@@ -2,19 +2,22 @@
 
 use crate::app_state::{tokens_from_delegated_session, AppState};
 use crate::broadcast::{make_dock_event, FeedHub};
-use crate::config_types::{DelegatedSessionFile, TwitchActiveMode, TwitchTokenFile};
+use crate::config_types::{
+    DelegatedSessionFile, TwitchActiveMode, TwitchActiveModeFile, TwitchTokenFile,
+};
 use crate::delegated_lifecycle::{
     append_sse_chunk, connection_key_authorization, connection_key_events_url,
     install_generation_task, parse_sse_json_data, redact_connection_key,
     stop_delegated_worker_handles, AuthorityLease, DelegatedGeneration, DelegatedWorker,
     GenerationTask, SseBufferError, TeardownCoordinator, MAX_DELEGATED_REVOCATION_DELAY,
-    SYNDICATE_SSE_READ_TIMEOUT,
+    SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,
 };
 use crate::syndicate_connection::{self, SyndicateApiError};
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
@@ -43,6 +46,8 @@ pub struct TwitchServices {
     watch_handle: RwLock<Option<GenerationTask>>,
     pub teardown_coordinator: TeardownCoordinator,
     authority_lease: Mutex<AuthorityLease>,
+    /// Monotonic apply-request fence; newer requests supersede older exchange completions.
+    apply_intent: AtomicU64,
     /// Serializes apply / durable revoke / refresh-apply / mode transitions.
     lifecycle_lock: Mutex<()>,
     teardown_tx: OnceLock<mpsc::UnboundedSender<TeardownRequest>>,
@@ -67,6 +72,7 @@ impl TwitchServices {
             watch_handle: RwLock::new(None),
             teardown_coordinator: TeardownCoordinator::new(),
             authority_lease: Mutex::new(AuthorityLease::inactive()),
+            apply_intent: AtomicU64::new(0),
             lifecycle_lock: Mutex::new(()),
             teardown_tx: OnceLock::new(),
         }
@@ -158,9 +164,19 @@ impl TwitchServices {
         &self,
         generation: DelegatedGeneration,
         connection_expires_at: Option<&str>,
+    ) -> Result<(), String> {
+        let mut lease = self.authority_lease.lock().await;
+        lease.renew_after_successful_remote_validation(generation, connection_expires_at)
+    }
+
+    /// Install a freshly validated lease for a new/replacement session.
+    async fn install_validated_authority_lease(
+        &self,
+        generation: DelegatedGeneration,
+        connection_expires_at: Option<&str>,
     ) {
         let mut lease = self.authority_lease.lock().await;
-        lease.renew_after_successful_remote_validation(generation, connection_expires_at);
+        lease.install_validated_generation(generation, connection_expires_at);
     }
 
     /// Cap lease by connection expiry without extending (local data never renews).
@@ -180,6 +196,17 @@ impl TwitchServices {
 
     async fn authority_sleep_budget(&self, preferred: Duration) -> Duration {
         self.authority_lease.lock().await.sleep_budget(preferred)
+    }
+
+    async fn authority_request_timeout(&self, configured: Duration) -> Duration {
+        self.authority_lease
+            .lock()
+            .await
+            .request_timeout(configured)
+    }
+
+    async fn authority_deadline(&self) -> std::time::Instant {
+        self.authority_lease.lock().await.deadline()
     }
 }
 
@@ -918,13 +945,102 @@ async fn stop_refresh_task(services: &TwitchServices) {
     }
 }
 
+fn disk_active_mode_is_delegated(state: &AppState) -> bool {
+    crate::storage::read_json_if_exists(
+        &state.paths.twitch_active_mode,
+        &TwitchActiveModeFile::default(),
+    )
+    .map(|f| f.mode == TwitchActiveMode::Delegated)
+    .unwrap_or(false)
+}
+
+fn durable_revoke_still_needed(state: &AppState) -> bool {
+    state.paths.twitch_delegated.is_file() || !state.paths.twitch_delegated_revoked.is_file()
+}
+
+/// Strip in-memory delegated authority for `generation` and stop platform/delegated workers.
+/// Durable storage is left for a subsequent teardown retry.
+async fn strip_in_memory_delegated_authority(
+    state: &AppState,
+    services: &TwitchServices,
+    generation: DelegatedGeneration,
+) {
+    if state.current_delegated_generation() != generation {
+        return;
+    }
+    {
+        let mut delegated = state.delegated.write().await;
+        if delegated
+            .as_ref()
+            .is_some_and(|s| s.generation == generation)
+        {
+            *delegated = None;
+        }
+    }
+    {
+        let mut lease = services.authority_lease.lock().await;
+        if lease.generation() == generation {
+            *lease = AuthorityLease::inactive();
+        }
+    }
+    if *state.active_mode.read().await == TwitchActiveMode::Delegated {
+        *state.active_mode.write().await = TwitchActiveMode::Local;
+        let mut tw = state.twitch.write().await;
+        clear_live_runtime_fields(&mut tw);
+        tw.tokens = TwitchTokenFile::default();
+    }
+    stop_delegated_worker_handles(&services.refresh_handle, &services.watch_handle, None).await;
+    stop_twitch_clients(services).await;
+}
+
+/// Absolute-lease fail-closed: clear memory first, then signal durable teardown (with retry).
+async fn fail_closed_lease_expired(
+    state: Arc<AppState>,
+    services: Arc<TwitchServices>,
+    generation: DelegatedGeneration,
+) {
+    {
+        let _lifecycle = services.lifecycle_lock.lock().await;
+        strip_in_memory_delegated_authority(&state, &services, generation).await;
+    }
+    match services
+        .signal_delegated_teardown(state.clone(), generation, "lease_expired")
+        .await
+    {
+        Ok(()) => {}
+        Err(e) => {
+            warn!("durable teardown after lease expiry failed: {e}; retrying");
+            let _ = services
+                .signal_delegated_teardown(state, generation, "lease_expired")
+                .await;
+        }
+    }
+}
+
+/// Race a network future against the absolute lease deadline. Deadline wins over a hung request.
+async fn race_against_lease_deadline<T>(
+    services: &TwitchServices,
+    network: impl std::future::Future<Output = T>,
+) -> Result<T, ()> {
+    let deadline = services.authority_deadline().await;
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(());
+    }
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep(remaining) => Err(()),
+        result = network => Ok(result),
+    }
+}
+
 async fn execute_delegated_teardown(
     state: Arc<AppState>,
     services: Arc<TwitchServices>,
     generation: DelegatedGeneration,
     code: &str,
 ) -> Result<(), String> {
-    let was_active = {
+    let need_personal_fallback = {
         let _lifecycle = services.lifecycle_lock.lock().await;
         if state.current_delegated_generation() != generation {
             return Ok(());
@@ -939,11 +1055,17 @@ async fn execute_delegated_teardown(
             }
         }
         warn!("delegated session ended: {}", code);
-        let was_active = state.is_delegated_mode().await;
-        state
-            .durable_revoke_delegated()
-            .await
-            .map_err(|e| e.to_string())?;
+
+        // 1. Durable revoke (idempotent): retry completes remaining work when file/tombstone incomplete.
+        if durable_revoke_still_needed(&state) {
+            if let Err(e) = state.durable_revoke_delegated().await {
+                // Clear in-memory authority first, then surface Err for durable retry.
+                strip_in_memory_delegated_authority(&state, &services, generation).await;
+                return Err(e.to_string());
+            }
+        }
+
+        // 2. Clear memory if gen matches.
         {
             let mut delegated = state.delegated.write().await;
             if state.current_delegated_generation() != generation {
@@ -951,15 +1073,25 @@ async fn execute_delegated_teardown(
             }
             if delegated
                 .as_ref()
+                .is_some_and(|s| s.generation == generation)
+            {
+                *delegated = None;
+            } else if delegated
+                .as_ref()
                 .is_some_and(|s| s.generation != generation)
             {
                 return Ok(());
             }
-            *delegated = None;
         }
+
+        // 3. Stop workers.
         stop_delegated_worker_handles(&services.refresh_handle, &services.watch_handle, None).await;
 
-        if was_active && state.current_delegated_generation() == generation {
+        // 4. Mode persist: do not skip based solely on was_active after memory already cleared.
+        let mem_delegated = *state.active_mode.read().await == TwitchActiveMode::Delegated;
+        let disk_delegated = disk_active_mode_is_delegated(&state);
+        let need_mode = mem_delegated || disk_delegated;
+        if need_mode && state.current_delegated_generation() == generation {
             let personal = state.personal_tokens.read().await.clone();
             if tokens_saved(&personal) {
                 {
@@ -968,20 +1100,26 @@ async fn execute_delegated_teardown(
                     tw.tokens = personal;
                     *state.active_mode.write().await = TwitchActiveMode::Local;
                 }
-                state.save_active_mode().await.map_err(|e| e.to_string())?;
+                if let Err(e) = state.save_active_mode().await {
+                    return Err(e.to_string());
+                }
             } else {
                 stop_twitch_clients(&services).await;
                 let mut tw = state.twitch.write().await;
                 tw.tokens = TwitchTokenFile::default();
                 clear_live_runtime_fields(&mut tw);
                 *state.active_mode.write().await = TwitchActiveMode::Local;
-                state.save_active_mode().await.map_err(|e| e.to_string())?;
+                drop(tw);
+                if let Err(e) = state.save_active_mode().await {
+                    return Err(e.to_string());
+                }
             }
         }
-        was_active
+        need_mode
     };
 
-    if was_active && state.current_delegated_generation() == generation {
+    // 5. Fallback/restart personal after mode persisted.
+    if need_personal_fallback && state.current_delegated_generation() == generation {
         let personal_ok = tokens_saved(&state.personal_tokens.read().await.clone());
         if personal_ok {
             restart_twitch_clients(state.clone(), services.clone()).await;
@@ -1038,8 +1176,12 @@ pub async fn apply_connection_key(
     services: Arc<TwitchServices>,
     key: &str,
 ) -> Result<()> {
+    let intent = services.apply_intent.fetch_add(1, Ordering::SeqCst) + 1;
     let exchange = syndicate_connection::exchange(key).await?;
-    apply_exchange_session(state, services, key, exchange, true).await
+    if services.apply_intent.load(Ordering::SeqCst) != intent {
+        return Err(anyhow!("superseded by newer apply request"));
+    }
+    apply_exchange_session(state, services, key, exchange, true, Some(intent)).await
 }
 
 /// Persist an exchanged takeover session. When `activate` is true, make it the live identity.
@@ -1049,9 +1191,15 @@ async fn apply_exchange_session(
     key: &str,
     exchange: syndicate_connection::ExchangeSuccess,
     activate: bool,
+    apply_intent: Option<u64>,
 ) -> Result<()> {
     let generation = {
         let _lifecycle = services.lifecycle_lock.lock().await;
+        if let Some(intent) = apply_intent {
+            if services.apply_intent.load(Ordering::SeqCst) != intent {
+                return Err(anyhow!("superseded by newer apply request"));
+            }
+        }
         stop_delegated_tasks(&services).await;
         let generation = state.bump_delegated_generation();
         let mut session = DelegatedSessionFile {
@@ -1083,10 +1231,7 @@ async fn apply_exchange_session(
             .await
             .map_err(|e| anyhow!(e))?;
         services
-            .renew_after_successful_remote_validation(
-                generation,
-                session.connection_expires_at.as_deref(),
-            )
+            .install_validated_authority_lease(generation, session.connection_expires_at.as_deref())
             .await;
 
         *state.delegated.write().await = Some(session);
@@ -1130,29 +1275,31 @@ async fn ensure_delegated_refresh_loop(state: Arc<AppState>, services: Arc<Twitc
         return;
     }
     let generation = state.current_delegated_generation();
-    // Restored sessions must revalidate promptly — do not grant a fresh five-minute lease.
-    {
-        let lease = services.authority_lease.lock().await;
-        if lease.generation() != generation {
-            drop(lease);
-            services.install_pending_authority_lease(generation).await;
-        }
-    }
     let running = services
         .refresh_handle
         .read()
         .await
         .as_ref()
         .is_some_and(|t| t.generation == generation);
-    if !running {
-        start_delegated_refresh_loop(state.clone(), services.clone(), generation).await;
-    }
     let watch_running = services
         .watch_handle
         .read()
         .await
         .as_ref()
         .is_some_and(|t| t.generation == generation);
+    // Restored sessions must revalidate promptly — never start workers on an inactive lease.
+    if !running || !watch_running {
+        let needs_pending = {
+            let lease = services.authority_lease.lock().await;
+            lease.generation() != generation || lease.is_expired()
+        };
+        if needs_pending {
+            services.install_pending_authority_lease(generation).await;
+        }
+    }
+    if !running {
+        start_delegated_refresh_loop(state.clone(), services.clone(), generation).await;
+    }
     if !watch_running {
         start_delegated_watch_loop(state, services, generation).await;
     }
@@ -1169,25 +1316,8 @@ async fn start_delegated_refresh_loop(
     let handle = tokio::spawn(async move {
         loop {
             if services2.authority_lease_expired().await {
-                match end_delegated_session_after_key_invalid(
-                    state2.clone(),
-                    services2.clone(),
-                    "lease_expired",
-                    generation,
-                )
-                .await
-                {
-                    Ok(()) => break,
-                    Err(e) => {
-                        warn!("lease expiry teardown failed: {e}");
-                        let wait = services2
-                            .authority_sleep_budget(Duration::from_secs(1))
-                            .await
-                            .max(Duration::from_millis(200));
-                        tokio::time::sleep(wait).await;
-                        continue;
-                    }
-                }
+                fail_closed_lease_expired(state2.clone(), services2.clone(), generation).await;
+                break;
             }
 
             let (key, expires_at, conn_exp) = {
@@ -1223,32 +1353,52 @@ async fn start_delegated_refresh_loop(
             };
             let sleep_for = services2.authority_sleep_budget(sleep_for).await;
             if sleep_for.is_zero() {
-                match end_delegated_session_after_key_invalid(
-                    state2.clone(),
-                    services2.clone(),
-                    "lease_expired",
-                    generation,
-                )
-                .await
-                {
-                    Ok(()) => break,
-                    Err(e) => {
-                        warn!("lease expiry teardown failed: {e}");
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        continue;
-                    }
-                }
+                fail_closed_lease_expired(state2.clone(), services2.clone(), generation).await;
+                break;
             }
             tokio::time::sleep(sleep_for).await;
 
+            // Absolute lease: recheck generation + expiry after every sleep before network.
             if !state2.session_still_current(generation).await {
                 break;
             }
+            if services2.authority_lease_expired().await {
+                fail_closed_lease_expired(state2.clone(), services2.clone(), generation).await;
+                break;
+            }
 
-            match syndicate_connection::refresh(&key).await {
+            let req_timeout = services2
+                .authority_request_timeout(SYNDICATE_HTTP_TIMEOUT)
+                .await;
+            if req_timeout.is_zero() {
+                fail_closed_lease_expired(state2.clone(), services2.clone(), generation).await;
+                break;
+            }
+
+            let refresh_result = race_against_lease_deadline(&services2, async {
+                tokio::time::timeout(req_timeout, syndicate_connection::refresh(&key)).await
+            })
+            .await;
+
+            let refresh_result = match refresh_result {
+                Err(()) => {
+                    fail_closed_lease_expired(state2.clone(), services2.clone(), generation).await;
+                    break;
+                }
+                Ok(Err(_)) => Err(anyhow!("Syndicate refresh timed out within lease budget")),
+                Ok(Ok(r)) => r,
+            };
+
+            match refresh_result {
                 Ok(exchange) => {
                     let _lifecycle = services2.lifecycle_lock.lock().await;
                     if !state2.session_still_current(generation).await {
+                        break;
+                    }
+                    if services2.authority_lease_expired().await {
+                        drop(_lifecycle);
+                        fail_closed_lease_expired(state2.clone(), services2.clone(), generation)
+                            .await;
                         break;
                     }
                     let session = {
@@ -1277,12 +1427,22 @@ async fn start_delegated_refresh_loop(
                         // Fail closed: do not treat refreshed tokens as committed authority.
                         continue;
                     }
-                    services2
+                    if let Err(e) = services2
                         .renew_after_successful_remote_validation(
                             generation,
                             exchange.connection.expires_at.as_deref(),
                         )
-                        .await;
+                        .await
+                    {
+                        warn!(
+                            "delegated refresh lease renew rejected: {}",
+                            redact_connection_key(&e, &key)
+                        );
+                        drop(_lifecycle);
+                        fail_closed_lease_expired(state2.clone(), services2.clone(), generation)
+                            .await;
+                        break;
+                    }
                     let active_delegated = state2.is_delegated_mode().await;
                     if active_delegated && state2.session_still_current(generation).await {
                         {
@@ -1330,22 +1490,26 @@ async fn start_delegated_refresh_loop(
                                     .authority_sleep_budget(Duration::from_secs(60))
                                     .await;
                                 if wait.is_zero() {
-                                    match end_delegated_session_after_key_invalid(
+                                    fail_closed_lease_expired(
                                         state2.clone(),
                                         services2.clone(),
-                                        "lease_expired",
                                         generation,
                                     )
-                                    .await
-                                    {
-                                        Ok(()) => break,
-                                        Err(err) => {
-                                            warn!("lease expiry teardown failed: {err}");
-                                            tokio::time::sleep(Duration::from_millis(200)).await;
-                                        }
-                                    }
-                                } else {
-                                    tokio::time::sleep(wait).await;
+                                    .await;
+                                    break;
+                                }
+                                tokio::time::sleep(wait).await;
+                                if !state2.session_still_current(generation).await {
+                                    break;
+                                }
+                                if services2.authority_lease_expired().await {
+                                    fail_closed_lease_expired(
+                                        state2.clone(),
+                                        services2.clone(),
+                                        generation,
+                                    )
+                                    .await;
+                                    break;
                                 }
                             }
                             _ => {
@@ -1354,22 +1518,26 @@ async fn start_delegated_refresh_loop(
                                     .authority_sleep_budget(Duration::from_secs(60))
                                     .await;
                                 if wait.is_zero() {
-                                    match end_delegated_session_after_key_invalid(
+                                    fail_closed_lease_expired(
                                         state2.clone(),
                                         services2.clone(),
-                                        "lease_expired",
                                         generation,
                                     )
-                                    .await
-                                    {
-                                        Ok(()) => break,
-                                        Err(err) => {
-                                            warn!("lease expiry teardown failed: {err}");
-                                            tokio::time::sleep(Duration::from_millis(200)).await;
-                                        }
-                                    }
-                                } else {
-                                    tokio::time::sleep(wait).await;
+                                    .await;
+                                    break;
+                                }
+                                tokio::time::sleep(wait).await;
+                                if !state2.session_still_current(generation).await {
+                                    break;
+                                }
+                                if services2.authority_lease_expired().await {
+                                    fail_closed_lease_expired(
+                                        state2.clone(),
+                                        services2.clone(),
+                                        generation,
+                                    )
+                                    .await;
+                                    break;
                                 }
                             }
                         }
@@ -1382,29 +1550,33 @@ async fn start_delegated_refresh_loop(
                             .authority_sleep_budget(Duration::from_secs(60))
                             .await;
                         if wait.is_zero() {
-                            match end_delegated_session_after_key_invalid(
+                            fail_closed_lease_expired(
                                 state2.clone(),
                                 services2.clone(),
-                                "lease_expired",
                                 generation,
                             )
-                            .await
-                            {
-                                Ok(()) => break,
-                                Err(err) => {
-                                    warn!("lease expiry teardown failed: {err}");
-                                    tokio::time::sleep(Duration::from_millis(200)).await;
-                                }
-                            }
-                        } else {
-                            tokio::time::sleep(wait).await;
+                            .await;
+                            break;
+                        }
+                        tokio::time::sleep(wait).await;
+                        if !state2.session_still_current(generation).await {
+                            break;
+                        }
+                        if services2.authority_lease_expired().await {
+                            fail_closed_lease_expired(
+                                state2.clone(),
+                                services2.clone(),
+                                generation,
+                            )
+                            .await;
+                            break;
                         }
                     }
                 }
             }
         }
     });
-    install_generation_task(&services.refresh_handle, generation, handle).await;
+    let _ = install_generation_task(&services.refresh_handle, generation, handle).await;
 }
 
 async fn consume_connection_key_events(
@@ -1413,19 +1585,49 @@ async fn consume_connection_key_events(
     generation: DelegatedGeneration,
     key: &str,
 ) -> Result<bool> {
+    if !state.session_still_current(generation).await {
+        return Ok(false);
+    }
+    if services.authority_lease_expired().await {
+        fail_closed_lease_expired(state, services, generation).await;
+        return Ok(true);
+    }
+
+    let connect_timeout = services
+        .authority_request_timeout(SYNDICATE_HTTP_TIMEOUT)
+        .await;
+    if connect_timeout.is_zero() {
+        fail_closed_lease_expired(state, services, generation).await;
+        return Ok(true);
+    }
+
     let url = connection_key_events_url(&syndicate_connection::api_base());
-    let res = syndicate_connection::syndicate_http_client()
+    let send_fut = syndicate_connection::syndicate_http_client()
         .get(&url)
         .header("Accept", "text/event-stream")
         .header("Authorization", connection_key_authorization(key))
-        .send()
-        .await
-        .map_err(|e| {
+        .send();
+    let res = match race_against_lease_deadline(&services, async {
+        tokio::time::timeout(connect_timeout, send_fut).await
+    })
+    .await
+    {
+        Err(()) => {
+            fail_closed_lease_expired(state, services, generation).await;
+            return Ok(true);
+        }
+        Ok(Err(_)) => {
+            return Err(anyhow!(
+                "connection key watch connect timed out within lease budget"
+            ));
+        }
+        Ok(Ok(r)) => r.map_err(|e| {
             anyhow!(
                 "connection key watch request failed: {}",
                 redact_connection_key(&e.to_string(), key)
             )
-        })?;
+        })?,
+    };
     if res.status() == reqwest::StatusCode::UNAUTHORIZED {
         let _ =
             end_delegated_session_after_key_invalid(state, services, "revoked", generation).await;
@@ -1436,24 +1638,58 @@ async fn consume_connection_key_events(
     }
     // Successful remote stream open counts as validation for this generation.
     if state.session_still_current(generation).await {
-        services
-            .renew_after_successful_remote_validation(
-                generation,
-                state
-                    .delegated
-                    .read()
-                    .await
-                    .as_ref()
-                    .and_then(|s| s.connection_expires_at.as_deref()),
-            )
-            .await;
+        if services.authority_lease_expired().await {
+            fail_closed_lease_expired(state, services, generation).await;
+            return Ok(true);
+        }
+        let expires = state
+            .delegated
+            .read()
+            .await
+            .as_ref()
+            .and_then(|s| s.connection_expires_at.clone());
+        if let Err(e) = services
+            .renew_after_successful_remote_validation(generation, expires.as_deref())
+            .await
+        {
+            warn!("lease renew rejected after watch connect: {e}");
+            fail_closed_lease_expired(state, services, generation).await;
+            return Ok(true);
+        }
     }
     let mut stream = res.bytes_stream();
     let mut buf = String::new();
     loop {
-        let chunk = tokio::time::timeout(SYNDICATE_SSE_READ_TIMEOUT, stream.next())
-            .await
-            .map_err(|_| anyhow!("connection key watch read timeout"))?;
+        if !state.session_still_current(generation).await {
+            return Ok(false);
+        }
+        if services.authority_lease_expired().await {
+            fail_closed_lease_expired(state, services, generation).await;
+            return Ok(true);
+        }
+        let read_timeout = services
+            .authority_request_timeout(SYNDICATE_SSE_READ_TIMEOUT)
+            .await;
+        if read_timeout.is_zero() {
+            fail_closed_lease_expired(state, services, generation).await;
+            return Ok(true);
+        }
+        let chunk = match race_against_lease_deadline(&services, async {
+            tokio::time::timeout(read_timeout, stream.next()).await
+        })
+        .await
+        {
+            Err(()) => {
+                fail_closed_lease_expired(state, services, generation).await;
+                return Ok(true);
+            }
+            Ok(Err(_)) => {
+                return Err(anyhow!(
+                    "connection key watch read timed out within lease budget"
+                ));
+            }
+            Ok(Ok(chunk)) => chunk,
+        };
         let Some(chunk) = chunk else {
             return Err(anyhow!("connection key watch stream ended"));
         };
@@ -1479,19 +1715,6 @@ async fn consume_connection_key_events(
                 }
             }
         }
-        if !state.session_still_current(generation).await {
-            return Ok(false);
-        }
-        if services.authority_lease_expired().await {
-            let _ = end_delegated_session_after_key_invalid(
-                state,
-                services,
-                "lease_expired",
-                generation,
-            )
-            .await;
-            return Ok(true);
-        }
     }
 }
 
@@ -1509,21 +1732,8 @@ async fn start_delegated_watch_loop(
         let mut consecutive_failures: u32 = 0;
         loop {
             if services2.authority_lease_expired().await {
-                match end_delegated_session_after_key_invalid(
-                    state2.clone(),
-                    services2.clone(),
-                    "lease_expired",
-                    generation,
-                )
-                .await
-                {
-                    Ok(()) => break,
-                    Err(e) => {
-                        warn!("lease expiry teardown failed: {e}");
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        continue;
-                    }
-                }
+                fail_closed_lease_expired(state2.clone(), services2.clone(), generation).await;
+                break;
             }
 
             let key = {
@@ -1548,19 +1758,77 @@ async fn start_delegated_watch_loop(
                         redact_connection_key(&format!("{e:#}"), &key)
                     );
                     if consecutive_failures >= 3 {
-                        match syndicate_connection::refresh(&key).await {
-                            Ok(exchange) => {
+                        if !state2.session_still_current(generation).await {
+                            break;
+                        }
+                        if services2.authority_lease_expired().await {
+                            fail_closed_lease_expired(
+                                state2.clone(),
+                                services2.clone(),
+                                generation,
+                            )
+                            .await;
+                            break;
+                        }
+                        let req_timeout = services2
+                            .authority_request_timeout(SYNDICATE_HTTP_TIMEOUT)
+                            .await;
+                        if req_timeout.is_zero() {
+                            fail_closed_lease_expired(
+                                state2.clone(),
+                                services2.clone(),
+                                generation,
+                            )
+                            .await;
+                            break;
+                        }
+                        let refresh_result = race_against_lease_deadline(&services2, async {
+                            tokio::time::timeout(req_timeout, syndicate_connection::refresh(&key))
+                                .await
+                        })
+                        .await;
+                        match refresh_result {
+                            Err(()) => {
+                                fail_closed_lease_expired(
+                                    state2.clone(),
+                                    services2.clone(),
+                                    generation,
+                                )
+                                .await;
+                                break;
+                            }
+                            Ok(Err(_)) => {
+                                warn!("watch revalidation timed out within lease budget");
+                            }
+                            Ok(Ok(Ok(exchange))) => {
                                 if state2.session_still_current(generation).await {
-                                    services2
+                                    match services2
                                         .renew_after_successful_remote_validation(
                                             generation,
                                             exchange.connection.expires_at.as_deref(),
                                         )
-                                        .await;
-                                    consecutive_failures = 0;
+                                        .await
+                                    {
+                                        Ok(()) => {
+                                            consecutive_failures = 0;
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "watch revalidation lease renew rejected: {}",
+                                                redact_connection_key(&e, &key)
+                                            );
+                                            fail_closed_lease_expired(
+                                                state2.clone(),
+                                                services2.clone(),
+                                                generation,
+                                            )
+                                            .await;
+                                            break;
+                                        }
+                                    }
                                 }
                             }
-                            Err(err) => {
+                            Ok(Ok(Err(err))) => {
                                 if let Some(api) = err.downcast_ref::<SyndicateApiError>() {
                                     match api.code.as_str() {
                                         "revoked" | "expired" | "invalid_key" => {
@@ -1596,26 +1864,21 @@ async fn start_delegated_watch_loop(
                 .authority_sleep_budget(Duration::from_secs(5))
                 .await;
             if wait.is_zero() {
-                match end_delegated_session_after_key_invalid(
-                    state2.clone(),
-                    services2.clone(),
-                    "lease_expired",
-                    generation,
-                )
-                .await
-                {
-                    Ok(()) => break,
-                    Err(e) => {
-                        warn!("lease expiry teardown failed: {e}");
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        continue;
-                    }
-                }
+                fail_closed_lease_expired(state2.clone(), services2.clone(), generation).await;
+                break;
             }
             tokio::time::sleep(wait).await;
+            // Recheck after sleep before next network attempt.
+            if !state2.session_still_current(generation).await {
+                break;
+            }
+            if services2.authority_lease_expired().await {
+                fail_closed_lease_expired(state2.clone(), services2.clone(), generation).await;
+                break;
+            }
         }
     });
-    install_generation_task(&services.watch_handle, generation, handle).await;
+    let _ = install_generation_task(&services.watch_handle, generation, handle).await;
 }
 
 pub async fn restart_twitch_clients(state: Arc<AppState>, services: Arc<TwitchServices>) {
@@ -2515,6 +2778,7 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
                     &key,
                     exchange,
                     activate,
+                    None,
                 )
                 .await
                 {
@@ -2532,12 +2796,14 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
                             if has_delegated_tokens {
                                 restart_twitch_clients(state.clone(), services.clone()).await;
                                 let generation = state.current_delegated_generation();
+                                services.install_pending_authority_lease(generation).await;
                                 start_delegated_refresh_loop(
                                     state.clone(),
                                     services.clone(),
                                     generation,
                                 )
                                 .await;
+                                start_delegated_watch_loop(state, services, generation).await;
                                 return;
                             }
                         }
@@ -2574,12 +2840,14 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
                                 if has_delegated_tokens {
                                     restart_twitch_clients(state.clone(), services.clone()).await;
                                     let generation = state.current_delegated_generation();
+                                    services.install_pending_authority_lease(generation).await;
                                     start_delegated_refresh_loop(
                                         state.clone(),
                                         services.clone(),
                                         generation,
                                     )
                                     .await;
+                                    start_delegated_watch_loop(state, services, generation).await;
                                     return;
                                 }
                             } else {
@@ -2598,12 +2866,14 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
                         if has_delegated_tokens {
                             restart_twitch_clients(state.clone(), services.clone()).await;
                             let generation = state.current_delegated_generation();
+                            services.install_pending_authority_lease(generation).await;
                             start_delegated_refresh_loop(
                                 state.clone(),
                                 services.clone(),
                                 generation,
                             )
                             .await;
+                            start_delegated_watch_loop(state, services, generation).await;
                             return;
                         }
                     } else {
@@ -2870,7 +3140,6 @@ mod tests {
 
     async fn phase2_app() -> (Arc<AppState>, Arc<TwitchServices>) {
         let userdata = phase2_userdata();
-        std::env::set_var("STREAMSYNC_USERDATA", userdata.display().to_string());
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
@@ -2880,6 +3149,7 @@ mod tests {
             port: 0,
             repo_root,
             readonly: false,
+            userdata_root: Some(userdata),
         };
         let (_router, state, services) = crate::OverlayServer::new(config)
             .build_app()
@@ -3115,6 +3385,7 @@ mod tests {
 
         let (state, services) = phase2_app().await;
         install_delegated_session(&state, &services).await;
+        services.install_pending_authority_lease(1).await;
         *state.active_mode.write().await = TwitchActiveMode::Delegated;
         install_fake_platform_workers(&state, &services).await;
 
@@ -3160,7 +3431,7 @@ mod tests {
         use crate::delegated_lifecycle::AuthorityLease;
         assert_eq!(MAX_DELEGATED_REVOCATION_DELAY, Duration::from_secs(300));
         let mut lease = AuthorityLease::inactive();
-        lease.renew_after_successful_remote_validation(1, None);
+        lease.install_validated_generation(1, None);
         assert!(lease.sleep_budget(Duration::from_secs(10_000)) <= MAX_DELEGATED_REVOCATION_DELAY);
     }
 }
