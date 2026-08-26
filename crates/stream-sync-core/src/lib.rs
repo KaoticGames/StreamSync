@@ -120,6 +120,8 @@ impl OverlayServer {
         )?;
         let twitch = Arc::new(twitch::TwitchServices::new());
         twitch.init_teardown_worker();
+        twitch.init_durable_revoke_worker();
+        state.bind_twitch_services(&twitch);
         let ctx = ServerContext {
             state: state.clone(),
             twitch: twitch.clone(),

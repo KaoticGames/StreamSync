@@ -5,6 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use stream_sync_core::{
     connection_key_events_url, disconnect_twitch, paths_for_root, remove_file_durable,
     sync_live_identity, write_delegated_revoked_tombstone, write_json, AppState,
@@ -377,7 +378,10 @@ async fn kick_feed_uses_authorization_not_query_key() {
     });
     std::env::set_var("SYNDICATE_API_BASE", format!("http://127.0.0.1:{port}"));
 
-    let (_router, state, _services) = build_app(0).await;
+    let (_router, state, services) = build_app(0).await;
+    state.delegated_generation.store(1, Ordering::SeqCst);
+    services.install_delegated_generation(1).await;
+    services.install_validated_authority_lease(1, None).await;
     *state.delegated.write().await = Some(sample_session(1, "ssk_test_placeholder_kick_feed_key"));
     *state.active_mode.write().await = TwitchActiveMode::Delegated;
     {
@@ -461,4 +465,43 @@ fn remove_file_durable_deletes_existing_file() {
     std::fs::write(&path, b"{}").unwrap();
     remove_file_durable(&path).unwrap();
     assert!(!path.is_file());
+}
+
+#[tokio::test]
+async fn autonomous_durable_revoke_completes_after_transient_failure() {
+    let (_router, state, services) = build_app(0).await;
+    services.init_teardown_worker();
+    services.init_durable_revoke_worker();
+    write_json(
+        &state.paths.twitch_delegated,
+        &sample_session(1, "ssk_test_placeholder_autonomous"),
+    )
+    .unwrap();
+    state.delegated_generation.store(1, Ordering::SeqCst);
+    *state.delegated.write().await = Some(sample_session(1, "ssk_test_placeholder_autonomous"));
+    *state.active_mode.write().await = TwitchActiveMode::Delegated;
+    services.install_delegated_generation(1).await;
+
+    state
+        .durable_fail
+        .credential_remove
+        .store(true, Ordering::SeqCst);
+    services
+        .signal_delegated_teardown(state.clone(), 1, "revoked")
+        .await
+        .expect_err("first teardown fails injected");
+    assert!(state.paths.twitch_delegated.is_file());
+
+    state
+        .durable_fail
+        .credential_remove
+        .store(false, Ordering::SeqCst);
+    for _ in 0..40 {
+        if !state.paths.twitch_delegated.is_file() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!state.paths.twitch_delegated.is_file());
+    assert!(state.paths.twitch_delegated_revoked.is_file());
 }

@@ -324,6 +324,13 @@ impl Default for TeardownCoordinator {
     }
 }
 
+/// Point-in-time `(generation, deadline)` for generation-bound network races.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorityLeaseSnapshot {
+    pub generation: DelegatedGeneration,
+    pub deadline: Instant,
+}
+
 /// Generation-scoped monotonic authority lease.
 ///
 /// Only [`AuthorityLease::renew_after_successful_remote_validation`] extends the deadline of an
@@ -359,6 +366,18 @@ impl AuthorityLease {
 
     pub fn deadline(&self) -> Instant {
         self.deadline
+    }
+
+    pub fn snapshot(&self) -> AuthorityLeaseSnapshot {
+        AuthorityLeaseSnapshot {
+            generation: self.generation,
+            deadline: self.deadline(),
+        }
+    }
+
+    /// True when this lease is bound to `generation` and the absolute deadline has not passed.
+    pub fn owns_generation(&self, generation: DelegatedGeneration) -> bool {
+        generation != 0 && self.generation == generation && !self.is_expired()
     }
 
     /// Reset the lease after a successful remote Syndicate validation for this generation.
@@ -471,10 +490,30 @@ pub struct GenerationTask {
     pub handle: JoinHandle<()>,
 }
 
+/// True when the slot holds a live worker for `generation`.
+pub fn generation_task_alive(task: &GenerationTask, generation: DelegatedGeneration) -> bool {
+    task.generation == generation && !task.handle.is_finished()
+}
+
+/// Drop a completed/panicked worker for `generation` so a restart can install.
+pub async fn clear_finished_generation_task(
+    slot: &RwLock<Option<GenerationTask>>,
+    generation: DelegatedGeneration,
+) {
+    let mut guard = slot.write().await;
+    if guard
+        .as_ref()
+        .is_some_and(|t| t.generation == generation && t.handle.is_finished())
+    {
+        guard.take();
+    }
+}
+
 /// Atomically install a generation-tagged worker.
 ///
-/// Returns `true` if `handle` was installed. If the slot already holds a newer or equal
-/// generation, aborts the incoming handle, keeps the current occupant, and returns `false`.
+/// Returns `true` if `handle` was installed. If the slot already holds a newer generation, or an
+/// equal generation with a live worker, aborts the incoming handle, keeps the current occupant,
+/// and returns `false`. A finished equal-generation occupant may be replaced (liveness restart).
 pub async fn install_generation_task(
     slot: &RwLock<Option<GenerationTask>>,
     generation: DelegatedGeneration,
@@ -482,13 +521,19 @@ pub async fn install_generation_task(
 ) -> bool {
     let mut guard = slot.write().await;
     if let Some(prev) = guard.as_ref() {
-        if prev.generation >= generation {
+        if prev.generation > generation {
+            handle.abort();
+            return false;
+        }
+        if prev.generation == generation && !prev.handle.is_finished() {
             handle.abort();
             return false;
         }
     }
     if let Some(prev) = guard.take() {
-        prev.handle.abort();
+        if !prev.handle.is_finished() {
+            prev.handle.abort();
+        }
     }
     *guard = Some(GenerationTask { generation, handle });
     true
@@ -879,11 +924,34 @@ mod tests {
         assert!(!install_generation_task(&slot, 1, stale).await);
         assert_eq!(slot.read().await.as_ref().map(|t| t.generation), Some(2));
 
-        // Equal generation is also rejected (keep current).
+        // Equal generation with a live worker is rejected (keep current).
         let equal = tokio::spawn(async { std::future::pending::<()>().await });
         assert!(!install_generation_task(&slot, 2, equal).await);
         assert_eq!(slot.read().await.as_ref().map(|t| t.generation), Some(2));
 
+        // Finished equal-generation occupant may be replaced for liveness restart.
+        if let Some(task) = slot.write().await.take() {
+            task.handle.abort();
+            let _ = task.handle.await;
+        };
+        let finished = tokio::spawn(async {});
+        assert!(install_generation_task(&slot, 2, finished).await);
+        for _ in 0..20 {
+            if slot
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|t| t.handle.is_finished())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        clear_finished_generation_task(&slot, 2).await;
+        assert!(slot.read().await.is_none());
+
+        let restart = tokio::spawn(async { std::future::pending::<()>().await });
+        assert!(install_generation_task(&slot, 2, restart).await);
         if let Some(task) = slot.write().await.take() {
             task.handle.abort();
         };
@@ -1036,6 +1104,50 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn stale_starter_cannot_pre_abort_newer_worker() {
+        let slot: RwLock<Option<GenerationTask>> = RwLock::new(None);
+        let (b_started_tx, b_started_rx) = tokio::sync::oneshot::channel();
+        let (b_grant_tx, b_grant_rx) = tokio::sync::oneshot::channel();
+        let b_handle = tokio::spawn(async move {
+            if b_grant_rx.await.is_err() {
+                return;
+            }
+            let _ = b_started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        assert!(install_generation_task(&slot, 2, b_handle).await);
+        let _ = b_grant_tx.send(());
+        b_started_rx.await.expect("gen-2 worker must run");
+
+        let (a_ran_tx, mut a_ran_rx) = tokio::sync::oneshot::channel();
+        let (a_grant_tx, a_grant_rx) = tokio::sync::oneshot::channel();
+        let a_handle = tokio::spawn(async move {
+            if a_grant_rx.await.is_err() {
+                return;
+            }
+            let _ = a_ran_tx.send(());
+        });
+        assert!(!install_generation_task(&slot, 1, a_handle).await);
+        assert!(a_ran_rx.try_recv().is_err(), "stale gen must not run body");
+        assert_eq!(slot.read().await.as_ref().map(|t| t.generation), Some(2));
+        let _ = a_grant_tx.send(());
+    }
+
+    #[test]
+    fn generation_bound_lease_snapshot_rejects_mismatch() {
+        let mut lease = AuthorityLease::pending_remote_validation(1);
+        lease
+            .renew_after_successful_remote_validation(1, None)
+            .unwrap();
+        let snap = lease.snapshot();
+        assert_eq!(snap.generation, 1);
+        lease.install_validated_generation(2, None);
+        assert_ne!(lease.snapshot().generation, snap.generation);
+        assert!(!lease.owns_generation(1));
+        assert!(lease.owns_generation(2));
     }
 
     fn oneshot_pair() -> (

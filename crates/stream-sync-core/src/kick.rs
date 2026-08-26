@@ -246,6 +246,13 @@ pub async fn send_chat_from_dock(state: Arc<AppState>, message: &str) -> Result<
     if trimmed.is_empty() {
         return Ok(());
     }
+    if state.is_delegated_mode().await {
+        if let Some(services) = state.twitch_services() {
+            services.ensure_delegated_authority(&state).await?;
+        } else {
+            return Err(anyhow!("Delegated authority unavailable"));
+        }
+    }
     ensure_fresh_personal_token(&state).await.ok();
     let tokens = state.kick.read().await.tokens.clone();
     let access = tokens
@@ -315,6 +322,19 @@ async fn feed_loop(state: Arc<AppState>) {
             tokio::time::sleep(Duration::from_secs(8)).await;
             continue;
         };
+        if state.is_delegated_mode().await {
+            if let Some(services) = state.twitch_services() {
+                if services.ensure_delegated_authority(&state).await.is_err() {
+                    state.kick.write().await.connected = false;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            } else {
+                state.kick.write().await.connected = false;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        }
         match consume_sse(state.clone(), &url, auth.as_deref()).await {
             Ok(()) => info!("Kick feed SSE ended"),
             Err(e) => {

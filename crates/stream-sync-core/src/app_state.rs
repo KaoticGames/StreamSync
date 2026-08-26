@@ -9,7 +9,7 @@ use crate::storage::{self, StoragePaths};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use tokio::sync::RwLock;
 
 type DockControlSockets =
@@ -149,6 +149,8 @@ pub struct AppState {
     pub dock_controls: DockControlRegistry,
     /// Test-only durable failure injection hooks.
     pub durable_fail: Arc<DurableFailureInject>,
+    /// Weak back-reference for delegated-authority guards on platform operations.
+    twitch_services: OnceLock<Weak<crate::twitch::TwitchServices>>,
 }
 
 impl AppState {
@@ -328,7 +330,16 @@ impl AppState {
             dock_credentials,
             dock_controls: DockControlRegistry::default(),
             durable_fail: Arc::new(DurableFailureInject::default()),
+            twitch_services: OnceLock::new(),
         }))
+    }
+
+    pub fn bind_twitch_services(&self, services: &Arc<crate::twitch::TwitchServices>) {
+        let _ = self.twitch_services.set(Arc::downgrade(services));
+    }
+
+    pub fn twitch_services(&self) -> Option<Arc<crate::twitch::TwitchServices>> {
+        self.twitch_services.get()?.upgrade()
     }
 
     pub fn control_token(&self) -> &str {
@@ -434,6 +445,20 @@ impl AppState {
 
     pub fn bump_delegated_generation(&self) -> u64 {
         self.delegated_generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub fn publish_delegated_generation(&self, generation: u64) {
+        self.delegated_generation
+            .store(generation, Ordering::SeqCst);
+    }
+
+    pub fn peek_next_delegated_generation(&self) -> u64 {
+        let cur = self.current_delegated_generation();
+        if cur == 0 {
+            1
+        } else {
+            cur.saturating_add(1)
+        }
     }
 
     pub async fn session_still_current(&self, generation: u64) -> bool {
