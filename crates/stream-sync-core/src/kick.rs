@@ -254,26 +254,65 @@ pub async fn send_chat_from_dock(state: Arc<AppState>, message: &str) -> Result<
     if trimmed.is_empty() {
         return Ok(());
     }
-    let provenance = if let Some(services) = state.twitch_services() {
-        services.capture_platform_provenance(&state).await?
+    let (provenance, access, broadcaster_user_id) = if let Some(services) = state.twitch_services()
+    {
+        let selection = services.select_platform_credentials(&state).await?;
+        let provenance = selection.provenance();
+        let (access, kick_id) = match selection {
+            crate::twitch::PlatformCredentialSelection::Local { .. } => {
+                ensure_fresh_personal_token(&state).await.ok();
+                let tokens = state.kick.read().await.tokens.clone();
+                let access = tokens
+                    .access_token
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow!("Kick is not connected"))?;
+                let kick_id = tokens
+                    .kick_id
+                    .clone()
+                    .ok_or_else(|| anyhow!("Kick is not connected"))?;
+                (access, kick_id)
+            }
+            crate::twitch::PlatformCredentialSelection::Delegated { .. } => {
+                let delegated = state.delegated.read().await.clone();
+                let session = delegated
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Delegated Kick session unavailable"))?;
+                let access = session
+                    .kick_access_token
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow!("Kick is not connected"))?;
+                let kick_id = session
+                    .kick_id
+                    .clone()
+                    .ok_or_else(|| anyhow!("Kick is not connected"))?;
+                (access, kick_id)
+            }
+        };
+        let broadcaster_user_id: i64 = kick_id.parse().unwrap_or(0);
+        (provenance, access, broadcaster_user_id)
     } else if state.is_delegated_mode().await {
         return Err(anyhow!("Delegated authority unavailable"));
     } else {
-        crate::twitch::PlatformCredentialProvenance::Local
+        ensure_fresh_personal_token(&state).await.ok();
+        let tokens = state.kick.read().await.tokens.clone();
+        let access = tokens
+            .access_token
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("Kick is not connected"))?;
+        let kick_id = tokens
+            .kick_id
+            .clone()
+            .ok_or_else(|| anyhow!("Kick is not connected"))?;
+        (
+            crate::twitch::PlatformCredentialProvenance::Local,
+            access,
+            kick_id.parse().unwrap_or(0),
+        )
     };
-    ensure_fresh_personal_token(&state).await.ok();
-    let tokens = state.kick.read().await.tokens.clone();
-    let access = tokens
-        .access_token
-        .clone()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("Kick is not connected"))?;
-    let kick_id = tokens
-        .kick_id
-        .clone()
-        .ok_or_else(|| anyhow!("Kick is not connected"))?;
-    let broadcaster_user_id: i64 = kick_id.parse().unwrap_or(0);
-    let send_fut = async {
+    let send_fut = async move {
         let res = reqwest::Client::new()
             .post(KICK_CHAT_URL)
             .header("Authorization", format!("Bearer {access}"))
@@ -306,24 +345,36 @@ pub async fn send_chat_from_dock(state: Arc<AppState>, message: &str) -> Result<
     Ok(())
 }
 
-async fn feed_request(state: &AppState) -> Option<(String, Option<String>, Option<String>)> {
-    let delegated_mode = state.is_delegated_mode().await;
-    if delegated_mode {
-        let d = state.delegated.read().await;
-        if let Some(sess) = d.as_ref() {
-            if sess.kick_id.as_ref().is_some_and(|s| !s.is_empty())
-                && !sess.connection_key.is_empty()
-            {
-                let key = sess.connection_key.clone();
-                return Some((
-                    syndicate_connection::kick_feed_url(),
-                    Some(crate::delegated_lifecycle::connection_key_authorization(
-                        &key,
-                    )),
-                    Some(key),
-                ));
-            }
+async fn select_kick_feed_connect(
+    state: &AppState,
+) -> Option<(
+    String,
+    Option<String>,
+    Option<String>,
+    Option<crate::delegated_lifecycle::AuthorityLeaseSnapshot>,
+)> {
+    let mode = *state.active_mode.read().await;
+    if mode == crate::config_types::TwitchActiveMode::Delegated {
+        let session = state.delegated.read().await.clone()?;
+        if session.kick_id.as_ref().is_none_or(|s| s.is_empty())
+            || session.connection_key.is_empty()
+        {
+            return None;
         }
+        let services = state.twitch_services()?;
+        let snap = services.authority_lease_snapshot_public().await;
+        if !services.syndicate_revalidation_still_valid(snap).await {
+            return None;
+        }
+        let key = session.connection_key.clone();
+        return Some((
+            syndicate_connection::kick_feed_url(),
+            Some(crate::delegated_lifecycle::connection_key_authorization(
+                &key,
+            )),
+            Some(key),
+            Some(snap),
+        ));
     }
     let tokens = state.kick.read().await.tokens.clone();
     let ticket = tokens.feed_ticket.filter(|s| !s.is_empty())?;
@@ -335,31 +386,16 @@ async fn feed_request(state: &AppState) -> Option<(String, Option<String>, Optio
         ),
         None,
         None,
+        None,
     ))
 }
 
 async fn feed_loop(state: Arc<AppState>) {
     loop {
-        let Some((url, auth, redact_key)) = feed_request(&state).await else {
+        let Some((url, auth, redact_key, snap)) = select_kick_feed_connect(&state).await else {
             state.kick.write().await.connected = false;
             tokio::time::sleep(Duration::from_secs(8)).await;
             continue;
-        };
-        let delegated = state.is_delegated_mode().await;
-        let snap = if delegated {
-            let Some(services) = state.twitch_services() else {
-                state.kick.write().await.connected = false;
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            };
-            if services.ensure_delegated_authority(&state).await.is_err() {
-                state.kick.write().await.connected = false;
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-            Some(services.authority_lease_snapshot_public().await)
-        } else {
-            None
         };
         match consume_sse(state.clone(), &url, auth.as_deref(), snap).await {
             Ok(()) => info!("Kick feed SSE ended"),
@@ -489,9 +525,10 @@ async fn fanout_kick_event(
                 return Err(anyhow!("Delegated authority unavailable"));
             };
             services.validate_delegated_snapshot(snap).await?;
+            let services = services.clone();
             let ok = state
                 .feed
-                .broadcast_all_while(&event, || snap.deadline > std::time::Instant::now())
+                .broadcast_all_while(&event, || services.delegated_send_gate_still_valid(snap))
                 .await;
             if !ok {
                 return Err(anyhow!("Delegated authority expired during fan-out"));
@@ -660,9 +697,10 @@ async fn emit_alert(
             return Err(anyhow!("Delegated authority unavailable"));
         };
         services.validate_delegated_snapshot(snap).await?;
+        let services = services.clone();
         let ok = state
             .feed
-            .broadcast_all_while(&event, || snap.deadline > std::time::Instant::now())
+            .broadcast_all_while(&event, || services.delegated_send_gate_still_valid(snap))
             .await;
         if !ok {
             return Err(anyhow!("Delegated authority expired during fan-out"));

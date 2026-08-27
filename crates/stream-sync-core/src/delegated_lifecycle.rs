@@ -341,6 +341,16 @@ pub struct AuthorityLeaseSnapshot {
     pub deadline: Instant,
 }
 
+/// Whether a lease may run platform clients or only Syndicate revalidation/watch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorityLeasePhase {
+    Inactive,
+    /// HTTP-budget window for Syndicate revalidation only — no platform activation.
+    PendingValidation,
+    /// Remote validation succeeded; platform operations are permitted until deadline.
+    Validated,
+}
+
 /// Generation-scoped monotonic authority lease.
 ///
 /// Only [`AuthorityLease::renew_after_successful_remote_validation`] extends the deadline of an
@@ -350,6 +360,7 @@ pub struct AuthorityLeaseSnapshot {
 pub struct AuthorityLease {
     generation: DelegatedGeneration,
     deadline: Instant,
+    phase: AuthorityLeasePhase,
 }
 
 impl AuthorityLease {
@@ -358,15 +369,17 @@ impl AuthorityLease {
         Self {
             generation: 0,
             deadline: Instant::now(),
+            phase: AuthorityLeasePhase::Inactive,
         }
     }
 
     /// Bootstrap after process restart with persisted delegated state: one HTTP-budget window to
-    /// revalidate. Does not grant a fresh five-minute lease.
+    /// revalidate. Does not grant a fresh five-minute lease or platform activation.
     pub fn pending_remote_validation(generation: DelegatedGeneration) -> Self {
         Self {
             generation,
             deadline: Instant::now() + SYNDICATE_HTTP_TIMEOUT,
+            phase: AuthorityLeasePhase::PendingValidation,
         }
     }
 
@@ -376,6 +389,10 @@ impl AuthorityLease {
 
     pub fn deadline(&self) -> Instant {
         self.deadline
+    }
+
+    pub fn phase(&self) -> AuthorityLeasePhase {
+        self.phase
     }
 
     pub fn snapshot(&self) -> AuthorityLeaseSnapshot {
@@ -388,6 +405,19 @@ impl AuthorityLease {
     /// True when this lease is bound to `generation` and the absolute deadline has not passed.
     pub fn owns_generation(&self, generation: DelegatedGeneration) -> bool {
         generation != 0 && self.generation == generation && !self.is_expired()
+    }
+
+    /// Platform HTTP/IRC/Kick operations require a validated lease for the generation.
+    pub fn allows_platform_operations(&self, generation: DelegatedGeneration) -> bool {
+        self.phase == AuthorityLeasePhase::Validated && self.owns_generation(generation)
+    }
+
+    /// Syndicate refresh/watch/SSE may run under pending or validated leases.
+    pub fn allows_syndicate_revalidation(&self, generation: DelegatedGeneration) -> bool {
+        matches!(
+            self.phase,
+            AuthorityLeasePhase::PendingValidation | AuthorityLeasePhase::Validated
+        ) && self.owns_generation(generation)
     }
 
     /// Reset the lease after a successful remote Syndicate validation for this generation.
@@ -413,6 +443,7 @@ impl AuthorityLease {
         }
         self.generation = generation;
         self.deadline = Instant::now() + MAX_DELEGATED_REVOCATION_DELAY;
+        self.phase = AuthorityLeasePhase::Validated;
         self.cap_by_connection_expiry(connection_expires_at);
         Ok(())
     }
@@ -428,6 +459,7 @@ impl AuthorityLease {
     ) {
         self.generation = generation;
         self.deadline = Instant::now() + MAX_DELEGATED_REVOCATION_DELAY;
+        self.phase = AuthorityLeasePhase::Validated;
         self.cap_by_connection_expiry(connection_expires_at);
     }
 
@@ -997,6 +1029,7 @@ mod tests {
         let mut lease = AuthorityLease {
             generation: 1,
             deadline: Instant::now() + Duration::from_secs(10),
+            phase: AuthorityLeasePhase::Validated,
         };
         let far = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
         lease.cap_by_connection_expiry(Some(&far));
@@ -1065,6 +1098,7 @@ mod tests {
     #[test]
     fn restart_lease_does_not_grant_full_window() {
         let lease = AuthorityLease::pending_remote_validation(7);
+        assert_eq!(lease.phase(), AuthorityLeasePhase::PendingValidation);
         assert!(lease.remaining() <= SYNDICATE_HTTP_TIMEOUT + Duration::from_millis(50));
         assert!(lease.remaining() < MAX_DELEGATED_REVOCATION_DELAY);
     }

@@ -203,8 +203,17 @@ impl FeedHub {
                 if !gate() {
                     return false;
                 }
-                let mut guard = client.sender.write().await;
-                // Bound blocked sends so revocation cannot wait forever behind backpressure.
+                let acquired = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    client.sender.write(),
+                )
+                .await;
+                let Ok(mut guard) = acquired else {
+                    return false;
+                };
+                if !gate() {
+                    return false;
+                }
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_millis(100),
                     guard.send(Message::Text(payload.clone())),

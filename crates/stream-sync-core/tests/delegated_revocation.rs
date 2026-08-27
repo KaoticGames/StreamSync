@@ -814,14 +814,104 @@ async fn mode_save_failure_rolls_back_personal_token_file() {
 
 #[test]
 fn acceptance_boundaries_document_manual_syndicate_integration() {
-    // B9: local two-instance tests are process-local service isolation, not multi-consumer
-    // Syndicate revocation. Real multi-consumer revoke, transient SSE transport failure,
-    // repeated reconnect failure, and production key-expiration remain manual/CI boundaries.
+    // B6/B11: local two-instance tests are process-local service isolation, not multi-consumer
+    // Syndicate revocation. Real multi-consumer revoke remains manual/CI evidence.
     let body = include_str!("../src/delegated_lifecycle.rs");
     assert!(body.contains("MAX_DELEGATED_REVOCATION_DELAY"));
+    assert!(body.contains("SYNDICATE_SSE_READ_TIMEOUT"));
+    let kick = include_str!("../src/kick.rs");
+    assert!(
+        kick.contains("select_kick_feed_connect"),
+        "kick feed must atomically select connection credentials"
+    );
+    assert!(
+        kick.contains("delegated_send_gate_still_valid"),
+        "kick fan-out must gate on generation+deadline after lock acquisition"
+    );
     assert!(
         include_str!("delegated_revocation.rs")
             .contains("two_instances_process_revoke_independently"),
         "local double-instance coverage remains available"
     );
+}
+
+#[tokio::test]
+async fn identity_rollback_pending_blocks_ambiguous_restart() {
+    let userdata = test_userdata_dir();
+    write_json(
+        &userdata.join("twitch-tokens.json"),
+        &stream_sync_core::TwitchTokenFile {
+            access_token: Some("atok".into()),
+            refresh_token: None,
+            expires_in: Some(3600),
+            obtainment_timestamp: Some(chrono::Utc::now().timestamp_millis()),
+            login: Some("user".into()),
+            user_id: Some("1".into()),
+            scopes: None,
+        },
+    )
+    .unwrap();
+    write_json(
+        &userdata.join("twitch-active-mode.json"),
+        &TwitchActiveModeFile {
+            mode: TwitchActiveMode::Delegated,
+        },
+    )
+    .unwrap();
+    write_json(
+        &userdata.join("twitch-delegated.json"),
+        &sample_session(1, "ssk_test_placeholder_rollback_restart"),
+    )
+    .unwrap();
+    stream_sync_core::write_identity_rollback_pending(
+        &userdata.join("twitch-tokens.rollback-pending"),
+    )
+    .unwrap();
+
+    let state = restart_app_at(&userdata, false);
+    assert!(state.identity_rollback_pending());
+    assert_ne!(*state.active_mode.read().await, TwitchActiveMode::Delegated);
+}
+
+#[test]
+fn delegated_variant_inventory_fails_closed_on_missing_parent() {
+    use stream_sync_core::delegated_temp_and_quarantine_variants;
+    let path = std::path::Path::new("Z:\\no-such-streamsync-parent\\twitch-delegated.json");
+    assert!(
+        delegated_temp_and_quarantine_variants(path).is_err(),
+        "read_dir failure must not return an empty inventory"
+    );
+}
+
+#[tokio::test]
+async fn backup_remove_failure_during_replacement_keeps_old_session() {
+    let userdata = test_userdata_dir();
+    let (_router, state, _services) = build_app_at(userdata.clone(), 0).await;
+    let session_a = sample_session(1, "ssk_test_placeholder_replace_a");
+    state.persist_delegated_session(&session_a).unwrap();
+    *state.delegated.write().await = Some(session_a.clone());
+    state.delegated_generation.store(1, Ordering::SeqCst);
+
+    let bak = state.paths.twitch_delegated.with_extension("bak");
+    std::fs::write(
+        &bak,
+        b"{\"connection_key\":\"ssk_test_placeholder_replace_bak\"}",
+    )
+    .unwrap();
+    state
+        .durable_fail
+        .backup_remove
+        .store(true, Ordering::SeqCst);
+    let session_b = sample_session(2, "ssk_test_placeholder_replace_b");
+    assert!(state.persist_delegated_session(&session_b).is_err());
+    assert!(bak.is_file());
+    // Primary must still be generation A after failed replacement.
+    let on_disk: DelegatedSessionFile =
+        serde_json::from_str(&std::fs::read_to_string(&state.paths.twitch_delegated).unwrap())
+            .unwrap();
+    assert_eq!(on_disk.generation, 1);
+    drop(state);
+    let restarted = restart_app_at(&userdata, false);
+    let reloaded = restarted.delegated.read().await.clone().unwrap();
+    assert_eq!(reloaded.generation, 1);
 }

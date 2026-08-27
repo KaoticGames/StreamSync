@@ -9,9 +9,9 @@ use crate::delegated_lifecycle::{
     append_sse_chunk, clear_finished_generation_task, connection_key_authorization,
     connection_key_events_url, generation_task_alive, install_generation_task, parse_sse_json_data,
     redact_connection_key, release_generation_slot_if_owned, stop_delegated_worker_handles,
-    AuthorityLease, AuthorityLeaseSnapshot, DelegatedGeneration, DelegatedWorker, GenerationTask,
-    SseBufferError, TeardownCoordinator, MAX_DELEGATED_REVOCATION_DELAY, SYNDICATE_HTTP_TIMEOUT,
-    SYNDICATE_SSE_READ_TIMEOUT,
+    AuthorityLease, AuthorityLeasePhase, AuthorityLeaseSnapshot, DelegatedGeneration,
+    DelegatedWorker, GenerationTask, SseBufferError, TeardownCoordinator,
+    MAX_DELEGATED_REVOCATION_DELAY, SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,
 };
 use crate::syndicate_connection::{self, SyndicateApiError};
 use anyhow::{anyhow, Result};
@@ -35,6 +35,29 @@ type StreamSyncIrcClient = TwitchIRCClient<SecureTCPTransport, StaticLoginCreden
 pub enum PlatformCredentialProvenance {
     Local,
     Delegated { snap: AuthorityLeaseSnapshot },
+}
+
+/// Atomically selected platform credentials with provenance (B2).
+#[derive(Debug, Clone)]
+pub enum PlatformCredentialSelection {
+    Local {
+        client_id: String,
+        access_token: String,
+    },
+    Delegated {
+        snap: AuthorityLeaseSnapshot,
+        client_id: String,
+        access_token: String,
+    },
+}
+
+impl PlatformCredentialSelection {
+    pub fn provenance(&self) -> PlatformCredentialProvenance {
+        match self {
+            Self::Local { .. } => PlatformCredentialProvenance::Local,
+            Self::Delegated { snap, .. } => PlatformCredentialProvenance::Delegated { snap: *snap },
+        }
+    }
 }
 
 static BADGE_TTL: Duration = Duration::from_secs(300);
@@ -305,20 +328,73 @@ impl TwitchServices {
         &self,
         state: &AppState,
     ) -> Result<PlatformCredentialProvenance> {
-        if !state.is_delegated_mode().await {
-            return Ok(PlatformCredentialProvenance::Local);
+        Ok(self.select_platform_credentials(state).await?.provenance())
+    }
+
+    /// Atomically select provenance and credentials under the lifecycle fence (B2).
+    pub async fn select_platform_credentials(
+        &self,
+        state: &AppState,
+    ) -> Result<PlatformCredentialSelection> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        let mode = *state.active_mode.read().await;
+        let delegated = state.delegated.read().await.clone();
+        let tokens = state.twitch.read().await.tokens.clone();
+        let access_token = tokens.access_token.unwrap_or_default();
+        let client_id = if mode == TwitchActiveMode::Delegated {
+            delegated
+                .as_ref()
+                .map(|d| d.client_id.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| state.client_id.clone())
+        } else {
+            state.client_id.clone()
+        };
+        if mode != TwitchActiveMode::Delegated || delegated.is_none() {
+            return Ok(PlatformCredentialSelection::Local {
+                client_id,
+                access_token,
+            });
         }
         let snap = self.authority_lease_snapshot().await;
-        if snap.generation == 0 || !state.session_still_current(snap.generation).await {
-            return Err(anyhow!("Delegated authority expired or superseded"));
-        }
         {
             let lease = self.authority_lease.lock().await;
-            if !lease.owns_generation(snap.generation) || lease.deadline() != snap.deadline {
+            if !lease.allows_platform_operations(snap.generation)
+                || lease.snapshot().generation != snap.generation
+                || lease.snapshot().deadline != snap.deadline
+            {
                 return Err(anyhow!("Delegated authority expired or superseded"));
             }
         }
-        Ok(PlatformCredentialProvenance::Delegated { snap })
+        if !state.session_still_current(snap.generation).await {
+            return Err(anyhow!("Delegated authority expired or superseded"));
+        }
+        Ok(PlatformCredentialSelection::Delegated {
+            snap,
+            client_id,
+            access_token,
+        })
+    }
+
+    /// True when the captured lease snapshot still authorizes platform fan-out/send.
+    pub fn delegated_send_gate_still_valid(&self, snap: AuthorityLeaseSnapshot) -> bool {
+        if snap.deadline <= std::time::Instant::now() {
+            return false;
+        }
+        let Ok(lease) = self.authority_lease.try_lock() else {
+            return false;
+        };
+        lease.allows_platform_operations(snap.generation)
+            && lease.snapshot().generation == snap.generation
+            && lease.snapshot().deadline == snap.deadline
+    }
+
+    /// True when Syndicate SSE/watch may continue for the captured snapshot.
+    pub async fn syndicate_revalidation_still_valid(&self, snap: AuthorityLeaseSnapshot) -> bool {
+        let lease = self.authority_lease.lock().await;
+        lease.allows_syndicate_revalidation(snap.generation)
+            && lease.snapshot().generation == snap.generation
+            && lease.snapshot().deadline == snap.deadline
     }
 
     /// Race using provenance captured at credential selection — never downgrades Delegated→Local.
@@ -345,7 +421,7 @@ impl TwitchServices {
         }
         let generation = state.current_delegated_generation();
         let lease = self.authority_lease.lock().await;
-        if !lease.owns_generation(generation) {
+        if !lease.allows_platform_operations(generation) {
             return Err(anyhow!("Delegated authority expired or superseded"));
         }
         drop(lease);
@@ -364,8 +440,12 @@ impl TwitchServices {
         if snap.deadline <= std::time::Instant::now() {
             return Err(anyhow!("Delegated authority expired during request"));
         }
-        let current = self.authority_lease_snapshot().await;
-        if current.generation != snap.generation || current.deadline != snap.deadline {
+        let lease = self.authority_lease.lock().await;
+        if !lease.allows_platform_operations(snap.generation)
+            || lease.phase() != AuthorityLeasePhase::Validated
+            || lease.snapshot().generation != snap.generation
+            || lease.snapshot().deadline != snap.deadline
+        {
             return Err(anyhow!("Delegated authority superseded during request"));
         }
         Ok(())
@@ -388,7 +468,10 @@ impl TwitchServices {
         }
         {
             let lease = self.authority_lease.lock().await;
-            if !lease.owns_generation(snap.generation) || lease.deadline() != snap.deadline {
+            if !lease.allows_platform_operations(snap.generation)
+                || lease.snapshot().generation != snap.generation
+                || lease.snapshot().deadline != snap.deadline
+            {
                 return Err(anyhow!("Delegated authority expired or superseded"));
             }
         }
@@ -478,14 +561,26 @@ async fn delegated_platform_http_with_provenance<T>(
         .await
 }
 
-async fn capture_helix_provenance(state: &AppState) -> Result<PlatformCredentialProvenance> {
+async fn select_helix_credentials(state: &AppState) -> Result<PlatformCredentialSelection> {
     let Some(services) = state.twitch_services() else {
         if state.is_delegated_mode().await {
             return Err(anyhow!("Delegated authority unavailable"));
         }
-        return Ok(PlatformCredentialProvenance::Local);
+        let client_id = state.helix_client_id().await;
+        let access_token = state
+            .twitch
+            .read()
+            .await
+            .tokens
+            .access_token
+            .clone()
+            .unwrap_or_default();
+        return Ok(PlatformCredentialSelection::Local {
+            client_id,
+            access_token,
+        });
     };
-    services.capture_platform_provenance(state).await
+    services.select_platform_credentials(state).await
 }
 
 pub async fn validate_token(access_token: &str) -> Result<Value> {
@@ -505,19 +600,25 @@ pub async fn validate_token(access_token: &str) -> Result<Value> {
 
 pub async fn helix_get(state: &AppState, path: &str) -> Result<Value> {
     ensure_valid_token(state).await?;
-    let provenance = capture_helix_provenance(state).await?;
-    let client_id = state.helix_client_id().await;
+    let selection = select_helix_credentials(state).await?;
+    let (provenance, client_id, token) = match selection {
+        PlatformCredentialSelection::Local {
+            client_id,
+            access_token,
+        } => (PlatformCredentialProvenance::Local, client_id, access_token),
+        PlatformCredentialSelection::Delegated {
+            snap,
+            client_id,
+            access_token,
+        } => (
+            PlatformCredentialProvenance::Delegated { snap },
+            client_id,
+            access_token,
+        ),
+    };
     if client_id.is_empty() {
         return Err(anyhow!("TWITCH_CLIENT_ID not configured."));
     }
-    let token = state
-        .twitch
-        .read()
-        .await
-        .tokens
-        .access_token
-        .clone()
-        .unwrap_or_default();
     let url = format!("https://api.twitch.tv/helix{path}");
     delegated_platform_http_with_provenance(state, provenance, async {
         let res = reqwest::Client::new()
@@ -538,16 +639,22 @@ pub async fn helix_get(state: &AppState, path: &str) -> Result<Value> {
 
 pub async fn helix_patch(state: &AppState, path: &str, body: Value) -> Result<Value> {
     ensure_valid_token(state).await?;
-    let provenance = capture_helix_provenance(state).await?;
-    let client_id = state.helix_client_id().await;
-    let token = state
-        .twitch
-        .read()
-        .await
-        .tokens
-        .access_token
-        .clone()
-        .unwrap();
+    let selection = select_helix_credentials(state).await?;
+    let (provenance, client_id, token) = match selection {
+        PlatformCredentialSelection::Local {
+            client_id,
+            access_token,
+        } => (PlatformCredentialProvenance::Local, client_id, access_token),
+        PlatformCredentialSelection::Delegated {
+            snap,
+            client_id,
+            access_token,
+        } => (
+            PlatformCredentialProvenance::Delegated { snap },
+            client_id,
+            access_token,
+        ),
+    };
     delegated_platform_http_with_provenance(state, provenance, async {
         let res = reqwest::Client::new()
             .patch(format!("https://api.twitch.tv/helix{path}"))
@@ -569,16 +676,22 @@ pub async fn helix_patch(state: &AppState, path: &str, body: Value) -> Result<Va
 
 pub async fn helix_post(state: &AppState, path: &str, body: Value) -> Result<Value> {
     ensure_valid_token(state).await?;
-    let provenance = capture_helix_provenance(state).await?;
-    let client_id = state.helix_client_id().await;
-    let token = state
-        .twitch
-        .read()
-        .await
-        .tokens
-        .access_token
-        .clone()
-        .unwrap();
+    let selection = select_helix_credentials(state).await?;
+    let (provenance, client_id, token) = match selection {
+        PlatformCredentialSelection::Local {
+            client_id,
+            access_token,
+        } => (PlatformCredentialProvenance::Local, client_id, access_token),
+        PlatformCredentialSelection::Delegated {
+            snap,
+            client_id,
+            access_token,
+        } => (
+            PlatformCredentialProvenance::Delegated { snap },
+            client_id,
+            access_token,
+        ),
+    };
     delegated_platform_http_with_provenance(state, provenance, async {
         let res = reqwest::Client::new()
             .post(format!("https://api.twitch.tv/helix{path}"))
@@ -955,9 +1068,14 @@ pub async fn apply_set_token(
             *state.active_mode.write().await = previous_mode;
             *state.personal_tokens.write().await = previous_personal.clone();
             if let Err(rollback_err) = state.save_twitch_tokens().await {
-                let _ = crate::storage::write_identity_rollback_pending(
-                    &state.paths.twitch_tokens.with_extension("rollback-pending"),
+                let marker_err = crate::storage::write_identity_rollback_pending(
+                    &state.paths.twitch_tokens_rollback_pending,
                 );
+                if let Err(marker_write_err) = marker_err {
+                    return Err(anyhow!(
+                        "active mode save failed ({e:#}); personal token rollback also failed ({rollback_err:#}); rollback marker write failed ({marker_write_err:#})"
+                    ));
+                }
                 return Err(anyhow!(
                     "active mode save failed ({e:#}); personal token rollback also failed ({rollback_err:#})"
                 ));
@@ -981,6 +1099,59 @@ pub async fn apply_set_token(
     restart_twitch_clients(state.clone(), services.clone()).await;
     ensure_delegated_refresh_loop(state, services).await;
     Ok(())
+}
+
+/// Remote validation gate before activating a saved delegated identity (B9).
+async fn validate_saved_delegated_for_activation(
+    state: Arc<AppState>,
+    services: Arc<TwitchServices>,
+    session: &DelegatedSessionFile,
+) -> Result<()> {
+    let generation = session.generation;
+    services.install_pending_authority_lease(generation).await;
+    match syndicate_connection::refresh(&session.connection_key).await {
+        Ok(exchange) => {
+            services
+                .renew_after_successful_remote_validation(
+                    generation,
+                    session.connection_expires_at.as_deref(),
+                )
+                .await
+                .map_err(|e| anyhow!(e))?;
+            // Refresh may rotate tokens; persist when exchange differs.
+            if exchange.twitch.access_token != session.access_token {
+                let mut updated = session.clone();
+                updated.access_token = exchange.twitch.access_token.clone();
+                updated.client_id = exchange.twitch.client_id.clone();
+                updated.twitch_expires_at = exchange.twitch.expires_at.clone();
+                updated.connection_expires_at = exchange.connection.expires_at.clone();
+                crate::kick::apply_kick_to_delegated(&mut updated, &exchange);
+                state.persist_delegated_session(&updated)?;
+                *state.delegated.write().await = Some(updated);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(api) = e.downcast_ref::<SyndicateApiError>() {
+                match api.code.as_str() {
+                    "revoked" | "expired" | "invalid_key" => {
+                        remove_delegated_session(&state, &services, None, generation).await?;
+                        Err(anyhow!(
+                            "Takeover connection key is no longer valid ({})",
+                            api.code
+                        ))
+                    }
+                    _ => {
+                        services.clear_authority_lease().await;
+                        Err(anyhow!("Takeover connection could not be validated: {api}"))
+                    }
+                }
+            } else {
+                services.clear_authority_lease().await;
+                Err(anyhow!("Takeover connection could not be validated: {e:#}"))
+            }
+        }
+    }
 }
 
 /// Switch the live identity between saved personal OAuth and a saved takeover key.
@@ -1035,6 +1206,8 @@ pub async fn use_connection(
                 state.delegated.read().await.clone().ok_or_else(|| {
                     anyhow!("No takeover connection key saved. Paste a key first.")
                 })?;
+            validate_saved_delegated_for_activation(state.clone(), services.clone(), &session)
+                .await?;
             {
                 let _lifecycle = services.lifecycle_lock.lock().await;
                 let previous_mode = *state.active_mode.read().await;
@@ -1288,7 +1461,7 @@ fn disk_active_mode_is_delegated(state: &AppState) -> bool {
 }
 
 fn durable_revoke_still_needed(state: &AppState) -> bool {
-    state.delegated_authority_artifacts_remain()
+    state.delegated_authority_artifacts_remain().unwrap_or(true)
 }
 
 /// Strip in-memory delegated authority for `generation` and stop platform/delegated workers.
@@ -3231,6 +3404,10 @@ async fn start_delegated_revalidation_only(
 }
 
 pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>) {
+    if state.identity_rollback_pending() {
+        warn!("identity rollback pending — skipping ambiguous Twitch autostart");
+        return;
+    }
     // Crash-persistent pending revoke: never activate stored delegated authority.
     if state.durable_revoke_pending() || state.paths.twitch_delegated_revoked.is_file() {
         // Resume durable cleanup from marker presence even when generation is 0 (B9).

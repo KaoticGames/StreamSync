@@ -133,6 +133,8 @@ pub struct StoragePaths {
     pub control_token: PathBuf,
     /// Scoped OBS chat-dock credentials (not the master control token).
     pub dock_credentials: PathBuf,
+    /// Fail-closed marker when personal-token rollback could not restore disk coherence.
+    pub twitch_tokens_rollback_pending: PathBuf,
 }
 
 fn looks_like_asar(p: &Path) -> bool {
@@ -271,7 +273,7 @@ fn paths_under_root(root: PathBuf, readonly: bool) -> Result<StoragePaths> {
         events_overlay_config,
         profiles: root.join("profiles.json"),
         tokens_dir,
-        twitch_tokens,
+        twitch_tokens: twitch_tokens.clone(),
         kick_tokens,
         twitch_delegated,
         twitch_delegated_revoked,
@@ -281,6 +283,7 @@ fn paths_under_root(root: PathBuf, readonly: bool) -> Result<StoragePaths> {
         events_media_dir,
         control_token,
         dock_credentials,
+        twitch_tokens_rollback_pending: twitch_tokens.with_extension("rollback-pending"),
     })
 }
 
@@ -416,19 +419,82 @@ fn now_ts() -> String {
 }
 
 pub fn write_file_atomic(target: &Path, data: &[u8]) -> Result<()> {
-    write_file_atomic_inner(target, data, false)
+    write_file_atomic_inner(target, data, WritePolicy::Plain)
 }
 
-/// Atomic write for secrets: restrictive permissions, no reusable `.bak`.
+/// Atomic write for secrets at an arbitrary path: restrictive file permissions only.
+/// Never mutates permissions on an existing parent directory (e.g. shared `/tmp`).
 pub fn write_secret_file(target: &Path, data: &[u8]) -> Result<()> {
-    write_file_atomic_inner(target, data, true)
+    write_file_atomic_inner(target, data, WritePolicy::SecretArbitraryParent)
 }
 
-fn write_file_atomic_inner(target: &Path, data: &[u8], secret: bool) -> Result<()> {
+/// Atomic write for secrets under a dedicated application-owned directory tree.
+/// Hardens the parent directory when it lies under `app_root`.
+pub fn write_secret_file_in_trusted_dir(app_root: &Path, target: &Path, data: &[u8]) -> Result<()> {
+    write_file_atomic_inner(
+        target,
+        data,
+        WritePolicy::SecretTrustedAppParent { app_root },
+    )
+}
+
+/// True when `path` is `app_root` or a descendant of it.
+fn is_under_app_root(path: &Path, app_root: &Path) -> bool {
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let app_root = fs::canonicalize(app_root).unwrap_or_else(|_| app_root.to_path_buf());
+    path.starts_with(&app_root)
+}
+
+/// Authority-bearing delegated session write: legacy cleanup before commit, no copy fallback.
+pub fn write_authority_bearing_secret(target: &Path, data: &[u8]) -> Result<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
-        if secret {
-            apply_secret_dir_permissions(parent)?;
+    }
+    let bak = target.with_extension("bak");
+    if bak.is_file() {
+        remove_file_durable(&bak)?;
+    }
+    let tmp = target.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let write_result = (|| -> Result<()> {
+        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        apply_secret_file_permissions(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if target.is_file() {
+        remove_file_durable(target)?;
+    }
+    fs::rename(&tmp, target)
+        .with_context(|| format!("commit authority secret {}", target.display()))?;
+    apply_secret_file_permissions(target)?;
+    sync_parent_dir(target)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum WritePolicy<'a> {
+    Plain,
+    SecretArbitraryParent,
+    SecretTrustedAppParent { app_root: &'a Path },
+}
+
+fn write_file_atomic_inner(target: &Path, data: &[u8], policy: WritePolicy<'_>) -> Result<()> {
+    let secret = !matches!(policy, WritePolicy::Plain);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+        if let WritePolicy::SecretTrustedAppParent { app_root } = policy {
+            if is_under_app_root(parent, app_root) {
+                apply_secret_dir_permissions(parent)?;
+            }
         }
     }
     let tmp = target.with_extension(format!(
@@ -453,9 +519,11 @@ fn write_file_atomic_inner(target: &Path, data: &[u8], secret: bool) -> Result<(
     if secret {
         // Never leave a reusable previous secret on disk.
         let bak = target.with_extension("bak");
-        let _ = fs::remove_file(&bak);
+        if bak.is_file() {
+            fs::remove_file(&bak)?;
+        }
         if target.exists() {
-            let _ = fs::remove_file(target);
+            fs::remove_file(target)?;
         }
     } else {
         let bak = target.with_extension("bak");
@@ -471,14 +539,15 @@ fn write_file_atomic_inner(target: &Path, data: &[u8], secret: bool) -> Result<(
             }
             Ok(())
         }
+        Err(e) if secret => {
+            let _ = fs::remove_file(&tmp);
+            Err(e).with_context(|| format!("atomic secret commit failed for {}", target.display()))
+        }
         Err(_) => {
             let _ = fs::remove_file(target);
             if fs::rename(&tmp, target).is_err() {
                 fs::copy(&tmp, target)?;
                 let _ = fs::remove_file(&tmp);
-            }
-            if secret {
-                apply_secret_file_permissions(target)?;
             }
             Ok(())
         }
@@ -556,37 +625,46 @@ fn apply_secret_file_permissions(path: &Path) -> Result<()> {
 }
 
 /// Bounded inventory: primary delegated secret + legacy `.bak`.
-pub fn delegated_secret_variants(delegated_path: &Path) -> Vec<PathBuf> {
+pub fn delegated_secret_variants(delegated_path: &Path) -> Result<Vec<PathBuf>> {
     let mut out = vec![
         delegated_path.to_path_buf(),
         delegated_path.with_extension("bak"),
     ];
-    out.extend(delegated_temp_and_quarantine_variants(delegated_path));
-    out
+    out.extend(delegated_temp_and_quarantine_variants(delegated_path)?);
+    Ok(out)
 }
 
 /// Bounded prefix scan for `twitch-delegated.tmp-*` / `twitch-delegated.revoked-*` only.
-pub fn delegated_temp_and_quarantine_variants(delegated_path: &Path) -> Vec<PathBuf> {
+pub fn delegated_temp_and_quarantine_variants(delegated_path: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let Some(parent) = delegated_path.parent() else {
-        return out;
+        return Ok(out);
     };
     let Some(stem) = delegated_path.file_stem().and_then(|s| s.to_str()) else {
-        return out;
+        return Ok(out);
     };
     let tmp_prefix = format!("{stem}.tmp-");
     let revoked_prefix = format!("{stem}.revoked-");
-    let Ok(entries) = fs::read_dir(parent) else {
-        return out;
-    };
-    for entry in entries.flatten() {
+    let entries = fs::read_dir(parent).with_context(|| {
+        format!(
+            "enumerate delegated secret variants in {}",
+            parent.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "read delegated secret variant entry in {}",
+                parent.display()
+            )
+        })?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with(&tmp_prefix) || name.starts_with(&revoked_prefix) {
             out.push(entry.path());
         }
     }
-    out
+    Ok(out)
 }
 
 /// Repair overly broad permissions on an existing secret file (Unix).
@@ -738,12 +816,36 @@ fn write_marker_file(target: &Path, data: &[u8]) -> Result<()> {
         let _ = fs::remove_file(target);
     }
     match fs::rename(&tmp, target) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            sync_parent_dir(target)?;
+            Ok(())
+        }
         Err(_) => {
             fs::copy(&tmp, target)?;
             let _ = fs::remove_file(&tmp);
+            sync_parent_dir(target)?;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+
+    #[test]
+    fn marker_write_syncs_parent_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "streamsync-marker-durable-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("twitch-delegated.revoke-pending");
+        write_delegated_revoke_pending(&marker).unwrap();
+        assert!(marker.is_file());
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -253,7 +253,11 @@ pub fn load_or_create_control_token(path: &Path) -> anyhow::Result<String> {
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
-    crate::storage::write_secret_file(path, token.as_bytes())?;
+    if let Some(root) = path.parent() {
+        crate::storage::write_secret_file_in_trusted_dir(root, path, token.as_bytes())?;
+    } else {
+        crate::storage::write_secret_file(path, token.as_bytes())?;
+    }
     // Authoritative read-back so concurrent losers converge on the winner.
     let committed = std::fs::read_to_string(path)?.trim().to_string();
     if committed.len() < 32 {

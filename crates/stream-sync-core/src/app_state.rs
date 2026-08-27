@@ -228,6 +228,7 @@ impl AppState {
 
         let personal =
             read_json_for_mode(&paths.twitch_tokens, &TwitchTokenFile::default(), readonly)?;
+        let identity_rollback_pending = paths.twitch_tokens_rollback_pending.is_file();
         let revoked_tombstone = paths.twitch_delegated_revoked.is_file();
         let revoke_pending = paths.twitch_delegated_revoke_pending.is_file();
         let quarantine = revoked_tombstone || revoke_pending;
@@ -266,7 +267,13 @@ impl AppState {
         .unwrap_or_default();
         let personal_ok = personal.access_token.is_some() && personal.login.is_some();
         let delegated_ok = delegated.is_some();
-        let active_mode = if quarantine || !delegated_ok {
+        let active_mode = if identity_rollback_pending {
+            tracing::warn!(
+                "identity rollback pending at {} — refusing ambiguous Twitch activation",
+                paths.twitch_tokens_rollback_pending.display()
+            );
+            TwitchActiveMode::Local
+        } else if quarantine || !delegated_ok {
             match saved_mode {
                 TwitchActiveMode::Delegated if personal_ok => TwitchActiveMode::Local,
                 TwitchActiveMode::Delegated => TwitchActiveMode::Local,
@@ -290,12 +297,20 @@ impl AppState {
                 },
             );
         }
-        let live_tokens = match active_mode {
-            TwitchActiveMode::Delegated => delegated
-                .as_ref()
-                .map(tokens_from_delegated_session)
-                .unwrap_or_default(),
-            TwitchActiveMode::Local => personal.clone(),
+        let live_tokens = if identity_rollback_pending {
+            if personal_ok {
+                personal.clone()
+            } else {
+                TwitchTokenFile::default()
+            }
+        } else {
+            match active_mode {
+                TwitchActiveMode::Delegated => delegated
+                    .as_ref()
+                    .map(tokens_from_delegated_session)
+                    .unwrap_or_default(),
+                TwitchActiveMode::Local => personal.clone(),
+            }
         };
 
         let personal_kick =
@@ -395,7 +410,11 @@ impl AppState {
         )?;
         // Always persist personal OAuth separately — never write takeover tokens here.
         let personal = self.personal_tokens.read().await;
-        storage::write_json(&self.paths.twitch_tokens, &*personal)
+        storage::write_json(&self.paths.twitch_tokens, &*personal)?;
+        if self.identity_rollback_pending() {
+            self.clear_identity_rollback_pending()?;
+        }
+        Ok(())
     }
 
     pub async fn save_kick_tokens(&self) -> anyhow::Result<()> {
@@ -427,10 +446,9 @@ impl AppState {
         self.durable_fail
             .fail(&self.durable_fail.save_session, "save_session")?;
         let bytes = serde_json::to_vec_pretty(sess)?;
-        storage::write_secret_file(&self.paths.twitch_delegated, &bytes)?;
-        // Legacy `.bak` removal is part of the durable transaction (must not report Ok while
-        // an authority-bearing backup remains).
+        // Legacy `.bak` removal and atomic commit are one transaction (B5/B10).
         self.remove_delegated_backup()?;
+        storage::write_authority_bearing_secret(&self.paths.twitch_delegated, &bytes)?;
         Ok(())
     }
 
@@ -447,14 +465,22 @@ impl AppState {
     }
 
     /// Bounded inventory of authority-bearing delegated secret variants.
-    pub fn delegated_secret_variants(&self) -> Vec<std::path::PathBuf> {
+    pub fn delegated_secret_variants(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
         storage::delegated_secret_variants(&self.paths.twitch_delegated)
     }
 
-    /// True when primary, backup, or other inventoried delegated secrets remain.
-    pub fn delegated_authority_artifacts_remain(&self) -> bool {
-        self.delegated_secret_variants().iter().any(|p| p.is_file())
-            || self.paths.twitch_delegated_revoke_pending.is_file()
+    /// True when primary, backup, or other inventoried delegated secret files remain.
+    pub fn delegated_secret_files_remain(&self) -> anyhow::Result<bool> {
+        Ok(self
+            .delegated_secret_variants()?
+            .iter()
+            .any(|p| p.is_file()))
+    }
+
+    /// True when authority-bearing secrets or a crash-persistent revoke marker remain.
+    pub fn delegated_authority_artifacts_remain(&self) -> anyhow::Result<bool> {
+        Ok(self.delegated_secret_files_remain()?
+            || self.paths.twitch_delegated_revoke_pending.is_file())
     }
 
     /// Persist revoked tombstone and remove delegated credential file durably.
@@ -477,7 +503,7 @@ impl AppState {
         // Backup + temp/revoked leftovers are part of the transaction (B1/B7).
         self.remove_delegated_backup()?;
         for leftover in
-            storage::delegated_temp_and_quarantine_variants(&self.paths.twitch_delegated)
+            storage::delegated_temp_and_quarantine_variants(&self.paths.twitch_delegated)?
         {
             storage::remove_file_durable(&leftover)?;
         }
@@ -485,7 +511,7 @@ impl AppState {
             .fail(&self.durable_fail.parent_sync, "parent_sync")?;
         storage::sync_parent_dir(&self.paths.twitch_delegated)?;
         // Pending marker clears only when all inventoried authority-bearing files are gone.
-        if self.delegated_secret_variants().iter().any(|p| p.is_file()) {
+        if self.delegated_secret_files_remain()? {
             anyhow::bail!("delegated authority-bearing artifacts remain after revoke");
         }
         self.durable_fail.fail(
@@ -510,6 +536,23 @@ impl AppState {
 
     pub fn durable_revoke_pending(&self) -> bool {
         self.paths.twitch_delegated_revoke_pending.is_file()
+    }
+
+    pub fn identity_rollback_pending(&self) -> bool {
+        self.paths.twitch_tokens_rollback_pending.is_file()
+    }
+
+    /// Clear rollback marker after durable/live identity coherence is verified.
+    pub fn clear_identity_rollback_pending(&self) -> anyhow::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
+        if !self.paths.twitch_tokens_rollback_pending.is_file() {
+            return Ok(());
+        }
+        storage::remove_file_durable(&self.paths.twitch_tokens_rollback_pending)?;
+        storage::sync_parent_dir(&self.paths.twitch_tokens)?;
+        Ok(())
     }
 
     /// Durably clear the revoked tombstone after a new generation credential is on disk.
