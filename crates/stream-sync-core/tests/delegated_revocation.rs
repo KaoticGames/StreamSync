@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use stream_sync_core::{
     connection_key_events_url, disconnect_twitch, paths_for_root, remove_file_durable,
-    sync_live_identity, write_delegated_revoked_tombstone, write_json, AppState,
-    DelegatedSessionFile, OverlayConfig, OverlayServer, TeardownPhase, TwitchActiveMode,
-    TwitchActiveModeFile, TwitchServices, MAX_DELEGATED_REVOCATION_DELAY, SYNDICATE_HTTP_TIMEOUT,
-    SYNDICATE_SSE_READ_TIMEOUT,
+    sync_live_identity, write_delegated_revoke_pending, write_delegated_revoked_tombstone,
+    write_json, AppState, DelegatedSessionFile, OverlayConfig, OverlayServer, TeardownPhase,
+    TwitchActiveMode, TwitchActiveModeFile, TwitchServices, MAX_DELEGATED_REVOCATION_DELAY,
+    SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,
 };
 
 static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -568,4 +568,140 @@ async fn disconnect_intent_advances_even_when_revoke_fails() {
         .is_err());
     assert!(services.apply_intent_for_test() > before);
     assert!(state.paths.twitch_delegated_revoke_pending.is_file());
+}
+
+#[tokio::test]
+async fn pending_marker_remove_failure_keeps_retry_active() {
+    let (_router, state, _services) = build_app(0).await;
+    write_json(
+        &state.paths.twitch_delegated,
+        &sample_session(1, "ssk_test_placeholder_pending_remove"),
+    )
+    .unwrap();
+    state
+        .durable_fail
+        .pending_marker_remove
+        .store(true, Ordering::SeqCst);
+    assert!(state.durable_revoke_delegated().await.is_err());
+    assert!(state.paths.twitch_delegated_revoked.is_file());
+    assert!(!state.paths.twitch_delegated.is_file());
+    assert!(state.paths.twitch_delegated_revoke_pending.is_file());
+}
+
+#[tokio::test]
+async fn durable_revoke_removes_delegated_bak_backup() {
+    let (_router, state, _services) = build_app(0).await;
+    let session = sample_session(1, "ssk_test_placeholder_bak");
+    state.persist_delegated_session(&session).unwrap();
+    // Simulate a legacy .bak from older write_json rotation.
+    let bak = state.paths.twitch_delegated.with_extension("bak");
+    std::fs::write(
+        &bak,
+        b"{\"connection_key\":\"ssk_test_placeholder_bak_legacy\"}",
+    )
+    .unwrap();
+    state.durable_revoke_delegated().await.unwrap();
+    assert!(!state.paths.twitch_delegated.is_file());
+    assert!(!bak.is_file());
+    assert!(state.paths.twitch_delegated_revoked.is_file());
+    assert!(!state.paths.twitch_delegated_revoke_pending.is_file());
+}
+
+#[tokio::test]
+async fn startup_resumes_pending_revoke_cleanup_at_generation_zero() {
+    let userdata = test_userdata_dir();
+    write_json(
+        &userdata.join("twitch-delegated.json"),
+        &sample_session(1, "ssk_test_placeholder_resume_pending"),
+    )
+    .unwrap();
+    write_delegated_revoke_pending(&userdata.join("twitch-delegated.revoke-pending")).unwrap();
+
+    let (_router, state, services) = build_app_at(userdata.clone(), 0).await;
+    assert!(state.delegated.read().await.is_none());
+    assert_eq!(state.current_delegated_generation(), 0);
+    // Autostart schedules marker cleanup even at generation 0.
+    services.init_durable_revoke_worker();
+    services.schedule_durable_revoke_for_test(state.clone(), 0, "startup_pending");
+    for _ in 0..40 {
+        if !state.paths.twitch_delegated.is_file()
+            && !state.paths.twitch_delegated_revoke_pending.is_file()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!state.paths.twitch_delegated.is_file());
+    assert!(state.paths.twitch_delegated_revoked.is_file());
+    assert!(!state.paths.twitch_delegated_revoke_pending.is_file());
+}
+
+#[tokio::test]
+async fn marker_write_failure_strips_memory_and_returns_error() {
+    let (_router, state, services) = build_app(0).await;
+    *state.delegated.write().await = Some(sample_session(1, "ssk_test_placeholder_marker_fail"));
+    state.delegated_generation.store(1, Ordering::SeqCst);
+    *state.active_mode.write().await = TwitchActiveMode::Delegated;
+    services.install_delegated_generation(1).await;
+    state
+        .durable_fail
+        .pending_marker_write
+        .store(true, Ordering::SeqCst);
+    assert!(disconnect_twitch(state.clone(), services.clone())
+        .await
+        .is_err());
+    assert!(state.delegated.read().await.is_none());
+}
+
+#[test]
+fn delegated_operation_inventory_documents_fenced_paths() {
+    // Static inventory (B6): every delegated-capable platform path must be covered by the
+    // authoritative helpers. This source scan fails closed if a bypass is reintroduced.
+    let twitch = include_str!("../src/twitch.rs");
+    let kick = include_str!("../src/kick.rs");
+    let required_twitch = [
+        ("helix_get", "Helix GET"),
+        ("helix_patch", "Helix PATCH"),
+        ("helix_post", "Helix POST"),
+        ("delegated_platform_http", "Helix fence helper"),
+        ("race_delegated_platform", "deadline race"),
+        (
+            "validate_delegated_snapshot",
+            "post-completion snapshot check",
+        ),
+        ("ensure_delegated_authority", "pre-dispatch guard"),
+        ("send_dock_privmsg", "IRC slash/moderation helper"),
+        ("send_plain_chat", "IRC chat send"),
+        (
+            "race_against_lease_deadline",
+            "Syndicate refresh/watch race",
+        ),
+    ];
+    for (needle, label) in required_twitch {
+        assert!(
+            twitch.contains(needle),
+            "twitch inventory missing {label} ({needle})"
+        );
+    }
+    assert!(
+        twitch.contains("helix_get(state, &path)"),
+        "helix_get_users must route through helix_get"
+    );
+    assert!(
+        !twitch.contains(".privmsg(") || twitch.contains("send_dock_privmsg"),
+        "IRC privmsg must go through send_dock_privmsg"
+    );
+    assert!(
+        kick.contains("race_delegated_platform")
+            && kick.contains("race_delegated_platform_with_snapshot"),
+        "kick chat send and feed must fence delegated ops"
+    );
+    assert!(
+        kick.contains("validate_delegated_snapshot"),
+        "kick feed frames must revalidate snapshot"
+    );
+    assert!(
+        !kick.contains("?key="),
+        "kick must not place connection key in URL"
+    );
 }

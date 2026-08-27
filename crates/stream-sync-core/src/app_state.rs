@@ -95,6 +95,8 @@ pub struct DurableFailureInject {
     pub save_session: std::sync::atomic::AtomicBool,
     pub save_active_mode: std::sync::atomic::AtomicBool,
     pub parent_sync: std::sync::atomic::AtomicBool,
+    pub pending_marker_remove: std::sync::atomic::AtomicBool,
+    pub pending_marker_write: std::sync::atomic::AtomicBool,
 }
 
 impl DurableFailureInject {
@@ -412,7 +414,12 @@ impl AppState {
         }
         self.durable_fail
             .fail(&self.durable_fail.save_session, "save_session")?;
-        storage::write_json(&self.paths.twitch_delegated, sess)
+        let bytes = serde_json::to_vec_pretty(sess)?;
+        storage::write_secret_file(&self.paths.twitch_delegated, &bytes)?;
+        // Repair: remove any legacy reusable backup from prior non-secret writes.
+        let bak = self.paths.twitch_delegated.with_extension("bak");
+        let _ = storage::remove_file_durable(&bak);
+        Ok(())
     }
 
     /// Persist revoked tombstone and remove delegated credential file durably.
@@ -421,6 +428,10 @@ impl AppState {
             return Ok(());
         }
         // Crash-safe ordering: pending marker first so restart always fail-closes.
+        self.durable_fail.fail(
+            &self.durable_fail.pending_marker_write,
+            "pending_marker_write",
+        )?;
         storage::write_delegated_revoke_pending(&self.paths.twitch_delegated_revoke_pending)?;
         self.durable_fail
             .fail(&self.durable_fail.tombstone_write, "tombstone_write")?;
@@ -428,10 +439,16 @@ impl AppState {
         self.durable_fail
             .fail(&self.durable_fail.credential_remove, "credential_remove")?;
         storage::remove_file_durable(&self.paths.twitch_delegated)?;
+        // Also remove reusable backup / temp leftovers (B11).
+        let bak = self.paths.twitch_delegated.with_extension("bak");
+        let _ = storage::remove_file_durable(&bak);
         self.durable_fail
             .fail(&self.durable_fail.parent_sync, "parent_sync")?;
-        // Pending marker no longer needed once tombstone + credential removal succeeded.
-        let _ = storage::remove_file_durable(&self.paths.twitch_delegated_revoke_pending);
+        self.durable_fail.fail(
+            &self.durable_fail.pending_marker_remove,
+            "pending_marker_remove",
+        )?;
+        storage::remove_file_durable(&self.paths.twitch_delegated_revoke_pending)?;
         Ok(())
     }
 
@@ -440,6 +457,10 @@ impl AppState {
         if self.readonly {
             return Ok(());
         }
+        self.durable_fail.fail(
+            &self.durable_fail.pending_marker_write,
+            "pending_marker_write",
+        )?;
         storage::write_delegated_revoke_pending(&self.paths.twitch_delegated_revoke_pending)
     }
 

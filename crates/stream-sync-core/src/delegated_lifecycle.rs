@@ -4,6 +4,16 @@
 //! The enforceable maximum delegated access window after the last successful remote validation is
 //! [`MAX_DELEGATED_REVOCATION_DELAY`] (300 seconds). Syndicate HTTP and SSE timeouts are consumed
 //! from that lease budget and must not extend it.
+//!
+//! ## Durable revoke failure model (B5)
+//! A successful local revoke response requires durable pending-marker and/or tombstone persistence.
+//! If the pending-marker write fails, the route returns an error and in-memory delegated authority
+//! is stripped immediately so live workers cannot continue. Startup never activates stored
+//! delegated credentials when a pending or tombstone marker exists.
+//! **Residual:** if every durable write fails *and* the process crashes before memory is stripped,
+//! local revocation intent cannot be recovered solely from an unchanged credential file. That
+//! total-storage-failure + crash case is unavoidable without an independent durable authority
+//! source; do not claim crash-persistent local revocation when all durable writes fail.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};

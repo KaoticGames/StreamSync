@@ -21,8 +21,8 @@ mod syndicate_connection;
 mod twitch;
 
 pub use delegated_lifecycle::{
-    redact_connection_key, TeardownPhase, MAX_DELEGATED_REVOCATION_DELAY, SYNDICATE_HTTP_TIMEOUT,
-    SYNDICATE_SSE_READ_TIMEOUT,
+    redact_connection_key, AuthorityLeaseSnapshot, TeardownPhase, MAX_DELEGATED_REVOCATION_DELAY,
+    SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,
 };
 pub use syndicate_connection::connection_key_events_url;
 pub use twitch::{disconnect_twitch, TwitchServices};

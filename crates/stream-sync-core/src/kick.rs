@@ -266,7 +266,7 @@ pub async fn send_chat_from_dock(state: Arc<AppState>, message: &str) -> Result<
         .ok_or_else(|| anyhow!("Kick is not connected"))?;
     let broadcaster_user_id: i64 = kick_id.parse().unwrap_or(0);
     let send_fut = async {
-        reqwest::Client::new()
+        let res = reqwest::Client::new()
             .post(KICK_CHAT_URL)
             .header("Authorization", format!("Bearer {access}"))
             .header("Content-Type", "application/json")
@@ -276,16 +276,19 @@ pub async fn send_chat_from_dock(state: Arc<AppState>, message: &str) -> Result<
                 "broadcaster_user_id": broadcaster_user_id,
             }))
             .send()
-            .await
+            .await?;
+        if !res.status().is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow!("Kick chat send failed: {text}"));
+        }
+        Ok(())
     };
-    let res = if let Some(services) = state.twitch_services() {
+    if let Some(services) = state.twitch_services() {
         services.race_delegated_platform(&state, send_fut).await??
+    } else if state.is_delegated_mode().await {
+        return Err(anyhow!("Delegated authority unavailable"));
     } else {
         send_fut.await?
-    };
-    if !res.status().is_success() {
-        let text = res.text().await.unwrap_or_default();
-        return Err(anyhow!("Kick chat send failed: {text}"));
     }
     Ok(())
 }
@@ -329,20 +332,23 @@ async fn feed_loop(state: Arc<AppState>) {
             tokio::time::sleep(Duration::from_secs(8)).await;
             continue;
         };
-        if state.is_delegated_mode().await {
-            if let Some(services) = state.twitch_services() {
-                if services.ensure_delegated_authority(&state).await.is_err() {
-                    state.kick.write().await.connected = false;
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    continue;
-                }
-            } else {
+        let delegated = state.is_delegated_mode().await;
+        let snap = if delegated {
+            let Some(services) = state.twitch_services() else {
+                state.kick.write().await.connected = false;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            };
+            if services.ensure_delegated_authority(&state).await.is_err() {
                 state.kick.write().await.connected = false;
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
-        }
-        match consume_sse(state.clone(), &url, auth.as_deref()).await {
+            Some(services.authority_lease_snapshot_public().await)
+        } else {
+            None
+        };
+        match consume_sse(state.clone(), &url, auth.as_deref(), snap).await {
             Ok(()) => info!("Kick feed SSE ended"),
             Err(e) => {
                 let msg = redact_key
@@ -351,7 +357,6 @@ async fn feed_loop(state: Arc<AppState>) {
                         crate::delegated_lifecycle::redact_connection_key(&format!("{e:#}"), k)
                     })
                     .unwrap_or_else(|| format!("{e:#}"));
-                // Defense in depth: never log Authorization header values.
                 let msg = msg.replace("Bearer ", "Bearer [redacted]");
                 warn!("Kick feed SSE error: {msg}");
             }
@@ -361,39 +366,96 @@ async fn feed_loop(state: Arc<AppState>) {
     }
 }
 
-async fn consume_sse(state: Arc<AppState>, url: &str, auth: Option<&str>) -> Result<()> {
+async fn consume_sse(
+    state: Arc<AppState>,
+    url: &str,
+    auth: Option<&str>,
+    snap: Option<crate::delegated_lifecycle::AuthorityLeaseSnapshot>,
+) -> Result<()> {
     let mut req = syndicate_connection::syndicate_http_client()
         .get(url)
         .header("Accept", "text/event-stream");
     if let Some(token) = auth {
         req = req.header("Authorization", token);
     }
-    let res = req.send().await?;
+    let send_fut = req.send();
+    let res = if let Some(snap) = snap {
+        let Some(services) = state.twitch_services() else {
+            return Err(anyhow!("Delegated authority unavailable"));
+        };
+        services
+            .race_delegated_platform_with_snapshot(&state, snap, send_fut)
+            .await??
+    } else {
+        send_fut.await?
+    };
     if !res.status().is_success() {
         return Err(anyhow!("Kick feed HTTP {}", res.status()));
+    }
+    if let Some(snap) = snap {
+        if let Some(services) = state.twitch_services() {
+            services.validate_delegated_snapshot(snap).await?;
+        }
     }
     state.kick.write().await.connected = true;
     let mut stream = res.bytes_stream();
     let mut buf = String::new();
     loop {
-        let chunk = tokio::time::timeout(
-            crate::delegated_lifecycle::SYNDICATE_SSE_READ_TIMEOUT,
-            stream.next(),
-        )
-        .await
-        .map_err(|_| anyhow!("Kick feed read timeout"))?;
-        let Some(chunk) = chunk else {
-            return Err(anyhow!("Kick feed stream ended"));
-        };
-        let bytes = chunk?;
-        let frames = crate::delegated_lifecycle::append_sse_chunk(
-            &mut buf,
-            &String::from_utf8_lossy(&bytes),
-        )
-        .map_err(|_| anyhow!("Kick feed buffer overflow"))?;
-        for frame in frames {
-            if let Some(event) = crate::delegated_lifecycle::parse_sse_json_data(&frame) {
-                fanout_kick_event(&state, event).await;
+        if let Some(snap) = snap {
+            let Some(services) = state.twitch_services() else {
+                return Err(anyhow!("Delegated authority unavailable"));
+            };
+            services.validate_delegated_snapshot(snap).await?;
+            let remaining = snap
+                .deadline
+                .saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!("Delegated authority expired during feed"));
+            }
+            let read_budget = remaining.min(crate::delegated_lifecycle::SYNDICATE_SSE_READ_TIMEOUT);
+            let chunk = match tokio::time::timeout(read_budget, stream.next()).await {
+                Ok(c) => c,
+                Err(_) => {
+                    // Deadline or read budget elapsed — revalidate before treating as soft timeout.
+                    services.validate_delegated_snapshot(snap).await?;
+                    return Err(anyhow!("Kick feed read timeout"));
+                }
+            };
+            let Some(chunk) = chunk else {
+                return Err(anyhow!("Kick feed stream ended"));
+            };
+            let bytes = chunk?;
+            let frames = crate::delegated_lifecycle::append_sse_chunk(
+                &mut buf,
+                &String::from_utf8_lossy(&bytes),
+            )
+            .map_err(|_| anyhow!("Kick feed buffer overflow"))?;
+            for frame in frames {
+                services.validate_delegated_snapshot(snap).await?;
+                if let Some(event) = crate::delegated_lifecycle::parse_sse_json_data(&frame) {
+                    fanout_kick_event(&state, event).await;
+                }
+            }
+        } else {
+            let chunk = tokio::time::timeout(
+                crate::delegated_lifecycle::SYNDICATE_SSE_READ_TIMEOUT,
+                stream.next(),
+            )
+            .await
+            .map_err(|_| anyhow!("Kick feed read timeout"))?;
+            let Some(chunk) = chunk else {
+                return Err(anyhow!("Kick feed stream ended"));
+            };
+            let bytes = chunk?;
+            let frames = crate::delegated_lifecycle::append_sse_chunk(
+                &mut buf,
+                &String::from_utf8_lossy(&bytes),
+            )
+            .map_err(|_| anyhow!("Kick feed buffer overflow"))?;
+            for frame in frames {
+                if let Some(event) = crate::delegated_lifecycle::parse_sse_json_data(&frame) {
+                    fanout_kick_event(&state, event).await;
+                }
             }
         }
     }
@@ -715,5 +777,161 @@ mod tests {
         apply_kick_to_delegated(&mut session, &exchange);
         assert_eq!(session.kick_id.as_deref(), Some("99"));
         assert_eq!(session.kick_access_token.as_deref(), Some("ktok"));
+    }
+
+    async fn kick_feed_app() -> (Arc<AppState>, Arc<crate::twitch::TwitchServices>) {
+        let userdata = std::env::temp_dir().join(format!(
+            "streamsync-kick-feed-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_dir_all(&userdata);
+        std::fs::create_dir_all(&userdata).unwrap();
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .to_path_buf();
+        let (_router, state, services) = crate::OverlayServer::new(crate::OverlayConfig {
+            port: 0,
+            repo_root,
+            readonly: false,
+            userdata_root: Some(userdata),
+        })
+        .build_app()
+        .await
+        .expect("build_app");
+        (state, services)
+    }
+
+    #[tokio::test]
+    async fn delegated_feed_connect_hang_rejected_at_deadline() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            loop {
+                if socket.read(&mut buf).await.unwrap_or(0) == 0 {
+                    break;
+                }
+            }
+        });
+        let (state, services) = kick_feed_app().await;
+        *state.active_mode.write().await = crate::TwitchActiveMode::Delegated;
+        services
+            .set_authority_deadline_for_test(
+                1,
+                std::time::Instant::now() + Duration::from_millis(40),
+            )
+            .await;
+        let snap = services.authority_lease_snapshot_public().await;
+        let url = format!("http://127.0.0.1:{port}/kick-feed");
+        let err = consume_sse(state, &url, Some("Bearer ssk_test"), Some(snap))
+            .await
+            .expect_err("hung connect must fail at lease deadline");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Delegated authority") || msg.contains("expired"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_feed_rejects_frame_after_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(headers).await;
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let payload = b"data: {\"type\":\"chat\",\"user\":\"late\",\"message\":\"x\",\"message_id\":\"late-1\"}\n\n";
+            let chunk = format!(
+                "{:x}\r\n{}\r\n0\r\n\r\n",
+                payload.len(),
+                String::from_utf8_lossy(payload)
+            );
+            let _ = socket.write_all(chunk.as_bytes()).await;
+        });
+
+        let (state, services) = kick_feed_app().await;
+        *state.active_mode.write().await = crate::TwitchActiveMode::Delegated;
+        services
+            .set_authority_deadline_for_test(
+                1,
+                std::time::Instant::now() + Duration::from_millis(40),
+            )
+            .await;
+        let snap = services.authority_lease_snapshot_public().await;
+        let url = format!("http://127.0.0.1:{port}/kick-feed");
+        let result = consume_sse(state, &url, Some("Bearer ssk_test"), Some(snap)).await;
+        assert!(
+            result.is_err(),
+            "frame after lease deadline must not complete successfully: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_feed_rejects_generation_change_mid_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n";
+            let _ = socket.write_all(headers).await;
+            let _ = gate_rx.await;
+            let payload =
+                b"data: {\"type\":\"chat\",\"user\":\"x\",\"message\":\"y\",\"message_id\":\"g-1\"}\n\n";
+            let chunk = format!(
+                "{:x}\r\n{}\r\n",
+                payload.len(),
+                String::from_utf8_lossy(payload)
+            );
+            let _ = socket.write_all(chunk.as_bytes()).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let (state, services) = kick_feed_app().await;
+        *state.active_mode.write().await = crate::TwitchActiveMode::Delegated;
+        services.install_validated_authority_lease(1, None).await;
+        let snap = services.authority_lease_snapshot_public().await;
+        let url = format!("http://127.0.0.1:{port}/kick-feed");
+        let services2 = services.clone();
+        let pending = tokio::spawn(async move {
+            consume_sse(state, &url, Some("Bearer ssk_test"), Some(snap)).await
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        services2.clear_authority_lease().await;
+        let _ = gate_tx.send(());
+        let result = pending.await.unwrap();
+        assert!(
+            result.is_err(),
+            "generation/lease clear mid-stream must reject further delivery: {result:?}"
+        );
     }
 }

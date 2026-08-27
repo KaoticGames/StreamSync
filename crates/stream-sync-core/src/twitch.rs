@@ -160,6 +160,16 @@ impl TwitchServices {
         });
     }
 
+    /// Test hook: schedule durable revoke recovery (including generation 0 marker cleanup).
+    pub fn schedule_durable_revoke_for_test(
+        self: &Arc<Self>,
+        state: Arc<AppState>,
+        generation: DelegatedGeneration,
+        reason: &str,
+    ) {
+        self.schedule_durable_revoke(state, generation, reason);
+    }
+
     pub async fn install_delegated_generation(&self, generation: DelegatedGeneration) {
         let _ = self
             .teardown_coordinator
@@ -267,7 +277,18 @@ impl TwitchServices {
         self.authority_lease.lock().await.snapshot()
     }
 
+    pub async fn authority_lease_snapshot_public(&self) -> AuthorityLeaseSnapshot {
+        self.authority_lease_snapshot().await
+    }
+
+    /// Clear live delegated lease (identity left Delegated or revoked).
+    pub async fn clear_authority_lease(&self) {
+        let mut lease = self.authority_lease.lock().await;
+        *lease = AuthorityLease::inactive();
+    }
+
     /// Synchronous delegated-authority guard for privileged platform operations.
+    /// Local mode is allowed (no-op). Does not validate a captured in-flight snapshot.
     pub async fn ensure_delegated_authority(&self, state: &AppState) -> Result<()> {
         if !state.is_delegated_mode().await {
             return Ok(());
@@ -284,7 +305,25 @@ impl TwitchServices {
         Ok(())
     }
 
+    /// Validate a captured delegated lease snapshot after network completion.
+    /// Never treats Local mode as success for a delegated in-flight request.
+    pub async fn validate_delegated_snapshot(&self, snap: AuthorityLeaseSnapshot) -> Result<()> {
+        if snap.generation == 0 {
+            return Err(anyhow!("Delegated authority unavailable"));
+        }
+        if snap.deadline <= std::time::Instant::now() {
+            return Err(anyhow!("Delegated authority expired during request"));
+        }
+        let current = self.authority_lease_snapshot().await;
+        if current.generation != snap.generation || current.deadline != snap.deadline {
+            return Err(anyhow!("Delegated authority superseded during request"));
+        }
+        Ok(())
+    }
+
     /// Race a delegated platform future against the generation-bound absolute lease.
+    /// Captures `(generation, deadline)` before dispatch and revalidates that snapshot after
+    /// completion regardless of current active mode.
     pub async fn race_delegated_platform<T>(
         &self,
         state: &AppState,
@@ -293,12 +332,35 @@ impl TwitchServices {
         if !state.is_delegated_mode().await {
             return Ok(network.await);
         }
-        let generation = state.current_delegated_generation();
-        self.ensure_delegated_authority(state).await?;
-        let result = race_against_lease_deadline(self, generation, network)
+        let snap = self.authority_lease_snapshot().await;
+        if snap.generation == 0 || !state.session_still_current(snap.generation).await {
+            return Err(anyhow!("Delegated authority expired or superseded"));
+        }
+        {
+            let lease = self.authority_lease.lock().await;
+            if !lease.owns_generation(snap.generation) || lease.deadline() != snap.deadline {
+                return Err(anyhow!("Delegated authority expired or superseded"));
+            }
+        }
+        let result = race_against_lease_deadline(self, snap.generation, network)
             .await
             .map_err(|()| anyhow!("Delegated authority expired during request"))?;
-        self.ensure_delegated_authority(state).await?;
+        self.validate_delegated_snapshot(snap).await?;
+        Ok(result)
+    }
+
+    /// Race against a previously captured delegated lease snapshot (Kick feed, etc.).
+    pub async fn race_delegated_platform_with_snapshot<T>(
+        &self,
+        _state: &AppState,
+        snap: AuthorityLeaseSnapshot,
+        network: impl std::future::Future<Output = T>,
+    ) -> Result<T> {
+        self.validate_delegated_snapshot(snap).await?;
+        let result = race_against_lease_deadline(self, snap.generation, network)
+            .await
+            .map_err(|()| anyhow!("Delegated authority expired during request"))?;
+        self.validate_delegated_snapshot(snap).await?;
         Ok(result)
     }
 
@@ -402,21 +464,21 @@ pub async fn helix_get(state: &AppState, path: &str) -> Result<Value> {
         .clone()
         .unwrap_or_default();
     let url = format!("https://api.twitch.tv/helix{path}");
-    let res = delegated_platform_http(state, async {
-        reqwest::Client::new()
+    delegated_platform_http(state, async {
+        let res = reqwest::Client::new()
             .get(&url)
             .header("Client-Id", &client_id)
             .header("Authorization", format!("Bearer {token}"))
             .send()
-            .await
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow!("Helix GET {path} failed: {} {}", status, text));
+        }
+        Ok(res.json().await?)
     })
-    .await??;
-    let status = res.status();
-    if !status.is_success() {
-        let text = res.text().await.unwrap_or_default();
-        return Err(anyhow!("Helix GET {path} failed: {} {}", status, text));
-    }
-    Ok(res.json().await?)
+    .await?
 }
 
 pub async fn helix_patch(state: &AppState, path: &str, body: Value) -> Result<Value> {
@@ -431,23 +493,23 @@ pub async fn helix_patch(state: &AppState, path: &str, body: Value) -> Result<Va
         .access_token
         .clone()
         .unwrap();
-    let res = delegated_platform_http(state, async {
-        reqwest::Client::new()
+    delegated_platform_http(state, async {
+        let res = reqwest::Client::new()
             .patch(format!("https://api.twitch.tv/helix{path}"))
             .header("Client-Id", &client_id)
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
-            .await
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow!("Helix PATCH failed: {} {}", status, text));
+        }
+        Ok(res.json().await?)
     })
-    .await??;
-    let status = res.status();
-    if !status.is_success() {
-        let text = res.text().await.unwrap_or_default();
-        return Err(anyhow!("Helix PATCH failed: {} {}", status, text));
-    }
-    Ok(res.json().await?)
+    .await?
 }
 
 pub async fn helix_post(state: &AppState, path: &str, body: Value) -> Result<Value> {
@@ -462,26 +524,26 @@ pub async fn helix_post(state: &AppState, path: &str, body: Value) -> Result<Val
         .access_token
         .clone()
         .unwrap();
-    let res = delegated_platform_http(state, async {
-        reqwest::Client::new()
+    delegated_platform_http(state, async {
+        let res = reqwest::Client::new()
             .post(format!("https://api.twitch.tv/helix{path}"))
             .header("Client-Id", &client_id)
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
-            .await
+            .await?;
+        if res.status() == 409 {
+            return Ok(json!({ "ok": true, "already": true }));
+        }
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow!("Helix POST failed: {} {}", status, text));
+        }
+        Ok(res.json().await?)
     })
-    .await??;
-    if res.status() == 409 {
-        return Ok(json!({ "ok": true, "already": true }));
-    }
-    let status = res.status();
-    if !status.is_success() {
-        let text = res.text().await.unwrap_or_default();
-        return Err(anyhow!("Helix POST failed: {} {}", status, text));
-    }
-    Ok(res.json().await?)
+    .await?
 }
 
 pub async fn update_chat_settings(state: &AppState, partial: Value) -> Result<()> {
@@ -753,40 +815,16 @@ async fn enrich_emote_owners(state: &AppState, list: &mut [Value]) {
 }
 
 async fn helix_get_users(state: &AppState, ids: &[String]) -> Result<Value> {
-    ensure_valid_token(state).await?;
-    let client_id = state.helix_client_id().await;
-    if client_id.is_empty() {
-        return Err(anyhow!("TWITCH_CLIENT_ID not configured."));
-    }
-    let token = state
-        .twitch
-        .read()
-        .await
-        .tokens
-        .access_token
-        .clone()
-        .unwrap_or_default();
-
-    let mut url = reqwest::Url::parse("https://api.twitch.tv/helix/users")?;
-    {
-        let mut pairs = url.query_pairs_mut();
-        for id in ids {
-            pairs.append_pair("id", id);
+    // Build Helix /users query and route through the fenced Helix helper (B3).
+    let mut path = String::from("/users?");
+    for (i, id) in ids.iter().enumerate() {
+        if i > 0 {
+            path.push('&');
         }
+        path.push_str("id=");
+        path.push_str(&urlencoding::encode(id));
     }
-
-    let res = reqwest::Client::new()
-        .get(url)
-        .header("Client-Id", &client_id)
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await?;
-    let status = res.status();
-    if !status.is_success() {
-        let text = res.text().await.unwrap_or_default();
-        return Err(anyhow!("Helix GET /users failed: {} {}", status, text));
-    }
-    Ok(res.json().await?)
+    helix_get(state, &path).await
 }
 
 async fn fetch_all_user_emotes(state: &AppState, user_id: &str) -> Result<Vec<Value>> {
@@ -847,16 +885,31 @@ pub async fn apply_set_token(
                 .collect()
         }),
     };
+    // Durable commit before live publish (B8).
     {
         let _lifecycle = services.lifecycle_lock.lock().await;
+        let previous_personal = state.personal_tokens.read().await.clone();
+        let previous_mode = *state.active_mode.read().await;
+        let previous_live = state.twitch.read().await.tokens.clone();
         *state.personal_tokens.write().await = tokens.clone();
+        if let Err(e) = state.save_twitch_tokens().await {
+            *state.personal_tokens.write().await = previous_personal;
+            return Err(e);
+        }
+        *state.active_mode.write().await = TwitchActiveMode::Local;
+        if let Err(e) = state.save_active_mode().await {
+            *state.active_mode.write().await = previous_mode;
+            *state.personal_tokens.write().await = previous_personal;
+            return Err(e);
+        }
+        if previous_mode == TwitchActiveMode::Delegated {
+            services.clear_authority_lease().await;
+        }
         let mut tw = state.twitch.write().await;
         clear_live_runtime_fields(&mut tw);
         tw.tokens = tokens;
-        *state.active_mode.write().await = TwitchActiveMode::Local;
+        let _ = previous_live;
     }
-    state.save_twitch_tokens().await?;
-    state.save_active_mode().await?;
     restart_twitch_clients(state.clone(), services.clone()).await;
     ensure_delegated_refresh_loop(state, services).await;
     Ok(())
@@ -879,12 +932,20 @@ pub async fn use_connection(
             }
             {
                 let _lifecycle = services.lifecycle_lock.lock().await;
+                // Stage durable mode first; only then publish live identity (B8).
+                let previous_mode = *state.active_mode.read().await;
+                *state.active_mode.write().await = TwitchActiveMode::Local;
+                if let Err(e) = state.save_active_mode().await {
+                    *state.active_mode.write().await = previous_mode;
+                    return Err(e);
+                }
+                if previous_mode == TwitchActiveMode::Delegated {
+                    services.clear_authority_lease().await;
+                }
                 let mut tw = state.twitch.write().await;
                 clear_live_runtime_fields(&mut tw);
                 tw.tokens = personal;
-                *state.active_mode.write().await = TwitchActiveMode::Local;
             }
-            state.save_active_mode().await?;
             restart_twitch_clients(state.clone(), services.clone()).await;
             ensure_delegated_refresh_loop(state.clone(), services).await;
             crate::kick::sync_live_identity(state).await;
@@ -896,12 +957,16 @@ pub async fn use_connection(
                 })?;
             {
                 let _lifecycle = services.lifecycle_lock.lock().await;
+                let previous_mode = *state.active_mode.read().await;
+                *state.active_mode.write().await = TwitchActiveMode::Delegated;
+                if let Err(e) = state.save_active_mode().await {
+                    *state.active_mode.write().await = previous_mode;
+                    return Err(e);
+                }
                 let mut tw = state.twitch.write().await;
                 clear_live_runtime_fields(&mut tw);
                 tw.tokens = tokens_from_delegated_session(&session);
-                *state.active_mode.write().await = TwitchActiveMode::Delegated;
             }
-            state.save_active_mode().await?;
             restart_twitch_clients(state.clone(), services.clone()).await;
             ensure_delegated_refresh_loop(state.clone(), services).await;
             crate::kick::sync_live_identity(state).await;
@@ -1025,7 +1090,7 @@ pub async fn remove_connection(
                 .as_ref()
                 .map(|s| s.generation)
                 .unwrap_or_else(|| state.current_delegated_generation());
-            remove_delegated_session(&state, &services, None, generation).await?;
+            remove_delegated_session_locked(&state, &services, None, generation).await?;
         }
     }
     Ok(())
@@ -1059,6 +1124,16 @@ async fn remove_delegated_session(
     generation: DelegatedGeneration,
 ) -> Result<()> {
     let _lifecycle = services.lifecycle_lock.lock().await;
+    remove_delegated_session_locked(state, services, except, generation).await
+}
+
+/// Caller must already hold `services.lifecycle_lock`.
+async fn remove_delegated_session_locked(
+    state: &AppState,
+    services: &TwitchServices,
+    except: Option<DelegatedWorker>,
+    generation: DelegatedGeneration,
+) -> Result<()> {
     if state.current_delegated_generation() != generation {
         return Ok(());
     }
@@ -1071,7 +1146,24 @@ async fn remove_delegated_session(
             return Ok(());
         }
     }
-    state.durable_revoke_delegated().await?;
+    match state.durable_revoke_delegated().await {
+        Ok(()) => {}
+        Err(e) => {
+            // B5: marker/durable write failure still strips live authority; route reports error.
+            {
+                let mut delegated = state.delegated.write().await;
+                if delegated
+                    .as_ref()
+                    .is_some_and(|s| s.generation == generation)
+                {
+                    *delegated = None;
+                }
+            }
+            stop_delegated_worker_handles(&services.refresh_handle, &services.watch_handle, except)
+                .await;
+            return Err(e);
+        }
+    }
     {
         let mut delegated = state.delegated.write().await;
         if state.current_delegated_generation() != generation {
@@ -2487,6 +2579,7 @@ async fn send_plain_chat(state: &AppState, services: &TwitchServices, trimmed: &
 }
 
 async fn send_dock_privmsg(state: &AppState, services: &TwitchServices, text: &str) -> Result<()> {
+    services.ensure_delegated_authority(state).await?;
     let channel = state
         .twitch
         .read()
@@ -2495,10 +2588,14 @@ async fn send_dock_privmsg(state: &AppState, services: &TwitchServices, text: &s
         .clone()
         .ok_or_else(|| anyhow!("No Twitch channel joined"))?;
     let client = irc_client_ready(services).await?;
-    client
-        .privmsg(channel.clone(), text.to_string())
-        .await
-        .map_err(|e| anyhow!("IRC privmsg failed: {e}"))?;
+    services
+        .race_delegated_platform(state, async {
+            client
+                .privmsg(channel.clone(), text.to_string())
+                .await
+                .map_err(|e| anyhow!("IRC privmsg failed: {e}"))
+        })
+        .await??;
     info!("Sent IRC command to #{channel}: {text}");
     Ok(())
 }
@@ -3032,10 +3129,8 @@ async fn start_delegated_revalidation_only(
 pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>) {
     // Crash-persistent pending revoke: never activate stored delegated authority.
     if state.durable_revoke_pending() || state.paths.twitch_delegated_revoked.is_file() {
-        let generation = state.current_delegated_generation();
-        if generation > 0 {
-            services.schedule_durable_revoke(state.clone(), generation, "startup_pending");
-        }
+        // Resume durable cleanup from marker presence even when generation is 0 (B9).
+        services.schedule_durable_revoke(state.clone(), 0, "startup_pending");
         let personal = state.personal_tokens.read().await.clone();
         if tokens_saved(&personal) {
             {
@@ -3838,10 +3933,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn race_rejects_stale_completion_after_switch_to_local() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let (state, services) = phase2_app().await;
+        install_delegated_session(&state, &services).await;
+        *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        services.install_validated_authority_lease(1, None).await;
+        *state.personal_tokens.write().await = sample_personal();
+        state.save_twitch_tokens().await.unwrap();
+
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let services2 = services.clone();
+        let state2 = state.clone();
+        let pending = tokio::spawn(async move {
+            services2
+                .race_delegated_platform(&state2, async {
+                    let _ = gate_rx.await;
+                    "stale-delegated-body"
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        use_connection(state.clone(), services.clone(), TwitchActiveMode::Local)
+            .await
+            .expect("switch local");
+        let _ = gate_tx.send(());
+        let result = pending.await.unwrap();
+        assert!(
+            result.is_err(),
+            "stale delegated completion after Local switch must be rejected: {result:?}"
+        );
+        assert_eq!(*state.active_mode.read().await, TwitchActiveMode::Local);
+    }
+
+    /// B2: headers can arrive before the lease deadline while the body completes after.
+    /// The full send+body future must remain under the fence so the late body is rejected.
+    #[tokio::test]
+    async fn race_rejects_http_body_completed_after_deadline() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // Headers before deadline…
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n")
+                .await;
+            // …body after deadline.
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let _ = socket.write_all(b"later").await;
+        });
+
+        let (state, services) = phase2_app().await;
+        install_delegated_session(&state, &services).await;
+        *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        services
+            .set_authority_deadline_for_test(
+                1,
+                std::time::Instant::now() + Duration::from_millis(40),
+            )
+            .await;
+
+        let url = format!("http://127.0.0.1:{port}/helix/users");
+        let result = services
+            .race_delegated_platform(&state, async {
+                let res = reqwest::Client::new().get(&url).send().await?;
+                let status = res.status();
+                let text = res.text().await?;
+                anyhow::Ok((status.as_u16(), text))
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "late HTTP body after lease deadline must be rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_mode_save_on_use_connection_keeps_intent_advanced() {
         let _guard = PHASE2_TEST_LOCK.lock().await;
         let (state, services) = phase2_app().await;
         install_delegated_session(&state, &services).await;
+        *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        state.save_active_mode().await.unwrap();
         *state.personal_tokens.write().await = sample_personal();
         state.save_twitch_tokens().await.unwrap();
         let before = services.apply_intent_for_test();
@@ -3852,6 +4038,39 @@ mod tests {
         let err = use_connection(state.clone(), services.clone(), TwitchActiveMode::Local).await;
         assert!(err.is_err());
         assert!(services.apply_intent_for_test() > before);
+        // Durable-before-publish: live identity must remain coherent with pre-failure mode.
+        assert_eq!(*state.active_mode.read().await, TwitchActiveMode::Delegated);
+    }
+
+    #[tokio::test]
+    async fn inactive_delegated_removal_does_not_deadlock() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let (state, services) = phase2_app().await;
+        install_delegated_session(&state, &services).await;
+        state.save_delegated().await.unwrap();
+        *state.personal_tokens.write().await = sample_personal();
+        state.save_twitch_tokens().await.unwrap();
+        *state.active_mode.write().await = TwitchActiveMode::Local;
+        state.save_active_mode().await.unwrap();
+        {
+            let mut tw = state.twitch.write().await;
+            tw.tokens = sample_personal();
+        }
+        let remove = tokio::time::timeout(
+            Duration::from_secs(3),
+            remove_connection(state.clone(), services.clone(), TwitchActiveMode::Delegated),
+        )
+        .await;
+        assert!(remove.is_ok(), "remove_connection timed out (deadlock)");
+        remove.unwrap().expect("remove_connection");
+        assert!(state.delegated.read().await.is_none());
+        assert!(!state.paths.twitch_delegated.is_file());
+        assert!(!state.paths.twitch_delegated.with_extension("bak").is_file());
+        assert_eq!(*state.active_mode.read().await, TwitchActiveMode::Local);
+        assert_eq!(
+            state.twitch.read().await.tokens.login.as_deref(),
+            Some("personal_login")
+        );
     }
 
     #[tokio::test]
