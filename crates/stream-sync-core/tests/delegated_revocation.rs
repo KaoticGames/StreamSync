@@ -505,3 +505,67 @@ async fn autonomous_durable_revoke_completes_after_transient_failure() {
     assert!(!state.paths.twitch_delegated.is_file());
     assert!(state.paths.twitch_delegated_revoked.is_file());
 }
+
+#[tokio::test]
+async fn revoke_pending_marker_survives_crash_and_quarantines_restart() {
+    let userdata = test_userdata_dir();
+    let (_router, state, _services) = build_app_at(userdata.clone(), 0).await;
+    write_json(
+        &state.paths.twitch_delegated,
+        &sample_session(1, "ssk_test_placeholder_pending_crash"),
+    )
+    .unwrap();
+    state.mark_durable_revoke_pending().unwrap();
+    assert!(state.paths.twitch_delegated_revoke_pending.is_file());
+    drop(state);
+
+    let restarted = restart_app_at(&userdata, false);
+    assert!(restarted.delegated.read().await.is_none());
+    assert_ne!(
+        *restarted.active_mode.read().await,
+        TwitchActiveMode::Delegated
+    );
+}
+
+#[tokio::test]
+async fn tombstone_write_failure_still_persists_pending_marker() {
+    let (_router, state, _services) = build_app(0).await;
+    write_json(
+        &state.paths.twitch_delegated,
+        &sample_session(1, "ssk_test_placeholder_pending_tombstone"),
+    )
+    .unwrap();
+    state
+        .durable_fail
+        .tombstone_write
+        .store(true, Ordering::SeqCst);
+    assert!(state.durable_revoke_delegated().await.is_err());
+    assert!(state.paths.twitch_delegated_revoke_pending.is_file());
+    assert!(!state.paths.twitch_delegated_revoked.is_file());
+    assert!(state.paths.twitch_delegated.is_file());
+}
+
+#[tokio::test]
+async fn disconnect_intent_advances_even_when_revoke_fails() {
+    let (_router, state, services) = build_app(0).await;
+    write_json(
+        &state.paths.twitch_delegated,
+        &sample_session(1, "ssk_test_placeholder_disconnect_intent"),
+    )
+    .unwrap();
+    state.delegated_generation.store(1, Ordering::SeqCst);
+    *state.delegated.write().await =
+        Some(sample_session(1, "ssk_test_placeholder_disconnect_intent"));
+    *state.active_mode.write().await = TwitchActiveMode::Delegated;
+    services.install_delegated_generation(1).await;
+    let before = services.apply_intent_for_test();
+    state
+        .durable_fail
+        .credential_remove
+        .store(true, Ordering::SeqCst);
+    assert!(disconnect_twitch(state.clone(), services.clone())
+        .await
+        .is_err());
+    assert!(services.apply_intent_for_test() > before);
+    assert!(state.paths.twitch_delegated_revoke_pending.is_file());
+}

@@ -122,6 +122,8 @@ pub struct StoragePaths {
     pub twitch_delegated: PathBuf,
     /// Tombstone written when delegated authority is revoked (startup fail-closed).
     pub twitch_delegated_revoked: PathBuf,
+    /// Crash-persistent intent that durable revoke is still pending (independent of tombstone).
+    pub twitch_delegated_revoke_pending: PathBuf,
     /// Which saved identity is active: local vs delegated.
     pub twitch_active_mode: PathBuf,
     pub fonts_dir: PathBuf,
@@ -241,6 +243,7 @@ fn paths_under_root(root: PathBuf, readonly: bool) -> Result<StoragePaths> {
         env_path("STREAMSYNC_KICK_TOKENS_FILE").unwrap_or_else(|| root.join("kick-tokens.json"));
     let twitch_delegated = root.join("twitch-delegated.json");
     let twitch_delegated_revoked = root.join("twitch-delegated.revoked");
+    let twitch_delegated_revoke_pending = root.join("twitch-delegated.revoke-pending");
     let twitch_active_mode = root.join("twitch-active-mode.json");
     let fonts_dir = env_path("STREAMSYNC_FONTS_DIR").unwrap_or_else(|| root.join("fonts"));
     let events_media_dir =
@@ -272,6 +275,7 @@ fn paths_under_root(root: PathBuf, readonly: bool) -> Result<StoragePaths> {
         kick_tokens,
         twitch_delegated,
         twitch_delegated_revoked,
+        twitch_delegated_revoke_pending,
         twitch_active_mode,
         fonts_dir,
         events_media_dir,
@@ -623,6 +627,14 @@ pub fn remove_file_durable(path: &Path) -> Result<()> {
 pub fn write_delegated_revoked_tombstone(path: &Path) -> Result<()> {
     let payload = serde_json::json!({
         "revoked_at": chrono::Utc::now().to_rfc3339(),
+    });
+    write_file_atomic(path, serde_json::to_string(&payload)?.as_bytes())
+}
+
+/// Crash-persistent marker that durable delegated revoke is still incomplete.
+pub fn write_delegated_revoke_pending(path: &Path) -> Result<()> {
+    let payload = serde_json::json!({
+        "pending_at": chrono::Utc::now().to_rfc3339(),
     });
     write_file_atomic(path, serde_json::to_string(&payload)?.as_bytes())
 }

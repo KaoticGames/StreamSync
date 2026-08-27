@@ -50,7 +50,10 @@ pub use storage::{
     legacy_electron_user_data, load_streamsync_dotenv, paths_for_root, resolve_repo_root,
     resolve_ui_assets_root, rust_dotenv_path, rust_workspace_root, write_secret_file, StoragePaths,
 };
-pub use storage::{remove_file_durable, write_delegated_revoked_tombstone, write_json};
+pub use storage::{
+    remove_file_durable, write_delegated_revoke_pending, write_delegated_revoked_tombstone,
+    write_json,
+};
 
 /// Back-compat alias.
 pub use storage::bootstrap_twitch_env_from_rust as bootstrap_twitch_env_from_repo;

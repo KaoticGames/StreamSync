@@ -265,17 +265,24 @@ pub async fn send_chat_from_dock(state: Arc<AppState>, message: &str) -> Result<
         .clone()
         .ok_or_else(|| anyhow!("Kick is not connected"))?;
     let broadcaster_user_id: i64 = kick_id.parse().unwrap_or(0);
-    let res = reqwest::Client::new()
-        .post(KICK_CHAT_URL)
-        .header("Authorization", format!("Bearer {access}"))
-        .header("Content-Type", "application/json")
-        .json(&json!({
-            "content": trimmed.chars().take(500).collect::<String>(),
-            "type": "user",
-            "broadcaster_user_id": broadcaster_user_id,
-        }))
-        .send()
-        .await?;
+    let send_fut = async {
+        reqwest::Client::new()
+            .post(KICK_CHAT_URL)
+            .header("Authorization", format!("Bearer {access}"))
+            .header("Content-Type", "application/json")
+            .json(&json!({
+                "content": trimmed.chars().take(500).collect::<String>(),
+                "type": "user",
+                "broadcaster_user_id": broadcaster_user_id,
+            }))
+            .send()
+            .await
+    };
+    let res = if let Some(services) = state.twitch_services() {
+        services.race_delegated_platform(&state, send_fut).await??
+    } else {
+        send_fut.await?
+    };
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
         return Err(anyhow!("Kick chat send failed: {text}"));

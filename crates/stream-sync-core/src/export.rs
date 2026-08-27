@@ -208,6 +208,7 @@ mod tests {
             kick_tokens: root.join("kick-tokens.json"),
             twitch_delegated: root.join("twitch-delegated.json"),
             twitch_delegated_revoked: root.join("twitch-delegated.revoked"),
+            twitch_delegated_revoke_pending: root.join("twitch-delegated.revoke-pending"),
             twitch_active_mode: root.join("twitch-active-mode.json"),
             fonts_dir: root.join("fonts"),
             events_media_dir: root.join("events-media"),

@@ -221,14 +221,20 @@ impl AppState {
         let personal =
             read_json_for_mode(&paths.twitch_tokens, &TwitchTokenFile::default(), readonly)?;
         let revoked_tombstone = paths.twitch_delegated_revoked.is_file();
-        let delegated = if revoked_tombstone {
+        let revoke_pending = paths.twitch_delegated_revoke_pending.is_file();
+        let quarantine = revoked_tombstone || revoke_pending;
+        let delegated = if quarantine {
             // Readonly must inspect/quarantine in memory only — never mutate disk.
             if !readonly && paths.twitch_delegated.is_file() {
                 if let Err(e) = storage::remove_file_durable(&paths.twitch_delegated) {
                     tracing::warn!("delegated quarantine cleanup failed: {e:#}");
                 }
             }
-            tracing::warn!("delegated session quarantined: revoked tombstone present");
+            if revoke_pending && !revoked_tombstone {
+                tracing::warn!("delegated session quarantined: durable revoke still pending");
+            } else {
+                tracing::warn!("delegated session quarantined: revoked tombstone present");
+            }
             None
         } else if paths.twitch_delegated.is_file() {
             read_json_for_mode(
@@ -252,7 +258,7 @@ impl AppState {
         .unwrap_or_default();
         let personal_ok = personal.access_token.is_some() && personal.login.is_some();
         let delegated_ok = delegated.is_some();
-        let active_mode = if revoked_tombstone || !delegated_ok {
+        let active_mode = if quarantine || !delegated_ok {
             match saved_mode {
                 TwitchActiveMode::Delegated if personal_ok => TwitchActiveMode::Local,
                 TwitchActiveMode::Delegated => TwitchActiveMode::Local,
@@ -268,7 +274,7 @@ impl AppState {
                 _ => TwitchActiveMode::Local,
             }
         };
-        if revoked_tombstone && active_mode == TwitchActiveMode::Local && !readonly {
+        if quarantine && active_mode == TwitchActiveMode::Local && !readonly {
             let _ = storage::write_json(
                 &paths.twitch_active_mode,
                 &TwitchActiveModeFile {
@@ -414,6 +420,8 @@ impl AppState {
         if self.readonly {
             return Ok(());
         }
+        // Crash-safe ordering: pending marker first so restart always fail-closes.
+        storage::write_delegated_revoke_pending(&self.paths.twitch_delegated_revoke_pending)?;
         self.durable_fail
             .fail(&self.durable_fail.tombstone_write, "tombstone_write")?;
         storage::write_delegated_revoked_tombstone(&self.paths.twitch_delegated_revoked)?;
@@ -422,7 +430,21 @@ impl AppState {
         storage::remove_file_durable(&self.paths.twitch_delegated)?;
         self.durable_fail
             .fail(&self.durable_fail.parent_sync, "parent_sync")?;
+        // Pending marker no longer needed once tombstone + credential removal succeeded.
+        let _ = storage::remove_file_durable(&self.paths.twitch_delegated_revoke_pending);
         Ok(())
+    }
+
+    /// Mark that durable revoke must complete across restarts (best-effort independent path).
+    pub fn mark_durable_revoke_pending(&self) -> anyhow::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
+        storage::write_delegated_revoke_pending(&self.paths.twitch_delegated_revoke_pending)
+    }
+
+    pub fn durable_revoke_pending(&self) -> bool {
+        self.paths.twitch_delegated_revoke_pending.is_file()
     }
 
     /// Durably clear the revoked tombstone after a new generation credential is on disk.
@@ -430,12 +452,19 @@ impl AppState {
         if self.readonly {
             return Ok(());
         }
-        if !self.paths.twitch_delegated_revoked.is_file() {
+        if !self.paths.twitch_delegated_revoked.is_file()
+            && !self.paths.twitch_delegated_revoke_pending.is_file()
+        {
             return Ok(());
         }
         self.durable_fail
             .fail(&self.durable_fail.tombstone_clear, "tombstone_clear")?;
-        storage::remove_file_durable(&self.paths.twitch_delegated_revoked)?;
+        if self.paths.twitch_delegated_revoked.is_file() {
+            storage::remove_file_durable(&self.paths.twitch_delegated_revoked)?;
+        }
+        if self.paths.twitch_delegated_revoke_pending.is_file() {
+            storage::remove_file_durable(&self.paths.twitch_delegated_revoke_pending)?;
+        }
         Ok(())
     }
 

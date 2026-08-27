@@ -509,6 +509,18 @@ pub async fn clear_finished_generation_task(
     }
 }
 
+/// Release the slot if it still belongs to `generation` (worker self-clear on exit).
+/// Does not abort the handle — the caller is the exiting task.
+pub async fn release_generation_slot_if_owned(
+    slot: &RwLock<Option<GenerationTask>>,
+    generation: DelegatedGeneration,
+) {
+    let mut guard = slot.write().await;
+    if guard.as_ref().is_some_and(|t| t.generation == generation) {
+        let _ = guard.take();
+    }
+}
+
 /// Atomically install a generation-tagged worker.
 ///
 /// Returns `true` if `handle` was installed. If the slot already holds a newer generation, or an
@@ -1134,6 +1146,71 @@ mod tests {
         assert!(a_ran_rx.try_recv().is_err(), "stale gen must not run body");
         assert_eq!(slot.read().await.as_ref().map(|t| t.generation), Some(2));
         let _ = a_grant_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn delayed_stale_starter_body_never_runs_after_newer_install() {
+        let slot: RwLock<Option<GenerationTask>> = RwLock::new(None);
+        let body_ops = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // Pause A before it can claim.
+        let (a_release_tx, a_release_rx) = tokio::sync::oneshot::channel();
+        let (a_grant_tx, a_grant_rx) = tokio::sync::oneshot::channel();
+        let ops_a = body_ops.clone();
+        let a_handle = tokio::spawn(async move {
+            let _ = a_release_rx.await;
+            if a_grant_rx.await.is_err() {
+                return;
+            }
+            ops_a.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // Install B first (as if it won the race).
+        let (b_grant_tx, b_grant_rx) = tokio::sync::oneshot::channel();
+        let b_handle = tokio::spawn(async move {
+            if b_grant_rx.await.is_err() {
+                return;
+            }
+            std::future::pending::<()>().await;
+        });
+        assert!(install_generation_task(&slot, 2, b_handle).await);
+        let _ = b_grant_tx.send(());
+
+        // Release A: it tries install and must be rejected before body.
+        assert!(!install_generation_task(&slot, 1, a_handle).await);
+        let _ = a_release_tx.send(());
+        let _ = a_grant_tx.send(());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(body_ops.load(Ordering::SeqCst), 0);
+        assert_eq!(slot.read().await.as_ref().map(|t| t.generation), Some(2));
+        if let Some(task) = slot.write().await.take() {
+            task.handle.abort();
+        };
+    }
+
+    #[tokio::test]
+    async fn release_own_slot_does_not_clear_newer_generation() {
+        let slot: RwLock<Option<GenerationTask>> = RwLock::new(None);
+        let older = tokio::spawn(async {});
+        assert!(install_generation_task(&slot, 1, older).await);
+        for _ in 0..20 {
+            if slot
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|t| t.handle.is_finished())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let newer = tokio::spawn(async { std::future::pending::<()>().await });
+        assert!(install_generation_task(&slot, 2, newer).await);
+        release_generation_slot_if_owned(&slot, 1).await;
+        assert_eq!(slot.read().await.as_ref().map(|t| t.generation), Some(2));
+        if let Some(task) = slot.write().await.take() {
+            task.handle.abort();
+        };
     }
 
     #[test]
