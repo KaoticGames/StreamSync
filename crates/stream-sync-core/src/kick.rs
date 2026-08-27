@@ -109,15 +109,23 @@ pub async fn apply_personal_bundle(state: Arc<AppState>, tokens: KickTokenFile) 
     if !tokens.is_linked() {
         return Err(anyhow!("Kick bundle missing access token or user id"));
     }
+    let previous = state.personal_kick.read().await.clone();
     *state.personal_kick.write().await = tokens;
-    state.save_kick_tokens().await?;
+    if let Err(e) = state.save_kick_tokens().await {
+        *state.personal_kick.write().await = previous;
+        return Err(e);
+    }
     sync_live_identity(state).await;
     Ok(())
 }
 
 pub async fn disconnect_personal(state: Arc<AppState>) -> Result<()> {
+    let previous = state.personal_kick.read().await.clone();
     *state.personal_kick.write().await = KickTokenFile::default();
-    state.save_kick_tokens().await?;
+    if let Err(e) = state.save_kick_tokens().await {
+        *state.personal_kick.write().await = previous;
+        return Err(e);
+    }
     sync_live_identity(state).await;
     Ok(())
 }
@@ -246,13 +254,13 @@ pub async fn send_chat_from_dock(state: Arc<AppState>, message: &str) -> Result<
     if trimmed.is_empty() {
         return Ok(());
     }
-    if state.is_delegated_mode().await {
-        if let Some(services) = state.twitch_services() {
-            services.ensure_delegated_authority(&state).await?;
-        } else {
-            return Err(anyhow!("Delegated authority unavailable"));
-        }
-    }
+    let provenance = if let Some(services) = state.twitch_services() {
+        services.capture_platform_provenance(&state).await?
+    } else if state.is_delegated_mode().await {
+        return Err(anyhow!("Delegated authority unavailable"));
+    } else {
+        crate::twitch::PlatformCredentialProvenance::Local
+    };
     ensure_fresh_personal_token(&state).await.ok();
     let tokens = state.kick.read().await.tokens.clone();
     let access = tokens
@@ -284,11 +292,16 @@ pub async fn send_chat_from_dock(state: Arc<AppState>, message: &str) -> Result<
         Ok(())
     };
     if let Some(services) = state.twitch_services() {
-        services.race_delegated_platform(&state, send_fut).await??
-    } else if state.is_delegated_mode().await {
-        return Err(anyhow!("Delegated authority unavailable"));
+        services
+            .race_delegated_platform_with_provenance(&state, provenance, send_fut)
+            .await??
     } else {
-        send_fut.await?
+        match provenance {
+            crate::twitch::PlatformCredentialProvenance::Local => send_fut.await?,
+            crate::twitch::PlatformCredentialProvenance::Delegated { .. } => {
+                return Err(anyhow!("Delegated authority unavailable"));
+            }
+        }
     }
     Ok(())
 }
@@ -433,7 +446,7 @@ async fn consume_sse(
             for frame in frames {
                 services.validate_delegated_snapshot(snap).await?;
                 if let Some(event) = crate::delegated_lifecycle::parse_sse_json_data(&frame) {
-                    fanout_kick_event(&state, event).await;
+                    fanout_kick_event(&state, event, Some(snap)).await?;
                 }
             }
         } else {
@@ -454,14 +467,42 @@ async fn consume_sse(
             .map_err(|_| anyhow!("Kick feed buffer overflow"))?;
             for frame in frames {
                 if let Some(event) = crate::delegated_lifecycle::parse_sse_json_data(&frame) {
-                    fanout_kick_event(&state, event).await;
+                    fanout_kick_event(&state, event, None).await?;
                 }
             }
         }
     }
 }
 
-async fn fanout_kick_event(state: &AppState, raw: Value) {
+async fn fanout_kick_event(
+    state: &AppState,
+    raw: Value,
+    snap: Option<crate::delegated_lifecycle::AuthorityLeaseSnapshot>,
+) -> Result<()> {
+    async fn deliver(
+        state: &AppState,
+        event: Value,
+        snap: Option<crate::delegated_lifecycle::AuthorityLeaseSnapshot>,
+    ) -> Result<()> {
+        if let Some(snap) = snap {
+            let Some(services) = state.twitch_services() else {
+                return Err(anyhow!("Delegated authority unavailable"));
+            };
+            services.validate_delegated_snapshot(snap).await?;
+            let ok = state
+                .feed
+                .broadcast_all_while(&event, || snap.deadline > std::time::Instant::now())
+                .await;
+            if !ok {
+                return Err(anyhow!("Delegated authority expired during fan-out"));
+            }
+            services.validate_delegated_snapshot(snap).await?;
+        } else {
+            state.feed.broadcast_all(&event).await;
+        }
+        Ok(())
+    }
+
     if raw.get("type").and_then(|v| v.as_str()) == Some("chat") {
         let message_id = raw
             .get("message_id")
@@ -469,10 +510,9 @@ async fn fanout_kick_event(state: &AppState, raw: Value) {
             .unwrap_or("")
             .to_string();
         if !message_id.is_empty() && mark_kick_message_seen(&message_id) {
-            return;
+            return Ok(());
         }
-        state.feed.broadcast_all(&normalize_kick_chat(&raw)).await;
-        return;
+        return deliver(state, normalize_kick_chat(&raw), snap).await;
     }
     let kind = raw
         .get("kind")
@@ -480,7 +520,7 @@ async fn fanout_kick_event(state: &AppState, raw: Value) {
         .unwrap_or("")
         .to_string();
     if kind.is_empty() {
-        return;
+        return Ok(());
     }
     let user = raw
         .get("user_login")
@@ -488,58 +528,84 @@ async fn fanout_kick_event(state: &AppState, raw: Value) {
         .unwrap_or("someone");
     match kind.as_str() {
         "follow" => {
-            emit_alert(state, "follow", json!({ "name": user })).await;
-            state
-                .feed
-                .broadcast_all(&make_platform_dock_event(
+            emit_alert(state, "follow", json!({ "name": user }), snap).await?;
+            deliver(
+                state,
+                make_platform_dock_event(
                     "kick",
                     "follow",
                     &format!("{user} followed"),
                     Some("Follow"),
                     None,
-                ))
-                .await;
+                ),
+                snap,
+            )
+            .await
         }
         "sub" => {
-            emit_alert(state, "sub", json!({ "name": user, "amount": "1000" })).await;
-            state
-                .feed
-                .broadcast_all(&make_platform_dock_event(
+            emit_alert(
+                state,
+                "sub",
+                json!({ "name": user, "amount": "1000" }),
+                snap,
+            )
+            .await?;
+            deliver(
+                state,
+                make_platform_dock_event(
                     "kick",
                     "sub",
                     &format!("{user} subscribed"),
                     Some("Sub"),
                     None,
-                ))
-                .await;
+                ),
+                snap,
+            )
+            .await
         }
         "sub_gift" => {
             let count = raw.get("count").cloned().unwrap_or(json!(1));
-            emit_alert(state, "gift", json!({ "name": user, "amount": count })).await;
-            state
-                .feed
-                .broadcast_all(&make_platform_dock_event(
+            emit_alert(
+                state,
+                "gift",
+                json!({ "name": user, "amount": count }),
+                snap,
+            )
+            .await?;
+            deliver(
+                state,
+                make_platform_dock_event(
                     "kick",
                     "gift",
                     &format!("{user} gifted {count}"),
                     Some("Gift"),
                     None,
-                ))
-                .await;
+                ),
+                snap,
+            )
+            .await
         }
         "kicks" => {
             let amount = raw.get("amount").cloned().unwrap_or(json!(0));
-            emit_alert(state, "bits", json!({ "name": user, "amount": amount })).await;
-            state
-                .feed
-                .broadcast_all(&make_platform_dock_event(
+            emit_alert(
+                state,
+                "bits",
+                json!({ "name": user, "amount": amount }),
+                snap,
+            )
+            .await?;
+            deliver(
+                state,
+                make_platform_dock_event(
                     "kick",
                     "kicks",
                     &format!("{user} gifted {amount} Kicks"),
                     Some("Kicks"),
                     None,
-                ))
-                .await;
+                ),
+                snap,
+            )
+            .await
         }
         "redemption" => {
             let title = raw
@@ -551,44 +617,61 @@ async fn fanout_kick_event(state: &AppState, raw: Value) {
             if !input.is_empty() {
                 detail.push_str(&format!(": {input}"));
             }
-            state
-                .feed
-                .broadcast_all(&make_platform_dock_event(
-                    "kick",
-                    "redeem",
-                    &detail,
-                    Some("Reward"),
-                    None,
-                ))
-                .await;
+            deliver(
+                state,
+                make_platform_dock_event("kick", "redeem", &detail, Some("Reward"), None),
+                snap,
+            )
+            .await
         }
         "stream" => {
             let label = raw.get("label").and_then(|v| v.as_str()).unwrap_or("live");
-            state
-                .feed
-                .broadcast_all(&make_platform_dock_event(
+            deliver(
+                state,
+                make_platform_dock_event(
                     "kick",
                     "announce",
                     &format!("Kick stream {label}"),
                     Some("Live"),
                     None,
-                ))
-                .await;
+                ),
+                snap,
+            )
+            .await
         }
-        _ => {}
+        _ => Ok(()),
     }
 }
 
-async fn emit_alert(state: &AppState, event_type: &str, variables: Value) {
-    state
-        .feed
-        .broadcast_all(&json!({
-            "type": "event-alert",
-            "platform": "kick",
-            "eventType": event_type,
-            "data": { "variables": variables },
-        }))
-        .await;
+async fn emit_alert(
+    state: &AppState,
+    event_type: &str,
+    variables: Value,
+    snap: Option<crate::delegated_lifecycle::AuthorityLeaseSnapshot>,
+) -> Result<()> {
+    let event = json!({
+        "type": "event-alert",
+        "platform": "kick",
+        "eventType": event_type,
+        "data": { "variables": variables },
+    });
+    if let Some(snap) = snap {
+        let Some(services) = state.twitch_services() else {
+            return Err(anyhow!("Delegated authority unavailable"));
+        };
+        services.validate_delegated_snapshot(snap).await?;
+        let ok = state
+            .feed
+            .broadcast_all_while(&event, || snap.deadline > std::time::Instant::now())
+            .await;
+        if !ok {
+            return Err(anyhow!("Delegated authority expired during fan-out"));
+        }
+        services.validate_delegated_snapshot(snap).await?;
+    } else {
+        state.feed.broadcast_all(&event).await;
+    }
+    Ok(())
 }
 
 fn normalize_kick_chat(raw: &Value) -> Value {

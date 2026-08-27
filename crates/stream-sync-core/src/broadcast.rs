@@ -185,17 +185,34 @@ impl FeedHub {
     }
 
     pub async fn broadcast_all(&self, event: &serde_json::Value) {
+        self.broadcast_all_while(event, || true).await;
+    }
+
+    /// Broadcast with a per-send gate. Returns false if the gate rejected mid-fanout.
+    pub async fn broadcast_all_while<F>(&self, event: &serde_json::Value, mut gate: F) -> bool
+    where
+        F: FnMut() -> bool,
+    {
         let payload = match serde_json::to_string(event) {
             Ok(s) => s,
-            Err(_) => return,
+            Err(_) => return true,
         };
         let map = self.inner.read().await;
         for clients in map.values() {
             for client in clients {
+                if !gate() {
+                    return false;
+                }
                 let mut guard = client.sender.write().await;
-                let _ = guard.send(Message::Text(payload.clone())).await;
+                // Bound blocked sends so revocation cannot wait forever behind backpressure.
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    guard.send(Message::Text(payload.clone())),
+                )
+                .await;
             }
         }
+        true
     }
 
     async fn broadcast_to_audiences(

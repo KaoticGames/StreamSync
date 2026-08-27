@@ -97,6 +97,12 @@ pub struct DurableFailureInject {
     pub parent_sync: std::sync::atomic::AtomicBool,
     pub pending_marker_remove: std::sync::atomic::AtomicBool,
     pub pending_marker_write: std::sync::atomic::AtomicBool,
+    /// Legacy reusable `.bak` removal (authority-bearing).
+    pub backup_remove: std::sync::atomic::AtomicBool,
+    /// Personal Twitch token file write.
+    pub save_personal_tokens: std::sync::atomic::AtomicBool,
+    /// Personal Kick token file write.
+    pub save_kick_tokens: std::sync::atomic::AtomicBool,
 }
 
 impl DurableFailureInject {
@@ -383,6 +389,10 @@ impl AppState {
         if self.readonly {
             return Ok(());
         }
+        self.durable_fail.fail(
+            &self.durable_fail.save_personal_tokens,
+            "save_personal_tokens",
+        )?;
         // Always persist personal OAuth separately — never write takeover tokens here.
         let personal = self.personal_tokens.read().await;
         storage::write_json(&self.paths.twitch_tokens, &*personal)
@@ -392,6 +402,8 @@ impl AppState {
         if self.readonly {
             return Ok(());
         }
+        self.durable_fail
+            .fail(&self.durable_fail.save_kick_tokens, "save_kick_tokens")?;
         let personal = self.personal_kick.read().await;
         storage::write_json(&self.paths.kick_tokens, &*personal)
     }
@@ -416,10 +428,33 @@ impl AppState {
             .fail(&self.durable_fail.save_session, "save_session")?;
         let bytes = serde_json::to_vec_pretty(sess)?;
         storage::write_secret_file(&self.paths.twitch_delegated, &bytes)?;
-        // Repair: remove any legacy reusable backup from prior non-secret writes.
-        let bak = self.paths.twitch_delegated.with_extension("bak");
-        let _ = storage::remove_file_durable(&bak);
+        // Legacy `.bak` removal is part of the durable transaction (must not report Ok while
+        // an authority-bearing backup remains).
+        self.remove_delegated_backup()?;
         Ok(())
+    }
+
+    /// Remove legacy reusable delegated `.bak` (propagates failure).
+    pub fn remove_delegated_backup(&self) -> anyhow::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
+        self.durable_fail
+            .fail(&self.durable_fail.backup_remove, "backup_remove")?;
+        let bak = self.paths.twitch_delegated.with_extension("bak");
+        storage::remove_file_durable(&bak)?;
+        Ok(())
+    }
+
+    /// Bounded inventory of authority-bearing delegated secret variants.
+    pub fn delegated_secret_variants(&self) -> Vec<std::path::PathBuf> {
+        storage::delegated_secret_variants(&self.paths.twitch_delegated)
+    }
+
+    /// True when primary, backup, or other inventoried delegated secrets remain.
+    pub fn delegated_authority_artifacts_remain(&self) -> bool {
+        self.delegated_secret_variants().iter().any(|p| p.is_file())
+            || self.paths.twitch_delegated_revoke_pending.is_file()
     }
 
     /// Persist revoked tombstone and remove delegated credential file durably.
@@ -439,11 +474,20 @@ impl AppState {
         self.durable_fail
             .fail(&self.durable_fail.credential_remove, "credential_remove")?;
         storage::remove_file_durable(&self.paths.twitch_delegated)?;
-        // Also remove reusable backup / temp leftovers (B11).
-        let bak = self.paths.twitch_delegated.with_extension("bak");
-        let _ = storage::remove_file_durable(&bak);
+        // Backup + temp/revoked leftovers are part of the transaction (B1/B7).
+        self.remove_delegated_backup()?;
+        for leftover in
+            storage::delegated_temp_and_quarantine_variants(&self.paths.twitch_delegated)
+        {
+            storage::remove_file_durable(&leftover)?;
+        }
         self.durable_fail
             .fail(&self.durable_fail.parent_sync, "parent_sync")?;
+        storage::sync_parent_dir(&self.paths.twitch_delegated)?;
+        // Pending marker clears only when all inventoried authority-bearing files are gone.
+        if self.delegated_secret_variants().iter().any(|p| p.is_file()) {
+            anyhow::bail!("delegated authority-bearing artifacts remain after revoke");
+        }
         self.durable_fail.fail(
             &self.durable_fail.pending_marker_remove,
             "pending_marker_remove",

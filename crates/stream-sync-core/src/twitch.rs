@@ -29,6 +29,14 @@ use twitch_irc::{ClientConfig, SecureTCPTransport, TwitchIRCClient};
 
 type StreamSyncIrcClient = TwitchIRCClient<SecureTCPTransport, StaticLoginCredentials>;
 
+/// Provenance of platform credentials captured at selection time (B5).
+/// A Delegated capture must never be downgraded to an unfenced Local bypass.
+#[derive(Debug, Clone, Copy)]
+pub enum PlatformCredentialProvenance {
+    Local,
+    Delegated { snap: AuthorityLeaseSnapshot },
+}
+
 static BADGE_TTL: Duration = Duration::from_secs(300);
 static EMOTE_TTL: Duration = Duration::from_secs(300);
 struct CacheEntry<T> {
@@ -287,6 +295,48 @@ impl TwitchServices {
         *lease = AuthorityLease::inactive();
     }
 
+    /// Install a short revalidation-only lease for an inactive saved takeover session.
+    pub async fn install_inactive_maintenance_lease(&self, generation: DelegatedGeneration) {
+        self.install_pending_authority_lease(generation).await;
+    }
+
+    /// Capture credential provenance at selection time (before awaits that can race mode).
+    pub async fn capture_platform_provenance(
+        &self,
+        state: &AppState,
+    ) -> Result<PlatformCredentialProvenance> {
+        if !state.is_delegated_mode().await {
+            return Ok(PlatformCredentialProvenance::Local);
+        }
+        let snap = self.authority_lease_snapshot().await;
+        if snap.generation == 0 || !state.session_still_current(snap.generation).await {
+            return Err(anyhow!("Delegated authority expired or superseded"));
+        }
+        {
+            let lease = self.authority_lease.lock().await;
+            if !lease.owns_generation(snap.generation) || lease.deadline() != snap.deadline {
+                return Err(anyhow!("Delegated authority expired or superseded"));
+            }
+        }
+        Ok(PlatformCredentialProvenance::Delegated { snap })
+    }
+
+    /// Race using provenance captured at credential selection — never downgrades Delegated→Local.
+    pub async fn race_delegated_platform_with_provenance<T>(
+        &self,
+        state: &AppState,
+        provenance: PlatformCredentialProvenance,
+        network: impl std::future::Future<Output = T>,
+    ) -> Result<T> {
+        match provenance {
+            PlatformCredentialProvenance::Local => Ok(network.await),
+            PlatformCredentialProvenance::Delegated { snap } => {
+                self.race_delegated_platform_with_snapshot(state, snap, network)
+                    .await
+            }
+        }
+    }
+
     /// Synchronous delegated-authority guard for privileged platform operations.
     /// Local mode is allowed (no-op). Does not validate a captured in-flight snapshot.
     pub async fn ensure_delegated_authority(&self, state: &AppState) -> Result<()> {
@@ -409,28 +459,33 @@ pub async fn ensure_valid_token(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-async fn ensure_delegated_platform_authority(state: &AppState) -> Result<()> {
-    if !state.is_delegated_mode().await {
-        return Ok(());
-    }
-    let Some(services) = state.twitch_services() else {
-        return Err(anyhow!("Delegated authority unavailable"));
-    };
-    services.ensure_delegated_authority(state).await
-}
-
-/// Run a delegated platform HTTP future under the absolute lease; reject late/stale completions.
-async fn delegated_platform_http<T>(
+/// Run a delegated platform HTTP future under a provenance captured with the credentials.
+async fn delegated_platform_http_with_provenance<T>(
     state: &AppState,
+    provenance: PlatformCredentialProvenance,
     network: impl std::future::Future<Output = T>,
 ) -> Result<T> {
+    let Some(services) = state.twitch_services() else {
+        return match provenance {
+            PlatformCredentialProvenance::Local => Ok(network.await),
+            PlatformCredentialProvenance::Delegated { .. } => {
+                Err(anyhow!("Delegated authority unavailable"))
+            }
+        };
+    };
+    services
+        .race_delegated_platform_with_provenance(state, provenance, network)
+        .await
+}
+
+async fn capture_helix_provenance(state: &AppState) -> Result<PlatformCredentialProvenance> {
     let Some(services) = state.twitch_services() else {
         if state.is_delegated_mode().await {
             return Err(anyhow!("Delegated authority unavailable"));
         }
-        return Ok(network.await);
+        return Ok(PlatformCredentialProvenance::Local);
     };
-    services.race_delegated_platform(state, network).await
+    services.capture_platform_provenance(state).await
 }
 
 pub async fn validate_token(access_token: &str) -> Result<Value> {
@@ -450,7 +505,7 @@ pub async fn validate_token(access_token: &str) -> Result<Value> {
 
 pub async fn helix_get(state: &AppState, path: &str) -> Result<Value> {
     ensure_valid_token(state).await?;
-    ensure_delegated_platform_authority(state).await?;
+    let provenance = capture_helix_provenance(state).await?;
     let client_id = state.helix_client_id().await;
     if client_id.is_empty() {
         return Err(anyhow!("TWITCH_CLIENT_ID not configured."));
@@ -464,7 +519,7 @@ pub async fn helix_get(state: &AppState, path: &str) -> Result<Value> {
         .clone()
         .unwrap_or_default();
     let url = format!("https://api.twitch.tv/helix{path}");
-    delegated_platform_http(state, async {
+    delegated_platform_http_with_provenance(state, provenance, async {
         let res = reqwest::Client::new()
             .get(&url)
             .header("Client-Id", &client_id)
@@ -483,7 +538,7 @@ pub async fn helix_get(state: &AppState, path: &str) -> Result<Value> {
 
 pub async fn helix_patch(state: &AppState, path: &str, body: Value) -> Result<Value> {
     ensure_valid_token(state).await?;
-    ensure_delegated_platform_authority(state).await?;
+    let provenance = capture_helix_provenance(state).await?;
     let client_id = state.helix_client_id().await;
     let token = state
         .twitch
@@ -493,7 +548,7 @@ pub async fn helix_patch(state: &AppState, path: &str, body: Value) -> Result<Va
         .access_token
         .clone()
         .unwrap();
-    delegated_platform_http(state, async {
+    delegated_platform_http_with_provenance(state, provenance, async {
         let res = reqwest::Client::new()
             .patch(format!("https://api.twitch.tv/helix{path}"))
             .header("Client-Id", &client_id)
@@ -514,7 +569,7 @@ pub async fn helix_patch(state: &AppState, path: &str, body: Value) -> Result<Va
 
 pub async fn helix_post(state: &AppState, path: &str, body: Value) -> Result<Value> {
     ensure_valid_token(state).await?;
-    ensure_delegated_platform_authority(state).await?;
+    let provenance = capture_helix_provenance(state).await?;
     let client_id = state.helix_client_id().await;
     let token = state
         .twitch
@@ -524,7 +579,7 @@ pub async fn helix_post(state: &AppState, path: &str, body: Value) -> Result<Val
         .access_token
         .clone()
         .unwrap();
-    delegated_platform_http(state, async {
+    delegated_platform_http_with_provenance(state, provenance, async {
         let res = reqwest::Client::new()
             .post(format!("https://api.twitch.tv/helix{path}"))
             .header("Client-Id", &client_id)
@@ -885,12 +940,11 @@ pub async fn apply_set_token(
                 .collect()
         }),
     };
-    // Durable commit before live publish (B8).
+    // Durable commit before live publish; restore personal token file if mode commit fails (B2).
     {
         let _lifecycle = services.lifecycle_lock.lock().await;
         let previous_personal = state.personal_tokens.read().await.clone();
         let previous_mode = *state.active_mode.read().await;
-        let previous_live = state.twitch.read().await.tokens.clone();
         *state.personal_tokens.write().await = tokens.clone();
         if let Err(e) = state.save_twitch_tokens().await {
             *state.personal_tokens.write().await = previous_personal;
@@ -899,16 +953,30 @@ pub async fn apply_set_token(
         *state.active_mode.write().await = TwitchActiveMode::Local;
         if let Err(e) = state.save_active_mode().await {
             *state.active_mode.write().await = previous_mode;
-            *state.personal_tokens.write().await = previous_personal;
+            *state.personal_tokens.write().await = previous_personal.clone();
+            if let Err(rollback_err) = state.save_twitch_tokens().await {
+                let _ = crate::storage::write_identity_rollback_pending(
+                    &state.paths.twitch_tokens.with_extension("rollback-pending"),
+                );
+                return Err(anyhow!(
+                    "active mode save failed ({e:#}); personal token rollback also failed ({rollback_err:#})"
+                ));
+            }
             return Err(e);
         }
         if previous_mode == TwitchActiveMode::Delegated {
-            services.clear_authority_lease().await;
+            let generation = state.current_delegated_generation();
+            stop_delegated_worker_handles(&services.refresh_handle, &services.watch_handle, None)
+                .await;
+            if generation > 0 {
+                services
+                    .install_inactive_maintenance_lease(generation)
+                    .await;
+            }
         }
         let mut tw = state.twitch.write().await;
         clear_live_runtime_fields(&mut tw);
         tw.tokens = tokens;
-        let _ = previous_live;
     }
     restart_twitch_clients(state.clone(), services.clone()).await;
     ensure_delegated_refresh_loop(state, services).await;
@@ -940,7 +1008,19 @@ pub async fn use_connection(
                     return Err(e);
                 }
                 if previous_mode == TwitchActiveMode::Delegated {
-                    services.clear_authority_lease().await;
+                    // Keep saved takeover; switch to inactive maintenance lease (B4).
+                    let generation = state.current_delegated_generation();
+                    stop_delegated_worker_handles(
+                        &services.refresh_handle,
+                        &services.watch_handle,
+                        None,
+                    )
+                    .await;
+                    if generation > 0 {
+                        services
+                            .install_inactive_maintenance_lease(generation)
+                            .await;
+                    }
                 }
                 let mut tw = state.twitch.write().await;
                 clear_live_runtime_fields(&mut tw);
@@ -1034,19 +1114,28 @@ async fn disconnect_twitch_inner(
         }
         TwitchActiveMode::Local => {
             {
+                let previous = state.personal_tokens.read().await.clone();
                 *state.personal_tokens.write().await = TwitchTokenFile::default();
+                if let Err(e) = state.save_twitch_tokens().await {
+                    *state.personal_tokens.write().await = previous;
+                    return Err(e);
+                }
             }
-            state.save_twitch_tokens().await?;
             let has_delegated = state.delegated.read().await.is_some();
             if has_delegated {
                 let session = state.delegated.read().await.clone().unwrap();
                 {
+                    let previous_mode = *state.active_mode.read().await;
                     let mut tw = state.twitch.write().await;
                     clear_live_runtime_fields(&mut tw);
                     tw.tokens = tokens_from_delegated_session(&session);
                     *state.active_mode.write().await = TwitchActiveMode::Delegated;
+                    drop(tw);
+                    if let Err(e) = state.save_active_mode().await {
+                        *state.active_mode.write().await = previous_mode;
+                        return Err(e);
+                    }
                 }
-                state.save_active_mode().await?;
                 restart_twitch_clients(state.clone(), services.clone()).await;
                 ensure_delegated_refresh_loop(state.clone(), services).await;
                 crate::kick::sync_live_identity(state).await;
@@ -1079,8 +1168,12 @@ pub async fn remove_connection(
     let _lifecycle = services.lifecycle_lock.lock().await;
     match mode {
         TwitchActiveMode::Local => {
+            let previous = state.personal_tokens.read().await.clone();
             *state.personal_tokens.write().await = TwitchTokenFile::default();
-            state.save_twitch_tokens().await?;
+            if let Err(e) = state.save_twitch_tokens().await {
+                *state.personal_tokens.write().await = previous;
+                return Err(e);
+            }
         }
         TwitchActiveMode::Delegated => {
             let generation = state
@@ -1195,7 +1288,7 @@ fn disk_active_mode_is_delegated(state: &AppState) -> bool {
 }
 
 fn durable_revoke_still_needed(state: &AppState) -> bool {
-    state.paths.twitch_delegated.is_file() || state.paths.twitch_delegated_revoke_pending.is_file()
+    state.delegated_authority_artifacts_remain()
 }
 
 /// Strip in-memory delegated authority for `generation` and stop platform/delegated workers.
@@ -1233,14 +1326,25 @@ async fn strip_in_memory_delegated_authority(
     stop_twitch_clients(services).await;
 }
 
-/// Absolute-lease fail-closed: clear memory first, then signal durable teardown (with retry).
+/// Absolute-lease fail-closed for *active* delegated mode.
+/// When Local with a saved takeover session, reinstalls inactive maintenance lease and does
+/// **not** revoke/delete the saved connection (identity switch ≠ revocation).
 async fn fail_closed_lease_expired(
     state: Arc<AppState>,
     services: Arc<TwitchServices>,
     generation: DelegatedGeneration,
 ) {
+    if !state.is_delegated_mode().await {
+        if state.session_still_current(generation).await {
+            services
+                .install_inactive_maintenance_lease(generation)
+                .await;
+        }
+        return;
+    }
     {
         let _lifecycle = services.lifecycle_lock.lock().await;
+        // Invalidate live lease before durable I/O so fan-out cannot pass validation mid-revoke.
         strip_in_memory_delegated_authority(&state, &services, generation).await;
     }
     match services
@@ -2556,7 +2660,7 @@ fn emotes_from_message_text(
 }
 
 async fn send_plain_chat(state: &AppState, services: &TwitchServices, trimmed: &str) -> Result<()> {
-    services.ensure_delegated_authority(state).await?;
+    let provenance = services.capture_platform_provenance(state).await?;
     let channel = state
         .twitch
         .read()
@@ -2566,7 +2670,7 @@ async fn send_plain_chat(state: &AppState, services: &TwitchServices, trimmed: &
         .ok_or_else(|| anyhow!("No Twitch channel joined"))?;
     let client = irc_client_ready(services).await?;
     services
-        .race_delegated_platform(state, async {
+        .race_delegated_platform_with_provenance(state, provenance, async {
             client
                 .say(channel.clone(), trimmed.to_string())
                 .await
@@ -2579,7 +2683,7 @@ async fn send_plain_chat(state: &AppState, services: &TwitchServices, trimmed: &
 }
 
 async fn send_dock_privmsg(state: &AppState, services: &TwitchServices, text: &str) -> Result<()> {
-    services.ensure_delegated_authority(state).await?;
+    let provenance = services.capture_platform_provenance(state).await?;
     let channel = state
         .twitch
         .read()
@@ -2589,7 +2693,7 @@ async fn send_dock_privmsg(state: &AppState, services: &TwitchServices, text: &s
         .ok_or_else(|| anyhow!("No Twitch channel joined"))?;
     let client = irc_client_ready(services).await?;
     services
-        .race_delegated_platform(state, async {
+        .race_delegated_platform_with_provenance(state, provenance, async {
             client
                 .privmsg(channel.clone(), text.to_string())
                 .await
@@ -4100,5 +4204,56 @@ mod tests {
         let mut lease = AuthorityLease::inactive();
         lease.install_validated_generation(1, None);
         assert!(lease.sleep_budget(Duration::from_secs(10_000)) <= MAX_DELEGATED_REVOCATION_DELAY);
+    }
+
+    #[tokio::test]
+    async fn local_switch_preserves_saved_delegated_credential() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let (state, services) = phase2_app().await;
+        install_delegated_session(&state, &services).await;
+        *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        state.save_active_mode().await.unwrap();
+        services.install_validated_authority_lease(1, None).await;
+        *state.personal_tokens.write().await = sample_personal();
+        state.save_twitch_tokens().await.unwrap();
+        state.save_delegated().await.unwrap();
+
+        use_connection(state.clone(), services.clone(), TwitchActiveMode::Local)
+            .await
+            .expect("switch local");
+        // Simulate lease expiry while Local — must not delete saved takeover.
+        fail_closed_lease_expired(state.clone(), services.clone(), 1).await;
+        assert!(state.paths.twitch_delegated.is_file());
+        assert!(state.delegated.read().await.is_some());
+        assert_eq!(*state.active_mode.read().await, TwitchActiveMode::Local);
+        // No platform actions while Local: helix provenance is Local.
+        let prov = services.capture_platform_provenance(&state).await.unwrap();
+        assert!(matches!(prov, PlatformCredentialProvenance::Local));
+    }
+
+    #[tokio::test]
+    async fn provenance_rejects_stale_delegated_after_local_switch() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let (state, services) = phase2_app().await;
+        install_delegated_session(&state, &services).await;
+        *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        services.install_validated_authority_lease(1, None).await;
+        let provenance = services.capture_platform_provenance(&state).await.unwrap();
+        assert!(matches!(
+            provenance,
+            PlatformCredentialProvenance::Delegated { .. }
+        ));
+        *state.personal_tokens.write().await = sample_personal();
+        state.save_twitch_tokens().await.unwrap();
+        use_connection(state.clone(), services.clone(), TwitchActiveMode::Local)
+            .await
+            .unwrap();
+        let err = services
+            .race_delegated_platform_with_provenance(&state, provenance, async { "stale" })
+            .await;
+        assert!(
+            err.is_err(),
+            "captured delegated provenance must stay fenced: {err:?}"
+        );
     }
 }

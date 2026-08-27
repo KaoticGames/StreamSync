@@ -428,7 +428,7 @@ fn write_file_atomic_inner(target: &Path, data: &[u8], secret: bool) -> Result<(
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
         if secret {
-            apply_secret_dir_permissions(parent);
+            apply_secret_dir_permissions(parent)?;
         }
     }
     let tmp = target.with_extension(format!(
@@ -438,6 +438,10 @@ fn write_file_atomic_inner(target: &Path, data: &[u8], secret: bool) -> Result<(
     ));
     let write_result = (|| -> Result<()> {
         let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        // Restrict permissions at creation, before writing secret bytes.
+        if secret {
+            apply_secret_file_permissions(&tmp)?;
+        }
         f.write_all(data)?;
         f.sync_all()?;
         Ok(())
@@ -447,10 +451,6 @@ fn write_file_atomic_inner(target: &Path, data: &[u8], secret: bool) -> Result<(
         return Err(error);
     }
     if secret {
-        if let Err(error) = apply_secret_file_permissions(&tmp) {
-            let _ = fs::remove_file(&tmp);
-            return Err(error);
-        }
         // Never leave a reusable previous secret on disk.
         let bak = target.with_extension("bak");
         let _ = fs::remove_file(&bak);
@@ -485,17 +485,27 @@ fn write_file_atomic_inner(target: &Path, data: &[u8], secret: bool) -> Result<(
     }
 }
 
-fn apply_secret_dir_permissions(dir: &Path) {
+fn apply_secret_dir_permissions(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        let meta = fs::metadata(dir)?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "secret directory permissions too broad after write: {:o} ({})",
+                mode,
+                dir.display()
+            );
+        }
     }
     #[cfg(windows)]
     {
         let _ = dir;
-        // Best-effort: Windows ACL tightening is applied on the secret file itself.
+        // Directory ACL tightening is applied on the secret file itself via icacls.
     }
+    Ok(())
 }
 
 fn apply_secret_file_permissions(path: &Path) -> Result<()> {
@@ -518,15 +528,65 @@ fn apply_secret_file_permissions(path: &Path) -> Result<()> {
         // Restrict to the current user via icacls (no world/Everyone read).
         let path_str = path.to_string_lossy().to_string();
         let user = std::env::var("USERNAME").unwrap_or_else(|_| "Administrators".into());
-        let _ = std::process::Command::new("icacls")
+        let inherit = std::process::Command::new("icacls")
             .args([&path_str, "/inheritance:r"])
-            .output();
+            .output()
+            .map_err(|e| anyhow::anyhow!("icacls inheritance failed: {e}"))?;
+        if !inherit.status.success() {
+            anyhow::bail!(
+                "icacls inheritance failed for {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&inherit.stderr)
+            );
+        }
         let grant = format!("{user}:F");
-        let _ = std::process::Command::new("icacls")
+        let grant_out = std::process::Command::new("icacls")
             .args([&path_str, "/grant:r", &grant])
-            .output();
+            .output()
+            .map_err(|e| anyhow::anyhow!("icacls grant failed: {e}"))?;
+        if !grant_out.status.success() {
+            anyhow::bail!(
+                "icacls grant failed for {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&grant_out.stderr)
+            );
+        }
     }
     Ok(())
+}
+
+/// Bounded inventory: primary delegated secret + legacy `.bak`.
+pub fn delegated_secret_variants(delegated_path: &Path) -> Vec<PathBuf> {
+    let mut out = vec![
+        delegated_path.to_path_buf(),
+        delegated_path.with_extension("bak"),
+    ];
+    out.extend(delegated_temp_and_quarantine_variants(delegated_path));
+    out
+}
+
+/// Bounded prefix scan for `twitch-delegated.tmp-*` / `twitch-delegated.revoked-*` only.
+pub fn delegated_temp_and_quarantine_variants(delegated_path: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Some(parent) = delegated_path.parent() else {
+        return out;
+    };
+    let Some(stem) = delegated_path.file_stem().and_then(|s| s.to_str()) else {
+        return out;
+    };
+    let tmp_prefix = format!("{stem}.tmp-");
+    let revoked_prefix = format!("{stem}.revoked-");
+    let Ok(entries) = fs::read_dir(parent) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&tmp_prefix) || name.starts_with(&revoked_prefix) {
+            out.push(entry.path());
+        }
+    }
+    out
 }
 
 /// Repair overly broad permissions on an existing secret file (Unix).
@@ -628,7 +688,9 @@ pub fn write_delegated_revoked_tombstone(path: &Path) -> Result<()> {
     let payload = serde_json::json!({
         "revoked_at": chrono::Utc::now().to_rfc3339(),
     });
-    write_file_atomic(path, serde_json::to_string(&payload)?.as_bytes())
+    // Marker files must not use bak-rotation: `twitch-delegated.revoked` + `.bak` would
+    // collide with the authority-bearing `twitch-delegated.bak` secret variant.
+    write_marker_file(path, serde_json::to_string(&payload)?.as_bytes())
 }
 
 /// Crash-persistent marker that durable delegated revoke is still incomplete.
@@ -636,7 +698,53 @@ pub fn write_delegated_revoke_pending(path: &Path) -> Result<()> {
     let payload = serde_json::json!({
         "pending_at": chrono::Utc::now().to_rfc3339(),
     });
-    write_file_atomic(path, serde_json::to_string(&payload)?.as_bytes())
+    write_marker_file(path, serde_json::to_string(&payload)?.as_bytes())
+}
+
+/// Fail-closed marker when a multi-file identity rollback could not restore disk coherence.
+pub fn write_identity_rollback_pending(path: &Path) -> Result<()> {
+    let payload = serde_json::json!({
+        "pending_at": chrono::Utc::now().to_rfc3339(),
+        "reason": "identity_rollback_incomplete",
+    });
+    write_marker_file(path, serde_json::to_string(&payload)?.as_bytes())
+}
+
+/// Atomic marker write without `.bak` rotation (avoids colliding with secret backups).
+fn write_marker_file(target: &Path, data: &[u8]) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("marker");
+    let tmp = target.with_file_name(format!(
+        "{file_name}.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let write_result = (|| -> Result<()> {
+        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if target.exists() {
+        let _ = fs::remove_file(target);
+    }
+    match fs::rename(&tmp, target) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fs::copy(&tmp, target)?;
+            let _ = fs::remove_file(&tmp);
+            Ok(())
+        }
+    }
 }
 
 /// Simple `dirs` helper without extra crate — home via USERPROFILE/HOME.
