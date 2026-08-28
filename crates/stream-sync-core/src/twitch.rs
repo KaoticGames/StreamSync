@@ -18,6 +18,8 @@ use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -1986,14 +1988,49 @@ async fn ensure_delegated_refresh_loop(state: Arc<AppState>, services: Arc<Twitc
 static REFRESH_COMMIT_GATE: OnceLock<Mutex<Option<RefreshCommitGateState>>> = OnceLock::new();
 
 #[cfg(test)]
+static REFRESH_LIVE_GATE: OnceLock<Mutex<Option<RefreshCommitGateState>>> = OnceLock::new();
+
+#[cfg(test)]
+static REFRESH_BYPASS_SLEEP: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn set_refresh_bypass_sleep(enabled: bool) {
+    REFRESH_BYPASS_SLEEP.store(enabled, Ordering::SeqCst);
+}
+
+#[cfg(test)]
 struct RefreshCommitGateState {
     arrived: oneshot::Sender<()>,
     resume: oneshot::Receiver<()>,
 }
 
+#[cfg(test)]
+pub(crate) struct RefreshGateCleanup;
+
+#[cfg(test)]
+impl Drop for RefreshGateCleanup {
+    fn drop(&mut self) {
+        if let Some(slot) = REFRESH_COMMIT_GATE.get() {
+            if let Ok(mut guard) = slot.try_lock() {
+                *guard = None;
+            }
+        }
+        if let Some(slot) = REFRESH_LIVE_GATE.get() {
+            if let Ok(mut guard) = slot.try_lock() {
+                *guard = None;
+            }
+        }
+        REFRESH_BYPASS_SLEEP.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Pause delegated refresh immediately before durable commit (deterministic race tests).
 #[cfg(test)]
-pub(crate) async fn install_refresh_commit_gate() -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+pub(crate) async fn install_refresh_commit_gate() -> (
+    RefreshGateCleanup,
+    oneshot::Receiver<()>,
+    oneshot::Sender<()>,
+) {
     let (arrived_tx, arrived_rx) = oneshot::channel();
     let (resume_tx, resume_rx) = oneshot::channel();
     let slot = REFRESH_COMMIT_GATE.get_or_init(|| Mutex::new(None));
@@ -2001,19 +2038,29 @@ pub(crate) async fn install_refresh_commit_gate() -> (oneshot::Receiver<()>, one
         arrived: arrived_tx,
         resume: resume_rx,
     });
-    (arrived_rx, resume_tx)
+    (RefreshGateCleanup, arrived_rx, resume_tx)
+}
+
+/// Pause delegated refresh immediately before live Twitch/Kick publication.
+#[cfg(test)]
+pub(crate) async fn install_refresh_live_gate() -> (
+    RefreshGateCleanup,
+    oneshot::Receiver<()>,
+    oneshot::Sender<()>,
+) {
+    let (arrived_tx, arrived_rx) = oneshot::channel();
+    let (resume_tx, resume_rx) = oneshot::channel();
+    let slot = REFRESH_LIVE_GATE.get_or_init(|| Mutex::new(None));
+    *slot.lock().await = Some(RefreshCommitGateState {
+        arrived: arrived_tx,
+        resume: resume_rx,
+    });
+    (RefreshGateCleanup, arrived_rx, resume_tx)
 }
 
 #[cfg(test)]
-pub(crate) async fn clear_refresh_commit_gate() {
-    if let Some(slot) = REFRESH_COMMIT_GATE.get() {
-        *slot.lock().await = None;
-    }
-}
-
-#[cfg(test)]
-async fn refresh_commit_gate_pause_if_installed() {
-    let Some(slot) = REFRESH_COMMIT_GATE.get() else {
+async fn pause_refresh_gate(slot: Option<&Mutex<Option<RefreshCommitGateState>>>) {
+    let Some(slot) = slot else {
         return;
     };
     let mut guard = slot.lock().await;
@@ -2024,8 +2071,33 @@ async fn refresh_commit_gate_pause_if_installed() {
     let _ = gate.resume.await;
 }
 
+#[cfg(test)]
+async fn refresh_commit_gate_pause_if_installed() {
+    pause_refresh_gate(REFRESH_COMMIT_GATE.get()).await;
+}
+
+#[cfg(test)]
+async fn refresh_live_gate_pause_if_installed() {
+    pause_refresh_gate(REFRESH_LIVE_GATE.get()).await;
+}
+
 #[cfg(not(test))]
 async fn refresh_commit_gate_pause_if_installed() {}
+
+#[cfg(not(test))]
+async fn refresh_live_gate_pause_if_installed() {}
+
+#[cfg(test)]
+async fn delegated_refresh_sleep(duration: Duration) {
+    if !REFRESH_BYPASS_SLEEP.load(Ordering::SeqCst) {
+        tokio::time::sleep(duration).await;
+    }
+}
+
+#[cfg(not(test))]
+async fn delegated_refresh_sleep(duration: Duration) {
+    tokio::time::sleep(duration).await;
+}
 
 async fn delegated_refresh_may_commit(
     state: &AppState,
@@ -2049,6 +2121,74 @@ async fn delegated_refresh_may_commit(
     }
     let lease = services.read_authority_lease().await;
     lease.allows_syndicate_revalidation(generation)
+}
+
+async fn delegated_refresh_live_may_publish(
+    state: &AppState,
+    services: &TwitchServices,
+    generation: DelegatedGeneration,
+) -> bool {
+    if !state.is_delegated_mode().await {
+        return false;
+    }
+    if state.current_delegated_generation() != generation {
+        return false;
+    }
+    if !state.session_still_current(generation).await {
+        return false;
+    }
+    if services.authority_lease_expired().await {
+        return false;
+    }
+    let lease = services.read_authority_lease().await;
+    lease.allows_platform_operations(generation)
+}
+
+/// Publish refreshed Twitch/Kick live state only when `generation` remains current.
+async fn publish_delegated_refresh_live_if_current(
+    state: Arc<AppState>,
+    services: Arc<TwitchServices>,
+    generation: DelegatedGeneration,
+    exchange: &syndicate_connection::ExchangeSuccess,
+    channel_login: &str,
+) {
+    let should_restart_twitch = {
+        let _lifecycle = services.lifecycle_lock.lock().await;
+        if !delegated_refresh_live_may_publish(&state, &services, generation).await {
+            false
+        } else {
+            {
+                let mut tw = state.twitch.write().await;
+                tw.tokens = install_tokens_from_exchange(exchange);
+            }
+            info!("delegated Twitch token refreshed for {}", channel_login);
+            stop_twitch_clients(&services).await;
+            delegated_refresh_live_may_publish(&state, &services, generation).await
+        }
+    };
+
+    if should_restart_twitch {
+        {
+            let _lifecycle = services.lifecycle_lock.lock().await;
+            if !delegated_refresh_live_may_publish(&state, &services, generation).await {
+                crate::kick::sync_live_identity_for_generation(state.clone(), generation).await;
+                return;
+            }
+        }
+        if let Err(e) = start_irc(state.clone(), services.clone()).await {
+            warn!("IRC start failed: {e}");
+        }
+        if let Err(e) = start_eventsub(state.clone(), services.clone()).await {
+            warn!("EventSub start failed: {e}");
+        }
+    } else if state.session_still_current(generation).await {
+        info!(
+            "delegated Twitch token refreshed (inactive) for {}",
+            channel_login
+        );
+    }
+
+    crate::kick::sync_live_identity_for_generation(state, generation).await;
 }
 
 /// Commit a successful delegated refresh under lifecycle lock.
@@ -2094,28 +2234,19 @@ async fn apply_delegated_refresh_commit(
         fail_closed_lease_expired(state.clone(), services.clone(), generation).await;
         return Ok(false);
     }
+    drop(_lifecycle);
 
-    let active_delegated = state.is_delegated_mode().await;
-    if active_delegated && state.session_still_current(generation).await {
-        {
-            let mut tw = state.twitch.write().await;
-            tw.tokens = install_tokens_from_exchange(exchange);
-        }
-        info!(
-            "delegated Twitch token refreshed for {}",
-            merged.channel_login
-        );
-        drop(_lifecycle);
-        restart_twitch_clients(state.clone(), services.clone()).await;
-    } else {
-        info!(
-            "delegated Twitch token refreshed (inactive) for {}",
-            merged.channel_login
-        );
-    }
-    if state.session_still_current(generation).await {
-        crate::kick::sync_live_identity(state.clone()).await;
-    }
+    refresh_live_gate_pause_if_installed().await;
+
+    publish_delegated_refresh_live_if_current(
+        state.clone(),
+        services.clone(),
+        generation,
+        exchange,
+        &merged.channel_login,
+    )
+    .await;
+
     Ok(true)
 }
 
@@ -2173,7 +2304,7 @@ async fn start_delegated_refresh_loop(
                 fail_closed_lease_expired(state2.clone(), services2.clone(), generation).await;
                 break;
             }
-            tokio::time::sleep(sleep_for).await;
+            delegated_refresh_sleep(sleep_for).await;
 
             // Absolute lease: recheck generation + expiry after every sleep before network.
             if !state2.session_still_current(generation).await {
@@ -5007,11 +5138,96 @@ mod tests {
                 login: "takeover_chan".into(),
                 display_name: None,
             },
-            kick: None,
+            kick: Some(syndicate_connection::ExchangeKick {
+                kick_id: Some("k2".into()),
+                login: Some("kick_winner".into()),
+                access_token: Some("gen2-kick".into()),
+                refresh_token: None,
+                expires_at: None,
+                scopes: vec![],
+                error: None,
+            }),
             connection: syndicate_connection::ExchangeConnection {
                 label: None,
                 expires_at: Some("2099-06-01T00:00:00Z".into()),
             },
+        }
+    }
+
+    const GATE_WAIT: Duration = Duration::from_secs(5);
+
+    async fn gate_wait(rx: oneshot::Receiver<()>, label: &str) {
+        tokio::time::timeout(GATE_WAIT, rx)
+            .await
+            .unwrap_or_else(|_| panic!("timeout waiting for {label}"))
+            .expect(label);
+    }
+
+    async fn task_join_with_timeout<T>(task: tokio::task::JoinHandle<T>, label: &str) -> T {
+        tokio::time::timeout(GATE_WAIT, task)
+            .await
+            .unwrap_or_else(|_| panic!("timeout joining {label}"))
+            .expect(label)
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PlatformWorkerSnapshot {
+        irc: Option<tokio::task::Id>,
+        eventsub: Option<tokio::task::Id>,
+        refresh_generation: Option<u64>,
+        watch_generation: Option<u64>,
+        kick_feed: Option<tokio::task::Id>,
+    }
+
+    async fn platform_worker_snapshot(
+        state: &AppState,
+        services: &TwitchServices,
+    ) -> PlatformWorkerSnapshot {
+        PlatformWorkerSnapshot {
+            irc: services.irc_handle.read().await.as_ref().map(|h| h.id()),
+            eventsub: services
+                .eventsub_handle
+                .read()
+                .await
+                .as_ref()
+                .map(|h| h.id()),
+            refresh_generation: services
+                .refresh_handle
+                .read()
+                .await
+                .as_ref()
+                .map(|t| t.generation),
+            watch_generation: services
+                .watch_handle
+                .read()
+                .await
+                .as_ref()
+                .map(|t| t.generation),
+            kick_feed: state.kick_feed_handle.read().await.as_ref().map(|h| h.id()),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct LiveIdentitySnapshot {
+        mode: TwitchActiveMode,
+        twitch_tokens: TwitchTokenFile,
+        kick_tokens: crate::config_types::KickTokenFile,
+        kick_connected: bool,
+        lease: AuthorityLeaseSnapshot,
+        delegated: Option<DelegatedSessionFile>,
+    }
+
+    async fn live_identity_snapshot(
+        state: &AppState,
+        services: &TwitchServices,
+    ) -> LiveIdentitySnapshot {
+        LiveIdentitySnapshot {
+            mode: *state.active_mode.read().await,
+            twitch_tokens: state.twitch.read().await.tokens.clone(),
+            kick_tokens: state.kick.read().await.tokens.clone(),
+            kick_connected: state.kick.read().await.connected,
+            lease: services.authority_lease_snapshot_public().await,
+            delegated: state.delegated.read().await.clone(),
         }
     }
 
@@ -5067,6 +5283,7 @@ mod tests {
         session.generation = generation;
         session.access_token = access_token.into();
         session.connection_key = format!("ssk_phase2_replacement_{generation}");
+        session.kick_access_token = Some(format!("{access_token}-kick"));
         state.persist_delegated_session(&session).unwrap();
         state.publish_delegated_generation(generation);
         services
@@ -5082,14 +5299,77 @@ mod tests {
         state.save_active_mode().await.unwrap();
         {
             let mut tw = state.twitch.write().await;
-            tw.tokens.access_token = Some(access_token.into());
+            tw.tokens = TwitchTokenFile {
+                access_token: Some(access_token.into()),
+                login: Some("takeover_chan".into()),
+                user_id: Some("999".into()),
+                ..Default::default()
+            };
         }
+        {
+            let mut k = state.kick.write().await;
+            k.tokens.access_token = Some(format!("{access_token}-kick"));
+            k.tokens.kick_id = Some("k2".into());
+            k.connected = true;
+        }
+    }
+
+    async fn install_winner_platform_workers(
+        state: &AppState,
+        services: &TwitchServices,
+        generation: u64,
+    ) -> PlatformWorkerSnapshot {
+        let forever = || {
+            tokio::spawn(async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+            })
+        };
+        *services.irc_handle.write().await = Some(forever());
+        *services.eventsub_handle.write().await = Some(forever());
+        *state.kick_feed_handle.write().await = Some(forever());
+        *services.refresh_handle.write().await = Some(GenerationTask {
+            generation,
+            handle: forever(),
+        });
+        *services.watch_handle.write().await = Some(GenerationTask {
+            generation,
+            handle: forever(),
+        });
+        platform_worker_snapshot(state, services).await
+    }
+
+    async fn assert_live_identity_eq(
+        state: &AppState,
+        services: &TwitchServices,
+        expected: &LiveIdentitySnapshot,
+    ) {
+        let actual = live_identity_snapshot(state, services).await;
+        assert_eq!(actual.mode, expected.mode);
+        assert_eq!(
+            actual.twitch_tokens.access_token,
+            expected.twitch_tokens.access_token
+        );
+        assert_eq!(
+            actual.kick_tokens.access_token,
+            expected.kick_tokens.access_token
+        );
+        assert_eq!(actual.kick_connected, expected.kick_connected);
+        assert_eq!(actual.lease, expected.lease);
+        assert_eq!(
+            actual.delegated.as_ref().map(|s| s.generation),
+            expected.delegated.as_ref().map(|s| s.generation)
+        );
+        assert_eq!(
+            actual.delegated.as_ref().map(|s| s.access_token.as_str()),
+            expected.delegated.as_ref().map(|s| s.access_token.as_str())
+        );
     }
 
     async fn refresh_stale_after_replacement_once() {
         let (state, services) = phase2_app().await;
         activate_delegated_gen1(&state, &services).await;
-        let irc_before = services.irc_handle.read().await.as_ref().map(|h| h.id());
 
         let exchange = stale_refresh_exchange("stale-refresh-token");
         let merged = crate::kick::merge_delegated_session_from_exchange(
@@ -5105,7 +5385,7 @@ mod tests {
             .connection_key
             .clone();
 
-        let (arrived_rx, resume_tx) = super::install_refresh_commit_gate().await;
+        let (_gate, arrived_rx, resume_tx) = super::install_refresh_commit_gate().await;
         let state2 = state.clone();
         let services2 = services.clone();
         let exchange2 = exchange.clone();
@@ -5114,37 +5394,44 @@ mod tests {
                 .await
         });
 
-        arrived_rx.await.expect("refresh must pause before commit");
+        gate_wait(arrived_rx, "refresh must pause before commit").await;
         commit_replacement_generation(&state, &services, 2, "gen2-token").await;
+        let winner_identity = live_identity_snapshot(&state, &services).await;
+        let winner_workers = install_winner_platform_workers(&state, &services, 2).await;
         resume_tx.send(()).expect("release stale refresh");
-        let committed = commit_task.await.expect("join").expect("commit result");
+        let committed = task_join_with_timeout(commit_task, "stale refresh commit")
+            .await
+            .expect("commit result");
         assert!(!committed, "stale refresh must not commit");
 
         let disk = read_delegated_disk(&state).expect("gen2 primary on disk");
         assert_eq!(disk.generation, 2);
         assert_eq!(disk.access_token, "gen2-token");
-
-        let memory = state.delegated.read().await.clone().unwrap();
-        assert_eq!(memory.generation, 2);
-        assert_eq!(memory.access_token, "gen2-token");
+        assert_live_identity_eq(&state, &services, &winner_identity).await;
         assert_eq!(
-            state.twitch.read().await.tokens.access_token.as_deref(),
-            Some("gen2-token")
-        );
-        let lease = services.authority_lease_snapshot_public().await;
-        assert_eq!(lease.generation, 2);
-        assert_eq!(
-            services.irc_handle.read().await.as_ref().map(|h| h.id()),
-            irc_before,
-            "stale refresh must not restart workers"
+            platform_worker_snapshot(&state, &services).await,
+            winner_workers
         );
 
         let restarted = restart_state_at(&state);
-        let disk_after = read_delegated_disk(&restarted).expect("gen2 survives restart");
-        assert_eq!(disk_after.generation, 2);
-        assert_eq!(disk_after.access_token, "gen2-token");
-
-        super::clear_refresh_commit_gate().await;
+        let restarted_identity = live_identity_snapshot(&restarted, &services).await;
+        assert_eq!(restarted_identity.mode, TwitchActiveMode::Delegated);
+        assert_eq!(
+            restarted_identity.twitch_tokens.access_token.as_deref(),
+            Some("gen2-token")
+        );
+        assert_eq!(
+            restarted_identity.delegated.as_ref().map(|s| s.generation),
+            Some(2)
+        );
+        assert_eq!(
+            restarted_identity
+                .delegated
+                .as_ref()
+                .map(|s| s.access_token.as_str()),
+            Some("gen2-token")
+        );
+        assert_eq!(restarted_identity.lease.generation, 2);
     }
 
     #[tokio::test]
@@ -5158,7 +5445,7 @@ mod tests {
     async fn refresh_stale_after_revocation_once() {
         let (state, services) = phase2_app().await;
         activate_delegated_gen1(&state, &services).await;
-        let irc_before = services.irc_handle.read().await.as_ref().map(|h| h.id());
+        let workers_before = platform_worker_snapshot(&state, &services).await;
 
         let exchange = stale_refresh_exchange("stale-refresh-token");
         let merged = crate::kick::merge_delegated_session_from_exchange(
@@ -5174,7 +5461,7 @@ mod tests {
             .connection_key
             .clone();
 
-        let (arrived_rx, resume_tx) = super::install_refresh_commit_gate().await;
+        let (_gate, arrived_rx, resume_tx) = super::install_refresh_commit_gate().await;
         let state2 = state.clone();
         let services2 = services.clone();
         let exchange2 = exchange.clone();
@@ -5183,12 +5470,14 @@ mod tests {
                 .await
         });
 
-        arrived_rx.await.expect("refresh must pause before commit");
+        gate_wait(arrived_rx, "refresh must pause before commit").await;
         remove_delegated_session(&state, &services, None, 1)
             .await
             .expect("revoke");
         resume_tx.send(()).expect("release stale refresh");
-        let committed = commit_task.await.expect("join").expect("commit result");
+        let committed = task_join_with_timeout(commit_task, "stale refresh commit")
+            .await
+            .expect("commit result");
         assert!(!committed, "stale refresh must not commit after revocation");
 
         assert!(!state.paths.twitch_delegated.is_file());
@@ -5203,17 +5492,22 @@ mod tests {
         assert!(!state.paths.twitch_delegated.with_extension("bak").is_file());
         assert!(state.delegated.read().await.is_none());
         assert_eq!(
-            services.irc_handle.read().await.as_ref().map(|h| h.id()),
-            irc_before,
-            "stale refresh must not restart workers after revocation"
+            platform_worker_snapshot(&state, &services).await,
+            workers_before
+        );
+        assert_eq!(
+            live_identity_snapshot(&state, &services).await.delegated,
+            None
         );
 
         let restarted = restart_state_at(&state);
         assert!(!restarted.paths.twitch_delegated.is_file());
         assert!(restarted.paths.twitch_delegated_revoked.is_file());
         assert!(restarted.delegated.read().await.is_none());
-
-        super::clear_refresh_commit_gate().await;
+        assert_ne!(
+            *restarted.active_mode.read().await,
+            TwitchActiveMode::Delegated
+        );
     }
 
     #[tokio::test]
@@ -5243,7 +5537,7 @@ mod tests {
             .connection_key
             .clone();
 
-        let (arrived_rx, resume_tx) = super::install_refresh_commit_gate().await;
+        let (_gate, arrived_rx, resume_tx) = super::install_refresh_commit_gate().await;
         let state2 = state.clone();
         let services2 = services.clone();
         let exchange2 = exchange.clone();
@@ -5252,26 +5546,22 @@ mod tests {
                 .await
         });
 
-        arrived_rx.await.expect("refresh must pause before commit");
+        gate_wait(arrived_rx, "refresh must pause before commit").await;
         commit_replacement_generation(&state, &services, 2, "gen2-token").await;
         let winner_lease = services.authority_lease_snapshot_public().await;
         resume_tx.send(()).expect("release stale refresh");
-        let committed = commit_task.await.expect("join").expect("commit result");
+        let committed = task_join_with_timeout(commit_task, "stale refresh commit")
+            .await
+            .expect("commit result");
         assert!(
             !committed,
             "stale refresh must not renew generation-1 lease"
         );
 
         let lease_after = services.authority_lease_snapshot_public().await;
-        assert_eq!(lease_after.generation, winner_lease.generation);
+        assert_eq!(lease_after, winner_lease);
         assert_eq!(lease_after.generation, 2);
         assert_ne!(lease_after.generation, lease_before.generation);
-        assert!(
-            lease_after.deadline <= winner_lease.deadline,
-            "stale refresh must not extend winner lease"
-        );
-
-        super::clear_refresh_commit_gate().await;
     }
 
     #[tokio::test]
@@ -5279,6 +5569,239 @@ mod tests {
         let _guard = PHASE2_TEST_LOCK.lock().await;
         for _ in 0..20 {
             refresh_stale_cannot_renew_lease_once().await;
+        }
+    }
+
+    async fn refresh_stale_after_commit_before_restart_once() {
+        let (state, services) = phase2_app().await;
+        activate_delegated_gen1(&state, &services).await;
+
+        let exchange = stale_refresh_exchange("refresh-committed-token");
+        let merged = crate::kick::merge_delegated_session_from_exchange(
+            state.delegated.read().await.clone().unwrap(),
+            &exchange,
+        );
+        let key = state
+            .delegated
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .connection_key
+            .clone();
+
+        let (_gate, arrived_rx, resume_tx) = super::install_refresh_live_gate().await;
+        let state2 = state.clone();
+        let services2 = services.clone();
+        let exchange2 = exchange.clone();
+        let commit_task = tokio::spawn(async move {
+            super::apply_delegated_refresh_commit(state2, services2, 1, merged, &exchange2, &key)
+                .await
+        });
+
+        gate_wait(arrived_rx, "refresh must pause before live publish").await;
+        commit_replacement_generation(&state, &services, 2, "gen2-token").await;
+        let winner_identity = live_identity_snapshot(&state, &services).await;
+        let winner_workers = install_winner_platform_workers(&state, &services, 2).await;
+        resume_tx.send(()).expect("release stale refresh live path");
+        let committed = task_join_with_timeout(commit_task, "stale refresh commit")
+            .await
+            .expect("commit result");
+        assert!(committed, "durable refresh commit should succeed");
+
+        assert_live_identity_eq(&state, &services, &winner_identity).await;
+        assert_eq!(
+            platform_worker_snapshot(&state, &services).await,
+            winner_workers
+        );
+        assert_eq!(
+            state.twitch.read().await.tokens.access_token.as_deref(),
+            Some("gen2-token")
+        );
+        assert_eq!(
+            state.kick.read().await.tokens.access_token.as_deref(),
+            Some("gen2-token-kick")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_stale_after_commit_before_restart_no_live_side_effects() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for _ in 0..20 {
+            refresh_stale_after_commit_before_restart_once().await;
+        }
+    }
+
+    async fn refresh_stale_after_commit_before_sync_once() {
+        let (state, services) = phase2_app().await;
+        activate_delegated_gen1(&state, &services).await;
+
+        let exchange = stale_refresh_exchange("refresh-committed-token");
+        let merged = crate::kick::merge_delegated_session_from_exchange(
+            state.delegated.read().await.clone().unwrap(),
+            &exchange,
+        );
+        let key = state
+            .delegated
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .connection_key
+            .clone();
+
+        let (_gate, arrived_rx, resume_tx) = super::install_refresh_live_gate().await;
+        let state2 = state.clone();
+        let services2 = services.clone();
+        let exchange2 = exchange.clone();
+        let commit_task = tokio::spawn(async move {
+            super::apply_delegated_refresh_commit(state2, services2, 1, merged, &exchange2, &key)
+                .await
+        });
+
+        gate_wait(arrived_rx, "refresh must pause before live publish").await;
+        remove_delegated_session(&state, &services, None, 1)
+            .await
+            .expect("revoke");
+        let workers_after_revoke = platform_worker_snapshot(&state, &services).await;
+        let identity_after_revoke = live_identity_snapshot(&state, &services).await;
+        resume_tx.send(()).expect("release stale refresh live path");
+        let committed = task_join_with_timeout(commit_task, "stale refresh commit")
+            .await
+            .expect("commit result");
+        assert!(
+            committed,
+            "durable refresh commit may complete before live gate"
+        );
+
+        assert_eq!(
+            platform_worker_snapshot(&state, &services).await,
+            workers_after_revoke
+        );
+        assert_eq!(
+            live_identity_snapshot(&state, &services).await.delegated,
+            identity_after_revoke.delegated
+        );
+        assert_eq!(
+            live_identity_snapshot(&state, &services).await.lease,
+            identity_after_revoke.lease
+        );
+        assert!(state.delegated.read().await.is_none());
+        assert!(!state.paths.twitch_delegated.is_file());
+    }
+
+    #[tokio::test]
+    async fn refresh_stale_after_commit_before_sync_no_live_side_effects() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for _ in 0..20 {
+            refresh_stale_after_commit_before_sync_once().await;
+        }
+    }
+
+    async fn spawn_mock_syndicate_refresh_server(
+        access_token: &str,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let access_token = access_token.to_string();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    let n = socket.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = serde_json::json!({
+                    "ok": true,
+                    "twitch": {
+                        "client_id": "cid",
+                        "access_token": access_token,
+                        "expires_at": "2099-01-01T00:00:00Z",
+                        "scopes": []
+                    },
+                    "channel": { "twitch_id": "999", "login": "takeover_chan" },
+                    "connection": { "expires_at": "2099-01-01T00:00:00Z" }
+                });
+                let payload = body.to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+        (port, server)
+    }
+
+    async fn refresh_production_path_race_once() {
+        let (port, _server) = spawn_mock_syndicate_refresh_server("loop-refresh-token").await;
+        std::env::set_var("SYNDICATE_API_BASE", format!("http://127.0.0.1:{port}"));
+        super::set_refresh_bypass_sleep(true);
+
+        let (state, services) = phase2_app().await;
+        install_delegated_session(&state, &services).await;
+        let mut session = state.delegated.read().await.clone().unwrap();
+        session.twitch_expires_at = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        state.persist_delegated_session(&session).unwrap();
+        *state.delegated.write().await = Some(session);
+        *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        state.save_active_mode().await.unwrap();
+        services.install_validated_authority_lease(1, None).await;
+        install_fake_platform_workers(&state, &services).await;
+
+        let (_gate, arrived_rx, _resume_tx) = super::install_refresh_live_gate().await;
+        start_delegated_refresh_loop(state.clone(), services.clone(), 1).await;
+        gate_wait(
+            arrived_rx,
+            "production refresh must pause before live publish",
+        )
+        .await;
+
+        let replacement = stale_refresh_exchange("gen2-token");
+        apply_exchange_session(
+            state.clone(),
+            services.clone(),
+            "ssk_phase2_production_replacement",
+            replacement,
+            true,
+            None,
+        )
+        .await
+        .expect("production replacement apply");
+        let winner_identity = live_identity_snapshot(&state, &services).await;
+        let winner_workers = platform_worker_snapshot(&state, &services).await;
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_live_identity_eq(&state, &services, &winner_identity).await;
+        assert_eq!(
+            platform_worker_snapshot(&state, &services).await,
+            winner_workers
+        );
+        let disk = read_delegated_disk(&state).expect("winner primary on disk");
+        assert_eq!(disk.generation, 2);
+        assert_eq!(disk.access_token, "gen2-token");
+        assert_ne!(
+            state.twitch.read().await.tokens.access_token.as_deref(),
+            Some("loop-refresh-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_production_path_cannot_escape_generation_fence() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for _ in 0..20 {
+            refresh_production_path_race_once().await;
         }
     }
 }

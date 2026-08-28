@@ -3,6 +3,7 @@
 use crate::app_state::{live_kick_tokens, AppState};
 use crate::broadcast::make_platform_dock_event;
 use crate::config_types::{DelegatedSessionFile, KickTokenFile};
+use crate::delegated_lifecycle::DelegatedGeneration;
 use crate::syndicate_connection::{self, ExchangeSuccess};
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
@@ -249,6 +250,40 @@ pub fn auth_url(state: &AppState, flow_nonce: &str) -> String {
 }
 
 pub async fn sync_live_identity(state: Arc<AppState>) {
+    let generation = state.current_delegated_generation();
+    if generation > 0 {
+        sync_live_identity_for_generation(state, generation).await;
+        return;
+    }
+    sync_live_identity_unchecked(state).await;
+}
+
+/// Publish Kick live tokens/feed only when `generation` is still the active delegated session.
+pub async fn sync_live_identity_for_generation(
+    state: Arc<AppState>,
+    generation: DelegatedGeneration,
+) {
+    if !state.session_still_current(generation).await {
+        return;
+    }
+    let mode = *state.active_mode.read().await;
+    let delegated = state.delegated.read().await.clone();
+    let personal = state.personal_kick.read().await.clone();
+    let live = live_kick_tokens(mode, delegated.as_ref(), &personal);
+    if !state.session_still_current(generation).await {
+        return;
+    }
+    {
+        let mut k = state.kick.write().await;
+        k.tokens = live;
+        if !k.tokens.is_linked() {
+            k.connected = false;
+        }
+    }
+    restart_feed_for_generation(state, generation).await;
+}
+
+async fn sync_live_identity_unchecked(state: Arc<AppState>) {
     let mode = *state.active_mode.read().await;
     let delegated = state.delegated.read().await.clone();
     let personal = state.personal_kick.read().await.clone();
@@ -261,6 +296,35 @@ pub async fn sync_live_identity(state: Arc<AppState>) {
         }
     }
     restart_feed(state).await;
+}
+
+async fn restart_feed_for_generation(state: Arc<AppState>, generation: DelegatedGeneration) {
+    if !state.session_still_current(generation).await {
+        return;
+    }
+    let linked = state.kick.read().await.tokens.is_linked();
+    if !state.session_still_current(generation).await {
+        return;
+    }
+    if let Some(h) = state.kick_feed_handle.write().await.take() {
+        h.abort();
+    }
+    if !state.session_still_current(generation).await {
+        return;
+    }
+    if !linked {
+        state.kick.write().await.connected = false;
+        return;
+    }
+    let state2 = state.clone();
+    let handle = tokio::spawn(async move {
+        feed_loop(state2).await;
+    });
+    if !state.session_still_current(generation).await {
+        handle.abort();
+        return;
+    }
+    *state.kick_feed_handle.write().await = Some(handle);
 }
 
 async fn restart_feed(state: Arc<AppState>) {
