@@ -232,6 +232,8 @@ impl AppState {
         let revoked_tombstone = paths.twitch_delegated_revoked.is_file();
         let revoke_pending = paths.twitch_delegated_revoke_pending.is_file();
         let quarantine = revoked_tombstone || revoke_pending;
+        let replace_pending =
+            storage::delegated_replace_pending_path(&paths.twitch_delegated).is_file();
         let delegated = if quarantine {
             // Readonly must inspect/quarantine in memory only — never mutate disk.
             if !readonly && paths.twitch_delegated.is_file() {
@@ -245,13 +247,34 @@ impl AppState {
                 tracing::warn!("delegated session quarantined: revoked tombstone present");
             }
             None
-        } else if paths.twitch_delegated.is_file() {
-            if !readonly {
-                if let Err(e) = storage::recover_delegated_replace_pending(&paths.twitch_delegated)
-                {
-                    tracing::warn!("delegated replace-pending recovery failed: {e:#}");
+        } else if replace_pending {
+            if readonly {
+                tracing::warn!(
+                    "delegated replace-pending marker present — refusing delegated load in readonly"
+                );
+                None
+            } else {
+                match storage::recover_delegated_replace_pending(&paths.twitch_delegated) {
+                    Ok(()) => {
+                        if paths.twitch_delegated.is_file() {
+                            read_json_for_mode(
+                                &paths.twitch_delegated,
+                                &DelegatedSessionFile::default(),
+                                readonly,
+                            )
+                            .ok()
+                            .filter(|d| !d.connection_key.is_empty() && !d.access_token.is_empty())
+                        } else {
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("delegated replace-pending recovery failed: {e:#}");
+                        None
+                    }
                 }
             }
+        } else if paths.twitch_delegated.is_file() {
             read_json_for_mode(
                 &paths.twitch_delegated,
                 &DelegatedSessionFile::default(),
@@ -506,12 +529,17 @@ impl AppState {
         self.durable_fail
             .fail(&self.durable_fail.credential_remove, "credential_remove")?;
         storage::remove_file_durable(&self.paths.twitch_delegated)?;
-        // Backup + temp/revoked leftovers are part of the transaction (B1/B7).
+        // Backup + temp/revoked/committing leftovers are part of the transaction (B1/B7).
         self.remove_delegated_backup()?;
-        for leftover in
-            storage::delegated_temp_and_quarantine_variants(&self.paths.twitch_delegated)?
-        {
-            storage::remove_file_durable(&leftover)?;
+        for leftover in self.delegated_secret_variants()? {
+            if leftover == self.paths.twitch_delegated
+                || leftover == self.paths.twitch_delegated.with_extension("bak")
+            {
+                continue;
+            }
+            if leftover.is_file() {
+                storage::remove_file_durable(&leftover)?;
+            }
         }
         self.durable_fail
             .fail(&self.durable_fail.parent_sync, "parent_sync")?;

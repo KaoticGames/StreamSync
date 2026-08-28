@@ -859,6 +859,19 @@ fn acceptance_boundaries_document_manual_syndicate_integration() {
         twitch_tests.contains("sse_401_uses_authorization_header_and_tears_down"),
         "repeated reconnect/auth failure must tear down delegated session"
     );
+    assert!(
+        twitch_tests.contains("irc_send_rejects_stale_delegated_client_after_local_mode"),
+        "IRC send must reject stale delegated client under Local provenance"
+    );
+    assert!(
+        twitch_tests.contains("refresh_persist_failure_leaves_memory_unchanged"),
+        "refresh must not publish uncommitted rotated credentials"
+    );
+    let storage_src = include_str!("../src/storage.rs");
+    assert!(
+        storage_src.contains("delegated_committing_path"),
+        "committing variant must be part of authority-bearing inventory"
+    );
 }
 
 #[tokio::test]
@@ -1001,4 +1014,57 @@ fn authority_secret_partial_commit_recovery_restores_primary_on_restart() {
     let restored = std::fs::read_to_string(&primary).unwrap();
     assert!(restored.contains("old"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn committing_staging_deletion_failure_keeps_replace_marker() {
+    use std::sync::atomic::Ordering;
+    use stream_sync_core::{
+        delegated_committing_path, delegated_replace_pending_path, INJECT_COMMITTING_REMOVE_FAILURE,
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "streamsync-committing-fail-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let primary = dir.join("twitch-delegated.json");
+    std::fs::write(&primary, br#"{"generation":1,"connection_key":"old"}"#).unwrap();
+    INJECT_COMMITTING_REMOVE_FAILURE.store(true, Ordering::SeqCst);
+    let result = stream_sync_core::write_authority_bearing_secret(
+        &primary,
+        br#"{"generation":2,"connection_key":"new"}"#,
+    );
+    INJECT_COMMITTING_REMOVE_FAILURE.store(false, Ordering::SeqCst);
+    assert!(result.is_err(), "staging deletion failure must propagate");
+    assert!(delegated_replace_pending_path(&primary).is_file());
+    assert!(delegated_committing_path(&primary).is_file());
+    let on_disk = std::fs::read_to_string(&primary).unwrap();
+    assert!(on_disk.contains("new"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn startup_recovers_replace_pending_without_primary() {
+    let userdata = test_userdata_dir();
+    let primary = userdata.join("twitch-delegated.json");
+    let committing = primary.with_extension("committing");
+    std::fs::write(
+        &committing,
+        br#"{"generation":1,"connection_key":"restored","access_token":"at","client_id":"cid","channel_login":"c","channel_twitch_id":"1","twitch_expires_at":"2099-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        primary.with_extension("replace-pending"),
+        br#"{"reason":"delegated_session_replace_pending"}"#,
+    )
+    .unwrap();
+    let state = restart_app_at(&userdata, false);
+    assert!(primary.is_file());
+    assert!(!committing.is_file());
+    let loaded = state.delegated.read().await.clone().unwrap();
+    assert_eq!(loaded.connection_key, "restored");
 }

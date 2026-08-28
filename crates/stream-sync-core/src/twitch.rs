@@ -29,9 +29,15 @@ use twitch_irc::{ClientConfig, SecureTCPTransport, TwitchIRCClient};
 
 type StreamSyncIrcClient = TwitchIRCClient<SecureTCPTransport, StaticLoginCredentials>;
 
+#[derive(Clone)]
+struct IrcClientBundle {
+    client: StreamSyncIrcClient,
+    provenance: PlatformCredentialProvenance,
+}
+
 /// Provenance of platform credentials captured at selection time (B5).
 /// A Delegated capture must never be downgraded to an unfenced Local bypass.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlatformCredentialProvenance {
     Local,
     Delegated { snap: AuthorityLeaseSnapshot },
@@ -71,7 +77,7 @@ struct CacheEntry<T> {
 pub struct TwitchServices {
     badge_cache: RwLock<Option<CacheEntry<Value>>>,
     emote_cache: RwLock<Option<CacheEntry<Vec<Value>>>>,
-    irc_client: RwLock<Option<StreamSyncIrcClient>>,
+    irc_client: RwLock<Option<IrcClientBundle>>,
     irc_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
     eventsub_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
     refresh_handle: RwLock<Option<GenerationTask>>,
@@ -353,6 +359,13 @@ impl TwitchServices {
         state: &AppState,
     ) -> Result<PlatformCredentialSelection> {
         let _lifecycle = self.lifecycle_lock.lock().await;
+        self.select_platform_credentials_under_lock(state).await
+    }
+
+    async fn select_platform_credentials_under_lock(
+        &self,
+        state: &AppState,
+    ) -> Result<PlatformCredentialSelection> {
         let mode = *state.active_mode.read().await;
         let delegated = state.delegated.read().await.clone();
         let tokens = state.twitch.read().await.tokens.clone();
@@ -390,6 +403,48 @@ impl TwitchServices {
             client_id,
             access_token,
         })
+    }
+
+    /// Atomically select IRC provenance, channel, and authenticated client (B1).
+    pub async fn select_irc_send_bundle(
+        &self,
+        state: &AppState,
+    ) -> Result<(PlatformCredentialProvenance, String, StreamSyncIrcClient)> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        let provenance = self
+            .select_platform_credentials_under_lock(state)
+            .await?
+            .provenance();
+        let channel = state
+            .twitch
+            .read()
+            .await
+            .channel
+            .clone()
+            .ok_or_else(|| anyhow!("No Twitch channel joined"))?;
+        let bundle = self
+            .irc_client
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("Twitch IRC client is not ready"))?;
+        if bundle.provenance != provenance {
+            return Err(anyhow!(
+                "IRC client identity does not match active credential provenance"
+            ));
+        }
+        Ok((provenance, channel, bundle.client))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn install_irc_bundle_for_test(
+        &self,
+        provenance: PlatformCredentialProvenance,
+    ) {
+        let (_incoming, client) = StreamSyncIrcClient::new(ClientConfig::new_simple(
+            StaticLoginCredentials::new("test".into(), Some("token".into())),
+        ));
+        *self.irc_client.write().await = Some(IrcClientBundle { client, provenance });
     }
 
     /// True when the captured lease snapshot still authorizes platform fan-out/send.
@@ -1135,13 +1190,6 @@ async fn validate_saved_delegated_for_activation(
     match syndicate_connection::refresh(&session.connection_key).await {
         Ok(exchange) => {
             services.ensure_apply_intent_current(intent)?;
-            services
-                .renew_after_successful_remote_validation(
-                    generation,
-                    exchange.connection.expires_at.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow!(e))?;
             Ok(crate::kick::merge_delegated_session_from_exchange(
                 session.clone(),
                 &exchange,
@@ -1168,6 +1216,41 @@ async fn validate_saved_delegated_for_activation(
             }
         }
     }
+}
+
+/// Publish a validated delegated session as the live identity under lifecycle lock.
+async fn commit_delegated_activation(
+    state: &AppState,
+    services: &TwitchServices,
+    intent: u64,
+    validated: DelegatedSessionFile,
+    saved: Option<&DelegatedSessionFile>,
+) -> Result<()> {
+    let _lifecycle = services.lifecycle_lock.lock().await;
+    services.ensure_apply_intent_current(intent)?;
+    if saved.is_none_or(|s| validated != *s) {
+        state.persist_delegated_session(&validated)?;
+    }
+    services.ensure_apply_intent_current(intent)?;
+    let previous_mode = *state.active_mode.read().await;
+    *state.active_mode.write().await = TwitchActiveMode::Delegated;
+    if let Err(e) = state.save_active_mode().await {
+        *state.active_mode.write().await = previous_mode;
+        return Err(e);
+    }
+    services.ensure_apply_intent_current(intent)?;
+    services
+        .renew_after_successful_remote_validation(
+            validated.generation,
+            validated.connection_expires_at.as_deref(),
+        )
+        .await
+        .map_err(|e| anyhow!(e))?;
+    *state.delegated.write().await = Some(validated.clone());
+    let mut tw = state.twitch.write().await;
+    clear_live_runtime_fields(&mut tw);
+    tw.tokens = tokens_from_delegated_session(&validated);
+    Ok(())
 }
 
 /// Switch the live identity between saved personal OAuth and a saved takeover key.
@@ -1231,24 +1314,7 @@ pub async fn use_connection(
                 intent,
             )
             .await?;
-            services.ensure_apply_intent_current(intent)?;
-            {
-                let _lifecycle = services.lifecycle_lock.lock().await;
-                services.ensure_apply_intent_current(intent)?;
-                if validated != saved {
-                    state.persist_delegated_session(&validated)?;
-                }
-                *state.delegated.write().await = Some(validated.clone());
-                let previous_mode = *state.active_mode.read().await;
-                *state.active_mode.write().await = TwitchActiveMode::Delegated;
-                if let Err(e) = state.save_active_mode().await {
-                    *state.active_mode.write().await = previous_mode;
-                    return Err(e);
-                }
-                let mut tw = state.twitch.write().await;
-                clear_live_runtime_fields(&mut tw);
-                tw.tokens = tokens_from_delegated_session(&validated);
-            }
+            commit_delegated_activation(&state, &services, intent, validated, Some(&saved)).await?;
             restart_twitch_clients(state.clone(), services.clone()).await;
             ensure_delegated_refresh_loop(state.clone(), services).await;
             crate::kick::sync_live_identity(state).await;
@@ -1271,14 +1337,16 @@ fn tokens_saved(t: &TwitchTokenFile) -> bool {
 
 /// Remove the currently active connection. If the other identity is still saved, activate it.
 pub async fn disconnect_twitch(state: Arc<AppState>, services: Arc<TwitchServices>) -> Result<()> {
-    let _intent = services.bump_apply_intent();
-    disconnect_twitch_inner(state, services).await
+    let intent = services.bump_apply_intent();
+    disconnect_twitch_inner(state, services, intent).await
 }
 
 async fn disconnect_twitch_inner(
     state: Arc<AppState>,
     services: Arc<TwitchServices>,
+    intent: u64,
 ) -> Result<()> {
+    state.ensure_identity_coherent_for_platform()?;
     let active = *state.active_mode.read().await;
     match active {
         TwitchActiveMode::Delegated => {
@@ -1290,32 +1358,43 @@ async fn disconnect_twitch_inner(
                 .map(|s| s.generation)
                 .unwrap_or_else(|| state.current_delegated_generation());
             remove_delegated_session(&state, &services, None, generation).await?;
+            services.ensure_apply_intent_current(intent)?;
             let personal = state.personal_tokens.read().await.clone();
             if tokens_saved(&personal) {
                 {
+                    let _lifecycle = services.lifecycle_lock.lock().await;
+                    services.ensure_apply_intent_current(intent)?;
+                    let previous_mode = *state.active_mode.read().await;
+                    *state.active_mode.write().await = TwitchActiveMode::Local;
+                    if let Err(e) = state.save_active_mode().await {
+                        *state.active_mode.write().await = previous_mode;
+                        return Err(e);
+                    }
                     let mut tw = state.twitch.write().await;
                     clear_live_runtime_fields(&mut tw);
                     tw.tokens = personal;
-                    *state.active_mode.write().await = TwitchActiveMode::Local;
                 }
-                state.save_active_mode().await?;
                 restart_twitch_clients(state.clone(), services).await;
                 crate::kick::sync_live_identity(state).await;
             } else {
                 stop_delegated_tasks(&services).await;
                 stop_twitch_clients(&services).await;
                 {
+                    let _lifecycle = services.lifecycle_lock.lock().await;
+                    services.ensure_apply_intent_current(intent)?;
                     let mut tw = state.twitch.write().await;
                     tw.tokens = TwitchTokenFile::default();
                     clear_live_runtime_fields(&mut tw);
                     *state.active_mode.write().await = TwitchActiveMode::Local;
+                    state.save_active_mode().await?;
                 }
-                state.save_active_mode().await?;
                 crate::kick::sync_live_identity(state).await;
             }
         }
         TwitchActiveMode::Local => {
             {
+                let _lifecycle = services.lifecycle_lock.lock().await;
+                services.ensure_apply_intent_current(intent)?;
                 let previous = state.personal_tokens.read().await.clone();
                 *state.personal_tokens.write().await = TwitchTokenFile::default();
                 if let Err(e) = state.save_twitch_tokens().await {
@@ -1323,21 +1402,17 @@ async fn disconnect_twitch_inner(
                     return Err(e);
                 }
             }
-            let has_delegated = state.delegated.read().await.is_some();
-            if has_delegated {
-                let session = state.delegated.read().await.clone().unwrap();
-                {
-                    let previous_mode = *state.active_mode.read().await;
-                    let mut tw = state.twitch.write().await;
-                    clear_live_runtime_fields(&mut tw);
-                    tw.tokens = tokens_from_delegated_session(&session);
-                    *state.active_mode.write().await = TwitchActiveMode::Delegated;
-                    drop(tw);
-                    if let Err(e) = state.save_active_mode().await {
-                        *state.active_mode.write().await = previous_mode;
-                        return Err(e);
-                    }
-                }
+            let saved = state.delegated.read().await.clone();
+            if let Some(session) = saved {
+                let validated = validate_saved_delegated_for_activation(
+                    state.clone(),
+                    services.clone(),
+                    &session,
+                    intent,
+                )
+                .await?;
+                commit_delegated_activation(&state, &services, intent, validated, Some(&session))
+                    .await?;
                 restart_twitch_clients(state.clone(), services.clone()).await;
                 ensure_delegated_refresh_loop(state.clone(), services).await;
                 crate::kick::sync_live_identity(state).await;
@@ -1345,6 +1420,8 @@ async fn disconnect_twitch_inner(
                 stop_delegated_tasks(&services).await;
                 stop_twitch_clients(&services).await;
                 {
+                    let _lifecycle = services.lifecycle_lock.lock().await;
+                    services.ensure_apply_intent_current(intent)?;
                     let mut tw = state.twitch.write().await;
                     tw.tokens = TwitchTokenFile::default();
                     clear_live_runtime_fields(&mut tw);
@@ -1362,14 +1439,15 @@ pub async fn remove_connection(
     services: Arc<TwitchServices>,
     mode: TwitchActiveMode,
 ) -> Result<()> {
-    let _intent = services.bump_apply_intent();
+    let intent = services.bump_apply_intent();
     let active = *state.active_mode.read().await;
     if active == mode {
-        return disconnect_twitch_inner(state, services).await;
+        return disconnect_twitch_inner(state, services, intent).await;
     }
     let _lifecycle = services.lifecycle_lock.lock().await;
     match mode {
         TwitchActiveMode::Local => {
+            services.ensure_apply_intent_current(intent)?;
             let previous = state.personal_tokens.read().await.clone();
             *state.personal_tokens.write().await = TwitchTokenFile::default();
             if let Err(e) = state.save_twitch_tokens().await {
@@ -1378,6 +1456,7 @@ pub async fn remove_connection(
             }
         }
         TwitchActiveMode::Delegated => {
+            services.ensure_apply_intent_current(intent)?;
             let generation = state
                 .delegated
                 .read()
@@ -1767,9 +1846,7 @@ pub async fn apply_connection_key(
 ) -> Result<()> {
     let intent = services.bump_apply_intent();
     let exchange = syndicate_connection::exchange(key).await?;
-    if services.apply_intent.load(Ordering::SeqCst) != intent {
-        return Err(anyhow!("superseded by newer apply request"));
-    }
+    services.ensure_apply_intent_current(intent)?;
     apply_exchange_session(state, services, key, exchange, true, Some(intent)).await
 }
 
@@ -1785,9 +1862,7 @@ async fn apply_exchange_session(
     let generation = {
         let _lifecycle = services.lifecycle_lock.lock().await;
         if let Some(intent) = apply_intent {
-            if services.apply_intent.load(Ordering::SeqCst) != intent {
-                return Err(anyhow!("superseded by newer apply request"));
-            }
+            services.ensure_apply_intent_current(intent)?;
         }
         let new_generation = state.peek_next_delegated_generation();
         let mut session = DelegatedSessionFile {
@@ -1806,7 +1881,10 @@ async fn apply_exchange_session(
         };
         crate::kick::apply_kick_to_delegated(&mut session, &exchange);
 
-        // Two-phase commit: durable persistence before disarming old generation/workers.
+        if let Some(intent) = apply_intent {
+            services.ensure_apply_intent_current(intent)?;
+        }
+
         state.persist_delegated_session(&session)?;
         if activate {
             storage_write_active_mode_delegated(&state)?;
@@ -1814,9 +1892,7 @@ async fn apply_exchange_session(
         state.clear_delegated_revoked_tombstone()?;
 
         if let Some(intent) = apply_intent {
-            if services.apply_intent.load(Ordering::SeqCst) != intent {
-                return Err(anyhow!("superseded by newer apply request"));
-            }
+            services.ensure_apply_intent_current(intent)?;
         }
 
         stop_delegated_tasks(&services).await;
@@ -1841,6 +1917,7 @@ async fn apply_exchange_session(
                 tw.tokens = install_tokens_from_exchange(&exchange);
                 *state.active_mode.write().await = TwitchActiveMode::Delegated;
             }
+            drop(_lifecycle);
             restart_twitch_clients(state.clone(), services.clone()).await;
         }
         new_generation
@@ -1994,6 +2071,23 @@ async fn start_delegated_refresh_loop(
 
             match refresh_result {
                 Ok(exchange) => {
+                    let merged = {
+                        let guard = state2.delegated.read().await;
+                        let Some(ref s) = *guard else {
+                            break;
+                        };
+                        if s.generation != generation {
+                            break;
+                        }
+                        crate::kick::merge_delegated_session_from_exchange(s.clone(), &exchange)
+                    };
+                    if let Err(e) = state2.persist_delegated_session(&merged) {
+                        warn!(
+                            "delegated refresh persist failed: {}",
+                            redact_connection_key(&format!("{e:#}"), &key)
+                        );
+                        continue;
+                    }
                     let _lifecycle = services2.lifecycle_lock.lock().await;
                     if !state2.session_still_current(generation).await {
                         break;
@@ -2004,32 +2098,7 @@ async fn start_delegated_refresh_loop(
                             .await;
                         break;
                     }
-                    let session = {
-                        let mut guard = state2.delegated.write().await;
-                        let Some(ref mut s) = *guard else {
-                            break;
-                        };
-                        if s.generation != generation {
-                            break;
-                        }
-                        s.access_token = exchange.twitch.access_token.clone();
-                        s.client_id = exchange.twitch.client_id.clone();
-                        s.twitch_expires_at = exchange.twitch.expires_at.clone();
-                        s.scopes = exchange.twitch.scopes.clone();
-                        if let Some(ref exp) = exchange.connection.expires_at {
-                            s.connection_expires_at = Some(exp.clone());
-                        }
-                        crate::kick::apply_kick_to_delegated(s, &exchange);
-                        s.clone()
-                    };
-                    if let Err(e) = state2.persist_delegated_session(&session) {
-                        warn!(
-                            "delegated refresh persist failed: {}",
-                            redact_connection_key(&format!("{e:#}"), &key)
-                        );
-                        // Fail closed: do not treat refreshed tokens as committed authority.
-                        continue;
-                    }
+                    *state2.delegated.write().await = Some(merged.clone());
                     if let Err(e) = services2
                         .renew_after_successful_remote_validation(
                             generation,
@@ -2054,14 +2123,14 @@ async fn start_delegated_refresh_loop(
                         }
                         info!(
                             "delegated Twitch token refreshed for {}",
-                            session.channel_login
+                            merged.channel_login
                         );
                         drop(_lifecycle);
                         restart_twitch_clients(state2.clone(), services2.clone()).await;
                     } else {
                         info!(
                             "delegated Twitch token refreshed (inactive) for {}",
-                            session.channel_login
+                            merged.channel_login
                         );
                     }
                     if state2.session_still_current(generation).await {
@@ -2578,7 +2647,14 @@ async fn start_irc(state: Arc<AppState>, services: Arc<TwitchServices>) -> Resul
     let feed = state.feed.clone();
     client.join(channel.clone()).ok();
 
-    *services.irc_client.write().await = Some(client);
+    let provenance = {
+        let _lifecycle = services.lifecycle_lock.lock().await;
+        services
+            .select_platform_credentials_under_lock(&state)
+            .await?
+            .provenance()
+    };
+    *services.irc_client.write().await = Some(IrcClientBundle { client, provenance });
 
     {
         let mut tw = state.twitch.write().await;
@@ -2701,15 +2777,6 @@ pub async fn send_chat_from_dock(
         return Ok(());
     }
     send_plain_chat(&state, &services, trimmed).await
-}
-
-async fn irc_client_ready(services: &TwitchServices) -> Result<StreamSyncIrcClient> {
-    services
-        .irc_client
-        .read()
-        .await
-        .clone()
-        .ok_or_else(|| anyhow!("Twitch IRC client is not ready"))
 }
 
 /// Convert twitch-irc emotes (exclusive end index) to TMI.js shape `{ id: ["start-end"] }`.
@@ -2862,15 +2929,7 @@ fn emotes_from_message_text(
 }
 
 async fn send_plain_chat(state: &AppState, services: &TwitchServices, trimmed: &str) -> Result<()> {
-    let provenance = services.capture_platform_provenance(state).await?;
-    let channel = state
-        .twitch
-        .read()
-        .await
-        .channel
-        .clone()
-        .ok_or_else(|| anyhow!("No Twitch channel joined"))?;
-    let client = irc_client_ready(services).await?;
+    let (provenance, channel, client) = services.select_irc_send_bundle(state).await?;
     services
         .race_delegated_platform_with_provenance(state, provenance, async {
             client
@@ -2885,15 +2944,7 @@ async fn send_plain_chat(state: &AppState, services: &TwitchServices, trimmed: &
 }
 
 async fn send_dock_privmsg(state: &AppState, services: &TwitchServices, text: &str) -> Result<()> {
-    let provenance = services.capture_platform_provenance(state).await?;
-    let channel = state
-        .twitch
-        .read()
-        .await
-        .channel
-        .clone()
-        .ok_or_else(|| anyhow!("No Twitch channel joined"))?;
-    let client = irc_client_ready(services).await?;
+    let (provenance, channel, client) = services.select_irc_send_bundle(state).await?;
     services
         .race_delegated_platform_with_provenance(state, provenance, async {
             client
@@ -4741,6 +4792,108 @@ mod tests {
         assert!(
             err.is_err(),
             "captured delegated provenance must stay fenced: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn irc_send_rejects_stale_delegated_client_after_local_mode() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let (state, services) = phase2_app().await;
+        install_delegated_session(&state, &services).await;
+        *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        services.install_validated_authority_lease(1, None).await;
+        let delegated_snap = services.authority_lease_snapshot_public().await;
+        services
+            .install_irc_bundle_for_test(PlatformCredentialProvenance::Delegated {
+                snap: delegated_snap,
+            })
+            .await;
+        {
+            let mut tw = state.twitch.write().await;
+            tw.channel = Some("takeover_chan".into());
+        }
+        *state.active_mode.write().await = TwitchActiveMode::Local;
+        let err = services.select_irc_send_bundle(&state).await;
+        assert!(
+            err.is_err(),
+            "stale delegated IRC client must not send under Local provenance: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_persist_failure_leaves_memory_unchanged() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    let n = socket.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = serde_json::json!({
+                    "ok": true,
+                    "twitch": {
+                        "client_id": "cid",
+                        "access_token": "rotated-access",
+                        "expires_at": "2099-01-01T00:00:00Z",
+                        "scopes": []
+                    },
+                    "channel": { "twitch_id": "999", "login": "takeover_chan" },
+                    "connection": { "expires_at": "2099-01-01T00:00:00Z" }
+                });
+                let payload = body.to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+        std::env::set_var("SYNDICATE_API_BASE", format!("http://127.0.0.1:{port}"));
+
+        let (state, services) = phase2_app().await;
+        install_delegated_session(&state, &services).await;
+        state
+            .persist_delegated_session(state.delegated.read().await.as_ref().unwrap())
+            .unwrap();
+        *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        services.install_validated_authority_lease(1, None).await;
+        let before = state
+            .delegated
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .access_token
+            .clone();
+        state
+            .durable_fail
+            .save_session
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        start_delegated_refresh_loop(state.clone(), services.clone(), 1).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let after = state
+            .delegated
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .access_token
+            .clone();
+        assert_eq!(
+            before, after,
+            "refresh persist failure must not mutate memory"
         );
     }
 }

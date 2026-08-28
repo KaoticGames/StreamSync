@@ -454,7 +454,7 @@ pub fn write_authority_bearing_secret(target: &Path, data: &[u8]) -> Result<()> 
     if bak.is_file() {
         remove_file_durable(&bak)?;
     }
-    let pending_marker = target.with_extension("replace-pending");
+    let pending_marker = delegated_replace_pending_path(target);
     let tmp = target.with_extension(format!(
         "tmp-{}-{}",
         std::process::id(),
@@ -482,9 +482,59 @@ pub fn write_authority_bearing_secret(target: &Path, data: &[u8]) -> Result<()> 
     }
     apply_secret_file_permissions(target)?;
     sync_parent_dir(target)?;
+    clear_delegated_replace_marker(target)?;
+    Ok(())
+}
+
+/// Authority-bearing staged previous primary during replacement.
+pub fn delegated_committing_path(delegated_path: &Path) -> PathBuf {
+    delegated_path.with_extension("committing")
+}
+
+/// Replacement transaction marker for authority-bearing delegated session writes.
+pub fn delegated_replace_pending_path(delegated_path: &Path) -> PathBuf {
+    delegated_path.with_extension("replace-pending")
+}
+
+/// Test hook: force staged `.committing` removal failure after successful primary commit.
+pub static INJECT_COMMITTING_REMOVE_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn find_delegated_staged_tmp(parent: &Path, stem: &str) -> Result<Option<PathBuf>> {
+    let tmp_prefix = format!("{stem}.tmp-");
+    let entries = fs::read_dir(parent).with_context(|| {
+        format!(
+            "enumerate delegated replacement temps in {}",
+            parent.display()
+        )
+    })?;
+    let mut staged_tmp: Option<PathBuf> = None;
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "read delegated replacement temp entry in {}",
+                parent.display()
+            )
+        })?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(&tmp_prefix) {
+            if staged_tmp.is_some() {
+                anyhow::bail!(
+                    "multiple delegated replacement temps in {}",
+                    parent.display()
+                );
+            }
+            staged_tmp = Some(entry.path());
+        }
+    }
+    Ok(staged_tmp)
+}
+
+fn clear_delegated_replace_marker(delegated_path: &Path) -> Result<()> {
+    let pending_marker = delegated_replace_pending_path(delegated_path);
     if pending_marker.is_file() {
-        let _ = fs::remove_file(&pending_marker);
-        sync_parent_dir(target)?;
+        remove_file_durable(&pending_marker)?;
+        sync_parent_dir(delegated_path)?;
     }
     Ok(())
 }
@@ -492,15 +542,21 @@ pub fn write_authority_bearing_secret(target: &Path, data: &[u8]) -> Result<()> 
 /// Preserve the previous primary until the staged temp is committed.
 fn commit_authority_secret_replace(target: &Path, tmp: &Path) -> Result<()> {
     if target.exists() {
-        let staging = target.with_extension("committing");
+        let staging = delegated_committing_path(target);
         if staging.is_file() {
-            fs::remove_file(&staging)?;
+            remove_file_durable(&staging)?;
         }
         fs::rename(target, &staging)
             .with_context(|| format!("stage previous authority secret {}", target.display()))?;
         match fs::rename(tmp, target) {
             Ok(()) => {
-                let _ = fs::remove_file(&staging);
+                if INJECT_COMMITTING_REMOVE_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(anyhow::anyhow!("injected committing remove failure"));
+                }
+                remove_file_durable(&staging).with_context(|| {
+                    format!("remove staged authority secret {}", staging.display())
+                })?;
+                sync_parent_dir(target)?;
                 Ok(())
             }
             Err(error) => {
@@ -516,7 +572,7 @@ fn commit_authority_secret_replace(target: &Path, tmp: &Path) -> Result<()> {
 
 /// Complete or fail-closed recover a partial delegated-session replacement.
 pub fn recover_delegated_replace_pending(delegated_path: &Path) -> Result<()> {
-    let pending_marker = delegated_path.with_extension("replace-pending");
+    let pending_marker = delegated_replace_pending_path(delegated_path);
     if !pending_marker.is_file() {
         return Ok(());
     }
@@ -527,42 +583,49 @@ pub fn recover_delegated_replace_pending(delegated_path: &Path) -> Result<()> {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("twitch-delegated");
-    let tmp_prefix = format!("{stem}.tmp-");
-    let mut staged_tmp: Option<PathBuf> = None;
-    if let Ok(entries) = fs::read_dir(parent) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&tmp_prefix) {
-                staged_tmp = Some(entry.path());
-            }
+    let staged_tmp = find_delegated_staged_tmp(parent, stem)?;
+    let committing = delegated_committing_path(delegated_path);
+
+    // marker + primary(new) + committing(old): commit succeeded but staging removal failed.
+    if delegated_path.is_file() && committing.is_file() {
+        remove_file_durable(&committing)
+            .with_context(|| format!("remove staged authority secret {}", committing.display()))?;
+        if let Some(tmp) = staged_tmp {
+            remove_file_durable(&tmp)?;
         }
+        clear_delegated_replace_marker(delegated_path)?;
+        return Ok(());
     }
-    let committing = delegated_path.with_extension("committing");
+
+    // marker + primary + temp (before staging): replacement aborted after marker write.
     if delegated_path.is_file() {
         if let Some(tmp) = staged_tmp {
-            let _ = fs::remove_file(&tmp);
+            remove_file_durable(&tmp)?;
         }
-        let _ = fs::remove_file(&pending_marker);
-        sync_parent_dir(delegated_path)?;
+        clear_delegated_replace_marker(delegated_path)?;
         return Ok(());
     }
+
+    // marker + committing + temp, no primary: crash after staging old primary.
     if committing.is_file() {
-        fs::rename(&committing, delegated_path)?;
+        fs::rename(&committing, delegated_path)
+            .with_context(|| format!("restore authority secret from {}", committing.display()))?;
         if let Some(tmp) = staged_tmp {
-            let _ = fs::remove_file(&tmp);
+            remove_file_durable(&tmp)?;
         }
-        let _ = fs::remove_file(&pending_marker);
-        sync_parent_dir(delegated_path)?;
+        clear_delegated_replace_marker(delegated_path)?;
         return Ok(());
     }
+
+    // marker + temp only: crash before staging; attempt commit.
     if let Some(tmp) = staged_tmp {
         commit_authority_secret_replace(delegated_path, &tmp)?;
         apply_secret_file_permissions(delegated_path)?;
         sync_parent_dir(delegated_path)?;
-        let _ = fs::remove_file(&pending_marker);
-        sync_parent_dir(delegated_path)?;
+        clear_delegated_replace_marker(delegated_path)?;
         return Ok(());
     }
+
     anyhow::bail!(
         "delegated session replace-pending marker present without recoverable primary or staged temp"
     );
@@ -712,11 +775,13 @@ fn apply_secret_file_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Bounded inventory: primary delegated secret + legacy `.bak`.
+/// Bounded inventory: primary delegated secret + legacy `.bak` + staged variants.
 pub fn delegated_secret_variants(delegated_path: &Path) -> Result<Vec<PathBuf>> {
     let mut out = vec![
         delegated_path.to_path_buf(),
         delegated_path.with_extension("bak"),
+        delegated_committing_path(delegated_path),
+        delegated_replace_pending_path(delegated_path),
     ];
     out.extend(delegated_temp_and_quarantine_variants(delegated_path)?);
     Ok(out)
