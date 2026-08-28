@@ -51,8 +51,9 @@ pub use storage::{
     resolve_ui_assets_root, rust_dotenv_path, rust_workspace_root, write_secret_file, StoragePaths,
 };
 pub use storage::{
-    delegated_temp_and_quarantine_variants, remove_file_durable, write_delegated_revoke_pending,
-    write_delegated_revoked_tombstone, write_identity_rollback_pending, write_json,
+    delegated_temp_and_quarantine_variants, recover_delegated_replace_pending, remove_file_durable,
+    write_delegated_revoke_pending, write_delegated_revoked_tombstone,
+    write_identity_rollback_pending, write_json,
 };
 
 /// Back-compat alias.

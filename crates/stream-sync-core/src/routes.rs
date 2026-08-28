@@ -458,6 +458,7 @@ async fn api_status(State(ctx): State<ServerContext>) -> Json<Value> {
             .and_then(|d| d.kick_id.clone())
             .is_some();
     Json(json!({
+        "identityRecoveryRequired": ctx.state.identity_recovery_required(),
         "twitch": {
             "connected": tw.connected,
             "channel": tw.channel,

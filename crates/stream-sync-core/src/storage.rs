@@ -454,6 +454,7 @@ pub fn write_authority_bearing_secret(target: &Path, data: &[u8]) -> Result<()> 
     if bak.is_file() {
         remove_file_durable(&bak)?;
     }
+    let pending_marker = target.with_extension("replace-pending");
     let tmp = target.with_extension(format!(
         "tmp-{}-{}",
         std::process::id(),
@@ -470,14 +471,101 @@ pub fn write_authority_bearing_secret(target: &Path, data: &[u8]) -> Result<()> 
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
-    if target.is_file() {
-        remove_file_durable(target)?;
+    write_marker_file(
+        &pending_marker,
+        br#"{"reason":"delegated_session_replace_pending"}"#,
+    )?;
+    let commit_result = commit_authority_secret_replace(target, &tmp);
+    if let Err(error) = commit_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
     }
-    fs::rename(&tmp, target)
-        .with_context(|| format!("commit authority secret {}", target.display()))?;
     apply_secret_file_permissions(target)?;
     sync_parent_dir(target)?;
+    if pending_marker.is_file() {
+        let _ = fs::remove_file(&pending_marker);
+        sync_parent_dir(target)?;
+    }
     Ok(())
+}
+
+/// Preserve the previous primary until the staged temp is committed.
+fn commit_authority_secret_replace(target: &Path, tmp: &Path) -> Result<()> {
+    if target.exists() {
+        let staging = target.with_extension("committing");
+        if staging.is_file() {
+            fs::remove_file(&staging)?;
+        }
+        fs::rename(target, &staging)
+            .with_context(|| format!("stage previous authority secret {}", target.display()))?;
+        match fs::rename(tmp, target) {
+            Ok(()) => {
+                let _ = fs::remove_file(&staging);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = fs::rename(&staging, target);
+                Err(error).with_context(|| format!("commit authority secret {}", target.display()))
+            }
+        }
+    } else {
+        fs::rename(tmp, target)
+            .with_context(|| format!("install authority secret {}", target.display()))
+    }
+}
+
+/// Complete or fail-closed recover a partial delegated-session replacement.
+pub fn recover_delegated_replace_pending(delegated_path: &Path) -> Result<()> {
+    let pending_marker = delegated_path.with_extension("replace-pending");
+    if !pending_marker.is_file() {
+        return Ok(());
+    }
+    let parent = delegated_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("delegated path has no parent"))?;
+    let stem = delegated_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("twitch-delegated");
+    let tmp_prefix = format!("{stem}.tmp-");
+    let mut staged_tmp: Option<PathBuf> = None;
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&tmp_prefix) {
+                staged_tmp = Some(entry.path());
+            }
+        }
+    }
+    let committing = delegated_path.with_extension("committing");
+    if delegated_path.is_file() {
+        if let Some(tmp) = staged_tmp {
+            let _ = fs::remove_file(&tmp);
+        }
+        let _ = fs::remove_file(&pending_marker);
+        sync_parent_dir(delegated_path)?;
+        return Ok(());
+    }
+    if committing.is_file() {
+        fs::rename(&committing, delegated_path)?;
+        if let Some(tmp) = staged_tmp {
+            let _ = fs::remove_file(&tmp);
+        }
+        let _ = fs::remove_file(&pending_marker);
+        sync_parent_dir(delegated_path)?;
+        return Ok(());
+    }
+    if let Some(tmp) = staged_tmp {
+        commit_authority_secret_replace(delegated_path, &tmp)?;
+        apply_secret_file_permissions(delegated_path)?;
+        sync_parent_dir(delegated_path)?;
+        let _ = fs::remove_file(&pending_marker);
+        sync_parent_dir(delegated_path)?;
+        return Ok(());
+    }
+    anyhow::bail!(
+        "delegated session replace-pending marker present without recoverable primary or staged temp"
+    );
 }
 
 #[derive(Clone, Copy)]

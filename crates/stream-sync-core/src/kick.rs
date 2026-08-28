@@ -16,6 +16,184 @@ use tracing::{info, warn};
 
 const KICK_CHAT_URL: &str = "https://api.kick.com/public/v1/chat";
 
+/// Kick chat credential captured atomically with provenance.
+#[derive(Debug, Clone)]
+pub struct KickChatCredential {
+    pub access_token: String,
+    pub kick_id: String,
+}
+
+/// Atomically selected Kick credentials with provenance (B1).
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // connection_key/feed_ticket are part of the atomic barrier bundle.
+pub enum KickCredentialSelection {
+    Local {
+        chat: KickChatCredential,
+        feed_ticket: Option<String>,
+    },
+    Delegated {
+        snap: crate::delegated_lifecycle::AuthorityLeaseSnapshot,
+        connection_key: String,
+        chat: KickChatCredential,
+    },
+}
+
+impl KickCredentialSelection {
+    pub fn provenance(&self) -> crate::twitch::PlatformCredentialProvenance {
+        match self {
+            Self::Local { .. } => crate::twitch::PlatformCredentialProvenance::Local,
+            Self::Delegated { snap, .. } => {
+                crate::twitch::PlatformCredentialProvenance::Delegated { snap: *snap }
+            }
+        }
+    }
+}
+
+/// Atomically selected Kick feed connection parameters.
+#[derive(Debug, Clone)]
+pub struct KickFeedSelection {
+    pub url: String,
+    pub auth: Option<String>,
+    pub redact_key: Option<String>,
+    pub snap: Option<crate::delegated_lifecycle::AuthorityLeaseSnapshot>,
+}
+
+/// Select Kick chat credentials under the lifecycle fence.
+pub async fn select_kick_credentials(
+    state: &AppState,
+    services: &crate::twitch::TwitchServices,
+) -> Result<KickCredentialSelection> {
+    state.ensure_identity_coherent_for_platform()?;
+    let _lifecycle = services.lock_lifecycle().await;
+    let mode = *state.active_mode.read().await;
+    if mode == crate::config_types::TwitchActiveMode::Delegated {
+        let session = state
+            .delegated
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("Delegated Kick session unavailable"))?;
+        let snap = services.authority_lease_snapshot_public().await;
+        {
+            let lease = services.read_authority_lease().await;
+            if !lease.allows_platform_operations(snap.generation)
+                || lease.snapshot().generation != snap.generation
+                || lease.snapshot().deadline != snap.deadline
+            {
+                return Err(anyhow!("Delegated authority expired or superseded"));
+            }
+        }
+        if !state.session_still_current(snap.generation).await {
+            return Err(anyhow!("Delegated authority expired or superseded"));
+        }
+        let access = session
+            .kick_access_token
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("Kick is not connected"))?;
+        let kick_id = session
+            .kick_id
+            .clone()
+            .ok_or_else(|| anyhow!("Kick is not connected"))?;
+        return Ok(KickCredentialSelection::Delegated {
+            snap,
+            connection_key: session.connection_key.clone(),
+            chat: KickChatCredential {
+                access_token: access,
+                kick_id,
+            },
+        });
+    }
+    let tokens = state.kick.read().await.tokens.clone();
+    let access = tokens
+        .access_token
+        .clone()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("Kick is not connected"))?;
+    let kick_id = tokens
+        .kick_id
+        .clone()
+        .ok_or_else(|| anyhow!("Kick is not connected"))?;
+    Ok(KickCredentialSelection::Local {
+        chat: KickChatCredential {
+            access_token: access,
+            kick_id,
+        },
+        feed_ticket: tokens.feed_ticket.filter(|s| !s.is_empty()),
+    })
+}
+
+/// Select Kick feed URL/auth/snapshot under one lifecycle transaction.
+pub async fn select_kick_feed_connect(
+    state: &AppState,
+    services: &crate::twitch::TwitchServices,
+) -> Option<KickFeedSelection> {
+    if state.identity_recovery_required() {
+        return None;
+    }
+    let _lifecycle = services.lock_lifecycle().await;
+    let mode = *state.active_mode.read().await;
+    if mode == crate::config_types::TwitchActiveMode::Delegated {
+        let session = state.delegated.read().await.clone()?;
+        if session.kick_id.as_ref().is_none_or(|s| s.is_empty())
+            || session.connection_key.is_empty()
+        {
+            return None;
+        }
+        let snap = services.authority_lease_snapshot_public().await;
+        if !services.syndicate_revalidation_still_valid(snap).await {
+            return None;
+        }
+        let key = session.connection_key.clone();
+        return Some(KickFeedSelection {
+            url: syndicate_connection::kick_feed_url(),
+            auth: Some(crate::delegated_lifecycle::connection_key_authorization(
+                &key,
+            )),
+            redact_key: Some(key),
+            snap: Some(snap),
+        });
+    }
+    let tokens = state.kick.read().await.tokens.clone();
+    let ticket = tokens.feed_ticket.filter(|s| !s.is_empty())?;
+    Some(KickFeedSelection {
+        url: format!(
+            "{}/api/stream-sync/kick-feed?ticket={}",
+            syndicate_connection::api_base(),
+            urlencoding::encode(&ticket)
+        ),
+        auth: None,
+        redact_key: None,
+        snap: None,
+    })
+}
+
+/// Merge a Syndicate exchange into a saved delegated session (all Twitch/Kick fields).
+pub fn merge_delegated_session_from_exchange(
+    mut session: DelegatedSessionFile,
+    exchange: &syndicate_connection::ExchangeSuccess,
+) -> DelegatedSessionFile {
+    session.client_id = exchange.twitch.client_id.clone();
+    session.access_token = exchange.twitch.access_token.clone();
+    session.channel_login = exchange.channel.login.clone();
+    session.channel_twitch_id = exchange.channel.twitch_id.clone();
+    session.display_name = exchange.channel.display_name.clone();
+    session.label = exchange.connection.label.clone();
+    session.scopes = exchange.twitch.scopes.clone();
+    session.twitch_expires_at = exchange.twitch.expires_at.clone();
+    session.connection_expires_at = exchange.connection.expires_at.clone();
+    apply_kick_to_delegated(&mut session, exchange);
+    session
+}
+
+#[cfg(test)]
+pub fn delegated_session_matches_exchange(
+    session: &DelegatedSessionFile,
+    exchange: &syndicate_connection::ExchangeSuccess,
+) -> bool {
+    &merge_delegated_session_from_exchange(session.clone(), exchange) == session
+}
+
 pub fn apply_kick_to_delegated(session: &mut DelegatedSessionFile, exchange: &ExchangeSuccess) {
     match kick_from_exchange(exchange) {
         Some(k) => {
@@ -254,63 +432,20 @@ pub async fn send_chat_from_dock(state: Arc<AppState>, message: &str) -> Result<
     if trimmed.is_empty() {
         return Ok(());
     }
-    let (provenance, access, broadcaster_user_id) = if let Some(services) = state.twitch_services()
-    {
-        let selection = services.select_platform_credentials(&state).await?;
-        let provenance = selection.provenance();
-        let (access, kick_id) = match selection {
-            crate::twitch::PlatformCredentialSelection::Local { .. } => {
-                ensure_fresh_personal_token(&state).await.ok();
-                let tokens = state.kick.read().await.tokens.clone();
-                let access = tokens
-                    .access_token
-                    .clone()
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| anyhow!("Kick is not connected"))?;
-                let kick_id = tokens
-                    .kick_id
-                    .clone()
-                    .ok_or_else(|| anyhow!("Kick is not connected"))?;
-                (access, kick_id)
-            }
-            crate::twitch::PlatformCredentialSelection::Delegated { .. } => {
-                let delegated = state.delegated.read().await.clone();
-                let session = delegated
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("Delegated Kick session unavailable"))?;
-                let access = session
-                    .kick_access_token
-                    .clone()
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| anyhow!("Kick is not connected"))?;
-                let kick_id = session
-                    .kick_id
-                    .clone()
-                    .ok_or_else(|| anyhow!("Kick is not connected"))?;
-                (access, kick_id)
-            }
-        };
-        let broadcaster_user_id: i64 = kick_id.parse().unwrap_or(0);
-        (provenance, access, broadcaster_user_id)
-    } else if state.is_delegated_mode().await {
-        return Err(anyhow!("Delegated authority unavailable"));
-    } else {
+    state.ensure_identity_coherent_for_platform()?;
+    if !state.is_delegated_mode().await {
         ensure_fresh_personal_token(&state).await.ok();
-        let tokens = state.kick.read().await.tokens.clone();
-        let access = tokens
-            .access_token
-            .clone()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow!("Kick is not connected"))?;
-        let kick_id = tokens
-            .kick_id
-            .clone()
-            .ok_or_else(|| anyhow!("Kick is not connected"))?;
-        (
-            crate::twitch::PlatformCredentialProvenance::Local,
-            access,
-            kick_id.parse().unwrap_or(0),
-        )
+    }
+    let services = state
+        .twitch_services()
+        .ok_or_else(|| anyhow!("Delegated authority unavailable"))?;
+    let selection = select_kick_credentials(&state, &services).await?;
+    let provenance = selection.provenance();
+    let (access, broadcaster_user_id) = match selection {
+        KickCredentialSelection::Local { chat, .. }
+        | KickCredentialSelection::Delegated { chat, .. } => {
+            (chat.access_token, chat.kick_id.parse().unwrap_or(0))
+        }
     };
     let send_fut = async move {
         let res = reqwest::Client::new()
@@ -345,62 +480,23 @@ pub async fn send_chat_from_dock(state: Arc<AppState>, message: &str) -> Result<
     Ok(())
 }
 
-async fn select_kick_feed_connect(
-    state: &AppState,
-) -> Option<(
-    String,
-    Option<String>,
-    Option<String>,
-    Option<crate::delegated_lifecycle::AuthorityLeaseSnapshot>,
-)> {
-    let mode = *state.active_mode.read().await;
-    if mode == crate::config_types::TwitchActiveMode::Delegated {
-        let session = state.delegated.read().await.clone()?;
-        if session.kick_id.as_ref().is_none_or(|s| s.is_empty())
-            || session.connection_key.is_empty()
-        {
-            return None;
-        }
-        let services = state.twitch_services()?;
-        let snap = services.authority_lease_snapshot_public().await;
-        if !services.syndicate_revalidation_still_valid(snap).await {
-            return None;
-        }
-        let key = session.connection_key.clone();
-        return Some((
-            syndicate_connection::kick_feed_url(),
-            Some(crate::delegated_lifecycle::connection_key_authorization(
-                &key,
-            )),
-            Some(key),
-            Some(snap),
-        ));
-    }
-    let tokens = state.kick.read().await.tokens.clone();
-    let ticket = tokens.feed_ticket.filter(|s| !s.is_empty())?;
-    Some((
-        format!(
-            "{}/api/stream-sync/kick-feed?ticket={}",
-            syndicate_connection::api_base(),
-            urlencoding::encode(&ticket)
-        ),
-        None,
-        None,
-        None,
-    ))
-}
-
 async fn feed_loop(state: Arc<AppState>) {
     loop {
-        let Some((url, auth, redact_key, snap)) = select_kick_feed_connect(&state).await else {
+        let Some(services) = state.twitch_services() else {
             state.kick.write().await.connected = false;
             tokio::time::sleep(Duration::from_secs(8)).await;
             continue;
         };
-        match consume_sse(state.clone(), &url, auth.as_deref(), snap).await {
+        let Some(sel) = select_kick_feed_connect(&state, &services).await else {
+            state.kick.write().await.connected = false;
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            continue;
+        };
+        match consume_sse(state.clone(), &sel.url, sel.auth.as_deref(), sel.snap).await {
             Ok(()) => info!("Kick feed SSE ended"),
             Err(e) => {
-                let msg = redact_key
+                let msg = sel
+                    .redact_key
                     .as_deref()
                     .map(|k| {
                         crate::delegated_lifecycle::redact_connection_key(&format!("{e:#}"), k)
@@ -923,6 +1019,46 @@ mod tests {
         .await
         .expect("build_app");
         (state, services)
+    }
+
+    #[tokio::test]
+    async fn select_kick_credentials_matches_active_mode_provenance() {
+        let (state, services) = kick_feed_app().await;
+        *state.active_mode.write().await = crate::TwitchActiveMode::Delegated;
+        services.install_delegated_generation(1).await;
+        services.install_validated_authority_lease(1, None).await;
+        state
+            .delegated_generation
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        *state.delegated.write().await = Some(DelegatedSessionFile {
+            generation: 1,
+            connection_key: "ssk_test_placeholder_kick_atomic".into(),
+            kick_id: Some("99".into()),
+            kick_access_token: Some("kick-at".into()),
+            ..Default::default()
+        });
+        sync_live_identity(state.clone()).await;
+        let delegated = select_kick_credentials(&state, &services)
+            .await
+            .expect("delegated kick selection");
+        assert!(matches!(
+            delegated.provenance(),
+            crate::twitch::PlatformCredentialProvenance::Delegated { .. }
+        ));
+
+        *state.active_mode.write().await = crate::TwitchActiveMode::Local;
+        {
+            let mut k = state.kick.write().await;
+            k.tokens.access_token = Some("local-kick".into());
+            k.tokens.kick_id = Some("42".into());
+        }
+        let local = select_kick_credentials(&state, &services)
+            .await
+            .expect("local kick selection");
+        assert!(matches!(
+            local.provenance(),
+            crate::twitch::PlatformCredentialProvenance::Local
+        ));
     }
 
     #[tokio::test]

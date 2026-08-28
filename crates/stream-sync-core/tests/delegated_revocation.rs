@@ -821,6 +821,10 @@ fn acceptance_boundaries_document_manual_syndicate_integration() {
     assert!(body.contains("SYNDICATE_SSE_READ_TIMEOUT"));
     let kick = include_str!("../src/kick.rs");
     assert!(
+        kick.contains("select_kick_credentials"),
+        "kick chat must atomically select credentials with provenance"
+    );
+    assert!(
         kick.contains("select_kick_feed_connect"),
         "kick feed must atomically select connection credentials"
     );
@@ -832,6 +836,28 @@ fn acceptance_boundaries_document_manual_syndicate_integration() {
         include_str!("delegated_revocation.rs")
             .contains("two_instances_process_revoke_independently"),
         "local double-instance coverage remains available"
+    );
+    let kick_tests = include_str!("../src/kick.rs");
+    assert!(
+        kick_tests.contains("delegated_feed_connect_hang_rejected_at_deadline"),
+        "production-path SSE transport hang must fail at lease deadline"
+    );
+    assert!(
+        kick_tests.contains("delegated_feed_rejects_frame_after_deadline"),
+        "production-path late SSE frame must be rejected"
+    );
+    assert!(
+        kick_tests.contains("delegated_feed_rejects_generation_change_mid_stream"),
+        "production-path reconnect/generation change must fail closed"
+    );
+    let twitch_tests = include_str!("../src/twitch.rs");
+    assert!(
+        twitch_tests.contains("refresh_hard_fail_codes_end_delegated_session"),
+        "explicit key expiration/revocation must end delegated session"
+    );
+    assert!(
+        twitch_tests.contains("sse_401_uses_authorization_header_and_tears_down"),
+        "repeated reconnect/auth failure must tear down delegated session"
     );
 }
 
@@ -871,6 +897,12 @@ async fn identity_rollback_pending_blocks_ambiguous_restart() {
     let state = restart_app_at(&userdata, false);
     assert!(state.identity_rollback_pending());
     assert_ne!(*state.active_mode.read().await, TwitchActiveMode::Delegated);
+    assert!(state.twitch.read().await.tokens.access_token.is_none());
+    assert!(!state.kick.read().await.tokens.is_linked());
+    assert!(
+        state.ensure_identity_coherent_for_platform().is_err(),
+        "rollback pending must block platform identity paths before Helix/IRC/Kick handlers"
+    );
 }
 
 #[test]
@@ -914,4 +946,59 @@ async fn backup_remove_failure_during_replacement_keeps_old_session() {
     let restarted = restart_app_at(&userdata, false);
     let reloaded = restarted.delegated.read().await.clone().unwrap();
     assert_eq!(reloaded.generation, 1);
+}
+
+#[test]
+fn authority_replace_pending_recovery_preserves_primary_on_marker_only() {
+    let dir = std::env::temp_dir().join(format!(
+        "streamsync-auth-replace-recover-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let primary = dir.join("twitch-delegated.json");
+    std::fs::write(&primary, br#"{"generation":1,"connection_key":"k"}"#).unwrap();
+    std::fs::write(
+        primary.with_extension("replace-pending"),
+        br#"{"reason":"delegated_session_replace_pending"}"#,
+    )
+    .unwrap();
+    stream_sync_core::recover_delegated_replace_pending(&primary).unwrap();
+    assert!(primary.is_file());
+    assert!(!primary.with_extension("replace-pending").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn authority_secret_partial_commit_recovery_restores_primary_on_restart() {
+    let dir = std::env::temp_dir().join(format!(
+        "streamsync-auth-partial-commit-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let primary = dir.join("twitch-delegated.json");
+    let committing = primary.with_extension("committing");
+    let tmp = dir.join("twitch-delegated.tmp-crash");
+    std::fs::write(&primary, br#"{"generation":1,"connection_key":"old"}"#).unwrap();
+    std::fs::rename(&primary, &committing).unwrap();
+    std::fs::write(&tmp, br#"{"generation":2,"connection_key":"new"}"#).unwrap();
+    std::fs::write(
+        primary.with_extension("replace-pending"),
+        br#"{"reason":"delegated_session_replace_pending"}"#,
+    )
+    .unwrap();
+    stream_sync_core::recover_delegated_replace_pending(&primary).unwrap();
+    assert!(primary.is_file());
+    assert!(!committing.is_file());
+    assert!(!tmp.is_file());
+    let restored = std::fs::read_to_string(&primary).unwrap();
+    assert!(restored.contains("old"));
+    let _ = std::fs::remove_dir_all(&dir);
 }

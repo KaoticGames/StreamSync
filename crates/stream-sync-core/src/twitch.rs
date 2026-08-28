@@ -128,6 +128,22 @@ impl TwitchServices {
         self.apply_intent.load(Ordering::SeqCst)
     }
 
+    /// Newest identity intent wins; stale operations must not commit after awaits.
+    pub fn ensure_apply_intent_current(&self, intent: u64) -> Result<()> {
+        if self.apply_intent.load(Ordering::SeqCst) != intent {
+            return Err(anyhow!("superseded by newer identity action"));
+        }
+        Ok(())
+    }
+
+    pub async fn lock_lifecycle(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.lifecycle_lock.lock().await
+    }
+
+    pub async fn read_authority_lease(&self) -> tokio::sync::MutexGuard<'_, AuthorityLease> {
+        self.authority_lease.lock().await
+    }
+
     /// Spawn the external teardown coordinator worker (must run outside watch/refresh tasks).
     pub fn init_teardown_worker(self: &Arc<Self>) {
         if self.teardown_tx.get().is_some() {
@@ -599,6 +615,7 @@ pub async fn validate_token(access_token: &str) -> Result<Value> {
 }
 
 pub async fn helix_get(state: &AppState, path: &str) -> Result<Value> {
+    state.ensure_identity_coherent_for_platform()?;
     ensure_valid_token(state).await?;
     let selection = select_helix_credentials(state).await?;
     let (provenance, client_id, token) = match selection {
@@ -638,6 +655,7 @@ pub async fn helix_get(state: &AppState, path: &str) -> Result<Value> {
 }
 
 pub async fn helix_patch(state: &AppState, path: &str, body: Value) -> Result<Value> {
+    state.ensure_identity_coherent_for_platform()?;
     ensure_valid_token(state).await?;
     let selection = select_helix_credentials(state).await?;
     let (provenance, client_id, token) = match selection {
@@ -675,6 +693,7 @@ pub async fn helix_patch(state: &AppState, path: &str, body: Value) -> Result<Va
 }
 
 pub async fn helix_post(state: &AppState, path: &str, body: Value) -> Result<Value> {
+    state.ensure_identity_coherent_for_platform()?;
     ensure_valid_token(state).await?;
     let selection = select_helix_credentials(state).await?;
     let (provenance, client_id, token) = match selection {
@@ -1024,13 +1043,14 @@ pub async fn apply_set_token(
     services: Arc<TwitchServices>,
     body: Value,
 ) -> Result<()> {
-    let _intent = services.bump_apply_intent();
+    let intent = services.bump_apply_intent();
     // Personal OAuth — keep any saved takeover session; just activate local.
     let access_token = body
         .get("accessToken")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("missing accessToken"))?;
     let validated = validate_token(access_token).await?;
+    services.ensure_apply_intent_current(intent)?;
     let login = validated
         .get("login")
         .and_then(|v| v.as_str())
@@ -1056,6 +1076,7 @@ pub async fn apply_set_token(
     // Durable commit before live publish; restore personal token file if mode commit fails (B2).
     {
         let _lifecycle = services.lifecycle_lock.lock().await;
+        services.ensure_apply_intent_current(intent)?;
         let previous_personal = state.personal_tokens.read().await.clone();
         let previous_mode = *state.active_mode.read().await;
         *state.personal_tokens.write().await = tokens.clone();
@@ -1101,35 +1122,30 @@ pub async fn apply_set_token(
     Ok(())
 }
 
-/// Remote validation gate before activating a saved delegated identity (B9).
+/// Remote validation gate before activating a saved delegated identity (B9/B3).
 async fn validate_saved_delegated_for_activation(
     state: Arc<AppState>,
     services: Arc<TwitchServices>,
     session: &DelegatedSessionFile,
-) -> Result<()> {
+    intent: u64,
+) -> Result<DelegatedSessionFile> {
+    services.ensure_apply_intent_current(intent)?;
     let generation = session.generation;
     services.install_pending_authority_lease(generation).await;
     match syndicate_connection::refresh(&session.connection_key).await {
         Ok(exchange) => {
+            services.ensure_apply_intent_current(intent)?;
             services
                 .renew_after_successful_remote_validation(
                     generation,
-                    session.connection_expires_at.as_deref(),
+                    exchange.connection.expires_at.as_deref(),
                 )
                 .await
                 .map_err(|e| anyhow!(e))?;
-            // Refresh may rotate tokens; persist when exchange differs.
-            if exchange.twitch.access_token != session.access_token {
-                let mut updated = session.clone();
-                updated.access_token = exchange.twitch.access_token.clone();
-                updated.client_id = exchange.twitch.client_id.clone();
-                updated.twitch_expires_at = exchange.twitch.expires_at.clone();
-                updated.connection_expires_at = exchange.connection.expires_at.clone();
-                crate::kick::apply_kick_to_delegated(&mut updated, &exchange);
-                state.persist_delegated_session(&updated)?;
-                *state.delegated.write().await = Some(updated);
-            }
-            Ok(())
+            Ok(crate::kick::merge_delegated_session_from_exchange(
+                session.clone(),
+                &exchange,
+            ))
         }
         Err(e) => {
             if let Some(api) = e.downcast_ref::<SyndicateApiError>() {
@@ -1160,7 +1176,8 @@ pub async fn use_connection(
     services: Arc<TwitchServices>,
     mode: TwitchActiveMode,
 ) -> Result<()> {
-    let _intent = services.bump_apply_intent();
+    let intent = services.bump_apply_intent();
+    state.ensure_identity_coherent_for_platform()?;
     match mode {
         TwitchActiveMode::Local => {
             let personal = state.personal_tokens.read().await.clone();
@@ -1171,6 +1188,7 @@ pub async fn use_connection(
             }
             {
                 let _lifecycle = services.lifecycle_lock.lock().await;
+                services.ensure_apply_intent_current(intent)?;
                 // Stage durable mode first; only then publish live identity (B8).
                 let previous_mode = *state.active_mode.read().await;
                 *state.active_mode.write().await = TwitchActiveMode::Local;
@@ -1202,14 +1220,25 @@ pub async fn use_connection(
             crate::kick::sync_live_identity(state).await;
         }
         TwitchActiveMode::Delegated => {
-            let session =
+            let saved =
                 state.delegated.read().await.clone().ok_or_else(|| {
                     anyhow!("No takeover connection key saved. Paste a key first.")
                 })?;
-            validate_saved_delegated_for_activation(state.clone(), services.clone(), &session)
-                .await?;
+            let validated = validate_saved_delegated_for_activation(
+                state.clone(),
+                services.clone(),
+                &saved,
+                intent,
+            )
+            .await?;
+            services.ensure_apply_intent_current(intent)?;
             {
                 let _lifecycle = services.lifecycle_lock.lock().await;
+                services.ensure_apply_intent_current(intent)?;
+                if validated != saved {
+                    state.persist_delegated_session(&validated)?;
+                }
+                *state.delegated.write().await = Some(validated.clone());
                 let previous_mode = *state.active_mode.read().await;
                 *state.active_mode.write().await = TwitchActiveMode::Delegated;
                 if let Err(e) = state.save_active_mode().await {
@@ -1218,7 +1247,7 @@ pub async fn use_connection(
                 }
                 let mut tw = state.twitch.write().await;
                 clear_live_runtime_fields(&mut tw);
-                tw.tokens = tokens_from_delegated_session(&session);
+                tw.tokens = tokens_from_delegated_session(&validated);
             }
             restart_twitch_clients(state.clone(), services.clone()).await;
             ensure_delegated_refresh_loop(state.clone(), services).await;
@@ -4381,6 +4410,287 @@ mod tests {
         let mut lease = AuthorityLease::inactive();
         lease.install_validated_generation(1, None);
         assert!(lease.sleep_budget(Duration::from_secs(10_000)) <= MAX_DELEGATED_REVOCATION_DELAY);
+    }
+
+    #[test]
+    fn ensure_apply_intent_rejects_stale_sequence() {
+        let services = TwitchServices::new();
+        let intent = services.bump_apply_intent();
+        services.bump_apply_intent();
+        assert!(services.ensure_apply_intent_current(intent).is_err());
+    }
+
+    #[test]
+    fn merge_delegated_session_updates_all_exchange_fields() {
+        use crate::kick::merge_delegated_session_from_exchange;
+        let session = DelegatedSessionFile {
+            generation: 1,
+            connection_key: "ssk_test".into(),
+            client_id: "old".into(),
+            access_token: "old-token".into(),
+            channel_login: "old_chan".into(),
+            channel_twitch_id: "1".into(),
+            twitch_expires_at: "2020-01-01T00:00:00Z".into(),
+            ..Default::default()
+        };
+        let exchange = syndicate_connection::ExchangeSuccess {
+            ok: true,
+            twitch: syndicate_connection::ExchangeTwitch {
+                client_id: "new-cid".into(),
+                access_token: "new-token".into(),
+                expires_at: "2026-01-01T00:00:00Z".into(),
+                scopes: vec!["chat:read".into()],
+            },
+            channel: syndicate_connection::ExchangeChannel {
+                login: "new_chan".into(),
+                twitch_id: "99".into(),
+                display_name: Some("New".into()),
+            },
+            connection: syndicate_connection::ExchangeConnection {
+                label: Some("label".into()),
+                expires_at: Some("2026-06-01T00:00:00Z".into()),
+            },
+            kick: Some(syndicate_connection::ExchangeKick {
+                kick_id: Some("12345".into()),
+                login: Some("kickuser".into()),
+                access_token: Some("kick-at".into()),
+                refresh_token: None,
+                expires_at: None,
+                scopes: vec![],
+                error: None,
+            }),
+        };
+        let merged = merge_delegated_session_from_exchange(session, &exchange);
+        assert!(crate::kick::delegated_session_matches_exchange(
+            &merged, &exchange
+        ));
+        assert_eq!(merged.access_token, "new-token");
+        assert_eq!(merged.client_id, "new-cid");
+        assert_eq!(merged.kick_id.as_deref(), Some("12345"));
+        assert_eq!(
+            merged.connection_expires_at.as_deref(),
+            Some("2026-06-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn merge_exchange_rotates_twitch_only() {
+        use crate::kick::{
+            delegated_session_matches_exchange, merge_delegated_session_from_exchange,
+        };
+        let session = sample_delegated();
+        let exchange = syndicate_connection::ExchangeSuccess {
+            ok: true,
+            twitch: syndicate_connection::ExchangeTwitch {
+                client_id: "rotated-cid".into(),
+                access_token: "rotated-at".into(),
+                expires_at: "2099-02-01T00:00:00Z".into(),
+                scopes: vec!["chat:edit".into()],
+            },
+            channel: syndicate_connection::ExchangeChannel {
+                twitch_id: session.channel_twitch_id.clone(),
+                login: session.channel_login.clone(),
+                display_name: session.display_name.clone(),
+            },
+            kick: Some(syndicate_connection::ExchangeKick {
+                kick_id: session.kick_id.clone(),
+                login: session.kick_login.clone(),
+                access_token: session.kick_access_token.clone(),
+                refresh_token: session.kick_refresh_token.clone(),
+                expires_at: session.kick_expires_at.clone(),
+                scopes: session.kick_scopes.clone(),
+                error: None,
+            }),
+            connection: syndicate_connection::ExchangeConnection {
+                label: session.label.clone(),
+                expires_at: session.connection_expires_at.clone(),
+            },
+        };
+        let merged = merge_delegated_session_from_exchange(session, &exchange);
+        assert!(delegated_session_matches_exchange(&merged, &exchange));
+        assert_eq!(merged.access_token, "rotated-at");
+        assert_eq!(merged.kick_access_token.as_deref(), Some("delegated-kick"));
+    }
+
+    #[test]
+    fn merge_exchange_rotates_kick_only() {
+        use crate::kick::{
+            delegated_session_matches_exchange, merge_delegated_session_from_exchange,
+        };
+        let session = sample_delegated();
+        let exchange = syndicate_connection::ExchangeSuccess {
+            ok: true,
+            twitch: syndicate_connection::ExchangeTwitch {
+                client_id: session.client_id.clone(),
+                access_token: session.access_token.clone(),
+                expires_at: session.twitch_expires_at.clone(),
+                scopes: session.scopes.clone(),
+            },
+            channel: syndicate_connection::ExchangeChannel {
+                twitch_id: session.channel_twitch_id.clone(),
+                login: session.channel_login.clone(),
+                display_name: session.display_name.clone(),
+            },
+            kick: Some(syndicate_connection::ExchangeKick {
+                kick_id: Some("kick-rotated".into()),
+                login: Some("kickuser".into()),
+                access_token: Some("kick-rotated-at".into()),
+                refresh_token: Some("kick-rotated-rt".into()),
+                expires_at: Some("2099-03-01T00:00:00Z".into()),
+                scopes: vec!["chat:write".into()],
+                error: None,
+            }),
+            connection: syndicate_connection::ExchangeConnection {
+                label: session.label.clone(),
+                expires_at: session.connection_expires_at.clone(),
+            },
+        };
+        let merged = merge_delegated_session_from_exchange(session, &exchange);
+        assert!(delegated_session_matches_exchange(&merged, &exchange));
+        assert_eq!(merged.access_token, "delegated-access");
+        assert_eq!(merged.kick_access_token.as_deref(), Some("kick-rotated-at"));
+    }
+
+    #[test]
+    fn merge_exchange_rotates_scopes_and_expiry_only() {
+        use crate::kick::{
+            delegated_session_matches_exchange, merge_delegated_session_from_exchange,
+        };
+        let session = sample_delegated();
+        let exchange = syndicate_connection::ExchangeSuccess {
+            ok: true,
+            twitch: syndicate_connection::ExchangeTwitch {
+                client_id: session.client_id.clone(),
+                access_token: session.access_token.clone(),
+                expires_at: "2099-12-31T00:00:00Z".into(),
+                scopes: vec!["channel:manage:broadcast".into(), "chat:read".into()],
+            },
+            channel: syndicate_connection::ExchangeChannel {
+                twitch_id: session.channel_twitch_id.clone(),
+                login: session.channel_login.clone(),
+                display_name: Some("Display".into()),
+            },
+            kick: Some(syndicate_connection::ExchangeKick {
+                kick_id: session.kick_id.clone(),
+                login: session.kick_login.clone(),
+                access_token: session.kick_access_token.clone(),
+                refresh_token: session.kick_refresh_token.clone(),
+                expires_at: session.kick_expires_at.clone(),
+                scopes: session.kick_scopes.clone(),
+                error: None,
+            }),
+            connection: syndicate_connection::ExchangeConnection {
+                label: Some("new-label".into()),
+                expires_at: Some("2099-11-01T00:00:00Z".into()),
+            },
+        };
+        let merged = merge_delegated_session_from_exchange(session, &exchange);
+        assert!(delegated_session_matches_exchange(&merged, &exchange));
+        assert_eq!(merged.scopes, vec!["channel:manage:broadcast", "chat:read"]);
+        assert_eq!(
+            merged.connection_expires_at.as_deref(),
+            Some("2099-11-01T00:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn use_connection_delegated_aborts_when_superseded_by_local_switch() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    let n = socket.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = gate_rx.await;
+                let body = serde_json::json!({
+                    "ok": true,
+                    "twitch": {
+                        "client_id": "cid",
+                        "access_token": "new-delegated",
+                        "expires_at": "2099-01-01T00:00:00Z",
+                        "scopes": []
+                    },
+                    "channel": { "twitch_id": "999", "login": "takeover_chan" },
+                    "connection": { "expires_at": "2099-01-01T00:00:00Z" }
+                });
+                let payload = body.to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+        std::env::set_var("SYNDICATE_API_BASE", format!("http://127.0.0.1:{port}"));
+
+        let (state, services) = phase2_app().await;
+        install_delegated_session(&state, &services).await;
+        state
+            .persist_delegated_session(state.delegated.read().await.as_ref().unwrap())
+            .unwrap();
+        *state.personal_tokens.write().await = sample_personal();
+        state.save_twitch_tokens().await.unwrap();
+        *state.active_mode.write().await = TwitchActiveMode::Local;
+        {
+            let mut tw = state.twitch.write().await;
+            tw.tokens = sample_personal();
+        }
+
+        let state2 = state.clone();
+        let services2 = services.clone();
+        let pending = tokio::spawn(async move {
+            use_connection(state2, services2, TwitchActiveMode::Delegated).await
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        use_connection(state.clone(), services.clone(), TwitchActiveMode::Local)
+            .await
+            .expect("switch local");
+        let _ = gate_tx.send(());
+        let result = pending.await.unwrap();
+        assert!(
+            result.is_err(),
+            "stale delegated activation must not commit after newer Local switch: {result:?}"
+        );
+        assert_eq!(*state.active_mode.read().await, TwitchActiveMode::Local);
+        assert_eq!(
+            state.twitch.read().await.tokens.access_token.as_deref(),
+            Some("personal-access")
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_rollback_blocks_use_connection_and_kick_send() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let (state, services) = phase2_app().await;
+        *state.personal_tokens.write().await = sample_personal();
+        state.save_twitch_tokens().await.unwrap();
+        crate::storage::write_identity_rollback_pending(
+            &state.paths.twitch_tokens_rollback_pending,
+        )
+        .unwrap();
+        assert!(state.identity_recovery_required());
+        assert!(
+            use_connection(state.clone(), services.clone(), TwitchActiveMode::Local)
+                .await
+                .is_err()
+        );
+        assert!(crate::kick::send_chat_from_dock(state.clone(), "hello")
+            .await
+            .is_err());
     }
 
     #[tokio::test]

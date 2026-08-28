@@ -246,6 +246,12 @@ impl AppState {
             }
             None
         } else if paths.twitch_delegated.is_file() {
+            if !readonly {
+                if let Err(e) = storage::recover_delegated_replace_pending(&paths.twitch_delegated)
+                {
+                    tracing::warn!("delegated replace-pending recovery failed: {e:#}");
+                }
+            }
             read_json_for_mode(
                 &paths.twitch_delegated,
                 &DelegatedSessionFile::default(),
@@ -298,11 +304,7 @@ impl AppState {
             );
         }
         let live_tokens = if identity_rollback_pending {
-            if personal_ok {
-                personal.clone()
-            } else {
-                TwitchTokenFile::default()
-            }
+            TwitchTokenFile::default()
         } else {
             match active_mode {
                 TwitchActiveMode::Delegated => delegated
@@ -315,7 +317,11 @@ impl AppState {
 
         let personal_kick =
             read_json_for_mode(&paths.kick_tokens, &KickTokenFile::default(), readonly)?;
-        let live_kick = live_kick_tokens(active_mode, delegated.as_ref(), &personal_kick);
+        let live_kick = if identity_rollback_pending {
+            KickTokenFile::default()
+        } else {
+            live_kick_tokens(active_mode, delegated.as_ref(), &personal_kick)
+        };
         let control_token =
             crate::control_plane::load_control_token(&paths.control_token, readonly)?;
         let dock_credentials = if paths.dock_credentials.is_file() {
@@ -540,6 +546,18 @@ impl AppState {
 
     pub fn identity_rollback_pending(&self) -> bool {
         self.paths.twitch_tokens_rollback_pending.is_file()
+    }
+
+    /// Fail-closed when personal-token rollback could not restore disk coherence.
+    pub fn ensure_identity_coherent_for_platform(&self) -> anyhow::Result<()> {
+        if self.identity_rollback_pending() {
+            anyhow::bail!("Twitch identity recovery required before platform actions");
+        }
+        Ok(())
+    }
+
+    pub fn identity_recovery_required(&self) -> bool {
+        self.identity_rollback_pending()
     }
 
     /// Clear rollback marker after durable/live identity coherence is verified.
