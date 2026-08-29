@@ -2,7 +2,7 @@
 
 use crate::app_state::{live_kick_tokens, AppState};
 use crate::broadcast::make_platform_dock_event;
-use crate::config_types::{DelegatedSessionFile, KickTokenFile};
+use crate::config_types::{DelegatedSessionFile, KickTokenFile, TwitchActiveMode};
 use crate::delegated_lifecycle::DelegatedGeneration;
 use crate::syndicate_connection::{self, ExchangeSuccess};
 use anyhow::{anyhow, Result};
@@ -16,6 +16,129 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 const KICK_CHAT_URL: &str = "https://api.kick.com/public/v1/chat";
+
+#[cfg(test)]
+static REFRESH_KICK_TOKEN_GATE: std::sync::OnceLock<
+    tokio::sync::Mutex<Option<KickRefreshGateState>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static REFRESH_KICK_FEED_TAKE_GATE: std::sync::OnceLock<
+    tokio::sync::Mutex<Option<KickRefreshGateState>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static REFRESH_KICK_FEED_PUBLISH_GATE: std::sync::OnceLock<
+    tokio::sync::Mutex<Option<KickRefreshGateState>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct KickRefreshGateState {
+    arrived: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+pub(crate) async fn install_refresh_kick_token_gate() -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    install_kick_refresh_gate(REFRESH_KICK_TOKEN_GATE.get_or_init(|| tokio::sync::Mutex::new(None)))
+        .await
+}
+
+#[cfg(test)]
+pub(crate) async fn install_refresh_kick_feed_take_gate() -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    install_kick_refresh_gate(
+        REFRESH_KICK_FEED_TAKE_GATE.get_or_init(|| tokio::sync::Mutex::new(None)),
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn install_refresh_kick_feed_publish_gate() -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    install_kick_refresh_gate(
+        REFRESH_KICK_FEED_PUBLISH_GATE.get_or_init(|| tokio::sync::Mutex::new(None)),
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) fn clear_refresh_kick_gates() {
+    for slot in [
+        REFRESH_KICK_TOKEN_GATE.get(),
+        REFRESH_KICK_FEED_TAKE_GATE.get(),
+        REFRESH_KICK_FEED_PUBLISH_GATE.get(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(mut guard) = slot.try_lock() {
+            *guard = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn install_kick_refresh_gate(
+    slot: &tokio::sync::Mutex<Option<KickRefreshGateState>>,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    *slot.lock().await = Some(KickRefreshGateState {
+        arrived: arrived_tx,
+        resume: resume_rx,
+    });
+    (arrived_rx, resume_tx)
+}
+
+#[cfg(test)]
+async fn pause_kick_refresh_gate(slot: Option<&tokio::sync::Mutex<Option<KickRefreshGateState>>>) {
+    let Some(slot) = slot else {
+        return;
+    };
+    let mut guard = slot.lock().await;
+    let Some(gate) = guard.take() else {
+        return;
+    };
+    crate::delegated_lifecycle::defer_refresh_worker_abort_for_test(true);
+    let _ = gate.arrived.send(());
+    let _ = gate.resume.await;
+    crate::delegated_lifecycle::defer_refresh_worker_abort_for_test(false);
+}
+
+#[cfg(test)]
+async fn refresh_kick_token_gate_pause_if_installed() {
+    pause_kick_refresh_gate(REFRESH_KICK_TOKEN_GATE.get()).await;
+}
+
+#[cfg(test)]
+async fn refresh_kick_feed_gate_pause_before_take_if_installed() {
+    pause_kick_refresh_gate(REFRESH_KICK_FEED_TAKE_GATE.get()).await;
+}
+
+#[cfg(test)]
+async fn refresh_kick_feed_gate_pause_before_publish_if_installed() {
+    pause_kick_refresh_gate(REFRESH_KICK_FEED_PUBLISH_GATE.get()).await;
+}
+
+#[cfg(not(test))]
+async fn refresh_kick_token_gate_pause_if_installed() {}
+
+#[cfg(not(test))]
+async fn refresh_kick_feed_gate_pause_before_take_if_installed() {}
+
+#[cfg(not(test))]
+async fn refresh_kick_feed_gate_pause_before_publish_if_installed() {}
 
 /// Kick chat credential captured atomically with provenance.
 #[derive(Debug, Clone)]
@@ -251,18 +374,34 @@ pub fn auth_url(state: &AppState, flow_nonce: &str) -> String {
 
 pub async fn sync_live_identity(state: Arc<AppState>) {
     let generation = state.current_delegated_generation();
-    if generation > 0 {
-        sync_live_identity_for_generation(state, generation).await;
+    if generation > 0 && state.session_still_current(generation).await {
+        sync_live_identity_for_generation(state, generation, None).await;
         return;
     }
     sync_live_identity_unchecked(state).await;
+}
+
+fn kick_generation_may_publish(
+    state: &AppState,
+    generation: DelegatedGeneration,
+    mode: TwitchActiveMode,
+    delegated: Option<&DelegatedSessionFile>,
+) -> bool {
+    state.current_delegated_generation() == generation
+        && delegated.is_some_and(|s| s.generation == generation)
+        && matches!(mode, TwitchActiveMode::Delegated)
 }
 
 /// Publish Kick live tokens/feed only when `generation` is still the active delegated session.
 pub async fn sync_live_identity_for_generation(
     state: Arc<AppState>,
     generation: DelegatedGeneration,
+    services: Option<&crate::twitch::TwitchServices>,
 ) {
+    if let Some(services) = services {
+        sync_live_identity_for_generation_locked(state, services, generation).await;
+        return;
+    }
     if !state.session_still_current(generation).await {
         return;
     }
@@ -280,7 +419,70 @@ pub async fn sync_live_identity_for_generation(
             k.connected = false;
         }
     }
-    restart_feed_for_generation(state, generation).await;
+    restart_feed_for_generation(state, generation, None).await;
+}
+
+async fn sync_live_identity_for_generation_locked(
+    state: Arc<AppState>,
+    services: &crate::twitch::TwitchServices,
+    generation: DelegatedGeneration,
+) {
+    refresh_kick_token_gate_pause_if_installed().await;
+
+    let planned = {
+        let _lifecycle = services.lock_lifecycle().await;
+        let mode = *state.active_mode.read().await;
+        let delegated = state.delegated.read().await.clone();
+        if !kick_generation_may_publish(&state, generation, mode, delegated.as_ref()) {
+            return;
+        }
+        let personal = state.personal_kick.read().await.clone();
+        let live = live_kick_tokens(mode, delegated.as_ref(), &personal);
+        let linked = live.is_linked();
+        (live, linked)
+    };
+
+    refresh_kick_feed_gate_pause_before_take_if_installed().await;
+
+    let old_handle = {
+        let _lifecycle = services.lock_lifecycle().await;
+        let mode = *state.active_mode.read().await;
+        let delegated = state.delegated.read().await.clone();
+        if !kick_generation_may_publish(&state, generation, mode, delegated.as_ref()) {
+            return;
+        }
+        {
+            let mut k = state.kick.write().await;
+            k.tokens = planned.0;
+            if !planned.1 {
+                k.connected = false;
+            }
+        }
+        state.kick_feed_handle.write().await.take()
+    };
+
+    refresh_kick_feed_gate_pause_before_publish_if_installed().await;
+
+    if let Some(handle) = old_handle {
+        handle.abort();
+    }
+    if !planned.1 {
+        return;
+    }
+
+    let state2 = state.clone();
+    let handle = tokio::spawn(async move {
+        feed_loop(state2).await;
+    });
+
+    let _lifecycle = services.lock_lifecycle().await;
+    let mode = *state.active_mode.read().await;
+    let delegated = state.delegated.read().await.clone();
+    if !kick_generation_may_publish(&state, generation, mode, delegated.as_ref()) {
+        handle.abort();
+        return;
+    }
+    *state.kick_feed_handle.write().await = Some(handle);
 }
 
 async fn sync_live_identity_unchecked(state: Arc<AppState>) {
@@ -298,7 +500,15 @@ async fn sync_live_identity_unchecked(state: Arc<AppState>) {
     restart_feed(state).await;
 }
 
-async fn restart_feed_for_generation(state: Arc<AppState>, generation: DelegatedGeneration) {
+async fn restart_feed_for_generation(
+    state: Arc<AppState>,
+    generation: DelegatedGeneration,
+    services: Option<&crate::twitch::TwitchServices>,
+) {
+    if let Some(services) = services {
+        sync_live_identity_for_generation_locked(state, services, generation).await;
+        return;
+    }
     if !state.session_still_current(generation).await {
         return;
     }

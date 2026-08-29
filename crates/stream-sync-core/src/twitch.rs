@@ -1991,6 +1991,10 @@ static REFRESH_COMMIT_GATE: OnceLock<Mutex<Option<RefreshCommitGateState>>> = On
 static REFRESH_LIVE_GATE: OnceLock<Mutex<Option<RefreshCommitGateState>>> = OnceLock::new();
 
 #[cfg(test)]
+static REFRESH_TWITCH_PUBLISH_GATE: OnceLock<Mutex<Option<RefreshCommitGateState>>> =
+    OnceLock::new();
+
+#[cfg(test)]
 static REFRESH_BYPASS_SLEEP: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
@@ -2020,6 +2024,12 @@ impl Drop for RefreshGateCleanup {
                 *guard = None;
             }
         }
+        if let Some(slot) = REFRESH_TWITCH_PUBLISH_GATE.get() {
+            if let Ok(mut guard) = slot.try_lock() {
+                *guard = None;
+            }
+        }
+        crate::kick::clear_refresh_kick_gates();
         REFRESH_BYPASS_SLEEP.store(false, Ordering::SeqCst);
     }
 }
@@ -2034,6 +2044,23 @@ pub(crate) async fn install_refresh_commit_gate() -> (
     let (arrived_tx, arrived_rx) = oneshot::channel();
     let (resume_tx, resume_rx) = oneshot::channel();
     let slot = REFRESH_COMMIT_GATE.get_or_init(|| Mutex::new(None));
+    *slot.lock().await = Some(RefreshCommitGateState {
+        arrived: arrived_tx,
+        resume: resume_rx,
+    });
+    (RefreshGateCleanup, arrived_rx, resume_tx)
+}
+
+/// Pause delegated refresh immediately before publishing IRC/EventSub handles.
+#[cfg(test)]
+pub(crate) async fn install_refresh_twitch_publish_gate() -> (
+    RefreshGateCleanup,
+    oneshot::Receiver<()>,
+    oneshot::Sender<()>,
+) {
+    let (arrived_tx, arrived_rx) = oneshot::channel();
+    let (resume_tx, resume_rx) = oneshot::channel();
+    let slot = REFRESH_TWITCH_PUBLISH_GATE.get_or_init(|| Mutex::new(None));
     *slot.lock().await = Some(RefreshCommitGateState {
         arrived: arrived_tx,
         resume: resume_rx,
@@ -2068,7 +2095,9 @@ async fn pause_refresh_gate(slot: Option<&Mutex<Option<RefreshCommitGateState>>>
         return;
     };
     let _ = gate.arrived.send(());
+    crate::delegated_lifecycle::defer_refresh_worker_abort_for_test(true);
     let _ = gate.resume.await;
+    crate::delegated_lifecycle::defer_refresh_worker_abort_for_test(false);
 }
 
 #[cfg(test)]
@@ -2081,11 +2110,19 @@ async fn refresh_live_gate_pause_if_installed() {
     pause_refresh_gate(REFRESH_LIVE_GATE.get()).await;
 }
 
+#[cfg(test)]
+async fn refresh_twitch_publish_gate_pause_if_installed() {
+    pause_refresh_gate(REFRESH_TWITCH_PUBLISH_GATE.get()).await;
+}
+
 #[cfg(not(test))]
 async fn refresh_commit_gate_pause_if_installed() {}
 
 #[cfg(not(test))]
 async fn refresh_live_gate_pause_if_installed() {}
+
+#[cfg(not(test))]
+async fn refresh_twitch_publish_gate_pause_if_installed() {}
 
 #[cfg(test)]
 async fn delegated_refresh_sleep(duration: Duration) {
@@ -2168,17 +2205,10 @@ async fn publish_delegated_refresh_live_if_current(
     };
 
     if should_restart_twitch {
-        {
-            let _lifecycle = services.lifecycle_lock.lock().await;
-            if !delegated_refresh_live_may_publish(&state, &services, generation).await {
-                crate::kick::sync_live_identity_for_generation(state.clone(), generation).await;
-                return;
-            }
-        }
-        if let Err(e) = start_irc(state.clone(), services.clone()).await {
+        if let Err(e) = start_irc(state.clone(), services.clone(), Some(generation)).await {
             warn!("IRC start failed: {e}");
         }
-        if let Err(e) = start_eventsub(state.clone(), services.clone()).await {
+        if let Err(e) = start_eventsub(state.clone(), services.clone(), Some(generation)).await {
             warn!("EventSub start failed: {e}");
         }
     } else if state.session_still_current(generation).await {
@@ -2188,7 +2218,7 @@ async fn publish_delegated_refresh_live_if_current(
         );
     }
 
-    crate::kick::sync_live_identity_for_generation(state, generation).await;
+    crate::kick::sync_live_identity_for_generation(state, generation, Some(&services)).await;
 }
 
 /// Commit a successful delegated refresh under lifecycle lock.
@@ -2832,10 +2862,10 @@ fn observe_and_restart_finished_worker(
 
 pub async fn restart_twitch_clients(state: Arc<AppState>, services: Arc<TwitchServices>) {
     stop_twitch_clients(&services).await;
-    if let Err(e) = start_irc(state.clone(), services.clone()).await {
+    if let Err(e) = start_irc(state.clone(), services.clone(), None).await {
         warn!("IRC start failed: {e}");
     }
-    if let Err(e) = start_eventsub(state.clone(), services.clone()).await {
+    if let Err(e) = start_eventsub(state.clone(), services.clone(), None).await {
         warn!("EventSub start failed: {e}");
     }
 }
@@ -2850,7 +2880,11 @@ async fn stop_twitch_clients(services: &TwitchServices) {
     }
 }
 
-async fn start_irc(state: Arc<AppState>, services: Arc<TwitchServices>) -> Result<()> {
+async fn start_irc(
+    state: Arc<AppState>,
+    services: Arc<TwitchServices>,
+    generation: Option<DelegatedGeneration>,
+) -> Result<()> {
     let (login, token) = {
         let tw = state.twitch.read().await;
         let login = tw.tokens.login.clone().ok_or_else(|| anyhow!("no login"))?;
@@ -2874,23 +2908,9 @@ async fn start_irc(state: Arc<AppState>, services: Arc<TwitchServices>) -> Resul
     let feed = state.feed.clone();
     client.join(channel.clone()).ok();
 
-    let provenance = {
-        let _lifecycle = services.lifecycle_lock.lock().await;
-        services
-            .select_platform_credentials_under_lock(&state)
-            .await?
-            .provenance()
-    };
-    *services.irc_client.write().await = Some(IrcClientBundle { client, provenance });
-
-    {
-        let mut tw = state.twitch.write().await;
-        tw.connected = true;
-        tw.channel = Some(channel.clone());
-    }
-
     let broadcaster_login = login.clone();
     let state_irc = state.clone();
+    let channel_log = channel.clone();
     let handle = tokio::spawn(async move {
         while let Some(message) = incoming.recv().await {
             match message {
@@ -2903,7 +2923,6 @@ async fn start_irc(state: Arc<AppState>, services: Arc<TwitchServices>) -> Resul
                     );
                 }
                 ServerMessage::UserState(msg) => {
-                    // Channel-scoped badges (broadcaster, mod, sub, etc.) — best source for dock sends.
                     store_broadcaster_user_state(
                         &state_irc,
                         msg.name_color.as_ref(),
@@ -2928,8 +2947,46 @@ async fn start_irc(state: Arc<AppState>, services: Arc<TwitchServices>) -> Resul
                 _ => {}
             }
         }
-        info!("IRC incoming ended for {channel}");
+        info!("IRC incoming ended for {channel_log}");
     });
+
+    if let Some(generation) = generation {
+        refresh_twitch_publish_gate_pause_if_installed().await;
+        let _lifecycle = services.lock_lifecycle().await;
+        if !delegated_refresh_live_may_publish(&state, &services, generation).await {
+            handle.abort();
+            return Ok(());
+        }
+        let provenance = services
+            .select_platform_credentials_under_lock(&state)
+            .await?
+            .provenance();
+        *services.irc_client.write().await = Some(IrcClientBundle { client, provenance });
+        {
+            let mut tw = state.twitch.write().await;
+            tw.connected = true;
+            tw.channel = Some(channel.clone());
+        }
+        *services.irc_handle.write().await = Some(handle);
+        drop(_lifecycle);
+        refresh_broadcaster_chat_color(&state).await;
+        return Ok(());
+    }
+
+    let provenance = {
+        let _lifecycle = services.lock_lifecycle().await;
+        services
+            .select_platform_credentials_under_lock(&state)
+            .await?
+            .provenance()
+    };
+    *services.irc_client.write().await = Some(IrcClientBundle { client, provenance });
+
+    {
+        let mut tw = state.twitch.write().await;
+        tw.connected = true;
+        tw.channel = Some(channel.clone());
+    }
 
     *services.irc_handle.write().await = Some(handle);
     refresh_broadcaster_chat_color(&state).await;
@@ -3557,7 +3614,11 @@ async fn handle_eventsub_notification(
     }
 }
 
-async fn start_eventsub(state: Arc<AppState>, services: Arc<TwitchServices>) -> Result<()> {
+async fn start_eventsub(
+    state: Arc<AppState>,
+    services: Arc<TwitchServices>,
+    generation: Option<DelegatedGeneration>,
+) -> Result<()> {
     let client_id = state.helix_client_id().await;
     if client_id.is_empty() {
         return Err(anyhow!("TWITCH_CLIENT_ID missing"));
@@ -3578,6 +3639,16 @@ async fn start_eventsub(state: Arc<AppState>, services: Arc<TwitchServices>) -> 
             }
         }
     });
+    if let Some(generation) = generation {
+        refresh_twitch_publish_gate_pause_if_installed().await;
+        let _lifecycle = services.lock_lifecycle().await;
+        if !delegated_refresh_live_may_publish(&state, &services, generation).await {
+            handle.abort();
+            return Ok(());
+        }
+        *services.eventsub_handle.write().await = Some(handle);
+        return Ok(());
+    }
     *services.eventsub_handle.write().await = Some(handle);
     Ok(())
 }
@@ -5758,14 +5829,20 @@ mod tests {
         services.install_validated_authority_lease(1, None).await;
         install_fake_platform_workers(&state, &services).await;
 
-        let (_gate, arrived_rx, _resume_tx) = super::install_refresh_live_gate().await;
+        let (_gate, arrived_rx, resume_tx) = super::install_refresh_commit_gate().await;
         start_delegated_refresh_loop(state.clone(), services.clone(), 1).await;
         gate_wait(
             arrived_rx,
-            "production refresh must pause before live publish",
+            "production refresh must pause before durable commit",
         )
         .await;
 
+        let refresh_before_gen = services
+            .refresh_handle
+            .read()
+            .await
+            .as_ref()
+            .map(|t| t.generation);
         let replacement = stale_refresh_exchange("gen2-token");
         apply_exchange_session(
             state.clone(),
@@ -5780,8 +5857,28 @@ mod tests {
         let winner_identity = live_identity_snapshot(&state, &services).await;
         let winner_workers = platform_worker_snapshot(&state, &services).await;
 
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
+        resume_tx
+            .send(())
+            .expect("release production refresh after replacement");
+        if let Some(gen) = refresh_before_gen {
+            tokio::time::timeout(GATE_WAIT, async {
+                loop {
+                    let finished = {
+                        let guard = services.refresh_handle.read().await;
+                        guard
+                            .as_ref()
+                            .map(|t| t.generation != gen || t.handle.is_finished())
+                            .unwrap_or(true)
+                    };
+                    if finished {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("production refresh worker should finish after resume");
+        }
 
         assert_live_identity_eq(&state, &services, &winner_identity).await;
         assert_eq!(
@@ -5802,6 +5899,219 @@ mod tests {
         let _guard = PHASE2_TEST_LOCK.lock().await;
         for _ in 0..20 {
             refresh_production_path_race_once().await;
+        }
+    }
+
+    async fn refresh_stale_before_twitch_publish_once() {
+        let (state, services) = phase2_app().await;
+        activate_delegated_gen1(&state, &services).await;
+
+        let exchange = stale_refresh_exchange("refresh-committed-token");
+        let merged = crate::kick::merge_delegated_session_from_exchange(
+            state.delegated.read().await.clone().unwrap(),
+            &exchange,
+        );
+        let key = state
+            .delegated
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .connection_key
+            .clone();
+
+        let (_gate, arrived_rx, resume_tx) = super::install_refresh_twitch_publish_gate().await;
+        let state2 = state.clone();
+        let services2 = services.clone();
+        let exchange2 = exchange.clone();
+        let commit_task = tokio::spawn(async move {
+            super::apply_delegated_refresh_commit(state2, services2, 1, merged, &exchange2, &key)
+                .await
+        });
+
+        gate_wait(arrived_rx, "refresh must pause before twitch publish").await;
+        commit_replacement_generation(&state, &services, 2, "gen2-token").await;
+        let winner_identity = live_identity_snapshot(&state, &services).await;
+        let winner_workers = install_winner_platform_workers(&state, &services, 2).await;
+        resume_tx.send(()).expect("release stale twitch publish");
+        let committed = task_join_with_timeout(commit_task, "stale refresh commit")
+            .await
+            .expect("commit result");
+        assert!(committed);
+
+        assert_live_identity_eq(&state, &services, &winner_identity).await;
+        assert_eq!(
+            platform_worker_snapshot(&state, &services).await,
+            winner_workers
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_stale_before_twitch_publish_no_side_effects() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for _ in 0..20 {
+            refresh_stale_before_twitch_publish_once().await;
+        }
+    }
+
+    async fn refresh_stale_before_kick_token_once() {
+        let (state, services) = phase2_app().await;
+        activate_delegated_gen1(&state, &services).await;
+
+        let exchange = stale_refresh_exchange("refresh-committed-token");
+        let merged = crate::kick::merge_delegated_session_from_exchange(
+            state.delegated.read().await.clone().unwrap(),
+            &exchange,
+        );
+        let key = state
+            .delegated
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .connection_key
+            .clone();
+
+        let (arrived_rx, resume_tx) = crate::kick::install_refresh_kick_token_gate().await;
+        let state2 = state.clone();
+        let services2 = services.clone();
+        let exchange2 = exchange.clone();
+        let commit_task = tokio::spawn(async move {
+            super::apply_delegated_refresh_commit(state2, services2, 1, merged, &exchange2, &key)
+                .await
+        });
+
+        gate_wait(arrived_rx, "refresh must pause before kick token write").await;
+        commit_replacement_generation(&state, &services, 2, "gen2-token").await;
+        let winner_identity = live_identity_snapshot(&state, &services).await;
+        let winner_workers = install_winner_platform_workers(&state, &services, 2).await;
+        resume_tx.send(()).expect("release stale kick token write");
+        let committed = task_join_with_timeout(commit_task, "stale refresh commit")
+            .await
+            .expect("commit result");
+        assert!(committed);
+
+        assert_live_identity_eq(&state, &services, &winner_identity).await;
+        assert_eq!(
+            platform_worker_snapshot(&state, &services).await,
+            winner_workers
+        );
+        crate::kick::clear_refresh_kick_gates();
+    }
+
+    #[tokio::test]
+    async fn refresh_stale_before_kick_token_no_side_effects() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for _ in 0..20 {
+            refresh_stale_before_kick_token_once().await;
+        }
+    }
+
+    async fn refresh_stale_before_kick_feed_once() {
+        let (state, services) = phase2_app().await;
+        activate_delegated_gen1(&state, &services).await;
+
+        let exchange = stale_refresh_exchange("refresh-committed-token");
+        let merged = crate::kick::merge_delegated_session_from_exchange(
+            state.delegated.read().await.clone().unwrap(),
+            &exchange,
+        );
+        let key = state
+            .delegated
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .connection_key
+            .clone();
+
+        let (arrived_rx, resume_tx) = crate::kick::install_refresh_kick_feed_take_gate().await;
+        let state2 = state.clone();
+        let services2 = services.clone();
+        let exchange2 = exchange.clone();
+        let commit_task = tokio::spawn(async move {
+            super::apply_delegated_refresh_commit(state2, services2, 1, merged, &exchange2, &key)
+                .await
+        });
+
+        gate_wait(arrived_rx, "refresh must pause before kick feed take").await;
+        remove_delegated_session(&state, &services, None, 1)
+            .await
+            .expect("revoke");
+        let workers_after_revoke = platform_worker_snapshot(&state, &services).await;
+        let identity_after_revoke = live_identity_snapshot(&state, &services).await;
+        resume_tx.send(()).expect("release stale kick feed take");
+        let committed = task_join_with_timeout(commit_task, "stale refresh commit")
+            .await
+            .expect("commit result");
+        assert!(committed);
+
+        assert_eq!(
+            platform_worker_snapshot(&state, &services).await,
+            workers_after_revoke
+        );
+        assert_eq!(
+            live_identity_snapshot(&state, &services).await.delegated,
+            identity_after_revoke.delegated
+        );
+        crate::kick::clear_refresh_kick_gates();
+    }
+
+    #[tokio::test]
+    async fn refresh_stale_before_kick_feed_no_side_effects() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for _ in 0..20 {
+            refresh_stale_before_kick_feed_once().await;
+        }
+    }
+
+    async fn refresh_stale_before_kick_feed_publish_once() {
+        let (state, services) = phase2_app().await;
+        activate_delegated_gen1(&state, &services).await;
+
+        let exchange = stale_refresh_exchange("refresh-committed-token");
+        let merged = crate::kick::merge_delegated_session_from_exchange(
+            state.delegated.read().await.clone().unwrap(),
+            &exchange,
+        );
+        let key = state
+            .delegated
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .connection_key
+            .clone();
+
+        let (arrived_rx, resume_tx) = crate::kick::install_refresh_kick_feed_publish_gate().await;
+        let state2 = state.clone();
+        let services2 = services.clone();
+        let exchange2 = exchange.clone();
+        let commit_task = tokio::spawn(async move {
+            super::apply_delegated_refresh_commit(state2, services2, 1, merged, &exchange2, &key)
+                .await
+        });
+
+        gate_wait(arrived_rx, "refresh must pause before kick feed publish").await;
+        commit_replacement_generation(&state, &services, 2, "gen2-token").await;
+        let winner_workers = install_winner_platform_workers(&state, &services, 2).await;
+        resume_tx.send(()).expect("release stale kick feed publish");
+        let _ = task_join_with_timeout(commit_task, "stale refresh commit")
+            .await
+            .expect("commit result");
+
+        assert_eq!(
+            platform_worker_snapshot(&state, &services).await,
+            winner_workers
+        );
+        crate::kick::clear_refresh_kick_gates();
+    }
+
+    #[tokio::test]
+    async fn refresh_stale_before_kick_feed_publish_no_side_effects() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for _ in 0..20 {
+            refresh_stale_before_kick_feed_publish_once().await;
         }
     }
 }
