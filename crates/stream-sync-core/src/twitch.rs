@@ -1607,6 +1607,7 @@ async fn strip_in_memory_delegated_authority(
     }
     stop_delegated_worker_handles(&services.refresh_handle, &services.watch_handle, None).await;
     stop_twitch_clients(services).await;
+    crate::kick::teardown_delegated_kick_live(state).await;
 }
 
 /// Absolute-lease fail-closed for *active* delegated mode.
@@ -1790,6 +1791,7 @@ async fn execute_delegated_teardown(
     };
 
     // 5. Fallback/restart personal after mode persisted.
+    crate::kick::teardown_delegated_kick_live(&state).await;
     if need_personal_fallback && state.current_delegated_generation() == generation {
         let personal_ok = tokens_saved(&state.personal_tokens.read().await.clone());
         if personal_ok {
@@ -2095,9 +2097,7 @@ async fn pause_refresh_gate(slot: Option<&Mutex<Option<RefreshCommitGateState>>>
         return;
     };
     let _ = gate.arrived.send(());
-    crate::delegated_lifecycle::defer_refresh_worker_abort_for_test(true);
     let _ = gate.resume.await;
-    crate::delegated_lifecycle::defer_refresh_worker_abort_for_test(false);
 }
 
 #[cfg(test)]
@@ -2905,12 +2905,91 @@ async fn start_irc(
     let (mut incoming, client) = StreamSyncIrcClient::new(config);
 
     let channel = login.clone();
-    let feed = state.feed.clone();
-    client.join(channel.clone()).ok();
+
+    if let Some(generation) = generation {
+        let (grant_tx, grant_rx) = oneshot::channel();
+        let broadcaster_login = login.clone();
+        let state_irc = state.clone();
+        let channel_log = channel.clone();
+        let feed = state.feed.clone();
+        let handle = tokio::spawn(async move {
+            if grant_rx.await.is_err() {
+                return;
+            }
+            while let Some(message) = incoming.recv().await {
+                if !state_irc.session_still_current(generation).await {
+                    break;
+                }
+                match message {
+                    ServerMessage::GlobalUserState(msg) => {
+                        store_broadcaster_user_state(
+                            &state_irc,
+                            msg.name_color.as_ref(),
+                            Some(msg.user_name.as_str()),
+                            &msg.badges,
+                        );
+                    }
+                    ServerMessage::UserState(msg) => {
+                        store_broadcaster_user_state(
+                            &state_irc,
+                            msg.name_color.as_ref(),
+                            Some(msg.user_name.as_str()),
+                            &msg.badges,
+                        );
+                    }
+                    ServerMessage::Privmsg(msg) => {
+                        if !state_irc.session_still_current(generation).await {
+                            break;
+                        }
+                        let is_self = msg.sender.login.eq_ignore_ascii_case(&broadcaster_login);
+                        if is_self {
+                            store_broadcaster_user_state(
+                                &state_irc,
+                                msg.name_color.as_ref(),
+                                Some(msg.sender.name.as_str()),
+                                &msg.badges,
+                            );
+                        }
+                        let evt = privmsg_to_chat_event(&msg, is_self);
+                        feed.broadcast_all(&evt).await;
+                    }
+                    ServerMessage::Notice(_) => {}
+                    _ => {}
+                }
+            }
+            info!("IRC incoming ended for {channel_log}");
+        });
+
+        refresh_twitch_publish_gate_pause_if_installed().await;
+        let _lifecycle = services.lock_lifecycle().await;
+        if !delegated_refresh_live_may_publish(&state, &services, generation).await {
+            handle.abort();
+            return Ok(());
+        }
+        let provenance = services
+            .select_platform_credentials_under_lock(&state)
+            .await?
+            .provenance();
+        client.join(channel.clone()).ok();
+        *services.irc_client.write().await = Some(IrcClientBundle { client, provenance });
+        {
+            let mut tw = state.twitch.write().await;
+            tw.connected = true;
+            tw.channel = Some(channel.clone());
+        }
+        let _ = grant_tx.send(());
+        *services.irc_handle.write().await = Some(handle);
+        drop(_lifecycle);
+        refresh_broadcaster_chat_color(&state).await;
+        return Ok(());
+    }
 
     let broadcaster_login = login.clone();
     let state_irc = state.clone();
     let channel_log = channel.clone();
+    let feed = state.feed.clone();
+    client.join(channel.clone()).ok();
+
     let handle = tokio::spawn(async move {
         while let Some(message) = incoming.recv().await {
             match message {
@@ -2949,29 +3028,6 @@ async fn start_irc(
         }
         info!("IRC incoming ended for {channel_log}");
     });
-
-    if let Some(generation) = generation {
-        refresh_twitch_publish_gate_pause_if_installed().await;
-        let _lifecycle = services.lock_lifecycle().await;
-        if !delegated_refresh_live_may_publish(&state, &services, generation).await {
-            handle.abort();
-            return Ok(());
-        }
-        let provenance = services
-            .select_platform_credentials_under_lock(&state)
-            .await?
-            .provenance();
-        *services.irc_client.write().await = Some(IrcClientBundle { client, provenance });
-        {
-            let mut tw = state.twitch.write().await;
-            tw.connected = true;
-            tw.channel = Some(channel.clone());
-        }
-        *services.irc_handle.write().await = Some(handle);
-        drop(_lifecycle);
-        refresh_broadcaster_chat_color(&state).await;
-        return Ok(());
-    }
 
     let provenance = {
         let _lifecycle = services.lock_lifecycle().await;
@@ -3627,9 +3683,46 @@ async fn start_eventsub(
     services.ensure_delegated_authority(&state).await?;
     let feed = state.feed.clone();
     let state2 = state.clone();
+
+    if let Some(generation) = generation {
+        let (grant_tx, grant_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            if grant_rx.await.is_err() {
+                return;
+            }
+            loop {
+                if !state2.session_still_current(generation).await {
+                    break;
+                }
+                if let Err(e) =
+                    eventsub_session(state2.clone(), feed.clone(), Some(generation)).await
+                {
+                    warn!("EventSub session error: {e}");
+                }
+                if !state2.session_still_current(generation).await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let tw = state2.twitch.read().await;
+                if tw.tokens.access_token.is_none() {
+                    break;
+                }
+            }
+        });
+        refresh_twitch_publish_gate_pause_if_installed().await;
+        let _lifecycle = services.lock_lifecycle().await;
+        if !delegated_refresh_live_may_publish(&state, &services, generation).await {
+            handle.abort();
+            return Ok(());
+        }
+        let _ = grant_tx.send(());
+        *services.eventsub_handle.write().await = Some(handle);
+        return Ok(());
+    }
+
     let handle = tokio::spawn(async move {
         loop {
-            if let Err(e) = eventsub_session(state2.clone(), feed.clone()).await {
+            if let Err(e) = eventsub_session(state2.clone(), feed.clone(), None).await {
                 warn!("EventSub session error: {e}");
             }
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -3639,25 +3732,29 @@ async fn start_eventsub(
             }
         }
     });
-    if let Some(generation) = generation {
-        refresh_twitch_publish_gate_pause_if_installed().await;
-        let _lifecycle = services.lock_lifecycle().await;
-        if !delegated_refresh_live_may_publish(&state, &services, generation).await {
-            handle.abort();
-            return Ok(());
-        }
-        *services.eventsub_handle.write().await = Some(handle);
-        return Ok(());
-    }
     *services.eventsub_handle.write().await = Some(handle);
     Ok(())
 }
 
-async fn eventsub_session(state: Arc<AppState>, feed: FeedHub) -> Result<()> {
+async fn eventsub_session(
+    state: Arc<AppState>,
+    feed: FeedHub,
+    generation: Option<DelegatedGeneration>,
+) -> Result<()> {
+    if let Some(gen) = generation {
+        if !state.session_still_current(gen).await {
+            return Ok(());
+        }
+    }
     let (ws, _) = connect_async("wss://eventsub.wss.twitch.tv/ws").await?;
     let (_write, mut read) = ws.split();
 
     while let Some(msg) = read.next().await {
+        if let Some(gen) = generation {
+            if !state.session_still_current(gen).await {
+                break;
+            }
+        }
         let msg = msg?;
         if !msg.is_text() {
             continue;
@@ -3666,11 +3763,21 @@ async fn eventsub_session(state: Arc<AppState>, feed: FeedHub) -> Result<()> {
         let message_type = parsed.metadata.message_type.as_str();
         match message_type {
             "session_welcome" | "session_reconnect" => {
+                if let Some(gen) = generation {
+                    if !state.session_still_current(gen).await {
+                        break;
+                    }
+                }
                 if let Some(sid) = parsed.payload.session.as_ref().and_then(|s| s.id.clone()) {
-                    subscribe_topics(&state, &sid).await;
+                    subscribe_topics(&state, &sid, generation).await;
                 }
             }
             "notification" => {
+                if let Some(gen) = generation {
+                    if !state.session_still_current(gen).await {
+                        break;
+                    }
+                }
                 let Some(sub_type) = parsed.metadata.subscription_type.as_deref() else {
                     continue;
                 };
@@ -3684,7 +3791,16 @@ async fn eventsub_session(state: Arc<AppState>, feed: FeedHub) -> Result<()> {
     Ok(())
 }
 
-async fn subscribe_topics(state: &AppState, session_id: &str) {
+async fn subscribe_topics(
+    state: &AppState,
+    session_id: &str,
+    generation: Option<DelegatedGeneration>,
+) {
+    if let Some(gen) = generation {
+        if !state.session_still_current(gen).await {
+            return;
+        }
+    }
     let user_id = match state.twitch.read().await.tokens.user_id.clone() {
         Some(id) => id,
         None => return,
@@ -5769,6 +5885,47 @@ mod tests {
         }
     }
 
+    struct ProductionTestEnvGuard {
+        syndicate_api_base: Option<String>,
+    }
+
+    impl ProductionTestEnvGuard {
+        fn install(port: u16) -> Self {
+            let prev = std::env::var("SYNDICATE_API_BASE").ok();
+            std::env::set_var("SYNDICATE_API_BASE", format!("http://127.0.0.1:{port}"));
+            super::set_refresh_bypass_sleep(true);
+            Self {
+                syndicate_api_base: prev,
+            }
+        }
+    }
+
+    impl Drop for ProductionTestEnvGuard {
+        fn drop(&mut self) {
+            match self.syndicate_api_base.take() {
+                Some(v) => std::env::set_var("SYNDICATE_API_BASE", v),
+                None => std::env::remove_var("SYNDICATE_API_BASE"),
+            }
+            super::set_refresh_bypass_sleep(false);
+        }
+    }
+
+    async fn stop_all_platform_workers(state: &AppState, services: &TwitchServices) {
+        crate::delegated_lifecycle::stop_delegated_worker_handles(
+            &services.refresh_handle,
+            &services.watch_handle,
+            None,
+        )
+        .await;
+        if let Some(h) = services.irc_handle.write().await.take() {
+            h.abort();
+        }
+        if let Some(h) = services.eventsub_handle.write().await.take() {
+            h.abort();
+        }
+        crate::kick::teardown_delegated_kick_live(state).await;
+    }
+
     async fn spawn_mock_syndicate_refresh_server(
         access_token: &str,
     ) -> (u16, tokio::task::JoinHandle<()>) {
@@ -5813,10 +5970,10 @@ mod tests {
         (port, server)
     }
 
-    async fn refresh_production_path_race_once() {
-        let (port, _server) = spawn_mock_syndicate_refresh_server("loop-refresh-token").await;
-        std::env::set_var("SYNDICATE_API_BASE", format!("http://127.0.0.1:{port}"));
-        super::set_refresh_bypass_sleep(true);
+    async fn refresh_production_path_race_once(iteration: u32) {
+        let token = format!("loop-refresh-token-{iteration}");
+        let (port, server) = spawn_mock_syndicate_refresh_server(&token).await;
+        let _env = ProductionTestEnvGuard::install(port);
 
         let (state, services) = phase2_app().await;
         install_delegated_session(&state, &services).await;
@@ -5857,9 +6014,7 @@ mod tests {
         let winner_identity = live_identity_snapshot(&state, &services).await;
         let winner_workers = platform_worker_snapshot(&state, &services).await;
 
-        resume_tx
-            .send(())
-            .expect("release production refresh after replacement");
+        let _ = resume_tx.send(());
         if let Some(gen) = refresh_before_gen {
             tokio::time::timeout(GATE_WAIT, async {
                 loop {
@@ -5877,7 +6032,7 @@ mod tests {
                 }
             })
             .await
-            .expect("production refresh worker should finish after resume");
+            .expect("production refresh worker should finish after replacement");
         }
 
         assert_live_identity_eq(&state, &services, &winner_identity).await;
@@ -5890,15 +6045,102 @@ mod tests {
         assert_eq!(disk.access_token, "gen2-token");
         assert_ne!(
             state.twitch.read().await.tokens.access_token.as_deref(),
-            Some("loop-refresh-token")
+            Some(token.as_str())
         );
+
+        server.abort();
+        stop_all_platform_workers(&state, &services).await;
     }
 
     #[tokio::test]
     async fn refresh_production_path_cannot_escape_generation_fence() {
         let _guard = PHASE2_TEST_LOCK.lock().await;
+        for i in 0..20 {
+            refresh_production_path_race_once(i).await;
+        }
+    }
+
+    async fn refresh_worker_abort_during_kick_feed_take_once() {
+        let token = "kick-take-abort-token";
+        let (port, server) = spawn_mock_syndicate_refresh_server(token).await;
+        let _env = ProductionTestEnvGuard::install(port);
+
+        let (state, services) = phase2_app().await;
+        activate_delegated_gen1(&state, &services).await;
+        let mut session = state.delegated.read().await.clone().unwrap();
+        session.twitch_expires_at = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        state.persist_delegated_session(&session).unwrap();
+        *state.delegated.write().await = Some(session);
+        services.install_validated_authority_lease(1, None).await;
+        *state.kick_feed_handle.write().await = Some(tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        }));
+        let pre_refresh_feed_id = state.kick_feed_handle.read().await.as_ref().map(|h| h.id());
+
+        let (arrived_rx, resume_tx) = crate::kick::install_refresh_kick_feed_take_gate().await;
+        start_delegated_refresh_loop(state.clone(), services.clone(), 1).await;
+        gate_wait(arrived_rx, "refresh worker must pause at kick feed take").await;
+
+        let stale_refresh_gen = services
+            .refresh_handle
+            .read()
+            .await
+            .as_ref()
+            .map(|t| t.generation);
+        let replacement = stale_refresh_exchange("gen2-kick-abort");
+        apply_exchange_session(
+            state.clone(),
+            services.clone(),
+            "ssk_phase2_kick_abort_replacement",
+            replacement,
+            true,
+            None,
+        )
+        .await
+        .expect("replacement during kick feed take");
+
+        let _ = resume_tx.send(());
+        if let Some(gen) = stale_refresh_gen {
+            tokio::time::timeout(GATE_WAIT, async {
+                loop {
+                    let finished = {
+                        let guard = services.refresh_handle.read().await;
+                        guard
+                            .as_ref()
+                            .map(|t| t.generation != gen || t.handle.is_finished())
+                            .unwrap_or(true)
+                    };
+                    if finished {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("stale refresh worker should terminate after abort");
+        }
+
+        if let Some(handle) = state.kick_feed_handle.read().await.as_ref() {
+            if Some(handle.id()) == pre_refresh_feed_id {
+                assert!(
+                    handle.is_finished(),
+                    "pre-refresh Kick feed must not survive as an orphan in the supervised slot"
+                );
+            }
+        }
+
+        server.abort();
+        stop_all_platform_workers(&state, &services).await;
+        crate::kick::clear_refresh_kick_gates();
+    }
+
+    #[tokio::test]
+    async fn refresh_worker_abort_during_kick_feed_take_terminates_orphan() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
         for _ in 0..20 {
-            refresh_production_path_race_once().await;
+            refresh_worker_abort_during_kick_feed_take_once().await;
         }
     }
 

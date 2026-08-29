@@ -3,7 +3,7 @@
 use crate::app_state::{live_kick_tokens, AppState};
 use crate::broadcast::make_platform_dock_event;
 use crate::config_types::{DelegatedSessionFile, KickTokenFile, TwitchActiveMode};
-use crate::delegated_lifecycle::DelegatedGeneration;
+use crate::delegated_lifecycle::{AbortOnDrop, DelegatedGeneration};
 use crate::syndicate_connection::{self, ExchangeSuccess};
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
@@ -110,10 +110,8 @@ async fn pause_kick_refresh_gate(slot: Option<&tokio::sync::Mutex<Option<KickRef
     let Some(gate) = guard.take() else {
         return;
     };
-    crate::delegated_lifecycle::defer_refresh_worker_abort_for_test(true);
     let _ = gate.arrived.send(());
     let _ = gate.resume.await;
-    crate::delegated_lifecycle::defer_refresh_worker_abort_for_test(false);
 }
 
 #[cfg(test)]
@@ -381,6 +379,19 @@ pub async fn sync_live_identity(state: Arc<AppState>) {
     sync_live_identity_unchecked(state).await;
 }
 
+const KICK_FEED_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Unconditionally stop the Kick feed and clear delegated live identity (revocation/teardown).
+pub async fn teardown_delegated_kick_live(state: &AppState) {
+    if let Some(handle) = state.kick_feed_handle.write().await.take() {
+        handle.abort();
+        let _ = tokio::time::timeout(KICK_FEED_STOP_TIMEOUT, handle).await;
+    }
+    let mut k = state.kick.write().await;
+    k.tokens = KickTokenFile::default();
+    k.connected = false;
+}
+
 fn kick_generation_may_publish(
     state: &AppState,
     generation: DelegatedGeneration,
@@ -442,9 +453,8 @@ async fn sync_live_identity_for_generation_locked(
         (live, linked)
     };
 
-    refresh_kick_feed_gate_pause_before_take_if_installed().await;
-
-    let old_handle = {
+    let old_feed;
+    {
         let _lifecycle = services.lock_lifecycle().await;
         let mode = *state.active_mode.read().await;
         let delegated = state.delegated.read().await.clone();
@@ -458,31 +468,41 @@ async fn sync_live_identity_for_generation_locked(
                 k.connected = false;
             }
         }
-        state.kick_feed_handle.write().await.take()
-    };
-
-    refresh_kick_feed_gate_pause_before_publish_if_installed().await;
-
-    if let Some(handle) = old_handle {
-        handle.abort();
+        old_feed = state
+            .kick_feed_handle
+            .write()
+            .await
+            .take()
+            .map(AbortOnDrop::new);
     }
+
+    refresh_kick_feed_gate_pause_before_take_if_installed().await;
+
     if !planned.1 {
         return;
     }
 
+    let (grant_tx, grant_rx) = tokio::sync::oneshot::channel();
     let state2 = state.clone();
-    let handle = tokio::spawn(async move {
-        feed_loop(state2).await;
+    let pending = tokio::spawn(async move {
+        if grant_rx.await.is_err() {
+            return;
+        }
+        feed_loop_for_generation(state2, generation).await;
     });
+
+    refresh_kick_feed_gate_pause_before_publish_if_installed().await;
 
     let _lifecycle = services.lock_lifecycle().await;
     let mode = *state.active_mode.read().await;
     let delegated = state.delegated.read().await.clone();
     if !kick_generation_may_publish(&state, generation, mode, delegated.as_ref()) {
-        handle.abort();
+        pending.abort();
         return;
     }
-    *state.kick_feed_handle.write().await = Some(handle);
+    drop(old_feed);
+    let _ = grant_tx.send(());
+    *state.kick_feed_handle.write().await = Some(pending);
 }
 
 async fn sync_live_identity_unchecked(state: Arc<AppState>) {
@@ -754,8 +774,21 @@ pub async fn send_chat_from_dock(state: Arc<AppState>, message: &str) -> Result<
     Ok(())
 }
 
+async fn feed_loop_for_generation(state: Arc<AppState>, generation: DelegatedGeneration) {
+    feed_loop_inner(state, Some(generation)).await;
+}
+
 async fn feed_loop(state: Arc<AppState>) {
+    feed_loop_inner(state, None).await;
+}
+
+async fn feed_loop_inner(state: Arc<AppState>, generation: Option<DelegatedGeneration>) {
     loop {
+        if let Some(gen) = generation {
+            if !state.session_still_current(gen).await {
+                break;
+            }
+        }
         let Some(services) = state.twitch_services() else {
             state.kick.write().await.connected = false;
             tokio::time::sleep(Duration::from_secs(8)).await;

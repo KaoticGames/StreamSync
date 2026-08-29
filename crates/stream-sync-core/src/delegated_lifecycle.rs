@@ -16,8 +16,6 @@
 //! source; do not claim crash-persistent local revocation when all durable writes fail.
 
 use std::future::Future;
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -505,29 +503,32 @@ impl AuthorityLease {
     }
 }
 
-/// Abort delegated worker handles except the caller, clearing slots so they are not restarted.
-#[cfg(test)]
-static REFRESH_WORKER_ABORT_DEFERRED: AtomicBool = AtomicBool::new(false);
+/// Owns a worker handle and aborts it on drop unless disarmed.
+pub struct AbortOnDrop(Option<JoinHandle<()>>);
 
-#[cfg(test)]
-pub fn defer_refresh_worker_abort_for_test(defer: bool) {
-    REFRESH_WORKER_ABORT_DEFERRED.store(defer, Ordering::SeqCst);
+impl AbortOnDrop {
+    pub fn new(handle: JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
 }
 
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Abort delegated worker handles except the caller, clearing slots so they are not restarted.
 pub async fn stop_delegated_worker_handles(
     refresh_handle: &RwLock<Option<GenerationTask>>,
     watch_handle: &RwLock<Option<GenerationTask>>,
     except: Option<DelegatedWorker>,
 ) {
     if except != Some(DelegatedWorker::Refresh) {
-        #[cfg(test)]
-        let defer_refresh_abort = REFRESH_WORKER_ABORT_DEFERRED.load(Ordering::SeqCst);
-        #[cfg(not(test))]
-        let defer_refresh_abort = false;
-        if !defer_refresh_abort {
-            if let Some(task) = refresh_handle.write().await.take() {
-                task.handle.abort();
-            }
+        if let Some(task) = refresh_handle.write().await.take() {
+            task.handle.abort();
         }
     } else {
         let _ = refresh_handle.write().await.take();
