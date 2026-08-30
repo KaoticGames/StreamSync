@@ -10,27 +10,25 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::{HashSet, VecDeque};
-use std::sync::Arc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::Mutex as RefreshGateMutex;
 use std::time::Duration;
 use tracing::{info, warn};
 
 const KICK_CHAT_URL: &str = "https://api.kick.com/public/v1/chat";
 
 #[cfg(test)]
-static REFRESH_KICK_TOKEN_GATE: std::sync::OnceLock<
-    tokio::sync::Mutex<Option<KickRefreshGateState>>,
-> = std::sync::OnceLock::new();
+static REFRESH_KICK_TOKEN_GATE: OnceLock<RefreshGateMutex<Option<KickRefreshGateState>>> =
+    OnceLock::new();
 
 #[cfg(test)]
-static REFRESH_KICK_FEED_TAKE_GATE: std::sync::OnceLock<
-    tokio::sync::Mutex<Option<KickRefreshGateState>>,
-> = std::sync::OnceLock::new();
+static REFRESH_KICK_FEED_TAKE_GATE: OnceLock<RefreshGateMutex<Option<KickRefreshGateState>>> =
+    OnceLock::new();
 
 #[cfg(test)]
-static REFRESH_KICK_FEED_PUBLISH_GATE: std::sync::OnceLock<
-    tokio::sync::Mutex<Option<KickRefreshGateState>>,
-> = std::sync::OnceLock::new();
+static REFRESH_KICK_FEED_PUBLISH_GATE: OnceLock<RefreshGateMutex<Option<KickRefreshGateState>>> =
+    OnceLock::new();
 
 #[cfg(test)]
 struct KickRefreshGateState {
@@ -40,37 +38,45 @@ struct KickRefreshGateState {
 
 #[cfg(test)]
 pub(crate) async fn install_refresh_kick_token_gate() -> (
+    crate::twitch::RefreshGateCleanup,
     tokio::sync::oneshot::Receiver<()>,
     tokio::sync::oneshot::Sender<()>,
 ) {
-    install_kick_refresh_gate(REFRESH_KICK_TOKEN_GATE.get_or_init(|| tokio::sync::Mutex::new(None)))
-        .await
+    let (arrived_rx, resume_tx) = install_kick_refresh_gate(
+        REFRESH_KICK_TOKEN_GATE.get_or_init(|| RefreshGateMutex::new(None)),
+    )
+    .await;
+    (crate::twitch::RefreshGateCleanup, arrived_rx, resume_tx)
 }
 
 #[cfg(test)]
 pub(crate) async fn install_refresh_kick_feed_take_gate() -> (
+    crate::twitch::RefreshGateCleanup,
     tokio::sync::oneshot::Receiver<()>,
     tokio::sync::oneshot::Sender<()>,
 ) {
-    install_kick_refresh_gate(
-        REFRESH_KICK_FEED_TAKE_GATE.get_or_init(|| tokio::sync::Mutex::new(None)),
+    let (arrived_rx, resume_tx) = install_kick_refresh_gate(
+        REFRESH_KICK_FEED_TAKE_GATE.get_or_init(|| RefreshGateMutex::new(None)),
     )
-    .await
+    .await;
+    (crate::twitch::RefreshGateCleanup, arrived_rx, resume_tx)
 }
 
 #[cfg(test)]
 pub(crate) async fn install_refresh_kick_feed_publish_gate() -> (
+    crate::twitch::RefreshGateCleanup,
     tokio::sync::oneshot::Receiver<()>,
     tokio::sync::oneshot::Sender<()>,
 ) {
-    install_kick_refresh_gate(
-        REFRESH_KICK_FEED_PUBLISH_GATE.get_or_init(|| tokio::sync::Mutex::new(None)),
+    let (arrived_rx, resume_tx) = install_kick_refresh_gate(
+        REFRESH_KICK_FEED_PUBLISH_GATE.get_or_init(|| RefreshGateMutex::new(None)),
     )
-    .await
+    .await;
+    (crate::twitch::RefreshGateCleanup, arrived_rx, resume_tx)
 }
 
 #[cfg(test)]
-pub(crate) fn clear_refresh_kick_gates() {
+pub(crate) fn clear_refresh_kick_gates_blocking() {
     for slot in [
         REFRESH_KICK_TOKEN_GATE.get(),
         REFRESH_KICK_FEED_TAKE_GATE.get(),
@@ -79,7 +85,7 @@ pub(crate) fn clear_refresh_kick_gates() {
     .into_iter()
     .flatten()
     {
-        if let Ok(mut guard) = slot.try_lock() {
+        if let Ok(mut guard) = slot.lock() {
             *guard = None;
         }
     }
@@ -87,14 +93,14 @@ pub(crate) fn clear_refresh_kick_gates() {
 
 #[cfg(test)]
 async fn install_kick_refresh_gate(
-    slot: &tokio::sync::Mutex<Option<KickRefreshGateState>>,
+    slot: &RefreshGateMutex<Option<KickRefreshGateState>>,
 ) -> (
     tokio::sync::oneshot::Receiver<()>,
     tokio::sync::oneshot::Sender<()>,
 ) {
     let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
     let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
-    *slot.lock().await = Some(KickRefreshGateState {
+    *slot.lock().unwrap() = Some(KickRefreshGateState {
         arrived: arrived_tx,
         resume: resume_rx,
     });
@@ -102,12 +108,15 @@ async fn install_kick_refresh_gate(
 }
 
 #[cfg(test)]
-async fn pause_kick_refresh_gate(slot: Option<&tokio::sync::Mutex<Option<KickRefreshGateState>>>) {
+async fn pause_kick_refresh_gate(slot: Option<&RefreshGateMutex<Option<KickRefreshGateState>>>) {
     let Some(slot) = slot else {
         return;
     };
-    let mut guard = slot.lock().await;
-    let Some(gate) = guard.take() else {
+    let gate = {
+        let mut guard = slot.lock().unwrap();
+        guard.take()
+    };
+    let Some(gate) = gate else {
         return;
     };
     let _ = gate.arrived.send(());

@@ -22,6 +22,8 @@ use serde_json::{json, Value};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+#[cfg(test)]
+use std::sync::Mutex as RefreshGateMutex;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio_tungstenite::connect_async;
@@ -1987,13 +1989,15 @@ async fn ensure_delegated_refresh_loop(state: Arc<AppState>, services: Arc<Twitc
 }
 
 #[cfg(test)]
-static REFRESH_COMMIT_GATE: OnceLock<Mutex<Option<RefreshCommitGateState>>> = OnceLock::new();
+static REFRESH_COMMIT_GATE: OnceLock<RefreshGateMutex<Option<RefreshCommitGateState>>> =
+    OnceLock::new();
 
 #[cfg(test)]
-static REFRESH_LIVE_GATE: OnceLock<Mutex<Option<RefreshCommitGateState>>> = OnceLock::new();
+static REFRESH_LIVE_GATE: OnceLock<RefreshGateMutex<Option<RefreshCommitGateState>>> =
+    OnceLock::new();
 
 #[cfg(test)]
-static REFRESH_TWITCH_PUBLISH_GATE: OnceLock<Mutex<Option<RefreshCommitGateState>>> =
+static REFRESH_TWITCH_PUBLISH_GATE: OnceLock<RefreshGateMutex<Option<RefreshCommitGateState>>> =
     OnceLock::new();
 
 #[cfg(test)]
@@ -2014,25 +2018,26 @@ struct RefreshCommitGateState {
 pub(crate) struct RefreshGateCleanup;
 
 #[cfg(test)]
+pub(crate) fn clear_refresh_twitch_gates_blocking() {
+    for slot in [
+        REFRESH_COMMIT_GATE.get(),
+        REFRESH_LIVE_GATE.get(),
+        REFRESH_TWITCH_PUBLISH_GATE.get(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(mut guard) = slot.lock() {
+            *guard = None;
+        }
+    }
+}
+
+#[cfg(test)]
 impl Drop for RefreshGateCleanup {
     fn drop(&mut self) {
-        if let Some(slot) = REFRESH_COMMIT_GATE.get() {
-            if let Ok(mut guard) = slot.try_lock() {
-                *guard = None;
-            }
-        }
-        if let Some(slot) = REFRESH_LIVE_GATE.get() {
-            if let Ok(mut guard) = slot.try_lock() {
-                *guard = None;
-            }
-        }
-        if let Some(slot) = REFRESH_TWITCH_PUBLISH_GATE.get() {
-            if let Ok(mut guard) = slot.try_lock() {
-                *guard = None;
-            }
-        }
-        crate::kick::clear_refresh_kick_gates();
-        #[cfg(test)]
+        clear_refresh_twitch_gates_blocking();
+        crate::kick::clear_refresh_kick_gates_blocking();
         crate::delegated_refresh_observability::reset_side_effect_counters();
         REFRESH_BYPASS_SLEEP.store(false, Ordering::SeqCst);
     }
@@ -2047,8 +2052,8 @@ pub(crate) async fn install_refresh_commit_gate() -> (
 ) {
     let (arrived_tx, arrived_rx) = oneshot::channel();
     let (resume_tx, resume_rx) = oneshot::channel();
-    let slot = REFRESH_COMMIT_GATE.get_or_init(|| Mutex::new(None));
-    *slot.lock().await = Some(RefreshCommitGateState {
+    let slot = REFRESH_COMMIT_GATE.get_or_init(|| RefreshGateMutex::new(None));
+    *slot.lock().unwrap() = Some(RefreshCommitGateState {
         arrived: arrived_tx,
         resume: resume_rx,
     });
@@ -2064,8 +2069,8 @@ pub(crate) async fn install_refresh_twitch_publish_gate() -> (
 ) {
     let (arrived_tx, arrived_rx) = oneshot::channel();
     let (resume_tx, resume_rx) = oneshot::channel();
-    let slot = REFRESH_TWITCH_PUBLISH_GATE.get_or_init(|| Mutex::new(None));
-    *slot.lock().await = Some(RefreshCommitGateState {
+    let slot = REFRESH_TWITCH_PUBLISH_GATE.get_or_init(|| RefreshGateMutex::new(None));
+    *slot.lock().unwrap() = Some(RefreshCommitGateState {
         arrived: arrived_tx,
         resume: resume_rx,
     });
@@ -2081,8 +2086,8 @@ pub(crate) async fn install_refresh_live_gate() -> (
 ) {
     let (arrived_tx, arrived_rx) = oneshot::channel();
     let (resume_tx, resume_rx) = oneshot::channel();
-    let slot = REFRESH_LIVE_GATE.get_or_init(|| Mutex::new(None));
-    *slot.lock().await = Some(RefreshCommitGateState {
+    let slot = REFRESH_LIVE_GATE.get_or_init(|| RefreshGateMutex::new(None));
+    *slot.lock().unwrap() = Some(RefreshCommitGateState {
         arrived: arrived_tx,
         resume: resume_rx,
     });
@@ -2090,12 +2095,15 @@ pub(crate) async fn install_refresh_live_gate() -> (
 }
 
 #[cfg(test)]
-async fn pause_refresh_gate(slot: Option<&Mutex<Option<RefreshCommitGateState>>>) {
+async fn pause_refresh_gate(slot: Option<&RefreshGateMutex<Option<RefreshCommitGateState>>>) {
     let Some(slot) = slot else {
         return;
     };
-    let mut guard = slot.lock().await;
-    let Some(gate) = guard.take() else {
+    let gate = {
+        let mut guard = slot.lock().unwrap();
+        guard.take()
+    };
+    let Some(gate) = gate else {
         return;
     };
     let _ = gate.arrived.send(());
@@ -4577,6 +4585,9 @@ mod tests {
         let (state, services) = phase2_app().await;
         install_delegated_session(&state, &services).await;
         services.install_validated_authority_lease(1, None).await;
+        // Keep ensure from starting the SSE watch loop (real network) in this unit test.
+        let watch_nop = tokio::spawn(async { std::future::pending::<()>().await });
+        assert!(install_generation_task(&services.watch_handle, 1, watch_nop).await);
         let finished = tokio::spawn(async {});
         assert!(install_generation_task(&services.refresh_handle, 1, finished).await);
         for _ in 0..20 {
@@ -4598,6 +4609,8 @@ mod tests {
             slot.as_ref().is_some_and(|t| generation_task_alive(t, 1)),
             "finished worker must be replaced"
         );
+        drop(slot);
+        stop_all_platform_workers(&state, &services).await;
     }
 
     #[tokio::test]
@@ -5244,50 +5257,15 @@ mod tests {
     #[tokio::test]
     async fn refresh_persist_failure_leaves_memory_unchanged() {
         let _guard = PHASE2_TEST_LOCK.lock().await;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = Vec::new();
-                let mut tmp = [0u8; 1024];
-                loop {
-                    let n = socket.read(&mut tmp).await.unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&tmp[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let body = serde_json::json!({
-                    "ok": true,
-                    "twitch": {
-                        "client_id": "cid",
-                        "access_token": "rotated-access",
-                        "expires_at": "2099-01-01T00:00:00Z",
-                        "scopes": []
-                    },
-                    "channel": { "twitch_id": "999", "login": "takeover_chan" },
-                    "connection": { "expires_at": "2099-01-01T00:00:00Z" }
-                });
-                let payload = body.to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    payload.len(),
-                    payload
-                );
-                let _ = socket.write_all(resp.as_bytes()).await;
-            }
-        });
-        std::env::set_var("SYNDICATE_API_BASE", format!("http://127.0.0.1:{port}"));
+        let (port, server) = spawn_mock_syndicate_refresh_server("rotated-access").await;
+        let _env = ProductionTestEnvGuard::install(port);
 
         let (state, services) = phase2_app().await;
         install_delegated_session(&state, &services).await;
-        state
-            .persist_delegated_session(state.delegated.read().await.as_ref().unwrap())
-            .unwrap();
+        let mut session = state.delegated.read().await.clone().unwrap();
+        session.twitch_expires_at = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        state.persist_delegated_session(&session).unwrap();
+        *state.delegated.write().await = Some(session);
         *state.active_mode.write().await = TwitchActiveMode::Delegated;
         services.install_validated_authority_lease(1, None).await;
         let before = state
@@ -5303,7 +5281,9 @@ mod tests {
             .save_session
             .store(true, std::sync::atomic::Ordering::SeqCst);
         start_delegated_refresh_loop(state.clone(), services.clone(), 1).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
         let after = state
             .delegated
             .read()
@@ -5316,6 +5296,12 @@ mod tests {
             before, after,
             "refresh persist failure must not mutate memory"
         );
+        state
+            .durable_fail
+            .save_session
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        server.abort();
+        stop_all_platform_workers(&state, &services).await;
     }
 
     fn stale_refresh_exchange(access_token: &str) -> syndicate_connection::ExchangeSuccess {
@@ -5922,6 +5908,10 @@ mod tests {
     }
 
     async fn stop_all_platform_workers(state: &AppState, services: &TwitchServices) {
+        *state.delegated.write().await = None;
+        state
+            .delegated_generation
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         crate::delegated_lifecycle::stop_delegated_worker_handles(
             &services.refresh_handle,
             &services.watch_handle,
@@ -6090,7 +6080,8 @@ mod tests {
         }));
         let pre_refresh_feed_id = state.kick_feed_handle.read().await.as_ref().map(|h| h.id());
 
-        let (arrived_rx, resume_tx) = crate::kick::install_refresh_kick_feed_take_gate().await;
+        let (_gate, arrived_rx, resume_tx) =
+            crate::kick::install_refresh_kick_feed_take_gate().await;
         start_delegated_refresh_loop(state.clone(), services.clone(), 1).await;
         gate_wait(arrived_rx, "refresh worker must pause at kick feed take").await;
 
@@ -6144,7 +6135,6 @@ mod tests {
 
         server.abort();
         stop_all_platform_workers(&state, &services).await;
-        crate::kick::clear_refresh_kick_gates();
     }
 
     #[tokio::test]
@@ -6299,7 +6289,7 @@ mod tests {
             .connection_key
             .clone();
 
-        let (arrived_rx, resume_tx) = crate::kick::install_refresh_kick_token_gate().await;
+        let (_gate, arrived_rx, resume_tx) = crate::kick::install_refresh_kick_token_gate().await;
         let state2 = state.clone();
         let services2 = services.clone();
         let exchange2 = exchange.clone();
@@ -6323,7 +6313,6 @@ mod tests {
             platform_worker_snapshot(&state, &services).await,
             winner_workers
         );
-        crate::kick::clear_refresh_kick_gates();
     }
 
     #[tokio::test]
@@ -6352,7 +6341,8 @@ mod tests {
             .connection_key
             .clone();
 
-        let (arrived_rx, resume_tx) = crate::kick::install_refresh_kick_feed_take_gate().await;
+        let (_gate, arrived_rx, resume_tx) =
+            crate::kick::install_refresh_kick_feed_take_gate().await;
         let state2 = state.clone();
         let services2 = services.clone();
         let exchange2 = exchange.clone();
@@ -6381,7 +6371,6 @@ mod tests {
             live_identity_snapshot(&state, &services).await.delegated,
             identity_after_revoke.delegated
         );
-        crate::kick::clear_refresh_kick_gates();
     }
 
     #[tokio::test]
@@ -6411,7 +6400,8 @@ mod tests {
             .connection_key
             .clone();
 
-        let (arrived_rx, resume_tx) = crate::kick::install_refresh_kick_feed_publish_gate().await;
+        let (_gate, arrived_rx, resume_tx) =
+            crate::kick::install_refresh_kick_feed_publish_gate().await;
         let state2 = state.clone();
         let services2 = services.clone();
         let exchange2 = exchange.clone();
@@ -6437,7 +6427,6 @@ mod tests {
             0,
             "stale refresh must not connect Kick SSE before feed grant"
         );
-        crate::kick::clear_refresh_kick_gates();
     }
 
     #[tokio::test]
