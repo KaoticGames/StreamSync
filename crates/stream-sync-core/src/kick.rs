@@ -10,9 +10,9 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::{HashSet, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(test)]
 use std::sync::Mutex as RefreshGateMutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tracing::{info, warn};
 
