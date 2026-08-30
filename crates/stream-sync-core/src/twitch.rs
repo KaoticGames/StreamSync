@@ -141,7 +141,7 @@ impl TwitchServices {
     /// Newest identity intent wins; stale operations must not commit after awaits.
     pub fn ensure_apply_intent_current(&self, intent: u64) -> Result<()> {
         if self.apply_intent.load(Ordering::SeqCst) != intent {
-            return Err(anyhow!("superseded by newer identity action"));
+            return Err(superseded_identity_error());
         }
         Ok(())
     }
@@ -1856,6 +1856,118 @@ pub async fn apply_connection_key(
     apply_exchange_session(state, services, key, exchange, true, Some(intent)).await
 }
 
+fn superseded_identity_error() -> anyhow::Error {
+    anyhow!("superseded by newer identity action")
+}
+
+fn error_is_superseded_identity(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|e| e.to_string() == "superseded by newer identity action")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApplyDurableBoundary {
+    BeforePersist,
+    AfterPersist,
+    AfterModeWrite,
+    AfterTombstoneClear,
+}
+
+/// Disk artifacts this apply may mutate; restored if a newer identity intent wins.
+struct DurableApplySnapshot {
+    delegated: Option<Vec<u8>>,
+    active_mode: Option<Vec<u8>>,
+    tombstone: bool,
+    pending: bool,
+}
+
+impl DurableApplySnapshot {
+    fn capture(state: &AppState) -> Result<Self> {
+        Ok(Self {
+            delegated: read_path_bytes_if_exists(&state.paths.twitch_delegated)?,
+            active_mode: read_path_bytes_if_exists(&state.paths.twitch_active_mode)?,
+            tombstone: state.paths.twitch_delegated_revoked.is_file(),
+            pending: state.paths.twitch_delegated_revoke_pending.is_file(),
+        })
+    }
+
+    fn rollback(&self, state: &AppState) -> Result<()> {
+        restore_or_remove_path(
+            &state.paths.twitch_delegated,
+            self.delegated.as_deref(),
+            true,
+        )?;
+        if self.delegated.is_none() {
+            let bak = state.paths.twitch_delegated.with_extension("bak");
+            crate::storage::remove_file_durable(&bak)?;
+            crate::storage::remove_file_durable(&crate::storage::delegated_replace_pending_path(
+                &state.paths.twitch_delegated,
+            ))?;
+            crate::storage::remove_file_durable(&crate::storage::delegated_committing_path(
+                &state.paths.twitch_delegated,
+            ))?;
+        }
+        restore_or_remove_path(
+            &state.paths.twitch_active_mode,
+            self.active_mode.as_deref(),
+            false,
+        )?;
+        restore_marker_file(
+            &state.paths.twitch_delegated_revoked,
+            self.tombstone,
+            crate::storage::write_delegated_revoked_tombstone,
+        )?;
+        restore_marker_file(
+            &state.paths.twitch_delegated_revoke_pending,
+            self.pending,
+            crate::storage::write_delegated_revoke_pending,
+        )?;
+        Ok(())
+    }
+}
+
+fn read_path_bytes_if_exists(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn restore_or_remove_path(
+    path: &std::path::Path,
+    bytes: Option<&[u8]>,
+    authority_secret: bool,
+) -> Result<()> {
+    match bytes {
+        Some(bytes) if authority_secret => {
+            crate::storage::write_authority_bearing_secret(path, bytes)?;
+            Ok(())
+        }
+        Some(bytes) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, bytes)?;
+            crate::storage::sync_parent_dir(path)?;
+            Ok(())
+        }
+        None => crate::storage::remove_file_durable(path),
+    }
+}
+
+fn restore_marker_file(
+    path: &std::path::Path,
+    should_exist: bool,
+    write: impl FnOnce(&std::path::Path) -> Result<()>,
+) -> Result<()> {
+    if should_exist {
+        write(path)
+    } else {
+        crate::storage::remove_file_durable(path)
+    }
+}
+
 /// Persist an exchanged takeover session. When `activate` is true, make it the live identity.
 async fn apply_exchange_session(
     state: Arc<AppState>,
@@ -1887,42 +1999,70 @@ async fn apply_exchange_session(
         };
         crate::kick::apply_kick_to_delegated(&mut session, &exchange);
 
+        pause_apply_durable_gate(ApplyDurableBoundary::BeforePersist).await;
         if let Some(intent) = apply_intent {
             services.ensure_apply_intent_current(intent)?;
         }
 
-        state.persist_delegated_session(&session)?;
-        if activate {
-            storage_write_active_mode_delegated(&state)?;
-        }
-        state.clear_delegated_revoked_tombstone()?;
+        let snapshot = DurableApplySnapshot::capture(&state)?;
+        let commit = async {
+            state.persist_delegated_session(&session)?;
+            pause_apply_durable_gate(ApplyDurableBoundary::AfterPersist).await;
+            if let Some(intent) = apply_intent {
+                services.ensure_apply_intent_current(intent)?;
+            }
 
-        if let Some(intent) = apply_intent {
-            services.ensure_apply_intent_current(intent)?;
-        }
+            if activate {
+                storage_write_active_mode_delegated(&state)?;
+            }
+            pause_apply_durable_gate(ApplyDurableBoundary::AfterModeWrite).await;
+            if let Some(intent) = apply_intent {
+                services.ensure_apply_intent_current(intent)?;
+            }
 
-        stop_delegated_tasks(&services).await;
-        state.publish_delegated_generation(new_generation);
-        services
-            .teardown_coordinator
-            .install_generation_async(new_generation)
-            .await
-            .map_err(|e| anyhow!(e))?;
-        services
-            .install_validated_authority_lease(
-                new_generation,
-                session.connection_expires_at.as_deref(),
-            )
-            .await;
+            state.clear_delegated_revoked_tombstone()?;
+            pause_apply_durable_gate(ApplyDurableBoundary::AfterTombstoneClear).await;
+            if let Some(intent) = apply_intent {
+                services.ensure_apply_intent_current(intent)?;
+            }
 
-        *state.delegated.write().await = Some(session);
-        if activate {
-            {
+            stop_delegated_tasks(&services).await;
+            state.publish_delegated_generation(new_generation);
+            services
+                .teardown_coordinator
+                .install_generation_async(new_generation)
+                .await
+                .map_err(|e| anyhow!(e))?;
+            services
+                .install_validated_authority_lease(
+                    new_generation,
+                    session.connection_expires_at.as_deref(),
+                )
+                .await;
+
+            *state.delegated.write().await = Some(session.clone());
+            if activate {
                 let mut tw = state.twitch.write().await;
                 clear_live_runtime_fields(&mut tw);
                 tw.tokens = install_tokens_from_exchange(&exchange);
                 *state.active_mode.write().await = TwitchActiveMode::Delegated;
             }
+            Ok(())
+        }
+        .await;
+
+        match commit {
+            Ok(()) => {}
+            Err(e) if error_is_superseded_identity(&e) => {
+                snapshot.rollback(&state).map_err(|rollback_err| {
+                    anyhow!("{e:#}; durable rollback also failed ({rollback_err:#})")
+                })?;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        }
+
+        if activate {
             drop(_lifecycle);
             restart_twitch_clients(state.clone(), services.clone()).await;
         }
@@ -2001,6 +2141,10 @@ static REFRESH_TWITCH_PUBLISH_GATE: OnceLock<RefreshGateMutex<Option<RefreshComm
     OnceLock::new();
 
 #[cfg(test)]
+static APPLY_DURABLE_GATE: OnceLock<RefreshGateMutex<Option<ApplyDurableGateState>>> =
+    OnceLock::new();
+
+#[cfg(test)]
 static REFRESH_BYPASS_SLEEP: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
@@ -2010,6 +2154,13 @@ pub(crate) fn set_refresh_bypass_sleep(enabled: bool) {
 
 #[cfg(test)]
 struct RefreshCommitGateState {
+    arrived: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+struct ApplyDurableGateState {
+    boundary: ApplyDurableBoundary,
     arrived: oneshot::Sender<()>,
     resume: oneshot::Receiver<()>,
 }
@@ -2133,6 +2284,67 @@ async fn refresh_live_gate_pause_if_installed() {}
 
 #[cfg(not(test))]
 async fn refresh_twitch_publish_gate_pause_if_installed() {}
+
+#[cfg(test)]
+pub(crate) struct ApplyDurableGateCleanup;
+
+#[cfg(test)]
+fn clear_apply_durable_gate_blocking() {
+    if let Some(slot) = APPLY_DURABLE_GATE.get() {
+        if let Ok(mut guard) = slot.lock() {
+            *guard = None;
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ApplyDurableGateCleanup {
+    fn drop(&mut self) {
+        clear_apply_durable_gate_blocking();
+    }
+}
+
+/// Pause `apply_exchange_session` at a durable write boundary (deterministic intent races).
+#[cfg(test)]
+pub(crate) async fn install_apply_durable_gate(
+    boundary: ApplyDurableBoundary,
+) -> (
+    ApplyDurableGateCleanup,
+    oneshot::Receiver<()>,
+    oneshot::Sender<()>,
+) {
+    let (arrived_tx, arrived_rx) = oneshot::channel();
+    let (resume_tx, resume_rx) = oneshot::channel();
+    let slot = APPLY_DURABLE_GATE.get_or_init(|| RefreshGateMutex::new(None));
+    *slot.lock().unwrap() = Some(ApplyDurableGateState {
+        boundary,
+        arrived: arrived_tx,
+        resume: resume_rx,
+    });
+    (ApplyDurableGateCleanup, arrived_rx, resume_tx)
+}
+
+#[cfg(test)]
+async fn pause_apply_durable_gate(boundary: ApplyDurableBoundary) {
+    let Some(slot) = APPLY_DURABLE_GATE.get() else {
+        return;
+    };
+    let gate = {
+        let mut guard = slot.lock().unwrap();
+        match guard.as_ref().map(|g| g.boundary) {
+            Some(installed) if installed == boundary => guard.take(),
+            _ => None,
+        }
+    };
+    let Some(gate) = gate else {
+        return;
+    };
+    let _ = gate.arrived.send(());
+    let _ = gate.resume.await;
+}
+
+#[cfg(not(test))]
+async fn pause_apply_durable_gate(_boundary: ApplyDurableBoundary) {}
 
 #[cfg(test)]
 async fn delegated_refresh_sleep(duration: Duration) {
@@ -6434,6 +6646,312 @@ mod tests {
         let _guard = PHASE2_TEST_LOCK.lock().await;
         for _ in 0..20 {
             refresh_stale_before_kick_feed_publish_once().await;
+        }
+    }
+
+    const APPLY_DURABLE_BOUNDARIES: [ApplyDurableBoundary; 4] = [
+        ApplyDurableBoundary::BeforePersist,
+        ApplyDurableBoundary::AfterPersist,
+        ApplyDurableBoundary::AfterModeWrite,
+        ApplyDurableBoundary::AfterTombstoneClear,
+    ];
+
+    async fn wait_apply_intent_advanced(services: &TwitchServices, previous: u64) {
+        tokio::time::timeout(GATE_WAIT, async {
+            loop {
+                if services.apply_intent_for_test() != previous {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("newer identity action must bump apply_intent");
+    }
+
+    fn assert_superseded_apply(err: anyhow::Error) {
+        assert!(
+            error_is_superseded_identity(&err),
+            "apply must return superseded, got {err:#}"
+        );
+    }
+
+    fn disk_active_mode(state: &AppState) -> TwitchActiveMode {
+        crate::storage::read_json_if_exists(
+            &state.paths.twitch_active_mode,
+            &TwitchActiveModeFile::default(),
+        )
+        .map(|f| f.mode)
+        .unwrap_or(TwitchActiveMode::Local)
+    }
+
+    fn assert_no_delegated_authority_artifacts(state: &AppState) {
+        assert!(
+            read_delegated_disk(state).is_none(),
+            "superseded apply must not leave a delegated credential"
+        );
+        assert!(!state.paths.twitch_delegated.is_file());
+        assert!(!state.paths.twitch_delegated.with_extension("bak").is_file());
+        assert!(
+            !crate::storage::delegated_committing_path(&state.paths.twitch_delegated).is_file()
+        );
+        assert!(
+            !crate::storage::delegated_replace_pending_path(&state.paths.twitch_delegated)
+                .is_file()
+        );
+    }
+
+    async fn apply_superseded_by_disconnect_once(boundary: ApplyDurableBoundary) {
+        let (state, services) = phase2_app().await;
+        *state.personal_tokens.write().await = sample_personal();
+        state.save_twitch_tokens().await.unwrap();
+        *state.active_mode.write().await = TwitchActiveMode::Local;
+        state.save_active_mode().await.unwrap();
+
+        let stale_intent = services.bump_apply_intent();
+        let (_gate, arrived_rx, resume_tx) = super::install_apply_durable_gate(boundary).await;
+        let state_apply = state.clone();
+        let services_apply = services.clone();
+        let apply_task = tokio::spawn(async move {
+            apply_exchange_session(
+                state_apply,
+                services_apply,
+                "ssk_phase2_stale_apply",
+                stale_refresh_exchange("stale-apply-token"),
+                true,
+                Some(stale_intent),
+            )
+            .await
+        });
+        gate_wait(arrived_rx, "stale apply must pause at durable boundary").await;
+
+        let state_disc = state.clone();
+        let services_disc = services.clone();
+        let disconnect_task =
+            tokio::spawn(async move { disconnect_twitch(state_disc, services_disc).await });
+        wait_apply_intent_advanced(&services, stale_intent).await;
+        resume_tx.send(()).expect("release stale apply");
+
+        let apply_err = task_join_with_timeout(apply_task, "stale apply")
+            .await
+            .expect_err("stale apply must return error");
+        assert_superseded_apply(apply_err);
+        task_join_with_timeout(disconnect_task, "disconnect winner")
+            .await
+            .expect("disconnect winner");
+
+        let winner = live_identity_snapshot(&state, &services).await;
+        let winner_workers = platform_worker_snapshot(&state, &services).await;
+        assert_eq!(winner.mode, TwitchActiveMode::Local);
+        assert!(winner.delegated.is_none());
+        assert_ne!(
+            winner.twitch_tokens.access_token.as_deref(),
+            Some("stale-apply-token")
+        );
+        assert_no_delegated_authority_artifacts(&state);
+        assert_eq!(disk_active_mode(&state), TwitchActiveMode::Local);
+        assert!(!state.paths.twitch_delegated_revoked.is_file());
+        assert_eq!(state.current_delegated_generation(), 0);
+
+        let restarted = restart_state_at(&state);
+        assert!(restarted.delegated.read().await.is_none());
+        assert_eq!(*restarted.active_mode.read().await, TwitchActiveMode::Local);
+        assert_ne!(
+            restarted.twitch.read().await.tokens.access_token.as_deref(),
+            Some("stale-apply-token")
+        );
+        assert!(read_delegated_disk(&restarted).is_none());
+        assert_eq!(
+            live_identity_snapshot(&state, &services).await.mode,
+            winner.mode
+        );
+        assert_eq!(
+            platform_worker_snapshot(&state, &services).await,
+            winner_workers
+        );
+        stop_all_platform_workers(&state, &services).await;
+    }
+
+    #[tokio::test]
+    async fn apply_superseded_by_disconnect_at_durable_boundaries() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for boundary in APPLY_DURABLE_BOUNDARIES {
+            for _ in 0..20 {
+                apply_superseded_by_disconnect_once(boundary).await;
+            }
+        }
+    }
+
+    async fn apply_superseded_by_replacement_once(boundary: ApplyDurableBoundary) {
+        let (state, services) = phase2_app().await;
+        activate_delegated_gen1(&state, &services).await;
+
+        let stale_intent = services.bump_apply_intent();
+        let (_gate, arrived_rx, resume_tx) = super::install_apply_durable_gate(boundary).await;
+        let state_stale = state.clone();
+        let services_stale = services.clone();
+        let stale_task = tokio::spawn(async move {
+            apply_exchange_session(
+                state_stale,
+                services_stale,
+                "ssk_phase2_stale_apply",
+                stale_refresh_exchange("stale-apply-token"),
+                true,
+                Some(stale_intent),
+            )
+            .await
+        });
+        gate_wait(arrived_rx, "stale apply must pause at durable boundary").await;
+
+        let winner_intent = services.bump_apply_intent();
+        let state_win = state.clone();
+        let services_win = services.clone();
+        let winner_task = tokio::spawn(async move {
+            apply_exchange_session(
+                state_win,
+                services_win,
+                "ssk_phase2_winner_apply",
+                stale_refresh_exchange("winner-apply-token"),
+                true,
+                Some(winner_intent),
+            )
+            .await
+        });
+        resume_tx.send(()).expect("release stale apply");
+
+        let stale_err = task_join_with_timeout(stale_task, "stale apply")
+            .await
+            .expect_err("stale apply must return error");
+        assert_superseded_apply(stale_err);
+        task_join_with_timeout(winner_task, "winner apply")
+            .await
+            .expect("winner apply");
+
+        let winner = live_identity_snapshot(&state, &services).await;
+        assert_eq!(winner.mode, TwitchActiveMode::Delegated);
+        assert_eq!(winner.delegated.as_ref().map(|s| s.generation), Some(2));
+        assert_eq!(
+            winner.delegated.as_ref().map(|s| s.access_token.as_str()),
+            Some("winner-apply-token")
+        );
+        assert_eq!(
+            winner.twitch_tokens.access_token.as_deref(),
+            Some("winner-apply-token")
+        );
+        assert_eq!(winner.lease.generation, 2);
+        let disk = read_delegated_disk(&state).expect("winner primary on disk");
+        assert_eq!(disk.generation, 2);
+        assert_eq!(disk.access_token, "winner-apply-token");
+        assert_eq!(disk.connection_key, "ssk_phase2_winner_apply");
+        assert_eq!(disk_active_mode(&state), TwitchActiveMode::Delegated);
+        assert_ne!(disk.access_token, "stale-apply-token");
+
+        let restarted = restart_state_at(&state);
+        assert_eq!(
+            restarted
+                .delegated
+                .read()
+                .await
+                .as_ref()
+                .map(|s| s.generation),
+            Some(2)
+        );
+        assert_eq!(
+            restarted
+                .delegated
+                .read()
+                .await
+                .as_ref()
+                .map(|s| s.access_token.as_str()),
+            Some("winner-apply-token")
+        );
+        assert_eq!(
+            *restarted.active_mode.read().await,
+            TwitchActiveMode::Delegated
+        );
+        stop_all_platform_workers(&state, &services).await;
+    }
+
+    #[tokio::test]
+    async fn apply_superseded_by_replacement_at_durable_boundaries() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for boundary in APPLY_DURABLE_BOUNDARIES {
+            for _ in 0..20 {
+                apply_superseded_by_replacement_once(boundary).await;
+            }
+        }
+    }
+
+    async fn apply_superseded_by_revocation_once(boundary: ApplyDurableBoundary) {
+        let (state, services) = phase2_app().await;
+        activate_delegated_gen1(&state, &services).await;
+        *state.personal_tokens.write().await = sample_personal();
+        state.save_twitch_tokens().await.unwrap();
+
+        let stale_intent = services.bump_apply_intent();
+        let (_gate, arrived_rx, resume_tx) = super::install_apply_durable_gate(boundary).await;
+        let state_apply = state.clone();
+        let services_apply = services.clone();
+        let apply_task = tokio::spawn(async move {
+            apply_exchange_session(
+                state_apply,
+                services_apply,
+                "ssk_phase2_stale_apply",
+                stale_refresh_exchange("stale-apply-token"),
+                true,
+                Some(stale_intent),
+            )
+            .await
+        });
+        gate_wait(arrived_rx, "stale apply must pause at durable boundary").await;
+
+        let state_disc = state.clone();
+        let services_disc = services.clone();
+        let revoke_task =
+            tokio::spawn(async move { disconnect_twitch(state_disc, services_disc).await });
+        wait_apply_intent_advanced(&services, stale_intent).await;
+        resume_tx.send(()).expect("release stale apply");
+
+        let apply_err = task_join_with_timeout(apply_task, "stale apply")
+            .await
+            .expect_err("stale apply must return error");
+        assert_superseded_apply(apply_err);
+        task_join_with_timeout(revoke_task, "revocation winner")
+            .await
+            .expect("revocation winner");
+
+        let winner = live_identity_snapshot(&state, &services).await;
+        assert!(winner.delegated.is_none());
+        assert_eq!(winner.mode, TwitchActiveMode::Local);
+        assert_ne!(
+            winner.twitch_tokens.access_token.as_deref(),
+            Some("stale-apply-token")
+        );
+        assert_no_delegated_authority_artifacts(&state);
+        assert!(
+            state.paths.twitch_delegated_revoked.is_file(),
+            "revocation winner must keep tombstone; superseded apply must not clear it"
+        );
+        assert_eq!(disk_active_mode(&state), TwitchActiveMode::Local);
+
+        let restarted = restart_state_at(&state);
+        assert!(
+            restarted.paths.twitch_delegated_revoked.is_file(),
+            "restart must remain quarantined"
+        );
+        assert!(restarted.delegated.read().await.is_none());
+        assert_eq!(*restarted.active_mode.read().await, TwitchActiveMode::Local);
+        assert!(read_delegated_disk(&restarted).is_none());
+        stop_all_platform_workers(&state, &services).await;
+    }
+
+    #[tokio::test]
+    async fn apply_superseded_by_revocation_at_durable_boundaries() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for boundary in APPLY_DURABLE_BOUNDARIES {
+            for _ in 0..20 {
+                apply_superseded_by_revocation_once(boundary).await;
+            }
         }
     }
 }
