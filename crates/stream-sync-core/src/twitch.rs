@@ -1871,6 +1871,7 @@ pub(crate) enum ApplyDurableBoundary {
     AfterPersist,
     AfterModeWrite,
     AfterTombstoneClear,
+    BeforeLivePublish,
 }
 
 /// Disk artifacts this apply may mutate; restored if a newer identity intent wins.
@@ -1879,6 +1880,55 @@ struct DurableApplySnapshot {
     active_mode: Option<Vec<u8>>,
     tombstone: bool,
     pending: bool,
+}
+
+/// In-memory identity published by apply; restored if intent goes stale after awaits.
+struct LiveApplySnapshot {
+    generation: DelegatedGeneration,
+    delegated: Option<DelegatedSessionFile>,
+    mode: TwitchActiveMode,
+    tokens: TwitchTokenFile,
+    lease: AuthorityLease,
+}
+
+impl LiveApplySnapshot {
+    async fn capture(state: &AppState, services: &TwitchServices) -> Self {
+        Self {
+            generation: state.current_delegated_generation(),
+            delegated: state.delegated.read().await.clone(),
+            mode: *state.active_mode.read().await,
+            tokens: state.twitch.read().await.tokens.clone(),
+            lease: services.authority_lease.lock().await.clone(),
+        }
+    }
+
+    async fn restore(self, state: &AppState, services: &TwitchServices) {
+        state
+            .delegated_generation
+            .store(self.generation, Ordering::SeqCst);
+        *state.delegated.write().await = self.delegated;
+        *state.active_mode.write().await = self.mode;
+        state.twitch.write().await.tokens = self.tokens;
+        *services.authority_lease.lock().await = self.lease;
+    }
+}
+
+fn recheck_apply_intent(services: &TwitchServices, apply_intent: Option<u64>) -> Result<()> {
+    if let Some(intent) = apply_intent {
+        services.ensure_apply_intent_current(intent)?;
+    }
+    Ok(())
+}
+
+fn clear_apply_replacement_artifacts(state: &AppState) -> Result<()> {
+    crate::storage::remove_file_durable(&state.paths.twitch_delegated.with_extension("bak"))?;
+    crate::storage::remove_file_durable(&crate::storage::delegated_replace_pending_path(
+        &state.paths.twitch_delegated,
+    ))?;
+    crate::storage::remove_file_durable(&crate::storage::delegated_committing_path(
+        &state.paths.twitch_delegated,
+    ))?;
+    Ok(())
 }
 
 impl DurableApplySnapshot {
@@ -1897,16 +1947,6 @@ impl DurableApplySnapshot {
             self.delegated.as_deref(),
             true,
         )?;
-        if self.delegated.is_none() {
-            let bak = state.paths.twitch_delegated.with_extension("bak");
-            crate::storage::remove_file_durable(&bak)?;
-            crate::storage::remove_file_durable(&crate::storage::delegated_replace_pending_path(
-                &state.paths.twitch_delegated,
-            ))?;
-            crate::storage::remove_file_durable(&crate::storage::delegated_committing_path(
-                &state.paths.twitch_delegated,
-            ))?;
-        }
         restore_or_remove_path(
             &state.paths.twitch_active_mode,
             self.active_mode.as_deref(),
@@ -1922,6 +1962,7 @@ impl DurableApplySnapshot {
             self.pending,
             crate::storage::write_delegated_revoke_pending,
         )?;
+        clear_apply_replacement_artifacts(state)?;
         Ok(())
     }
 }
@@ -2005,40 +2046,43 @@ async fn apply_exchange_session(
         }
 
         let snapshot = DurableApplySnapshot::capture(&state)?;
+        let live_snapshot = LiveApplySnapshot::capture(&state, &services).await;
         let commit = async {
             state.persist_delegated_session(&session)?;
             pause_apply_durable_gate(ApplyDurableBoundary::AfterPersist).await;
-            if let Some(intent) = apply_intent {
-                services.ensure_apply_intent_current(intent)?;
-            }
+            recheck_apply_intent(&services, apply_intent)?;
 
             if activate {
                 storage_write_active_mode_delegated(&state)?;
             }
             pause_apply_durable_gate(ApplyDurableBoundary::AfterModeWrite).await;
-            if let Some(intent) = apply_intent {
-                services.ensure_apply_intent_current(intent)?;
-            }
+            recheck_apply_intent(&services, apply_intent)?;
 
             state.clear_delegated_revoked_tombstone()?;
             pause_apply_durable_gate(ApplyDurableBoundary::AfterTombstoneClear).await;
-            if let Some(intent) = apply_intent {
-                services.ensure_apply_intent_current(intent)?;
-            }
+            recheck_apply_intent(&services, apply_intent)?;
 
             stop_delegated_tasks(&services).await;
+            recheck_apply_intent(&services, apply_intent)?;
+
+            pause_apply_durable_gate(ApplyDurableBoundary::BeforeLivePublish).await;
+            recheck_apply_intent(&services, apply_intent)?;
+
             state.publish_delegated_generation(new_generation);
             services
                 .teardown_coordinator
                 .install_generation_async(new_generation)
                 .await
                 .map_err(|e| anyhow!(e))?;
+            recheck_apply_intent(&services, apply_intent)?;
+
             services
                 .install_validated_authority_lease(
                     new_generation,
                     session.connection_expires_at.as_deref(),
                 )
                 .await;
+            recheck_apply_intent(&services, apply_intent)?;
 
             *state.delegated.write().await = Some(session.clone());
             if activate {
@@ -2057,6 +2101,7 @@ async fn apply_exchange_session(
                 snapshot.rollback(&state).map_err(|rollback_err| {
                     anyhow!("{e:#}; durable rollback also failed ({rollback_err:#})")
                 })?;
+                live_snapshot.restore(&state, &services).await;
                 return Err(e);
             }
             Err(e) => return Err(e),
@@ -6649,11 +6694,12 @@ mod tests {
         }
     }
 
-    const APPLY_DURABLE_BOUNDARIES: [ApplyDurableBoundary; 4] = [
+    const APPLY_DURABLE_BOUNDARIES: [ApplyDurableBoundary; 5] = [
         ApplyDurableBoundary::BeforePersist,
         ApplyDurableBoundary::AfterPersist,
         ApplyDurableBoundary::AfterModeWrite,
         ApplyDurableBoundary::AfterTombstoneClear,
+        ApplyDurableBoundary::BeforeLivePublish,
     ];
 
     async fn wait_apply_intent_advanced(services: &TwitchServices, previous: u64) {
