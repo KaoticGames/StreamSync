@@ -799,7 +799,15 @@ async fn feed_loop_inner(state: Arc<AppState>, generation: Option<DelegatedGener
             tokio::time::sleep(Duration::from_secs(8)).await;
             continue;
         };
-        match consume_sse(state.clone(), &sel.url, sel.auth.as_deref(), sel.snap).await {
+        match consume_sse(
+            state.clone(),
+            &sel.url,
+            sel.auth.as_deref(),
+            sel.snap,
+            generation,
+        )
+        .await
+        {
             Ok(()) => info!("Kick feed SSE ended"),
             Err(e) => {
                 let msg = sel
@@ -823,7 +831,11 @@ async fn consume_sse(
     url: &str,
     auth: Option<&str>,
     snap: Option<crate::delegated_lifecycle::AuthorityLeaseSnapshot>,
+    generation: Option<DelegatedGeneration>,
 ) -> Result<()> {
+    if generation.is_some() {
+        crate::delegated_refresh_observability::record_kick_sse_connect();
+    }
     let mut req = syndicate_connection::syndicate_http_client()
         .get(url)
         .header("Accept", "text/event-stream");
@@ -1392,7 +1404,7 @@ mod tests {
             .await;
         let snap = services.authority_lease_snapshot_public().await;
         let url = format!("http://127.0.0.1:{port}/kick-feed");
-        let err = consume_sse(state, &url, Some("Bearer ssk_test"), Some(snap))
+        let err = consume_sse(state, &url, Some("Bearer ssk_test"), Some(snap), None)
             .await
             .expect_err("hung connect must fail at lease deadline");
         let msg = format!("{err:#}");
@@ -1441,7 +1453,7 @@ mod tests {
             .await;
         let snap = services.authority_lease_snapshot_public().await;
         let url = format!("http://127.0.0.1:{port}/kick-feed");
-        let result = consume_sse(state, &url, Some("Bearer ssk_test"), Some(snap)).await;
+        let result = consume_sse(state, &url, Some("Bearer ssk_test"), Some(snap), None).await;
         assert!(
             result.is_err(),
             "frame after lease deadline must not complete successfully: {result:?}"
@@ -1487,7 +1499,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}/kick-feed");
         let services2 = services.clone();
         let pending = tokio::spawn(async move {
-            consume_sse(state, &url, Some("Bearer ssk_test"), Some(snap)).await
+            consume_sse(state, &url, Some("Bearer ssk_test"), Some(snap), None).await
         });
         tokio::time::sleep(Duration::from_millis(40)).await;
         services2.clear_authority_lease().await;

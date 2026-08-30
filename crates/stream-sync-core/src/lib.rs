@@ -8,6 +8,7 @@ mod broadcast;
 mod config_types;
 mod control_plane;
 mod delegated_lifecycle;
+mod delegated_refresh_observability;
 mod dock_capability;
 mod export;
 mod kick;

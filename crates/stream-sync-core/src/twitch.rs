@@ -2032,6 +2032,8 @@ impl Drop for RefreshGateCleanup {
             }
         }
         crate::kick::clear_refresh_kick_gates();
+        #[cfg(test)]
+        crate::delegated_refresh_observability::reset_side_effect_counters();
         REFRESH_BYPASS_SLEEP.store(false, Ordering::SeqCst);
     }
 }
@@ -2907,14 +2909,34 @@ async fn start_irc(
     let channel = login.clone();
 
     if let Some(generation) = generation {
+        refresh_twitch_publish_gate_pause_if_installed().await;
+        let _lifecycle = services.lock_lifecycle().await;
+        if !delegated_refresh_live_may_publish(&state, &services, generation).await {
+            return Ok(());
+        }
+        let provenance = services
+            .select_platform_credentials_under_lock(&state)
+            .await?
+            .provenance();
+
         let (grant_tx, grant_rx) = oneshot::channel();
         let broadcaster_login = login.clone();
         let state_irc = state.clone();
         let channel_log = channel.clone();
+        let channel_join = channel.clone();
         let feed = state.feed.clone();
+        let services_task = services.clone();
         let handle = tokio::spawn(async move {
             if grant_rx.await.is_err() {
                 return;
+            }
+            crate::delegated_refresh_observability::record_irc_join();
+            client.join(channel_join.clone()).ok();
+            *services_task.irc_client.write().await = Some(IrcClientBundle { client, provenance });
+            {
+                let mut tw = state_irc.twitch.write().await;
+                tw.connected = true;
+                tw.channel = Some(channel_join);
             }
             while let Some(message) = incoming.recv().await {
                 if !state_irc.session_still_current(generation).await {
@@ -2951,6 +2973,7 @@ async fn start_irc(
                             );
                         }
                         let evt = privmsg_to_chat_event(&msg, is_self);
+                        crate::delegated_refresh_observability::record_delegated_chat_fanout();
                         feed.broadcast_all(&evt).await;
                     }
                     ServerMessage::Notice(_) => {}
@@ -2960,23 +2983,6 @@ async fn start_irc(
             info!("IRC incoming ended for {channel_log}");
         });
 
-        refresh_twitch_publish_gate_pause_if_installed().await;
-        let _lifecycle = services.lock_lifecycle().await;
-        if !delegated_refresh_live_may_publish(&state, &services, generation).await {
-            handle.abort();
-            return Ok(());
-        }
-        let provenance = services
-            .select_platform_credentials_under_lock(&state)
-            .await?
-            .provenance();
-        client.join(channel.clone()).ok();
-        *services.irc_client.write().await = Some(IrcClientBundle { client, provenance });
-        {
-            let mut tw = state.twitch.write().await;
-            tw.connected = true;
-            tw.channel = Some(channel.clone());
-        }
         let _ = grant_tx.send(());
         *services.irc_handle.write().await = Some(handle);
         drop(_lifecycle);
@@ -3745,6 +3751,7 @@ async fn eventsub_session(
         if !state.session_still_current(gen).await {
             return Ok(());
         }
+        crate::delegated_refresh_observability::record_eventsub_connect();
     }
     let (ws, _) = connect_async("wss://eventsub.wss.twitch.tv/ws").await?;
     let (_write, mut read) = ws.split();
@@ -5343,6 +5350,10 @@ mod tests {
 
     const GATE_WAIT: Duration = Duration::from_secs(5);
 
+    fn begin_refresh_side_effect_race() {
+        crate::delegated_refresh_observability::reset_side_effect_counters();
+    }
+
     async fn gate_wait(rx: oneshot::Receiver<()>, label: &str) {
         tokio::time::timeout(GATE_WAIT, rx)
             .await
@@ -6145,6 +6156,7 @@ mod tests {
     }
 
     async fn refresh_stale_before_twitch_publish_once() {
+        begin_refresh_side_effect_race();
         let (state, services) = phase2_app().await;
         activate_delegated_gen1(&state, &services).await;
 
@@ -6186,8 +6198,81 @@ mod tests {
             platform_worker_snapshot(&state, &services).await,
             winner_workers
         );
+        crate::delegated_refresh_observability::assert_zero_pre_grant_side_effects();
     }
 
+    async fn refresh_production_worker_before_twitch_publish_once(iteration: u32) {
+        begin_refresh_side_effect_race();
+        let token = format!("prod-twitch-grant-{iteration}");
+        let (port, server) = spawn_mock_syndicate_refresh_server(&token).await;
+        let _env = ProductionTestEnvGuard::install(port);
+
+        let (state, services) = phase2_app().await;
+        activate_delegated_gen1(&state, &services).await;
+        let mut session = state.delegated.read().await.clone().unwrap();
+        session.twitch_expires_at = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        state.persist_delegated_session(&session).unwrap();
+        *state.delegated.write().await = Some(session);
+        services.install_validated_authority_lease(1, None).await;
+        install_fake_platform_workers(&state, &services).await;
+
+        let (_gate, arrived_rx, resume_tx) = super::install_refresh_twitch_publish_gate().await;
+        start_delegated_refresh_loop(state.clone(), services.clone(), 1).await;
+        gate_wait(
+            arrived_rx,
+            "production worker must pause before IRC/EventSub grant",
+        )
+        .await;
+
+        let stale_gen = services
+            .refresh_handle
+            .read()
+            .await
+            .as_ref()
+            .map(|t| t.generation);
+        commit_replacement_generation(&state, &services, 2, "gen2-prod-grant").await;
+        let winner_identity = live_identity_snapshot(&state, &services).await;
+        let winner_workers = install_winner_platform_workers(&state, &services, 2).await;
+
+        let _ = resume_tx.send(());
+        if let Some(gen) = stale_gen {
+            tokio::time::timeout(GATE_WAIT, async {
+                loop {
+                    let finished = {
+                        let guard = services.refresh_handle.read().await;
+                        guard
+                            .as_ref()
+                            .map(|t| t.generation != gen || t.handle.is_finished())
+                            .unwrap_or(true)
+                    };
+                    if finished {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("stale production refresh worker should finish");
+        }
+
+        assert_live_identity_eq(&state, &services, &winner_identity).await;
+        assert_eq!(
+            platform_worker_snapshot(&state, &services).await,
+            winner_workers
+        );
+        crate::delegated_refresh_observability::assert_zero_pre_grant_side_effects();
+
+        server.abort();
+        stop_all_platform_workers(&state, &services).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_production_worker_before_twitch_publish_zero_pre_grant_effects() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for i in 0..20 {
+            refresh_production_worker_before_twitch_publish_once(i).await;
+        }
+    }
     #[tokio::test]
     async fn refresh_stale_before_twitch_publish_no_side_effects() {
         let _guard = PHASE2_TEST_LOCK.lock().await;
@@ -6308,6 +6393,7 @@ mod tests {
     }
 
     async fn refresh_stale_before_kick_feed_publish_once() {
+        begin_refresh_side_effect_race();
         let (state, services) = phase2_app().await;
         activate_delegated_gen1(&state, &services).await;
 
@@ -6345,6 +6431,11 @@ mod tests {
         assert_eq!(
             platform_worker_snapshot(&state, &services).await,
             winner_workers
+        );
+        assert_eq!(
+            crate::delegated_refresh_observability::kick_sse_connect_count(),
+            0,
+            "stale refresh must not connect Kick SSE before feed grant"
         );
         crate::kick::clear_refresh_kick_gates();
     }
