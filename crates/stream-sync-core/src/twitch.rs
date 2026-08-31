@@ -1873,6 +1873,7 @@ pub(crate) enum ApplyDurableBoundary {
     AfterTombstoneClear,
     BeforeLivePublish,
     BeforeLiveMemoryPublish,
+    BeforeWorkerStart,
 }
 
 /// Disk artifacts this apply may mutate; restored if a newer identity intent wins.
@@ -2010,39 +2011,52 @@ async fn rollback_superseded_apply(
     }
 }
 
-async fn rollback_superseded_apply_after_workers(
-    durable_snapshot: &DurableApplySnapshot,
-    live_snapshot: LiveApplySnapshot,
+async fn apply_post_commit_workers_may_run(
     state: &AppState,
     services: &TwitchServices,
-    err: anyhow::Error,
-) -> Result<()> {
-    stop_twitch_clients(services).await;
-    stop_delegated_tasks(services).await;
-    rollback_superseded_apply(durable_snapshot, live_snapshot, state, services, err).await
+    generation: DelegatedGeneration,
+    apply_intent: Option<u64>,
+) -> bool {
+    if recheck_apply_intent(services, apply_intent).is_err() {
+        return false;
+    }
+    if state.current_delegated_generation() != generation {
+        return false;
+    }
+    if !state.session_still_current(generation).await {
+        return false;
+    }
+    if services.authority_lease_expired().await {
+        return false;
+    }
+    let lease = services.read_authority_lease().await;
+    lease.allows_platform_operations(generation)
 }
 
-async fn recheck_apply_or_rollback_after_workers(
-    services: &TwitchServices,
-    apply_intent: Option<u64>,
-    durable_snapshot: &DurableApplySnapshot,
-    live_snapshot: LiveApplySnapshot,
+async fn stop_stale_apply_generation_workers(
     state: &AppState,
-) -> Result<LiveApplySnapshot> {
-    match recheck_apply_intent(services, apply_intent) {
-        Ok(()) => Ok(live_snapshot),
-        Err(e) if error_is_superseded_identity(&e) => {
-            rollback_superseded_apply_after_workers(
-                durable_snapshot,
-                live_snapshot,
-                state,
-                services,
-                e,
-            )
-            .await?;
-            unreachable!("rollback_superseded_apply_after_workers always returns Err")
+    services: &TwitchServices,
+    generation: DelegatedGeneration,
+    may_stop_twitch: bool,
+) {
+    {
+        let mut guard = services.refresh_handle.write().await;
+        if guard.as_ref().is_some_and(|t| t.generation == generation) {
+            if let Some(task) = guard.take() {
+                task.handle.abort();
+            }
         }
-        Err(e) => Err(e),
+    }
+    {
+        let mut guard = services.watch_handle.write().await;
+        if guard.as_ref().is_some_and(|t| t.generation == generation) {
+            if let Some(task) = guard.take() {
+                task.handle.abort();
+            }
+        }
+    }
+    if may_stop_twitch && state.session_still_current(generation).await {
+        stop_twitch_clients(services).await;
     }
 }
 
@@ -2124,7 +2138,7 @@ async fn apply_exchange_session(
     }
 
     let snapshot = DurableApplySnapshot::capture(&state)?;
-    let mut live_snapshot = LiveApplySnapshot::capture(&state, &services).await;
+    let live_snapshot = LiveApplySnapshot::capture(&state, &services).await;
     let commit = async {
         state.persist_delegated_session(&session)?;
         pause_apply_durable_gate(ApplyDurableBoundary::AfterPersist).await;
@@ -2204,47 +2218,33 @@ async fn apply_exchange_session(
 
     drop(_lifecycle);
 
+    pause_apply_durable_gate(ApplyDurableBoundary::BeforeWorkerStart).await;
+    if !apply_post_commit_workers_may_run(&state, &services, new_generation, apply_intent).await {
+        return Ok(());
+    }
+
     if activate {
         restart_twitch_clients(state.clone(), services.clone()).await;
-        live_snapshot = recheck_apply_or_rollback_after_workers(
-            &services,
-            apply_intent,
-            &snapshot,
-            live_snapshot,
-            &state,
-        )
-        .await?;
+        if !apply_post_commit_workers_may_run(&state, &services, new_generation, apply_intent).await
+        {
+            stop_stale_apply_generation_workers(&state, &services, new_generation, true).await;
+            return Ok(());
+        }
     }
 
     start_delegated_refresh_loop(state.clone(), services.clone(), new_generation).await;
-    live_snapshot = recheck_apply_or_rollback_after_workers(
-        &services,
-        apply_intent,
-        &snapshot,
-        live_snapshot,
-        &state,
-    )
-    .await?;
+    if !apply_post_commit_workers_may_run(&state, &services, new_generation, apply_intent).await {
+        stop_stale_apply_generation_workers(&state, &services, new_generation, false).await;
+        return Ok(());
+    }
 
     start_delegated_watch_loop(state.clone(), services.clone(), new_generation).await;
-    live_snapshot = recheck_apply_or_rollback_after_workers(
-        &services,
-        apply_intent,
-        &snapshot,
-        live_snapshot,
-        &state,
-    )
-    .await?;
+    if !apply_post_commit_workers_may_run(&state, &services, new_generation, apply_intent).await {
+        stop_stale_apply_generation_workers(&state, &services, new_generation, false).await;
+        return Ok(());
+    }
 
     crate::kick::sync_live_identity(state.clone()).await;
-    recheck_apply_or_rollback_after_workers(
-        &services,
-        apply_intent,
-        &snapshot,
-        live_snapshot,
-        &state,
-    )
-    .await?;
 
     Ok(())
 }
@@ -7128,6 +7128,96 @@ mod tests {
             for _ in 0..20 {
                 apply_superseded_by_revocation_once(boundary).await;
             }
+        }
+    }
+
+    async fn apply_post_commit_winner_survives_stale_worker_fence_once() {
+        let (state, services) = phase2_app().await;
+        activate_delegated_gen1(&state, &services).await;
+
+        let stale_intent = services.bump_apply_intent();
+        let (_gate, arrived_rx, resume_tx) =
+            super::install_apply_durable_gate(ApplyDurableBoundary::BeforeWorkerStart).await;
+        let state_stale = state.clone();
+        let services_stale = services.clone();
+        let stale_task = tokio::spawn(async move {
+            apply_exchange_session(
+                state_stale,
+                services_stale,
+                "ssk_phase2_stale_apply",
+                stale_refresh_exchange("stale-apply-token"),
+                true,
+                Some(stale_intent),
+            )
+            .await
+        });
+        gate_wait(arrived_rx, "stale apply must pause before workers").await;
+
+        let winner_intent = services.bump_apply_intent();
+        let state_win = state.clone();
+        let services_win = services.clone();
+        let winner_task = tokio::spawn(async move {
+            apply_exchange_session(
+                state_win,
+                services_win,
+                "ssk_phase2_winner_apply",
+                stale_refresh_exchange("winner-apply-token"),
+                true,
+                Some(winner_intent),
+            )
+            .await
+        });
+        task_join_with_timeout(winner_task, "winner apply")
+            .await
+            .expect("winner apply");
+
+        resume_tx.send(()).expect("release stale worker start");
+        task_join_with_timeout(stale_task, "stale apply after winner")
+            .await
+            .expect("stale apply must return after worker fence");
+
+        let winner = live_identity_snapshot(&state, &services).await;
+        assert_eq!(winner.delegated.as_ref().map(|s| s.generation), Some(3));
+        assert_eq!(
+            winner.delegated.as_ref().map(|s| s.access_token.as_str()),
+            Some("winner-apply-token")
+        );
+        assert_eq!(
+            winner.twitch_tokens.access_token.as_deref(),
+            Some("winner-apply-token")
+        );
+        let disk = read_delegated_disk(&state).expect("winner primary on disk");
+        assert_eq!(disk.generation, 3);
+        assert_eq!(disk.access_token, "winner-apply-token");
+        assert_ne!(disk.access_token, "stale-apply-token");
+
+        let restarted = restart_state_at(&state);
+        assert_eq!(
+            restarted
+                .delegated
+                .read()
+                .await
+                .as_ref()
+                .map(|s| s.generation),
+            Some(3)
+        );
+        assert_eq!(
+            restarted
+                .delegated
+                .read()
+                .await
+                .as_ref()
+                .map(|s| s.access_token.as_str()),
+            Some("winner-apply-token")
+        );
+        stop_all_platform_workers(&state, &services).await;
+    }
+
+    #[tokio::test]
+    async fn apply_post_commit_winner_survives_stale_worker_fence() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for _ in 0..20 {
+            apply_post_commit_winner_survives_stale_worker_fence_once().await;
         }
     }
 }
