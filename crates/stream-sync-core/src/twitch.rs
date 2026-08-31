@@ -1872,6 +1872,7 @@ pub(crate) enum ApplyDurableBoundary {
     AfterModeWrite,
     AfterTombstoneClear,
     BeforeLivePublish,
+    BeforeLiveMemoryPublish,
 }
 
 /// Disk artifacts this apply may mutate; restored if a newer identity intent wins.
@@ -1885,6 +1886,7 @@ struct DurableApplySnapshot {
 /// In-memory identity published by apply; restored if intent goes stale after awaits.
 struct LiveApplySnapshot {
     generation: DelegatedGeneration,
+    coordinator_generation: DelegatedGeneration,
     delegated: Option<DelegatedSessionFile>,
     mode: TwitchActiveMode,
     tokens: TwitchTokenFile,
@@ -1895,6 +1897,7 @@ impl LiveApplySnapshot {
     async fn capture(state: &AppState, services: &TwitchServices) -> Self {
         Self {
             generation: state.current_delegated_generation(),
+            coordinator_generation: services.teardown_coordinator.active_generation(),
             delegated: state.delegated.read().await.clone(),
             mode: *state.active_mode.read().await,
             tokens: state.twitch.read().await.tokens.clone(),
@@ -1910,6 +1913,12 @@ impl LiveApplySnapshot {
         *state.active_mode.write().await = self.mode;
         state.twitch.write().await.tokens = self.tokens;
         *services.authority_lease.lock().await = self.lease;
+        if let Err(err) = services
+            .teardown_coordinator
+            .restore_active_generation_for_rollback(self.coordinator_generation)
+        {
+            warn!("coordinator rollback after superseded apply failed: {err}");
+        }
     }
 }
 
@@ -1920,15 +1929,19 @@ fn recheck_apply_intent(services: &TwitchServices, apply_intent: Option<u64>) ->
     Ok(())
 }
 
-fn clear_apply_replacement_artifacts(state: &AppState) -> Result<()> {
-    crate::storage::remove_file_durable(&state.paths.twitch_delegated.with_extension("bak"))?;
-    crate::storage::remove_file_durable(&crate::storage::delegated_replace_pending_path(
-        &state.paths.twitch_delegated,
-    ))?;
-    crate::storage::remove_file_durable(&crate::storage::delegated_committing_path(
-        &state.paths.twitch_delegated,
-    ))?;
-    Ok(())
+fn clear_apply_replacement_artifacts(state: &AppState) {
+    for path in [
+        state.paths.twitch_delegated.with_extension("bak"),
+        crate::storage::delegated_replace_pending_path(&state.paths.twitch_delegated),
+        crate::storage::delegated_committing_path(&state.paths.twitch_delegated),
+    ] {
+        if let Err(err) = crate::storage::remove_file_durable(&path) {
+            warn!(
+                "superseded apply artifact cleanup failed for {}: {err:#}",
+                path.display()
+            );
+        }
+    }
 }
 
 impl DurableApplySnapshot {
@@ -1942,28 +1955,58 @@ impl DurableApplySnapshot {
     }
 
     fn rollback(&self, state: &AppState) -> Result<()> {
-        restore_or_remove_path(
+        let mut errors = Vec::new();
+        if let Err(err) = restore_or_remove_path(
             &state.paths.twitch_delegated,
             self.delegated.as_deref(),
             true,
-        )?;
-        restore_or_remove_path(
+        ) {
+            errors.push(format!("delegated credential rollback failed: {err:#}"));
+        }
+        if let Err(err) = restore_or_remove_path(
             &state.paths.twitch_active_mode,
             self.active_mode.as_deref(),
             false,
-        )?;
-        restore_marker_file(
+        ) {
+            errors.push(format!("active mode rollback failed: {err:#}"));
+        }
+        if let Err(err) = restore_marker_file(
             &state.paths.twitch_delegated_revoked,
             self.tombstone,
             crate::storage::write_delegated_revoked_tombstone,
-        )?;
-        restore_marker_file(
+        ) {
+            errors.push(format!("revoked tombstone rollback failed: {err:#}"));
+        }
+        if let Err(err) = restore_marker_file(
             &state.paths.twitch_delegated_revoke_pending,
             self.pending,
             crate::storage::write_delegated_revoke_pending,
-        )?;
-        clear_apply_replacement_artifacts(state)?;
-        Ok(())
+        ) {
+            errors.push(format!("revoke pending rollback failed: {err:#}"));
+        }
+        clear_apply_replacement_artifacts(state);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(errors.join("; ")))
+        }
+    }
+}
+
+async fn rollback_superseded_apply(
+    durable_snapshot: &DurableApplySnapshot,
+    live_snapshot: LiveApplySnapshot,
+    state: &AppState,
+    services: &TwitchServices,
+    err: anyhow::Error,
+) -> Result<()> {
+    let durable_err = durable_snapshot.rollback(state).err();
+    live_snapshot.restore(state, services).await;
+    match durable_err {
+        Some(rollback_err) => Err(anyhow!(
+            "{err:#}; durable rollback also failed ({rollback_err:#})"
+        )),
+        None => Err(err),
     }
 }
 
@@ -2070,13 +2113,6 @@ async fn apply_exchange_session(
 
             state.publish_delegated_generation(new_generation);
             services
-                .teardown_coordinator
-                .install_generation_async(new_generation)
-                .await
-                .map_err(|e| anyhow!(e))?;
-            recheck_apply_intent(&services, apply_intent)?;
-
-            services
                 .install_validated_authority_lease(
                     new_generation,
                     session.connection_expires_at.as_deref(),
@@ -2084,12 +2120,33 @@ async fn apply_exchange_session(
                 .await;
             recheck_apply_intent(&services, apply_intent)?;
 
-            *state.delegated.write().await = Some(session.clone());
+            pause_apply_durable_gate(ApplyDurableBoundary::BeforeLiveMemoryPublish).await;
+            recheck_apply_intent(&services, apply_intent)?;
+
+            services
+                .teardown_coordinator
+                .install_generation_async(new_generation)
+                .await
+                .map_err(|e| anyhow!(e))?;
+            recheck_apply_intent(&services, apply_intent)?;
+
+            {
+                let mut delegated = state.delegated.write().await;
+                recheck_apply_intent(&services, apply_intent)?;
+                *delegated = Some(session.clone());
+            }
             if activate {
-                let mut tw = state.twitch.write().await;
-                clear_live_runtime_fields(&mut tw);
-                tw.tokens = install_tokens_from_exchange(&exchange);
-                *state.active_mode.write().await = TwitchActiveMode::Delegated;
+                {
+                    let mut tw = state.twitch.write().await;
+                    recheck_apply_intent(&services, apply_intent)?;
+                    clear_live_runtime_fields(&mut tw);
+                    tw.tokens = install_tokens_from_exchange(&exchange);
+                }
+                {
+                    let mut mode = state.active_mode.write().await;
+                    recheck_apply_intent(&services, apply_intent)?;
+                    *mode = TwitchActiveMode::Delegated;
+                }
             }
             Ok(())
         }
@@ -2098,22 +2155,30 @@ async fn apply_exchange_session(
         match commit {
             Ok(()) => {}
             Err(e) if error_is_superseded_identity(&e) => {
-                snapshot.rollback(&state).map_err(|rollback_err| {
-                    anyhow!("{e:#}; durable rollback also failed ({rollback_err:#})")
-                })?;
-                live_snapshot.restore(&state, &services).await;
-                return Err(e);
+                return rollback_superseded_apply(&snapshot, live_snapshot, &state, &services, e)
+                    .await;
             }
             Err(e) => return Err(e),
+        }
+
+        if let Err(e) = recheck_apply_intent(&services, apply_intent) {
+            if error_is_superseded_identity(&e) {
+                return rollback_superseded_apply(&snapshot, live_snapshot, &state, &services, e)
+                    .await;
+            }
+            return Err(e);
         }
 
         if activate {
             drop(_lifecycle);
             restart_twitch_clients(state.clone(), services.clone()).await;
+        } else {
+            drop(_lifecycle);
         }
         new_generation
     };
 
+    recheck_apply_intent(&services, apply_intent)?;
     start_delegated_refresh_loop(state.clone(), services.clone(), generation).await;
     start_delegated_watch_loop(state.clone(), services, generation).await;
     crate::kick::sync_live_identity(state).await;
@@ -6694,12 +6759,13 @@ mod tests {
         }
     }
 
-    const APPLY_DURABLE_BOUNDARIES: [ApplyDurableBoundary; 5] = [
+    const APPLY_DURABLE_BOUNDARIES: [ApplyDurableBoundary; 6] = [
         ApplyDurableBoundary::BeforePersist,
         ApplyDurableBoundary::AfterPersist,
         ApplyDurableBoundary::AfterModeWrite,
         ApplyDurableBoundary::AfterTombstoneClear,
         ApplyDurableBoundary::BeforeLivePublish,
+        ApplyDurableBoundary::BeforeLiveMemoryPublish,
     ];
 
     async fn wait_apply_intent_advanced(services: &TwitchServices, previous: u64) {

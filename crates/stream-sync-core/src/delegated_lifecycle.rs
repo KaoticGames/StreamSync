@@ -94,6 +94,19 @@ impl TeardownCoordinator {
         self.active_generation.load(Ordering::SeqCst)
     }
 
+    /// Restore coordinator generation after a superseded apply rollback (not monotonic install).
+    pub fn restore_active_generation_for_rollback(
+        &self,
+        generation: DelegatedGeneration,
+    ) -> Result<(), String> {
+        let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
+        self.active_generation.store(generation, Ordering::SeqCst);
+        inner.generation = generation;
+        inner.result_tx = None;
+        inner.phase = TeardownPhase::Idle;
+        Ok(())
+    }
+
     /// Install a newer generation. Rejects stale/lower generations (monotonic).
     ///
     /// Same-generation install is idempotent: a Running teardown is left untouched.
