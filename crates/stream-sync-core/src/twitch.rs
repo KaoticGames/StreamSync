@@ -2010,6 +2010,42 @@ async fn rollback_superseded_apply(
     }
 }
 
+async fn rollback_superseded_apply_after_workers(
+    durable_snapshot: &DurableApplySnapshot,
+    live_snapshot: LiveApplySnapshot,
+    state: &AppState,
+    services: &TwitchServices,
+    err: anyhow::Error,
+) -> Result<()> {
+    stop_twitch_clients(services).await;
+    stop_delegated_tasks(services).await;
+    rollback_superseded_apply(durable_snapshot, live_snapshot, state, services, err).await
+}
+
+async fn recheck_apply_or_rollback_after_workers(
+    services: &TwitchServices,
+    apply_intent: Option<u64>,
+    durable_snapshot: &DurableApplySnapshot,
+    live_snapshot: LiveApplySnapshot,
+    state: &AppState,
+) -> Result<LiveApplySnapshot> {
+    match recheck_apply_intent(services, apply_intent) {
+        Ok(()) => Ok(live_snapshot),
+        Err(e) if error_is_superseded_identity(&e) => {
+            rollback_superseded_apply_after_workers(
+                durable_snapshot,
+                live_snapshot,
+                state,
+                services,
+                e,
+            )
+            .await?;
+            unreachable!("rollback_superseded_apply_after_workers always returns Err")
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn read_path_bytes_if_exists(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -2061,127 +2097,155 @@ async fn apply_exchange_session(
     activate: bool,
     apply_intent: Option<u64>,
 ) -> Result<()> {
-    let generation = {
-        let _lifecycle = services.lifecycle_lock.lock().await;
-        if let Some(intent) = apply_intent {
-            services.ensure_apply_intent_current(intent)?;
-        }
-        let new_generation = state.peek_next_delegated_generation();
-        let mut session = DelegatedSessionFile {
-            generation: new_generation,
-            connection_key: key.trim().to_string(),
-            client_id: exchange.twitch.client_id.clone(),
-            access_token: exchange.twitch.access_token.clone(),
-            channel_login: exchange.channel.login.clone(),
-            channel_twitch_id: exchange.channel.twitch_id.clone(),
-            display_name: exchange.channel.display_name.clone(),
-            label: exchange.connection.label.clone(),
-            scopes: exchange.twitch.scopes.clone(),
-            twitch_expires_at: exchange.twitch.expires_at.clone(),
-            connection_expires_at: exchange.connection.expires_at.clone(),
-            ..Default::default()
-        };
-        crate::kick::apply_kick_to_delegated(&mut session, &exchange);
+    let _lifecycle = services.lifecycle_lock.lock().await;
+    if let Some(intent) = apply_intent {
+        services.ensure_apply_intent_current(intent)?;
+    }
+    let new_generation = state.peek_next_delegated_generation();
+    let mut session = DelegatedSessionFile {
+        generation: new_generation,
+        connection_key: key.trim().to_string(),
+        client_id: exchange.twitch.client_id.clone(),
+        access_token: exchange.twitch.access_token.clone(),
+        channel_login: exchange.channel.login.clone(),
+        channel_twitch_id: exchange.channel.twitch_id.clone(),
+        display_name: exchange.channel.display_name.clone(),
+        label: exchange.connection.label.clone(),
+        scopes: exchange.twitch.scopes.clone(),
+        twitch_expires_at: exchange.twitch.expires_at.clone(),
+        connection_expires_at: exchange.connection.expires_at.clone(),
+        ..Default::default()
+    };
+    crate::kick::apply_kick_to_delegated(&mut session, &exchange);
 
-        pause_apply_durable_gate(ApplyDurableBoundary::BeforePersist).await;
-        if let Some(intent) = apply_intent {
-            services.ensure_apply_intent_current(intent)?;
-        }
+    pause_apply_durable_gate(ApplyDurableBoundary::BeforePersist).await;
+    if let Some(intent) = apply_intent {
+        services.ensure_apply_intent_current(intent)?;
+    }
 
-        let snapshot = DurableApplySnapshot::capture(&state)?;
-        let live_snapshot = LiveApplySnapshot::capture(&state, &services).await;
-        let commit = async {
-            state.persist_delegated_session(&session)?;
-            pause_apply_durable_gate(ApplyDurableBoundary::AfterPersist).await;
-            recheck_apply_intent(&services, apply_intent)?;
-
-            if activate {
-                storage_write_active_mode_delegated(&state)?;
-            }
-            pause_apply_durable_gate(ApplyDurableBoundary::AfterModeWrite).await;
-            recheck_apply_intent(&services, apply_intent)?;
-
-            state.clear_delegated_revoked_tombstone()?;
-            pause_apply_durable_gate(ApplyDurableBoundary::AfterTombstoneClear).await;
-            recheck_apply_intent(&services, apply_intent)?;
-
-            stop_delegated_tasks(&services).await;
-            recheck_apply_intent(&services, apply_intent)?;
-
-            pause_apply_durable_gate(ApplyDurableBoundary::BeforeLivePublish).await;
-            recheck_apply_intent(&services, apply_intent)?;
-
-            state.publish_delegated_generation(new_generation);
-            services
-                .install_validated_authority_lease(
-                    new_generation,
-                    session.connection_expires_at.as_deref(),
-                )
-                .await;
-            recheck_apply_intent(&services, apply_intent)?;
-
-            pause_apply_durable_gate(ApplyDurableBoundary::BeforeLiveMemoryPublish).await;
-            recheck_apply_intent(&services, apply_intent)?;
-
-            services
-                .teardown_coordinator
-                .install_generation_async(new_generation)
-                .await
-                .map_err(|e| anyhow!(e))?;
-            recheck_apply_intent(&services, apply_intent)?;
-
-            {
-                let mut delegated = state.delegated.write().await;
-                recheck_apply_intent(&services, apply_intent)?;
-                *delegated = Some(session.clone());
-            }
-            if activate {
-                {
-                    let mut tw = state.twitch.write().await;
-                    recheck_apply_intent(&services, apply_intent)?;
-                    clear_live_runtime_fields(&mut tw);
-                    tw.tokens = install_tokens_from_exchange(&exchange);
-                }
-                {
-                    let mut mode = state.active_mode.write().await;
-                    recheck_apply_intent(&services, apply_intent)?;
-                    *mode = TwitchActiveMode::Delegated;
-                }
-            }
-            Ok(())
-        }
-        .await;
-
-        match commit {
-            Ok(()) => {}
-            Err(e) if error_is_superseded_identity(&e) => {
-                return rollback_superseded_apply(&snapshot, live_snapshot, &state, &services, e)
-                    .await;
-            }
-            Err(e) => return Err(e),
-        }
-
-        if let Err(e) = recheck_apply_intent(&services, apply_intent) {
-            if error_is_superseded_identity(&e) {
-                return rollback_superseded_apply(&snapshot, live_snapshot, &state, &services, e)
-                    .await;
-            }
-            return Err(e);
-        }
+    let snapshot = DurableApplySnapshot::capture(&state)?;
+    let mut live_snapshot = LiveApplySnapshot::capture(&state, &services).await;
+    let commit = async {
+        state.persist_delegated_session(&session)?;
+        pause_apply_durable_gate(ApplyDurableBoundary::AfterPersist).await;
+        recheck_apply_intent(&services, apply_intent)?;
 
         if activate {
-            drop(_lifecycle);
-            restart_twitch_clients(state.clone(), services.clone()).await;
-        } else {
-            drop(_lifecycle);
+            storage_write_active_mode_delegated(&state)?;
         }
-        new_generation
-    };
+        pause_apply_durable_gate(ApplyDurableBoundary::AfterModeWrite).await;
+        recheck_apply_intent(&services, apply_intent)?;
 
-    recheck_apply_intent(&services, apply_intent)?;
-    start_delegated_refresh_loop(state.clone(), services.clone(), generation).await;
-    start_delegated_watch_loop(state.clone(), services, generation).await;
-    crate::kick::sync_live_identity(state).await;
+        state.clear_delegated_revoked_tombstone()?;
+        pause_apply_durable_gate(ApplyDurableBoundary::AfterTombstoneClear).await;
+        recheck_apply_intent(&services, apply_intent)?;
+
+        stop_delegated_tasks(&services).await;
+        recheck_apply_intent(&services, apply_intent)?;
+
+        pause_apply_durable_gate(ApplyDurableBoundary::BeforeLivePublish).await;
+        recheck_apply_intent(&services, apply_intent)?;
+
+        state.publish_delegated_generation(new_generation);
+        services
+            .install_validated_authority_lease(
+                new_generation,
+                session.connection_expires_at.as_deref(),
+            )
+            .await;
+        recheck_apply_intent(&services, apply_intent)?;
+
+        pause_apply_durable_gate(ApplyDurableBoundary::BeforeLiveMemoryPublish).await;
+        recheck_apply_intent(&services, apply_intent)?;
+
+        services
+            .teardown_coordinator
+            .install_generation_async(new_generation)
+            .await
+            .map_err(|e| anyhow!(e))?;
+        recheck_apply_intent(&services, apply_intent)?;
+
+        {
+            let mut delegated = state.delegated.write().await;
+            recheck_apply_intent(&services, apply_intent)?;
+            *delegated = Some(session.clone());
+        }
+        if activate {
+            {
+                let mut tw = state.twitch.write().await;
+                recheck_apply_intent(&services, apply_intent)?;
+                clear_live_runtime_fields(&mut tw);
+                tw.tokens = install_tokens_from_exchange(&exchange);
+            }
+            {
+                let mut mode = state.active_mode.write().await;
+                recheck_apply_intent(&services, apply_intent)?;
+                *mode = TwitchActiveMode::Delegated;
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    match commit {
+        Ok(()) => {}
+        Err(e) if error_is_superseded_identity(&e) => {
+            return rollback_superseded_apply(&snapshot, live_snapshot, &state, &services, e).await;
+        }
+        Err(e) => return Err(e),
+    }
+
+    if let Err(e) = recheck_apply_intent(&services, apply_intent) {
+        if error_is_superseded_identity(&e) {
+            return rollback_superseded_apply(&snapshot, live_snapshot, &state, &services, e).await;
+        }
+        return Err(e);
+    }
+
+    drop(_lifecycle);
+
+    if activate {
+        restart_twitch_clients(state.clone(), services.clone()).await;
+        live_snapshot = recheck_apply_or_rollback_after_workers(
+            &services,
+            apply_intent,
+            &snapshot,
+            live_snapshot,
+            &state,
+        )
+        .await?;
+    }
+
+    start_delegated_refresh_loop(state.clone(), services.clone(), new_generation).await;
+    live_snapshot = recheck_apply_or_rollback_after_workers(
+        &services,
+        apply_intent,
+        &snapshot,
+        live_snapshot,
+        &state,
+    )
+    .await?;
+
+    start_delegated_watch_loop(state.clone(), services.clone(), new_generation).await;
+    live_snapshot = recheck_apply_or_rollback_after_workers(
+        &services,
+        apply_intent,
+        &snapshot,
+        live_snapshot,
+        &state,
+    )
+    .await?;
+
+    crate::kick::sync_live_identity(state.clone()).await;
+    recheck_apply_or_rollback_after_workers(
+        &services,
+        apply_intent,
+        &snapshot,
+        live_snapshot,
+        &state,
+    )
+    .await?;
+
     Ok(())
 }
 
