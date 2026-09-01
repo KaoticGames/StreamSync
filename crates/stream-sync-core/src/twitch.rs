@@ -2035,10 +2035,8 @@ async fn apply_post_commit_workers_may_run(
 }
 
 async fn stop_stale_apply_generation_workers(
-    state: &AppState,
     services: &TwitchServices,
     generation: DelegatedGeneration,
-    may_stop_twitch: bool,
 ) {
     {
         let mut guard = services.refresh_handle.write().await;
@@ -2056,9 +2054,6 @@ async fn stop_stale_apply_generation_workers(
             }
         }
     }
-    if may_stop_twitch && state.session_still_current(generation).await {
-        stop_twitch_clients(services).await;
-    }
 }
 
 async fn start_apply_exchange_twitch_clients(
@@ -2075,7 +2070,7 @@ async fn start_apply_exchange_twitch_clients(
         warn!("IRC start failed: {e}");
     }
     if !apply_post_commit_workers_may_run(&state, &services, generation, apply_intent).await {
-        stop_stale_apply_generation_workers(&state, &services, generation, true).await;
+        stop_stale_apply_generation_workers(&services, generation).await;
         return;
     }
     if let Err(e) = start_eventsub(state.clone(), services.clone(), Some(generation)).await {
@@ -2256,20 +2251,20 @@ async fn apply_exchange_session(
         .await;
         if !apply_post_commit_workers_may_run(&state, &services, new_generation, apply_intent).await
         {
-            stop_stale_apply_generation_workers(&state, &services, new_generation, false).await;
+            stop_stale_apply_generation_workers(&services, new_generation).await;
             return Ok(());
         }
     }
 
     start_delegated_refresh_loop(state.clone(), services.clone(), new_generation).await;
     if !apply_post_commit_workers_may_run(&state, &services, new_generation, apply_intent).await {
-        stop_stale_apply_generation_workers(&state, &services, new_generation, false).await;
+        stop_stale_apply_generation_workers(&services, new_generation).await;
         return Ok(());
     }
 
     start_delegated_watch_loop(state.clone(), services.clone(), new_generation).await;
     if !apply_post_commit_workers_may_run(&state, &services, new_generation, apply_intent).await {
-        stop_stale_apply_generation_workers(&state, &services, new_generation, false).await;
+        stop_stale_apply_generation_workers(&services, new_generation).await;
         return Ok(());
     }
 
