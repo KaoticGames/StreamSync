@@ -34,6 +34,7 @@ use twitch_irc::{ClientConfig, SecureTCPTransport, TwitchIRCClient};
 type StreamSyncIrcClient = TwitchIRCClient<SecureTCPTransport, StaticLoginCredentials>;
 
 mod identity_commit;
+mod platform_workers;
 
 pub(crate) use identity_commit::{
     apply_post_commit_workers_may_run, commit_delegated_activation, recheck_apply_intent,
@@ -42,11 +43,17 @@ pub(crate) use identity_commit::{
     stop_stale_apply_generation_workers, ApplyDurableBoundary, DurableApplySnapshot,
     LiveApplySnapshot, PersonalTokensDurableSnapshot,
 };
+pub(crate) use platform_workers::{
+    current_live_worker_owner, start_platform_twitch_workers,
+    stop_platform_twitch_workers_for_delegated_generation, transition_platform_twitch_workers,
+    WorkerOwner,
+};
 
 #[derive(Clone)]
 struct IrcClientBundle {
     client: StreamSyncIrcClient,
     provenance: PlatformCredentialProvenance,
+    owner: WorkerOwner,
 }
 
 /// Provenance of platform credentials captured at selection time (B5).
@@ -94,14 +101,15 @@ pub struct TwitchServices {
     irc_client: RwLock<Option<IrcClientBundle>>,
     irc_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
     eventsub_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
+    eventsub_owner: RwLock<Option<WorkerOwner>>,
     refresh_handle: RwLock<Option<GenerationTask>>,
     watch_handle: RwLock<Option<GenerationTask>>,
     pub teardown_coordinator: TeardownCoordinator,
     authority_lease: Mutex<AuthorityLease>,
     /// Monotonic apply-request fence; newer requests supersede older exchange completions.
     apply_intent: AtomicU64,
-    /// Monotonic personal platform start fence (Phase B; replaced by personal_gen in Phase D).
-    personal_platform_fence: AtomicU64,
+    /// Monotonic personal token generation; bumps on every personal token save/OAuth.
+    personal_token_generation: AtomicU64,
     /// Serializes apply / durable revoke / refresh-apply / mode transitions.
     lifecycle_lock: Mutex<()>,
     teardown_tx: OnceLock<mpsc::UnboundedSender<TeardownRequest>>,
@@ -129,12 +137,13 @@ impl TwitchServices {
             irc_client: RwLock::new(None),
             irc_handle: RwLock::new(None),
             eventsub_handle: RwLock::new(None),
+            eventsub_owner: RwLock::new(None),
             refresh_handle: RwLock::new(None),
             watch_handle: RwLock::new(None),
             teardown_coordinator: TeardownCoordinator::new(),
             authority_lease: Mutex::new(AuthorityLease::inactive()),
             apply_intent: AtomicU64::new(0),
-            personal_platform_fence: AtomicU64::new(0),
+            personal_token_generation: AtomicU64::new(0),
             lifecycle_lock: Mutex::new(()),
             teardown_tx: OnceLock::new(),
             durable_revoke_tx: OnceLock::new(),
@@ -159,12 +168,16 @@ impl TwitchServices {
         Ok(())
     }
 
-    pub(crate) fn bump_personal_platform_fence(&self) -> u64 {
-        self.personal_platform_fence.fetch_add(1, Ordering::SeqCst) + 1
+    pub(crate) fn bump_personal_token_generation(&self) -> u64 {
+        self.personal_token_generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    pub(crate) fn personal_platform_still_current(&self, fence: u64) -> bool {
-        self.personal_platform_fence.load(Ordering::SeqCst) == fence
+    pub(crate) fn personal_token_generation_current(&self) -> u64 {
+        self.personal_token_generation.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn personal_token_generation_still_current(&self, local_gen: u64) -> bool {
+        self.personal_token_generation.load(Ordering::SeqCst) == local_gen
     }
 
     pub async fn lock_lifecycle(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -440,6 +453,9 @@ impl TwitchServices {
             .select_platform_credentials_under_lock(state)
             .await?
             .provenance();
+        let expected_owner = current_live_worker_owner(state, self)
+            .await
+            .ok_or_else(|| anyhow!("No live platform worker owner"))?;
         let channel = state
             .twitch
             .read()
@@ -458,6 +474,11 @@ impl TwitchServices {
                 "IRC client identity does not match active credential provenance"
             ));
         }
+        if bundle.owner != expected_owner {
+            return Err(anyhow!(
+                "IRC client owner does not match active identity owner"
+            ));
+        }
         Ok((provenance, channel, bundle.client))
     }
 
@@ -465,11 +486,16 @@ impl TwitchServices {
     pub(crate) async fn install_irc_bundle_for_test(
         &self,
         provenance: PlatformCredentialProvenance,
+        owner: WorkerOwner,
     ) {
         let (_incoming, client) = StreamSyncIrcClient::new(ClientConfig::new_simple(
             StaticLoginCredentials::new("test".into(), Some("token".into())),
         ));
-        *self.irc_client.write().await = Some(IrcClientBundle { client, provenance });
+        *self.irc_client.write().await = Some(IrcClientBundle {
+            client,
+            provenance,
+            owner,
+        });
     }
 
     /// True when the captured lease snapshot still authorizes platform fan-out/send.
@@ -1154,7 +1180,7 @@ pub async fn apply_set_token(
         }),
     };
     // Durable commit before live publish; restore personal token file if mode commit fails (B2).
-    {
+    let (previous_mode, previous_delegated_generation, local_gen) = {
         let _lifecycle = services.lifecycle_lock.lock().await;
         services.ensure_apply_intent_current(intent)?;
         let previous_personal = state.personal_tokens.read().await.clone();
@@ -1193,11 +1219,26 @@ pub async fn apply_set_token(
                     .await;
             }
         }
+        let local_gen = services.bump_personal_token_generation();
         let mut tw = state.twitch.write().await;
         clear_live_runtime_fields(&mut tw);
         tw.tokens = tokens;
-    }
-    restart_twitch_clients(state.clone(), services.clone()).await;
+        (previous_mode, state.current_delegated_generation(), local_gen)
+    };
+    let previous_owner = if previous_mode == TwitchActiveMode::Delegated && previous_delegated_generation > 0
+    {
+        Some(WorkerOwner::delegated(previous_delegated_generation))
+    } else {
+        None
+    };
+    transition_platform_twitch_workers(
+        state.clone(),
+        services.clone(),
+        previous_owner,
+        WorkerOwner::personal(local_gen),
+        Some(intent),
+    )
+    .await;
     ensure_delegated_refresh_loop(state, services).await;
     Ok(())
 }
@@ -1259,7 +1300,7 @@ pub async fn use_connection(
                     "No personal Twitch account saved. Connect with Twitch first."
                 ));
             }
-            let (previous_mode, previous_delegated_generation, personal_fence) = {
+            let (previous_mode, previous_delegated_generation, local_gen) = {
                 let _lifecycle = services.lifecycle_lock.lock().await;
                 services.ensure_apply_intent_current(intent)?;
                 let previous_mode = *state.active_mode.read().await;
@@ -1286,23 +1327,20 @@ pub async fn use_connection(
                 let mut tw = state.twitch.write().await;
                 clear_live_runtime_fields(&mut tw);
                 tw.tokens = personal;
-                (
-                    previous_mode,
-                    previous_delegated_generation,
-                    services.bump_personal_platform_fence(),
-                )
+                let local_gen = services.bump_personal_token_generation();
+                (previous_mode, previous_delegated_generation, local_gen)
             };
             start_personal_twitch_clients(
                 state.clone(),
                 services.clone(),
                 intent,
-                personal_fence,
+                local_gen,
                 previous_mode,
                 previous_delegated_generation,
             )
             .await;
-            ensure_delegated_refresh_loop(state.clone(), services).await;
-            crate::kick::sync_live_identity(state).await;
+            ensure_delegated_refresh_loop(state.clone(), services.clone()).await;
+            sync_kick_for_active_identity(state, services).await;
         }
         TwitchActiveMode::Delegated => {
             let saved =
@@ -1337,6 +1375,19 @@ fn tokens_saved(t: &TwitchTokenFile) -> bool {
     t.access_token.is_some() && t.login.is_some()
 }
 
+async fn sync_kick_for_active_identity(state: Arc<AppState>, services: Arc<TwitchServices>) {
+    let mode = *state.active_mode.read().await;
+    match mode {
+        TwitchActiveMode::Delegated => {
+            let generation = state.current_delegated_generation();
+            crate::kick::sync_live_identity_for_generation(state, generation, Some(&services)).await;
+        }
+        TwitchActiveMode::Local => {
+            crate::kick::sync_live_identity_for_local(state).await;
+        }
+    }
+}
+
 /// Remove the currently active connection. If the other identity is still saved, activate it.
 pub async fn disconnect_twitch(state: Arc<AppState>, services: Arc<TwitchServices>) -> Result<()> {
     let intent = services.bump_apply_intent();
@@ -1363,7 +1414,7 @@ async fn disconnect_twitch_inner(
             services.ensure_apply_intent_current(intent)?;
             let personal = state.personal_tokens.read().await.clone();
             if tokens_saved(&personal) {
-                {
+                let (local_gen, previous_delegated_generation) = {
                     let _lifecycle = services.lifecycle_lock.lock().await;
                     services.ensure_apply_intent_current(intent)?;
                     let previous_mode = *state.active_mode.read().await;
@@ -1375,12 +1426,23 @@ async fn disconnect_twitch_inner(
                     let mut tw = state.twitch.write().await;
                     clear_live_runtime_fields(&mut tw);
                     tw.tokens = personal;
-                }
-                restart_twitch_clients(state.clone(), services).await;
-                crate::kick::sync_live_identity(state).await;
+                    (
+                        services.bump_personal_token_generation(),
+                        generation,
+                    )
+                };
+                transition_platform_twitch_workers(
+                    state.clone(),
+                    services.clone(),
+                    Some(WorkerOwner::delegated(previous_delegated_generation)),
+                    WorkerOwner::personal(local_gen),
+                    Some(intent),
+                )
+                .await;
+                sync_kick_for_active_identity(state, services).await;
             } else {
                 stop_delegated_tasks(&services).await;
-                stop_twitch_clients(&services).await;
+                stop_platform_twitch_workers_for_delegated_generation(&services, generation).await;
                 {
                     let _lifecycle = services.lifecycle_lock.lock().await;
                     services.ensure_apply_intent_current(intent)?;
@@ -1390,7 +1452,7 @@ async fn disconnect_twitch_inner(
                     *state.active_mode.write().await = TwitchActiveMode::Local;
                     state.save_active_mode().await?;
                 }
-                crate::kick::sync_live_identity(state).await;
+                sync_kick_for_active_identity(state, services).await;
             }
         }
         TwitchActiveMode::Local => {
@@ -1413,11 +1475,11 @@ async fn disconnect_twitch_inner(
                     intent,
                 )
                 .await?;
-                commit_delegated_activation(&state, &services, intent, validated, Some(&session))
-                    .await?;
-                restart_twitch_clients(state.clone(), services.clone()).await;
-                ensure_delegated_refresh_loop(state.clone(), services).await;
-                crate::kick::sync_live_identity(state).await;
+                let generation =
+                    commit_delegated_activation(&state, &services, intent, validated, Some(&session))
+                        .await?;
+                run_delegated_activation_post_commit(state.clone(), services, generation, intent)
+                    .await;
             } else {
                 stop_delegated_tasks(&services).await;
                 stop_twitch_clients(&services).await;
@@ -1428,7 +1490,7 @@ async fn disconnect_twitch_inner(
                     tw.tokens = TwitchTokenFile::default();
                     clear_live_runtime_fields(&mut tw);
                 }
-                crate::kick::sync_live_identity(state).await;
+                crate::kick::sync_live_identity_for_local(state).await;
             }
         }
     }
@@ -1833,11 +1895,19 @@ async fn execute_delegated_teardown(
     if need_personal_fallback && state.current_delegated_generation() == generation {
         let personal_ok = tokens_saved(&state.personal_tokens.read().await.clone());
         if personal_ok {
-            restart_twitch_clients(state.clone(), services.clone()).await;
+            let local_gen = services.bump_personal_token_generation();
+            transition_platform_twitch_workers(
+                state.clone(),
+                services.clone(),
+                Some(WorkerOwner::delegated(generation)),
+                WorkerOwner::personal(local_gen),
+                None,
+            )
+            .await;
         }
-        crate::kick::sync_live_identity(state).await;
+        sync_kick_for_active_identity(state.clone(), services).await;
     } else if state.current_delegated_generation() == generation {
-        crate::kick::sync_live_identity(state).await;
+        crate::kick::sync_live_identity_for_generation(state, generation, Some(&services)).await;
     }
     Ok(())
 }
@@ -2055,7 +2125,8 @@ async fn apply_exchange_session(
         return Ok(());
     }
 
-    crate::kick::sync_live_identity(state.clone()).await;
+    crate::kick::sync_live_identity_for_generation(state.clone(), new_generation, Some(&services))
+        .await;
 
     Ok(())
 }
@@ -2406,18 +2477,19 @@ async fn publish_delegated_refresh_live_if_current(
                 tw.tokens = install_tokens_from_exchange(exchange);
             }
             info!("delegated Twitch token refreshed for {}", channel_login);
-            stop_twitch_clients(&services).await;
+            stop_platform_twitch_workers_for_delegated_generation(&services, generation).await;
             delegated_refresh_live_may_publish(&state, &services, generation).await
         }
     };
 
     if should_restart_twitch {
-        if let Err(e) = start_irc(state.clone(), services.clone(), Some(generation)).await {
-            warn!("IRC start failed: {e}");
-        }
-        if let Err(e) = start_eventsub(state.clone(), services.clone(), Some(generation)).await {
-            warn!("EventSub start failed: {e}");
-        }
+        start_platform_twitch_workers(
+            state.clone(),
+            services.clone(),
+            WorkerOwner::delegated(generation),
+            None,
+        )
+        .await;
     } else if state.session_still_current(generation).await {
         info!(
             "delegated Twitch token refreshed (inactive) for {}",
@@ -3067,16 +3139,6 @@ fn observe_and_restart_finished_worker(
     });
 }
 
-pub async fn restart_twitch_clients(state: Arc<AppState>, services: Arc<TwitchServices>) {
-    stop_twitch_clients(&services).await;
-    if let Err(e) = start_irc(state.clone(), services.clone(), None).await {
-        warn!("IRC start failed: {e}");
-    }
-    if let Err(e) = start_eventsub(state.clone(), services.clone(), None).await {
-        warn!("EventSub start failed: {e}");
-    }
-}
-
 async fn stop_twitch_clients(services: &TwitchServices) {
     *services.irc_client.write().await = None;
     if let Some(h) = services.irc_handle.write().await.take() {
@@ -3085,12 +3147,13 @@ async fn stop_twitch_clients(services: &TwitchServices) {
     if let Some(h) = services.eventsub_handle.write().await.take() {
         h.abort();
     }
+    *services.eventsub_owner.write().await = None;
 }
 
 async fn start_irc(
     state: Arc<AppState>,
     services: Arc<TwitchServices>,
-    generation: Option<DelegatedGeneration>,
+    owner: WorkerOwner,
 ) -> Result<()> {
     let (login, token) = {
         let tw = state.twitch.read().await;
@@ -3113,151 +3176,170 @@ async fn start_irc(
 
     let channel = login.clone();
 
-    if let Some(generation) = generation {
-        refresh_twitch_publish_gate_pause_if_installed().await;
-        let _lifecycle = services.lock_lifecycle().await;
-        if !delegated_refresh_live_may_publish(&state, &services, generation).await {
-            return Ok(());
-        }
-        let provenance = services
-            .select_platform_credentials_under_lock(&state)
-            .await?
-            .provenance();
+    match owner {
+        WorkerOwner::Delegated { generation } => {
+            refresh_twitch_publish_gate_pause_if_installed().await;
+            let _lifecycle = services.lock_lifecycle().await;
+            if !delegated_refresh_live_may_publish(&state, &services, generation).await {
+                return Ok(());
+            }
+            let provenance = services
+                .select_platform_credentials_under_lock(&state)
+                .await?
+                .provenance();
 
-        let (grant_tx, grant_rx) = oneshot::channel();
-        let broadcaster_login = login.clone();
-        let state_irc = state.clone();
-        let channel_log = channel.clone();
-        let channel_join = channel.clone();
-        let feed = state.feed.clone();
-        let services_task = services.clone();
-        let handle = tokio::spawn(async move {
-            if grant_rx.await.is_err() {
-                return;
-            }
-            crate::delegated_refresh_observability::record_irc_join();
-            client.join(channel_join.clone()).ok();
-            *services_task.irc_client.write().await = Some(IrcClientBundle { client, provenance });
-            {
-                let mut tw = state_irc.twitch.write().await;
-                tw.connected = true;
-                tw.channel = Some(channel_join);
-            }
-            while let Some(message) = incoming.recv().await {
-                if !state_irc.session_still_current(generation).await {
-                    break;
+            let (grant_tx, grant_rx) = oneshot::channel();
+            let broadcaster_login = login.clone();
+            let state_irc = state.clone();
+            let channel_log = channel.clone();
+            let channel_join = channel.clone();
+            let feed = state.feed.clone();
+            let services_task = services.clone();
+            let handle = tokio::spawn(async move {
+                if grant_rx.await.is_err() {
+                    return;
                 }
-                match message {
-                    ServerMessage::GlobalUserState(msg) => {
-                        store_broadcaster_user_state(
-                            &state_irc,
-                            msg.name_color.as_ref(),
-                            Some(msg.user_name.as_str()),
-                            &msg.badges,
-                        );
+                crate::delegated_refresh_observability::record_irc_join();
+                client.join(channel_join.clone()).ok();
+                *services_task.irc_client.write().await = Some(IrcClientBundle {
+                    client,
+                    provenance,
+                    owner,
+                });
+                {
+                    let mut tw = state_irc.twitch.write().await;
+                    tw.connected = true;
+                    tw.channel = Some(channel_join);
+                }
+                while let Some(message) = incoming.recv().await {
+                    if !state_irc.session_still_current(generation).await {
+                        break;
                     }
-                    ServerMessage::UserState(msg) => {
-                        store_broadcaster_user_state(
-                            &state_irc,
-                            msg.name_color.as_ref(),
-                            Some(msg.user_name.as_str()),
-                            &msg.badges,
-                        );
-                    }
-                    ServerMessage::Privmsg(msg) => {
-                        if !state_irc.session_still_current(generation).await {
-                            break;
-                        }
-                        let is_self = msg.sender.login.eq_ignore_ascii_case(&broadcaster_login);
-                        if is_self {
+                    match message {
+                        ServerMessage::GlobalUserState(msg) => {
                             store_broadcaster_user_state(
                                 &state_irc,
                                 msg.name_color.as_ref(),
-                                Some(msg.sender.name.as_str()),
+                                Some(msg.user_name.as_str()),
                                 &msg.badges,
                             );
                         }
-                        let evt = privmsg_to_chat_event(&msg, is_self);
-                        crate::delegated_refresh_observability::record_delegated_chat_fanout();
-                        feed.broadcast_all(&evt).await;
+                        ServerMessage::UserState(msg) => {
+                            store_broadcaster_user_state(
+                                &state_irc,
+                                msg.name_color.as_ref(),
+                                Some(msg.user_name.as_str()),
+                                &msg.badges,
+                            );
+                        }
+                        ServerMessage::Privmsg(msg) => {
+                            if !state_irc.session_still_current(generation).await {
+                                break;
+                            }
+                            let is_self =
+                                msg.sender.login.eq_ignore_ascii_case(&broadcaster_login);
+                            if is_self {
+                                store_broadcaster_user_state(
+                                    &state_irc,
+                                    msg.name_color.as_ref(),
+                                    Some(msg.sender.name.as_str()),
+                                    &msg.badges,
+                                );
+                            }
+                            let evt = privmsg_to_chat_event(&msg, is_self);
+                            crate::delegated_refresh_observability::record_delegated_chat_fanout();
+                            feed.broadcast_all(&evt).await;
+                        }
+                        ServerMessage::Notice(_) => {}
+                        _ => {}
                     }
-                    ServerMessage::Notice(_) => {}
-                    _ => {}
                 }
-            }
-            info!("IRC incoming ended for {channel_log}");
-        });
+                info!("IRC incoming ended for {channel_log}");
+            });
 
-        let _ = grant_tx.send(());
-        *services.irc_handle.write().await = Some(handle);
-        drop(_lifecycle);
-        refresh_broadcaster_chat_color(&state).await;
-        return Ok(());
-    }
-
-    let broadcaster_login = login.clone();
-    let state_irc = state.clone();
-    let channel_log = channel.clone();
-    let feed = state.feed.clone();
-    client.join(channel.clone()).ok();
-
-    let handle = tokio::spawn(async move {
-        while let Some(message) = incoming.recv().await {
-            match message {
-                ServerMessage::GlobalUserState(msg) => {
-                    store_broadcaster_user_state(
-                        &state_irc,
-                        msg.name_color.as_ref(),
-                        Some(msg.user_name.as_str()),
-                        &msg.badges,
-                    );
-                }
-                ServerMessage::UserState(msg) => {
-                    store_broadcaster_user_state(
-                        &state_irc,
-                        msg.name_color.as_ref(),
-                        Some(msg.user_name.as_str()),
-                        &msg.badges,
-                    );
-                }
-                ServerMessage::Privmsg(msg) => {
-                    let is_self = msg.sender.login.eq_ignore_ascii_case(&broadcaster_login);
-                    if is_self {
-                        store_broadcaster_user_state(
-                            &state_irc,
-                            msg.name_color.as_ref(),
-                            Some(msg.sender.name.as_str()),
-                            &msg.badges,
-                        );
-                    }
-                    let evt = privmsg_to_chat_event(&msg, is_self);
-                    feed.broadcast_all(&evt).await;
-                }
-                ServerMessage::Notice(_) => {}
-                _ => {}
-            }
+            let _ = grant_tx.send(());
+            *services.irc_handle.write().await = Some(handle);
+            drop(_lifecycle);
+            refresh_broadcaster_chat_color(&state).await;
+            Ok(())
         }
-        info!("IRC incoming ended for {channel_log}");
-    });
+        WorkerOwner::Personal { local_gen } => {
+            let broadcaster_login = login.clone();
+            let state_irc = state.clone();
+            let channel_log = channel.clone();
+            let feed = state.feed.clone();
+            let services_task = services.clone();
+            client.join(channel.clone()).ok();
+            let handle = tokio::spawn(async move {
+                while let Some(message) = incoming.recv().await {
+                    if !services_task.personal_token_generation_still_current(local_gen) {
+                        break;
+                    }
+                    if *state_irc.active_mode.read().await != TwitchActiveMode::Local {
+                        break;
+                    }
+                    match message {
+                        ServerMessage::GlobalUserState(msg) => {
+                            store_broadcaster_user_state(
+                                &state_irc,
+                                msg.name_color.as_ref(),
+                                Some(msg.user_name.as_str()),
+                                &msg.badges,
+                            );
+                        }
+                        ServerMessage::UserState(msg) => {
+                            store_broadcaster_user_state(
+                                &state_irc,
+                                msg.name_color.as_ref(),
+                                Some(msg.user_name.as_str()),
+                                &msg.badges,
+                            );
+                        }
+                        ServerMessage::Privmsg(msg) => {
+                            let is_self =
+                                msg.sender.login.eq_ignore_ascii_case(&broadcaster_login);
+                            if is_self {
+                                store_broadcaster_user_state(
+                                    &state_irc,
+                                    msg.name_color.as_ref(),
+                                    Some(msg.sender.name.as_str()),
+                                    &msg.badges,
+                                );
+                            }
+                            let evt = privmsg_to_chat_event(&msg, is_self);
+                            feed.broadcast_all(&evt).await;
+                        }
+                        ServerMessage::Notice(_) => {}
+                        _ => {}
+                    }
+                }
+                info!("IRC incoming ended for {channel_log}");
+            });
 
-    let provenance = {
-        let _lifecycle = services.lock_lifecycle().await;
-        services
-            .select_platform_credentials_under_lock(&state)
-            .await?
-            .provenance()
-    };
-    *services.irc_client.write().await = Some(IrcClientBundle { client, provenance });
+            let provenance = {
+                let _lifecycle = services.lock_lifecycle().await;
+                services
+                    .select_platform_credentials_under_lock(&state)
+                    .await?
+                    .provenance()
+            };
+            *services.irc_client.write().await = Some(IrcClientBundle {
+                client,
+                provenance,
+                owner,
+            });
 
-    {
-        let mut tw = state.twitch.write().await;
-        tw.connected = true;
-        tw.channel = Some(channel.clone());
+            {
+                let mut tw = state.twitch.write().await;
+                tw.connected = true;
+                tw.channel = Some(channel.clone());
+            }
+
+            *services.irc_handle.write().await = Some(handle);
+            refresh_broadcaster_chat_color(&state).await;
+            Ok(())
+        }
     }
-
-    *services.irc_handle.write().await = Some(handle);
-    refresh_broadcaster_chat_color(&state).await;
-    Ok(())
 }
 
 async fn refresh_broadcaster_chat_color(state: &AppState) {
@@ -3884,7 +3966,7 @@ async fn handle_eventsub_notification(
 async fn start_eventsub(
     state: Arc<AppState>,
     services: Arc<TwitchServices>,
-    generation: Option<DelegatedGeneration>,
+    owner: WorkerOwner,
 ) -> Result<()> {
     let client_id = state.helix_client_id().await;
     if client_id.is_empty() {
@@ -3894,57 +3976,72 @@ async fn start_eventsub(
     services.ensure_delegated_authority(&state).await?;
     let feed = state.feed.clone();
     let state2 = state.clone();
+    let services2 = services.clone();
 
-    if let Some(generation) = generation {
-        let (grant_tx, grant_rx) = oneshot::channel();
-        let handle = tokio::spawn(async move {
-            if grant_rx.await.is_err() {
-                return;
+    match owner {
+        WorkerOwner::Delegated { generation } => {
+            let (grant_tx, grant_rx) = oneshot::channel();
+            let handle = tokio::spawn(async move {
+                if grant_rx.await.is_err() {
+                    return;
+                }
+                loop {
+                    if !state2.session_still_current(generation).await {
+                        break;
+                    }
+                    if let Err(e) =
+                        eventsub_session(state2.clone(), feed.clone(), Some(generation)).await
+                    {
+                        warn!("EventSub session error: {e}");
+                    }
+                    if !state2.session_still_current(generation).await {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    let tw = state2.twitch.read().await;
+                    if tw.tokens.access_token.is_none() {
+                        break;
+                    }
+                }
+            });
+            refresh_twitch_publish_gate_pause_if_installed().await;
+            let _lifecycle = services.lock_lifecycle().await;
+            if !delegated_refresh_live_may_publish(&state, &services, generation).await {
+                handle.abort();
+                return Ok(());
             }
-            loop {
-                if !state2.session_still_current(generation).await {
-                    break;
-                }
-                if let Err(e) =
-                    eventsub_session(state2.clone(), feed.clone(), Some(generation)).await
-                {
-                    warn!("EventSub session error: {e}");
-                }
-                if !state2.session_still_current(generation).await {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                let tw = state2.twitch.read().await;
-                if tw.tokens.access_token.is_none() {
-                    break;
-                }
-            }
-        });
-        refresh_twitch_publish_gate_pause_if_installed().await;
-        let _lifecycle = services.lock_lifecycle().await;
-        if !delegated_refresh_live_may_publish(&state, &services, generation).await {
-            handle.abort();
-            return Ok(());
+            let _ = grant_tx.send(());
+            *services.eventsub_handle.write().await = Some(handle);
+            *services.eventsub_owner.write().await = Some(owner);
+            Ok(())
         }
-        let _ = grant_tx.send(());
-        *services.eventsub_handle.write().await = Some(handle);
-        return Ok(());
+        WorkerOwner::Personal { local_gen } => {
+            let handle = tokio::spawn(async move {
+                loop {
+                    if !services2.personal_token_generation_still_current(local_gen) {
+                        break;
+                    }
+                    if *state2.active_mode.read().await != TwitchActiveMode::Local {
+                        break;
+                    }
+                    if let Err(e) = eventsub_session(state2.clone(), feed.clone(), None).await {
+                        warn!("EventSub session error: {e}");
+                    }
+                    if !services2.personal_token_generation_still_current(local_gen) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    let tw = state2.twitch.read().await;
+                    if tw.tokens.access_token.is_none() {
+                        break;
+                    }
+                }
+            });
+            *services.eventsub_handle.write().await = Some(handle);
+            *services.eventsub_owner.write().await = Some(owner);
+            Ok(())
+        }
     }
-
-    let handle = tokio::spawn(async move {
-        loop {
-            if let Err(e) = eventsub_session(state2.clone(), feed.clone(), None).await {
-                warn!("EventSub session error: {e}");
-            }
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            let tw = state2.twitch.read().await;
-            if tw.tokens.access_token.is_none() {
-                break;
-            }
-        }
-    });
-    *services.eventsub_handle.write().await = Some(handle);
-    Ok(())
 }
 
 async fn eventsub_session(
@@ -4121,7 +4218,7 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
         services.schedule_durable_revoke(state.clone(), 0, "startup_pending");
         let personal = state.personal_tokens.read().await.clone();
         if tokens_saved(&personal) {
-            let (previous_mode, previous_delegated_generation, personal_fence) = {
+            let (previous_mode, previous_delegated_generation, local_gen) = {
                 let _lifecycle = services.lifecycle_lock.lock().await;
                 if services.ensure_apply_intent_current(intent).is_err() {
                     return;
@@ -4133,17 +4230,14 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
                 tw.tokens = personal;
                 *state.active_mode.write().await = TwitchActiveMode::Local;
                 let _ = state.save_active_mode().await;
-                (
-                    previous_mode,
-                    previous_delegated_generation,
-                    services.bump_personal_platform_fence(),
-                )
+                let local_gen = services.bump_personal_token_generation();
+                (previous_mode, previous_delegated_generation, local_gen)
             };
             start_personal_twitch_clients(
                 state.clone(),
                 services.clone(),
                 intent,
-                personal_fence,
+                local_gen,
                 previous_mode,
                 previous_delegated_generation,
             )
@@ -4249,7 +4343,7 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
     // Active mode Local (or delegated cleared): start personal OAuth if present.
     let personal = state.personal_tokens.read().await.clone();
     if tokens_saved(&personal) {
-        let (previous_mode, previous_delegated_generation, personal_fence) = {
+        let (previous_mode, previous_delegated_generation, local_gen) = {
             let _lifecycle = services.lifecycle_lock.lock().await;
             if services.ensure_apply_intent_current(intent).is_err() {
                 return;
@@ -4261,17 +4355,14 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
             tw.tokens = personal;
             *state.active_mode.write().await = TwitchActiveMode::Local;
             let _ = state.save_active_mode().await;
-            (
-                previous_mode,
-                previous_delegated_generation,
-                services.bump_personal_platform_fence(),
-            )
+            let local_gen = services.bump_personal_token_generation();
+            (previous_mode, previous_delegated_generation, local_gen)
         };
         start_personal_twitch_clients(
             state.clone(),
             services.clone(),
             intent,
-            personal_fence,
+            local_gen,
             previous_mode,
             previous_delegated_generation,
         )
@@ -5474,14 +5565,18 @@ mod tests {
         services.install_validated_authority_lease(1, None).await;
         let delegated_snap = services.authority_lease_snapshot_public().await;
         services
-            .install_irc_bundle_for_test(PlatformCredentialProvenance::Delegated {
-                snap: delegated_snap,
-            })
+            .install_irc_bundle_for_test(
+                PlatformCredentialProvenance::Delegated {
+                    snap: delegated_snap,
+                },
+                WorkerOwner::delegated(1),
+            )
             .await;
         {
             let mut tw = state.twitch.write().await;
             tw.channel = Some("takeover_chan".into());
         }
+        services.bump_personal_token_generation();
         *state.active_mode.write().await = TwitchActiveMode::Local;
         let err = services.select_irc_send_bundle(&state).await;
         assert!(

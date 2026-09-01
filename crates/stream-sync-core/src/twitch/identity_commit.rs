@@ -17,8 +17,10 @@ use tracing::warn;
 
 use super::{
     clear_live_runtime_fields, pause_apply_durable_gate, start_delegated_refresh_loop,
-    start_delegated_watch_loop, start_eventsub, start_irc, PlatformCredentialProvenance,
-    TwitchServices,
+    start_delegated_watch_loop, TwitchServices, WorkerOwner,
+};
+use super::platform_workers::{
+    start_platform_twitch_workers, transition_platform_twitch_workers,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,19 +224,13 @@ pub(crate) async fn start_apply_exchange_twitch_clients(
     apply_intent: Option<u64>,
 ) {
     pause_apply_durable_gate(ApplyDurableBoundary::BeforeTwitchStart).await;
-    if !apply_post_commit_workers_may_run(&state, &services, generation, apply_intent).await {
-        return;
-    }
-    if let Err(e) = start_irc(state.clone(), services.clone(), Some(generation)).await {
-        warn!("IRC start failed: {e}");
-    }
-    if !apply_post_commit_workers_may_run(&state, &services, generation, apply_intent).await {
-        stop_stale_apply_generation_workers(&services, generation).await;
-        return;
-    }
-    if let Err(e) = start_eventsub(state.clone(), services.clone(), Some(generation)).await {
-        warn!("EventSub start failed: {e}");
-    }
+    start_platform_twitch_workers(
+        state,
+        services,
+        WorkerOwner::delegated(generation),
+        apply_intent,
+    )
+    .await;
 }
 
 fn error_is_superseded_identity(err: &anyhow::Error) -> bool {
@@ -359,88 +355,35 @@ pub(crate) async fn run_delegated_activation_post_commit(
     crate::kick::sync_live_identity_for_generation(state, generation, Some(&services)).await;
 }
 
-pub(crate) async fn stop_delegated_platform_clients(
-    services: &TwitchServices,
-    generation: DelegatedGeneration,
-) {
-    let stop_irc = services.irc_client.read().await.as_ref().is_some_and(|b| {
-        matches!(
-            b.provenance,
-            PlatformCredentialProvenance::Delegated { snap } if snap.generation == generation
-        )
-    });
-    if stop_irc {
-        *services.irc_client.write().await = None;
-        if let Some(h) = services.irc_handle.write().await.take() {
-            h.abort();
-        }
-    }
-    if let Some(h) = services.eventsub_handle.write().await.take() {
-        h.abort();
-    }
-}
-
-pub(crate) async fn stop_personal_platform_clients(services: &TwitchServices) {
-    let stop_irc = services
-        .irc_client
-        .read()
-        .await
-        .as_ref()
-        .is_some_and(|b| b.provenance == PlatformCredentialProvenance::Local);
-    if stop_irc {
-        *services.irc_client.write().await = None;
-        if let Some(h) = services.irc_handle.write().await.take() {
-            h.abort();
-        }
-    }
-    if let Some(h) = services.eventsub_handle.write().await.take() {
-        h.abort();
-    }
-}
-
-/// Intent- and fence-scoped personal IRC/EventSub start (no global stop/restart).
+/// Intent-scoped personal IRC/EventSub start via PlatformWorkers.
 pub(crate) async fn start_personal_twitch_clients(
     state: Arc<AppState>,
     services: Arc<TwitchServices>,
     intent: u64,
-    personal_fence: u64,
+    local_gen: u64,
     previous_mode: TwitchActiveMode,
     previous_delegated_generation: DelegatedGeneration,
 ) {
-    let apply_intent = Some(intent);
-    if recheck_apply_intent(&services, apply_intent).is_err() {
-        return;
-    }
-    if !services.personal_platform_still_current(personal_fence) {
-        return;
-    }
-    if previous_mode == TwitchActiveMode::Delegated && previous_delegated_generation > 0 {
-        stop_delegated_platform_clients(&services, previous_delegated_generation).await;
-        stop_stale_apply_generation_workers(&services, previous_delegated_generation).await;
+    let previous_owner = if previous_mode == TwitchActiveMode::Delegated && previous_delegated_generation > 0
+    {
+        Some(WorkerOwner::delegated(previous_delegated_generation))
     } else {
-        stop_personal_platform_clients(&services).await;
-    }
-    if recheck_apply_intent(&services, apply_intent).is_err() {
-        return;
-    }
-    if !services.personal_platform_still_current(personal_fence) {
-        return;
-    }
-    if *state.active_mode.read().await != TwitchActiveMode::Local {
-        return;
-    }
-    if let Err(e) = start_irc(state.clone(), services.clone(), None).await {
-        warn!("IRC start failed: {e}");
-    }
-    if recheck_apply_intent(&services, apply_intent).is_err() {
-        return;
-    }
-    if !services.personal_platform_still_current(personal_fence) {
-        return;
-    }
-    if let Err(e) = start_eventsub(state.clone(), services.clone(), None).await {
-        warn!("EventSub start failed: {e}");
-    }
+        services
+            .irc_client
+            .read()
+            .await
+            .as_ref()
+            .map(|b| b.owner)
+            .filter(|owner| matches!(owner, WorkerOwner::Personal { .. }))
+    };
+    transition_platform_twitch_workers(
+        state,
+        services,
+        previous_owner,
+        WorkerOwner::personal(local_gen),
+        Some(intent),
+    )
+    .await;
 }
 
 fn read_path_bytes_if_exists(path: &std::path::Path) -> Result<Option<Vec<u8>>> {

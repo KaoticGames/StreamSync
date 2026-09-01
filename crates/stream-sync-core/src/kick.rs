@@ -388,6 +388,11 @@ pub async fn sync_live_identity(state: Arc<AppState>) {
     sync_live_identity_unchecked(state).await;
 }
 
+/// Publish personal Kick live state when Local mode is active (no delegated generation fence).
+pub async fn sync_live_identity_for_local(state: Arc<AppState>) {
+    sync_live_identity_unchecked(state).await;
+}
+
 const KICK_FEED_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Unconditionally stop the Kick feed and clear delegated live identity (revocation/teardown).
