@@ -1,4 +1,5 @@
-//! Identity commit helpers for delegated takeover (`apply_exchange_session`).
+//! Identity commit helpers for delegated takeover (`apply_exchange_session`) and
+//! other identity entry points (`use_connection`, `remove_connection`, autostart).
 //!
 //! **In-lock commit:** the last successful intent recheck while holding `lifecycle_lock`
 //! is the commit point; superseded applies roll back durable and live snapshots.
@@ -6,7 +7,7 @@
 //! **Post-lock fence:** after the lock drops, workers start only if intent, generation,
 //! session, and lease still allow; otherwise return `Ok(())` and leave the winner.
 
-use crate::app_state::AppState;
+use crate::app_state::{tokens_from_delegated_session, AppState};
 use crate::config_types::{DelegatedSessionFile, TwitchActiveMode, TwitchTokenFile};
 use crate::delegated_lifecycle::{AuthorityLease, DelegatedGeneration};
 use anyhow::{anyhow, Result};
@@ -14,7 +15,11 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::warn;
 
-use super::{pause_apply_durable_gate, start_eventsub, start_irc, TwitchServices};
+use super::{
+    clear_live_runtime_fields, pause_apply_durable_gate, start_delegated_refresh_loop,
+    start_delegated_watch_loop, start_eventsub, start_irc, PlatformCredentialProvenance,
+    TwitchServices,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ApplyDurableBoundary {
@@ -110,7 +115,7 @@ impl DurableApplySnapshot {
         })
     }
 
-    fn rollback(&self, state: &AppState) -> Result<()> {
+    pub(crate) fn rollback(&self, state: &AppState) -> Result<()> {
         let mut errors = Vec::new();
         if let Err(err) = restore_or_remove_path(
             &state.paths.twitch_delegated,
@@ -228,6 +233,212 @@ pub(crate) async fn start_apply_exchange_twitch_clients(
         return;
     }
     if let Err(e) = start_eventsub(state.clone(), services.clone(), Some(generation)).await {
+        warn!("EventSub start failed: {e}");
+    }
+}
+
+fn error_is_superseded_identity(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|e| e.to_string() == "superseded by newer identity action")
+}
+
+/// Disk snapshot for inactive personal-token removal.
+pub(crate) struct PersonalTokensDurableSnapshot {
+    personal_tokens: Option<Vec<u8>>,
+}
+
+impl PersonalTokensDurableSnapshot {
+    pub(crate) fn capture(state: &AppState) -> Result<Self> {
+        Ok(Self {
+            personal_tokens: read_path_bytes_if_exists(&state.paths.twitch_tokens)?,
+        })
+    }
+
+    pub(crate) fn rollback(&self, state: &AppState) -> Result<()> {
+        restore_or_remove_path(
+            &state.paths.twitch_tokens,
+            self.personal_tokens.as_deref(),
+            true,
+        )
+    }
+}
+
+/// Publish a validated delegated session as the live identity under lifecycle lock.
+pub(crate) async fn commit_delegated_activation(
+    state: &AppState,
+    services: &TwitchServices,
+    intent: u64,
+    validated: DelegatedSessionFile,
+    saved: Option<&DelegatedSessionFile>,
+) -> Result<DelegatedGeneration> {
+    let _lifecycle = services.lifecycle_lock.lock().await;
+    recheck_apply_intent(services, Some(intent))?;
+
+    let durable_snapshot = DurableApplySnapshot::capture(state)?;
+    let live_snapshot = LiveApplySnapshot::capture(state, services).await;
+
+    let commit = async {
+        if saved.is_none_or(|s| validated != *s) {
+            pause_apply_durable_gate(ApplyDurableBoundary::BeforePersist).await;
+            recheck_apply_intent(services, Some(intent))?;
+            state.persist_delegated_session(&validated)?;
+            pause_apply_durable_gate(ApplyDurableBoundary::AfterPersist).await;
+            recheck_apply_intent(services, Some(intent))?;
+        }
+
+        let previous_mode = *state.active_mode.read().await;
+        *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        if let Err(e) = state.save_active_mode().await {
+            *state.active_mode.write().await = previous_mode;
+            return Err(e);
+        }
+        pause_apply_durable_gate(ApplyDurableBoundary::AfterModeWrite).await;
+        recheck_apply_intent(services, Some(intent))?;
+
+        services
+            .renew_after_successful_remote_validation(
+                validated.generation,
+                validated.connection_expires_at.as_deref(),
+            )
+            .await
+            .map_err(|e| anyhow!(e))?;
+        recheck_apply_intent(services, Some(intent))?;
+
+        pause_apply_durable_gate(ApplyDurableBoundary::BeforeLiveMemoryPublish).await;
+        recheck_apply_intent(services, Some(intent))?;
+
+        *state.delegated.write().await = Some(validated.clone());
+        {
+            let mut tw = state.twitch.write().await;
+            clear_live_runtime_fields(&mut tw);
+            tw.tokens = tokens_from_delegated_session(&validated);
+        }
+        recheck_apply_intent(services, Some(intent))?;
+        Ok(validated.generation)
+    }
+    .await;
+
+    match commit {
+        Ok(generation) => Ok(generation),
+        Err(e) if error_is_superseded_identity(&e) => {
+            rollback_superseded_apply(&durable_snapshot, live_snapshot, state, services, e).await?;
+            unreachable!()
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Post-lock going live for delegated activation (generation-fenced Twitch + refresh/watch).
+pub(crate) async fn run_delegated_activation_post_commit(
+    state: Arc<AppState>,
+    services: Arc<TwitchServices>,
+    generation: DelegatedGeneration,
+    intent: u64,
+) {
+    let apply_intent = Some(intent);
+    if !apply_post_commit_workers_may_run(&state, &services, generation, apply_intent).await {
+        return;
+    }
+
+    start_apply_exchange_twitch_clients(state.clone(), services.clone(), generation, apply_intent)
+        .await;
+    if !apply_post_commit_workers_may_run(&state, &services, generation, apply_intent).await {
+        return;
+    }
+
+    start_delegated_refresh_loop(state.clone(), services.clone(), generation).await;
+    if !apply_post_commit_workers_may_run(&state, &services, generation, apply_intent).await {
+        return;
+    }
+
+    start_delegated_watch_loop(state.clone(), services.clone(), generation).await;
+    if !apply_post_commit_workers_may_run(&state, &services, generation, apply_intent).await {
+        return;
+    }
+
+    crate::kick::sync_live_identity_for_generation(state, generation, Some(&services)).await;
+}
+
+pub(crate) async fn stop_delegated_platform_clients(
+    services: &TwitchServices,
+    generation: DelegatedGeneration,
+) {
+    let stop_irc = services.irc_client.read().await.as_ref().is_some_and(|b| {
+        matches!(
+            b.provenance,
+            PlatformCredentialProvenance::Delegated { snap } if snap.generation == generation
+        )
+    });
+    if stop_irc {
+        *services.irc_client.write().await = None;
+        if let Some(h) = services.irc_handle.write().await.take() {
+            h.abort();
+        }
+    }
+    if let Some(h) = services.eventsub_handle.write().await.take() {
+        h.abort();
+    }
+}
+
+pub(crate) async fn stop_personal_platform_clients(services: &TwitchServices) {
+    let stop_irc = services
+        .irc_client
+        .read()
+        .await
+        .as_ref()
+        .is_some_and(|b| b.provenance == PlatformCredentialProvenance::Local);
+    if stop_irc {
+        *services.irc_client.write().await = None;
+        if let Some(h) = services.irc_handle.write().await.take() {
+            h.abort();
+        }
+    }
+    if let Some(h) = services.eventsub_handle.write().await.take() {
+        h.abort();
+    }
+}
+
+/// Intent- and fence-scoped personal IRC/EventSub start (no global stop/restart).
+pub(crate) async fn start_personal_twitch_clients(
+    state: Arc<AppState>,
+    services: Arc<TwitchServices>,
+    intent: u64,
+    personal_fence: u64,
+    previous_mode: TwitchActiveMode,
+    previous_delegated_generation: DelegatedGeneration,
+) {
+    let apply_intent = Some(intent);
+    if recheck_apply_intent(&services, apply_intent).is_err() {
+        return;
+    }
+    if !services.personal_platform_still_current(personal_fence) {
+        return;
+    }
+    if previous_mode == TwitchActiveMode::Delegated && previous_delegated_generation > 0 {
+        stop_delegated_platform_clients(&services, previous_delegated_generation).await;
+        stop_stale_apply_generation_workers(&services, previous_delegated_generation).await;
+    } else {
+        stop_personal_platform_clients(&services).await;
+    }
+    if recheck_apply_intent(&services, apply_intent).is_err() {
+        return;
+    }
+    if !services.personal_platform_still_current(personal_fence) {
+        return;
+    }
+    if *state.active_mode.read().await != TwitchActiveMode::Local {
+        return;
+    }
+    if let Err(e) = start_irc(state.clone(), services.clone(), None).await {
+        warn!("IRC start failed: {e}");
+    }
+    if recheck_apply_intent(&services, apply_intent).is_err() {
+        return;
+    }
+    if !services.personal_platform_still_current(personal_fence) {
+        return;
+    }
+    if let Err(e) = start_eventsub(state.clone(), services.clone(), None).await {
         warn!("EventSub start failed: {e}");
     }
 }

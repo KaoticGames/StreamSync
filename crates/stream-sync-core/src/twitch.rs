@@ -1,6 +1,6 @@
 //! Twitch OAuth, Helix, IRC chat, EventSub (port of overlay-server/server.js Twitch stack).
 
-use crate::app_state::{tokens_from_delegated_session, AppState};
+use crate::app_state::AppState;
 use crate::broadcast::{make_dock_event, FeedHub};
 use crate::config_types::{
     DelegatedSessionFile, TwitchActiveMode, TwitchActiveModeFile, TwitchTokenFile,
@@ -36,9 +36,11 @@ type StreamSyncIrcClient = TwitchIRCClient<SecureTCPTransport, StaticLoginCreden
 mod identity_commit;
 
 pub(crate) use identity_commit::{
-    apply_post_commit_workers_may_run, recheck_apply_intent, rollback_superseded_apply,
-    start_apply_exchange_twitch_clients, stop_stale_apply_generation_workers, ApplyDurableBoundary,
-    DurableApplySnapshot, LiveApplySnapshot,
+    apply_post_commit_workers_may_run, commit_delegated_activation, recheck_apply_intent,
+    rollback_superseded_apply, run_delegated_activation_post_commit,
+    start_apply_exchange_twitch_clients, start_personal_twitch_clients,
+    stop_stale_apply_generation_workers, ApplyDurableBoundary, DurableApplySnapshot,
+    LiveApplySnapshot, PersonalTokensDurableSnapshot,
 };
 
 #[derive(Clone)]
@@ -98,6 +100,8 @@ pub struct TwitchServices {
     authority_lease: Mutex<AuthorityLease>,
     /// Monotonic apply-request fence; newer requests supersede older exchange completions.
     apply_intent: AtomicU64,
+    /// Monotonic personal platform start fence (Phase B; replaced by personal_gen in Phase D).
+    personal_platform_fence: AtomicU64,
     /// Serializes apply / durable revoke / refresh-apply / mode transitions.
     lifecycle_lock: Mutex<()>,
     teardown_tx: OnceLock<mpsc::UnboundedSender<TeardownRequest>>,
@@ -130,6 +134,7 @@ impl TwitchServices {
             teardown_coordinator: TeardownCoordinator::new(),
             authority_lease: Mutex::new(AuthorityLease::inactive()),
             apply_intent: AtomicU64::new(0),
+            personal_platform_fence: AtomicU64::new(0),
             lifecycle_lock: Mutex::new(()),
             teardown_tx: OnceLock::new(),
             durable_revoke_tx: OnceLock::new(),
@@ -152,6 +157,14 @@ impl TwitchServices {
             return Err(superseded_identity_error());
         }
         Ok(())
+    }
+
+    pub(crate) fn bump_personal_platform_fence(&self) -> u64 {
+        self.personal_platform_fence.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub(crate) fn personal_platform_still_current(&self, fence: u64) -> bool {
+        self.personal_platform_fence.load(Ordering::SeqCst) == fence
     }
 
     pub async fn lock_lifecycle(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -1230,41 +1243,6 @@ async fn validate_saved_delegated_for_activation(
     }
 }
 
-/// Publish a validated delegated session as the live identity under lifecycle lock.
-async fn commit_delegated_activation(
-    state: &AppState,
-    services: &TwitchServices,
-    intent: u64,
-    validated: DelegatedSessionFile,
-    saved: Option<&DelegatedSessionFile>,
-) -> Result<()> {
-    let _lifecycle = services.lifecycle_lock.lock().await;
-    services.ensure_apply_intent_current(intent)?;
-    if saved.is_none_or(|s| validated != *s) {
-        state.persist_delegated_session(&validated)?;
-    }
-    services.ensure_apply_intent_current(intent)?;
-    let previous_mode = *state.active_mode.read().await;
-    *state.active_mode.write().await = TwitchActiveMode::Delegated;
-    if let Err(e) = state.save_active_mode().await {
-        *state.active_mode.write().await = previous_mode;
-        return Err(e);
-    }
-    services.ensure_apply_intent_current(intent)?;
-    services
-        .renew_after_successful_remote_validation(
-            validated.generation,
-            validated.connection_expires_at.as_deref(),
-        )
-        .await
-        .map_err(|e| anyhow!(e))?;
-    *state.delegated.write().await = Some(validated.clone());
-    let mut tw = state.twitch.write().await;
-    clear_live_runtime_fields(&mut tw);
-    tw.tokens = tokens_from_delegated_session(&validated);
-    Ok(())
-}
-
 /// Switch the live identity between saved personal OAuth and a saved takeover key.
 pub async fn use_connection(
     state: Arc<AppState>,
@@ -1281,36 +1259,48 @@ pub async fn use_connection(
                     "No personal Twitch account saved. Connect with Twitch first."
                 ));
             }
-            {
+            let (previous_mode, previous_delegated_generation, personal_fence) = {
                 let _lifecycle = services.lifecycle_lock.lock().await;
                 services.ensure_apply_intent_current(intent)?;
-                // Stage durable mode first; only then publish live identity (B8).
                 let previous_mode = *state.active_mode.read().await;
+                let previous_delegated_generation = state.current_delegated_generation();
+                // Stage durable mode first; only then publish live identity (B8).
                 *state.active_mode.write().await = TwitchActiveMode::Local;
                 if let Err(e) = state.save_active_mode().await {
                     *state.active_mode.write().await = previous_mode;
                     return Err(e);
                 }
                 if previous_mode == TwitchActiveMode::Delegated {
-                    // Keep saved takeover; switch to inactive maintenance lease (B4).
-                    let generation = state.current_delegated_generation();
                     stop_delegated_worker_handles(
                         &services.refresh_handle,
                         &services.watch_handle,
                         None,
                     )
                     .await;
-                    if generation > 0 {
+                    if previous_delegated_generation > 0 {
                         services
-                            .install_inactive_maintenance_lease(generation)
+                            .install_inactive_maintenance_lease(previous_delegated_generation)
                             .await;
                     }
                 }
                 let mut tw = state.twitch.write().await;
                 clear_live_runtime_fields(&mut tw);
                 tw.tokens = personal;
-            }
-            restart_twitch_clients(state.clone(), services.clone()).await;
+                (
+                    previous_mode,
+                    previous_delegated_generation,
+                    services.bump_personal_platform_fence(),
+                )
+            };
+            start_personal_twitch_clients(
+                state.clone(),
+                services.clone(),
+                intent,
+                personal_fence,
+                previous_mode,
+                previous_delegated_generation,
+            )
+            .await;
             ensure_delegated_refresh_loop(state.clone(), services).await;
             crate::kick::sync_live_identity(state).await;
         }
@@ -1326,10 +1316,10 @@ pub async fn use_connection(
                 intent,
             )
             .await?;
-            commit_delegated_activation(&state, &services, intent, validated, Some(&saved)).await?;
-            restart_twitch_clients(state.clone(), services.clone()).await;
-            ensure_delegated_refresh_loop(state.clone(), services).await;
-            crate::kick::sync_live_identity(state).await;
+            let generation =
+                commit_delegated_activation(&state, &services, intent, validated, Some(&saved))
+                    .await?;
+            run_delegated_activation_post_commit(state, services, generation, intent).await;
         }
     }
     Ok(())
@@ -1459,16 +1449,26 @@ pub async fn remove_connection(
     let _lifecycle = services.lifecycle_lock.lock().await;
     match mode {
         TwitchActiveMode::Local => {
-            services.ensure_apply_intent_current(intent)?;
+            recheck_apply_intent(&services, Some(intent))?;
+            let durable_snapshot = PersonalTokensDurableSnapshot::capture(&state)?;
             let previous = state.personal_tokens.read().await.clone();
             *state.personal_tokens.write().await = TwitchTokenFile::default();
             if let Err(e) = state.save_twitch_tokens().await {
                 *state.personal_tokens.write().await = previous;
                 return Err(e);
             }
+            if let Err(e) = recheck_apply_intent(&services, Some(intent)) {
+                if error_is_superseded_identity(&e) {
+                    let _ = durable_snapshot.rollback(&state);
+                    *state.personal_tokens.write().await = previous;
+                }
+                return Err(e);
+            }
         }
         TwitchActiveMode::Delegated => {
-            services.ensure_apply_intent_current(intent)?;
+            recheck_apply_intent(&services, Some(intent))?;
+            let durable_snapshot = DurableApplySnapshot::capture(&state)?;
+            let live_snapshot = LiveApplySnapshot::capture(&state, &services).await;
             let generation = state
                 .delegated
                 .read()
@@ -1476,7 +1476,35 @@ pub async fn remove_connection(
                 .as_ref()
                 .map(|s| s.generation)
                 .unwrap_or_else(|| state.current_delegated_generation());
-            remove_delegated_session_locked(&state, &services, None, generation).await?;
+            match remove_delegated_session_locked(&state, &services, None, generation).await {
+                Ok(()) => {
+                    if let Err(e) = recheck_apply_intent(&services, Some(intent)) {
+                        if error_is_superseded_identity(&e) {
+                            let durable_err = durable_snapshot.rollback(&state).err();
+                            live_snapshot.restore(&state, &services).await;
+                            if let Some(rollback_err) = durable_err {
+                                return Err(anyhow!(
+                                    "{e:#}; durable rollback also failed ({rollback_err:#})"
+                                ));
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
+                Err(e) => {
+                    if error_is_superseded_identity(&e) {
+                        return rollback_superseded_apply(
+                            &durable_snapshot,
+                            live_snapshot,
+                            &state,
+                            &services,
+                            e,
+                        )
+                        .await;
+                    }
+                    return Err(e);
+                }
+            }
         }
     }
     Ok(())
@@ -4082,6 +4110,7 @@ async fn start_delegated_revalidation_only(
 }
 
 pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>) {
+    let intent = services.bump_apply_intent();
     if state.identity_rollback_pending() {
         warn!("identity rollback pending — skipping ambiguous Twitch autostart");
         return;
@@ -4092,14 +4121,33 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
         services.schedule_durable_revoke(state.clone(), 0, "startup_pending");
         let personal = state.personal_tokens.read().await.clone();
         if tokens_saved(&personal) {
-            {
+            let (previous_mode, previous_delegated_generation, personal_fence) = {
+                let _lifecycle = services.lifecycle_lock.lock().await;
+                if services.ensure_apply_intent_current(intent).is_err() {
+                    return;
+                }
+                let previous_mode = *state.active_mode.read().await;
+                let previous_delegated_generation = state.current_delegated_generation();
                 let mut tw = state.twitch.write().await;
                 clear_live_runtime_fields(&mut tw);
                 tw.tokens = personal;
                 *state.active_mode.write().await = TwitchActiveMode::Local;
-            }
-            let _ = state.save_active_mode().await;
-            restart_twitch_clients(state, services).await;
+                let _ = state.save_active_mode().await;
+                (
+                    previous_mode,
+                    previous_delegated_generation,
+                    services.bump_personal_platform_fence(),
+                )
+            };
+            start_personal_twitch_clients(
+                state.clone(),
+                services.clone(),
+                intent,
+                personal_fence,
+                previous_mode,
+                previous_delegated_generation,
+            )
+            .await;
         }
         return;
     }
@@ -4125,7 +4173,7 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
                     &key,
                     exchange,
                     activate,
-                    None,
+                    Some(intent),
                 )
                 .await
                 {
@@ -4201,14 +4249,33 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
     // Active mode Local (or delegated cleared): start personal OAuth if present.
     let personal = state.personal_tokens.read().await.clone();
     if tokens_saved(&personal) {
-        {
+        let (previous_mode, previous_delegated_generation, personal_fence) = {
+            let _lifecycle = services.lifecycle_lock.lock().await;
+            if services.ensure_apply_intent_current(intent).is_err() {
+                return;
+            }
+            let previous_mode = *state.active_mode.read().await;
+            let previous_delegated_generation = state.current_delegated_generation();
             let mut tw = state.twitch.write().await;
             clear_live_runtime_fields(&mut tw);
             tw.tokens = personal;
             *state.active_mode.write().await = TwitchActiveMode::Local;
-        }
-        let _ = state.save_active_mode().await;
-        restart_twitch_clients(state.clone(), services.clone()).await;
+            let _ = state.save_active_mode().await;
+            (
+                previous_mode,
+                previous_delegated_generation,
+                services.bump_personal_platform_fence(),
+            )
+        };
+        start_personal_twitch_clients(
+            state.clone(),
+            services.clone(),
+            intent,
+            personal_fence,
+            previous_mode,
+            previous_delegated_generation,
+        )
+        .await;
         ensure_delegated_refresh_loop(state, services).await;
         return;
     }
@@ -6992,6 +7059,146 @@ mod tests {
         let _guard = PHASE2_TEST_LOCK.lock().await;
         for _ in 0..20 {
             apply_post_commit_winner_survives_stale_worker_fence_once().await;
+        }
+    }
+
+    const ACTIVATION_COMMIT_BOUNDARIES: [ApplyDurableBoundary; 3] = [
+        ApplyDurableBoundary::AfterPersist,
+        ApplyDurableBoundary::AfterModeWrite,
+        ApplyDurableBoundary::BeforeLiveMemoryPublish,
+    ];
+
+    async fn use_connection_delegated_superseded_at_activation_once(
+        boundary: ApplyDurableBoundary,
+    ) {
+        let (port, server) = spawn_mock_syndicate_refresh_server("activation-new-token").await;
+        let _env = ProductionTestEnvGuard::install(port);
+
+        let (state, services) = phase2_app().await;
+        install_delegated_session(&state, &services).await;
+        state
+            .persist_delegated_session(state.delegated.read().await.as_ref().unwrap())
+            .unwrap();
+        *state.personal_tokens.write().await = sample_personal();
+        state.save_twitch_tokens().await.unwrap();
+        *state.active_mode.write().await = TwitchActiveMode::Local;
+        state.save_active_mode().await.unwrap();
+        {
+            let mut tw = state.twitch.write().await;
+            tw.tokens = sample_personal();
+        }
+
+        let (_gate, arrived_rx, resume_tx) = super::install_apply_durable_gate(boundary).await;
+        let state_stale = state.clone();
+        let services_stale = services.clone();
+        let pending = tokio::spawn(async move {
+            use_connection(state_stale, services_stale, TwitchActiveMode::Delegated).await
+        });
+        gate_wait(
+            arrived_rx,
+            "delegated activation must pause at commit boundary",
+        )
+        .await;
+
+        let stale_intent = services.apply_intent_for_test();
+        services.bump_apply_intent();
+        wait_apply_intent_advanced(&services, stale_intent).await;
+        resume_tx.send(()).expect("release stale activation");
+        let result = task_join_with_timeout(pending, "stale delegated activation").await;
+        assert!(
+            result.is_err(),
+            "stale delegated activation must not commit after newer intent: {result:?}"
+        );
+        assert_superseded_apply(result.unwrap_err());
+        assert_eq!(*state.active_mode.read().await, TwitchActiveMode::Local);
+        assert_eq!(
+            state.twitch.read().await.tokens.access_token.as_deref(),
+            Some("personal-access")
+        );
+        assert_eq!(disk_active_mode(&state), TwitchActiveMode::Local);
+        server.abort();
+        stop_all_platform_workers(&state, &services).await;
+    }
+
+    #[tokio::test]
+    async fn use_connection_delegated_superseded_at_activation_boundaries() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for boundary in ACTIVATION_COMMIT_BOUNDARIES {
+            for _ in 0..20 {
+                use_connection_delegated_superseded_at_activation_once(boundary).await;
+            }
+        }
+    }
+
+    async fn use_connection_delegated_post_commit_winner_survives_once() {
+        let (port, server) = spawn_mock_syndicate_refresh_server("stale-activation-token").await;
+        let _env = ProductionTestEnvGuard::install(port);
+
+        let (state, services) = phase2_app().await;
+        install_delegated_session(&state, &services).await;
+        state
+            .persist_delegated_session(state.delegated.read().await.as_ref().unwrap())
+            .unwrap();
+        *state.personal_tokens.write().await = sample_personal();
+        state.save_twitch_tokens().await.unwrap();
+        *state.active_mode.write().await = TwitchActiveMode::Local;
+        state.save_active_mode().await.unwrap();
+        {
+            let mut tw = state.twitch.write().await;
+            tw.tokens = sample_personal();
+        }
+
+        let (_gate, arrived_rx, resume_tx) =
+            super::install_apply_durable_gate(ApplyDurableBoundary::BeforeTwitchStart).await;
+        let state_stale = state.clone();
+        let services_stale = services.clone();
+        let stale_task = tokio::spawn(async move {
+            use_connection(state_stale, services_stale, TwitchActiveMode::Delegated).await
+        });
+        gate_wait(
+            arrived_rx,
+            "stale activation must pause before twitch start",
+        )
+        .await;
+
+        use_connection(state.clone(), services.clone(), TwitchActiveMode::Local)
+            .await
+            .expect("winner local switch");
+        let winner_workers = platform_worker_snapshot(&state, &services).await;
+        resume_tx.send(()).expect("release stale twitch start");
+        let result = task_join_with_timeout(stale_task, "stale activation after winner").await;
+        assert!(
+            result.is_ok(),
+            "stale activation must fence post-commit without error: {result:?}"
+        );
+
+        assert_eq!(*state.active_mode.read().await, TwitchActiveMode::Local);
+        assert_eq!(
+            state.twitch.read().await.tokens.access_token.as_deref(),
+            Some("personal-access")
+        );
+        assert_eq!(
+            platform_worker_snapshot(&state, &services).await,
+            winner_workers,
+            "stale delegated activation must not replace winner platform handles"
+        );
+        assert_eq!(disk_active_mode(&state), TwitchActiveMode::Local);
+
+        let restarted = restart_state_at(&state);
+        assert_eq!(*restarted.active_mode.read().await, TwitchActiveMode::Local);
+        assert_eq!(
+            restarted.twitch.read().await.tokens.access_token.as_deref(),
+            Some("personal-access")
+        );
+        server.abort();
+        stop_all_platform_workers(&state, &services).await;
+    }
+
+    #[tokio::test]
+    async fn use_connection_delegated_post_commit_winner_survives() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for _ in 0..20 {
+            use_connection_delegated_post_commit_winner_survives_once().await;
         }
     }
 }
