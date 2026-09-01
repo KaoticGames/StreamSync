@@ -1874,6 +1874,7 @@ pub(crate) enum ApplyDurableBoundary {
     BeforeLivePublish,
     BeforeLiveMemoryPublish,
     BeforeWorkerStart,
+    BeforeTwitchStart,
 }
 
 /// Disk artifacts this apply may mutate; restored if a newer identity intent wins.
@@ -2060,6 +2061,28 @@ async fn stop_stale_apply_generation_workers(
     }
 }
 
+async fn start_apply_exchange_twitch_clients(
+    state: Arc<AppState>,
+    services: Arc<TwitchServices>,
+    generation: DelegatedGeneration,
+    apply_intent: Option<u64>,
+) {
+    pause_apply_durable_gate(ApplyDurableBoundary::BeforeTwitchStart).await;
+    if !apply_post_commit_workers_may_run(&state, &services, generation, apply_intent).await {
+        return;
+    }
+    if let Err(e) = start_irc(state.clone(), services.clone(), Some(generation)).await {
+        warn!("IRC start failed: {e}");
+    }
+    if !apply_post_commit_workers_may_run(&state, &services, generation, apply_intent).await {
+        stop_stale_apply_generation_workers(&state, &services, generation, true).await;
+        return;
+    }
+    if let Err(e) = start_eventsub(state.clone(), services.clone(), Some(generation)).await {
+        warn!("EventSub start failed: {e}");
+    }
+}
+
 fn read_path_bytes_if_exists(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -2224,10 +2247,16 @@ async fn apply_exchange_session(
     }
 
     if activate {
-        restart_twitch_clients(state.clone(), services.clone()).await;
+        start_apply_exchange_twitch_clients(
+            state.clone(),
+            services.clone(),
+            new_generation,
+            apply_intent,
+        )
+        .await;
         if !apply_post_commit_workers_may_run(&state, &services, new_generation, apply_intent).await
         {
-            stop_stale_apply_generation_workers(&state, &services, new_generation, true).await;
+            stop_stale_apply_generation_workers(&state, &services, new_generation, false).await;
             return Ok(());
         }
     }
@@ -7137,7 +7166,7 @@ mod tests {
 
         let stale_intent = services.bump_apply_intent();
         let (_gate, arrived_rx, resume_tx) =
-            super::install_apply_durable_gate(ApplyDurableBoundary::BeforeWorkerStart).await;
+            super::install_apply_durable_gate(ApplyDurableBoundary::BeforeTwitchStart).await;
         let state_stale = state.clone();
         let services_stale = services.clone();
         let stale_task = tokio::spawn(async move {
@@ -7151,27 +7180,13 @@ mod tests {
             )
             .await
         });
-        gate_wait(arrived_rx, "stale apply must pause before workers").await;
+        gate_wait(arrived_rx, "stale apply must pause before twitch start").await;
 
-        let winner_intent = services.bump_apply_intent();
-        let state_win = state.clone();
-        let services_win = services.clone();
-        let winner_task = tokio::spawn(async move {
-            apply_exchange_session(
-                state_win,
-                services_win,
-                "ssk_phase2_winner_apply",
-                stale_refresh_exchange("winner-apply-token"),
-                true,
-                Some(winner_intent),
-            )
-            .await
-        });
-        task_join_with_timeout(winner_task, "winner apply")
-            .await
-            .expect("winner apply");
+        let _winner_intent = services.bump_apply_intent();
+        commit_replacement_generation(&state, &services, 3, "winner-apply-token").await;
+        let winner_workers = install_winner_platform_workers(&state, &services, 3).await;
 
-        resume_tx.send(()).expect("release stale worker start");
+        resume_tx.send(()).expect("release stale twitch start");
         task_join_with_timeout(stale_task, "stale apply after winner")
             .await
             .expect("stale apply must return after worker fence");
@@ -7185,6 +7200,11 @@ mod tests {
         assert_eq!(
             winner.twitch_tokens.access_token.as_deref(),
             Some("winner-apply-token")
+        );
+        assert_eq!(
+            platform_worker_snapshot(&state, &services).await,
+            winner_workers,
+            "stale apply must not abort or replace winner IRC/EventSub handles"
         );
         let disk = read_delegated_disk(&state).expect("winner primary on disk");
         assert_eq!(disk.generation, 3);
