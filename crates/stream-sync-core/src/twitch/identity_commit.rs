@@ -257,6 +257,93 @@ impl PersonalTokensDurableSnapshot {
     }
 }
 
+/// In-memory personal live state cleared by personal disconnect mini-commit.
+pub(crate) struct PersonalRemovalLiveSnapshot {
+    personal_tokens: TwitchTokenFile,
+    twitch_tokens: TwitchTokenFile,
+}
+
+impl PersonalRemovalLiveSnapshot {
+    async fn capture(state: &AppState) -> Self {
+        Self {
+            personal_tokens: state.personal_tokens.read().await.clone(),
+            twitch_tokens: state.twitch.read().await.tokens.clone(),
+        }
+    }
+
+    async fn restore(self, state: &AppState) {
+        *state.personal_tokens.write().await = self.personal_tokens;
+        state.twitch.write().await.tokens = self.twitch_tokens;
+    }
+}
+
+/// Outcome of a committed personal removal (disk + live personal gone).
+pub(crate) struct PersonalRemovalCommitOutcome {
+    pub previous_local_gen: u64,
+}
+
+/// Personal disconnect mini-commit: disk clear → intent current → live personal gone.
+pub(crate) async fn commit_personal_removal(
+    state: &AppState,
+    services: &TwitchServices,
+    intent: u64,
+) -> Result<PersonalRemovalCommitOutcome> {
+    let _lifecycle = services.lifecycle_lock.lock().await;
+    recheck_apply_intent(services, Some(intent))?;
+
+    let durable = PersonalTokensDurableSnapshot::capture(state)?;
+    let live = PersonalRemovalLiveSnapshot::capture(state).await;
+    let previous_local_gen = services.personal_token_generation_current();
+
+    let commit = async {
+        let previous = state.personal_tokens.read().await.clone();
+        *state.personal_tokens.write().await = TwitchTokenFile::default();
+        if let Err(e) = state.save_twitch_tokens().await {
+            *state.personal_tokens.write().await = previous;
+            return Err(e);
+        }
+        recheck_apply_intent(services, Some(intent))?;
+
+        {
+            let mut tw = state.twitch.write().await;
+            tw.tokens = TwitchTokenFile::default();
+            clear_live_runtime_fields(&mut tw);
+        }
+        recheck_apply_intent(services, Some(intent))?;
+        services.bump_personal_token_generation();
+        Ok(PersonalRemovalCommitOutcome { previous_local_gen })
+    }
+    .await;
+
+    match commit {
+        Ok(outcome) => Ok(outcome),
+        Err(e) if error_is_superseded_identity(&e) => {
+            let _ = durable.rollback(state);
+            live.restore(state).await;
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// After personal mini-commit, publish live identity none when delegated is not activated.
+pub(crate) async fn finalize_live_identity_none_after_personal_removal(
+    state: &AppState,
+    services: &TwitchServices,
+    intent: u64,
+) -> Result<()> {
+    let _lifecycle = services.lifecycle_lock.lock().await;
+    services.ensure_apply_intent_current(intent)?;
+    {
+        let mut tw = state.twitch.write().await;
+        tw.tokens = TwitchTokenFile::default();
+        clear_live_runtime_fields(&mut tw);
+    }
+    *state.active_mode.write().await = TwitchActiveMode::Local;
+    state.save_active_mode().await?;
+    Ok(())
+}
+
 /// Publish a validated delegated session as the live identity under lifecycle lock.
 pub(crate) async fn commit_delegated_activation(
     state: &AppState,

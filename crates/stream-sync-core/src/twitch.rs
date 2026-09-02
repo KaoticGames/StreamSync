@@ -37,7 +37,8 @@ mod identity_commit;
 mod platform_workers;
 
 pub(crate) use identity_commit::{
-    apply_post_commit_workers_may_run, commit_delegated_activation, recheck_apply_intent,
+    apply_post_commit_workers_may_run, commit_delegated_activation, commit_personal_removal,
+    finalize_live_identity_none_after_personal_removal, recheck_apply_intent,
     rollback_superseded_apply, run_delegated_activation_post_commit,
     start_apply_exchange_twitch_clients, start_personal_twitch_clients,
     stop_stale_apply_generation_workers, ApplyDurableBoundary, DurableApplySnapshot,
@@ -45,8 +46,8 @@ pub(crate) use identity_commit::{
 };
 pub(crate) use platform_workers::{
     current_live_worker_owner, start_platform_twitch_workers,
-    stop_platform_twitch_workers_for_delegated_generation, transition_platform_twitch_workers,
-    WorkerOwner,
+    stop_platform_twitch_workers_for_delegated_generation, stop_platform_twitch_workers_for_owner,
+    transition_platform_twitch_workers, WorkerOwner,
 };
 
 #[derive(Clone)]
@@ -1460,46 +1461,56 @@ async fn disconnect_twitch_inner(
             }
         }
         TwitchActiveMode::Local => {
-            {
-                let _lifecycle = services.lifecycle_lock.lock().await;
-                services.ensure_apply_intent_current(intent)?;
-                let previous = state.personal_tokens.read().await.clone();
-                *state.personal_tokens.write().await = TwitchTokenFile::default();
-                if let Err(e) = state.save_twitch_tokens().await {
-                    *state.personal_tokens.write().await = previous;
-                    return Err(e);
-                }
-            }
             let saved = state.delegated.read().await.clone();
+            let removal = commit_personal_removal(&state, &services, intent).await?;
+            if removal.previous_local_gen > 0 {
+                stop_platform_twitch_workers_for_owner(
+                    &services,
+                    WorkerOwner::personal(removal.previous_local_gen),
+                )
+                .await;
+            }
             if let Some(session) = saved {
-                let validated = validate_saved_delegated_for_activation(
+                match validate_saved_delegated_for_activation(
                     state.clone(),
                     services.clone(),
                     &session,
                     intent,
                 )
-                .await?;
-                let generation = commit_delegated_activation(
-                    &state,
-                    &services,
-                    intent,
-                    validated,
-                    Some(&session),
-                )
-                .await?;
-                run_delegated_activation_post_commit(state.clone(), services, generation, intent)
-                    .await;
-            } else {
-                stop_delegated_tasks(&services).await;
-                stop_twitch_clients(&services).await;
+                .await
                 {
-                    let _lifecycle = services.lifecycle_lock.lock().await;
-                    services.ensure_apply_intent_current(intent)?;
-                    let mut tw = state.twitch.write().await;
-                    tw.tokens = TwitchTokenFile::default();
-                    clear_live_runtime_fields(&mut tw);
+                    Ok(validated) => {
+                        let generation = commit_delegated_activation(
+                            &state,
+                            &services,
+                            intent,
+                            validated,
+                            Some(&session),
+                        )
+                        .await?;
+                        run_delegated_activation_post_commit(
+                            state.clone(),
+                            services,
+                            generation,
+                            intent,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        finalize_live_identity_none_after_personal_removal(
+                            &state, &services, intent,
+                        )
+                        .await?;
+                        stop_delegated_tasks(&services).await;
+                        sync_kick_for_active_identity(state, services).await;
+                        return Err(e);
+                    }
                 }
-                crate::kick::sync_live_identity_for_local(state).await;
+            } else {
+                finalize_live_identity_none_after_personal_removal(&state, &services, intent)
+                    .await?;
+                stop_delegated_tasks(&services).await;
+                sync_kick_for_active_identity(state, services).await;
             }
         }
     }
@@ -4686,6 +4697,35 @@ mod tests {
         }
     }
 
+    async fn install_fake_personal_platform_workers(
+        state: &AppState,
+        services: &TwitchServices,
+        local_gen: u64,
+    ) {
+        let forever = || {
+            tokio::spawn(async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+            })
+        };
+        services
+            .install_irc_bundle_for_test(
+                PlatformCredentialProvenance::Local,
+                WorkerOwner::personal(local_gen),
+            )
+            .await;
+        *services.irc_handle.write().await = Some(forever());
+        *services.eventsub_owner.write().await = Some(WorkerOwner::personal(local_gen));
+        *services.eventsub_handle.write().await = Some(forever());
+        *state.kick_feed_handle.write().await = Some(forever());
+        {
+            let mut k = state.kick.write().await;
+            k.tokens.access_token = Some("personal-kick".into());
+            k.connected = true;
+        }
+    }
+
     /// External coordinator completes teardown with personal fallback.
     #[tokio::test]
     async fn watcher_teardown_completes_personal_fallback_and_stops_platforms() {
@@ -5200,6 +5240,135 @@ mod tests {
             state.twitch.read().await.tokens.login.as_deref(),
             Some("personal_login")
         );
+    }
+
+    #[tokio::test]
+    async fn personal_disconnect_without_delegated_clears_live_identity() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let (state, services) = phase2_app().await;
+        *state.personal_tokens.write().await = sample_personal();
+        state.save_twitch_tokens().await.unwrap();
+        *state.active_mode.write().await = TwitchActiveMode::Local;
+        state.save_active_mode().await.unwrap();
+        {
+            let mut tw = state.twitch.write().await;
+            tw.tokens = sample_personal();
+            tw.channel = Some("personal_login".into());
+            tw.connected = true;
+        }
+        services.bump_personal_token_generation();
+        let local_gen = services.personal_token_generation_current();
+        install_fake_personal_platform_workers(&state, &services, local_gen).await;
+
+        disconnect_twitch(state.clone(), services.clone())
+            .await
+            .expect("disconnect personal");
+
+        let identity = live_identity_snapshot(&state, &services).await;
+        assert_eq!(identity.mode, TwitchActiveMode::Local);
+        assert!(identity.twitch_tokens.access_token.is_none());
+        assert!(identity.twitch_tokens.login.is_none());
+        assert!(!tokens_saved(&state.personal_tokens.read().await.clone()));
+        assert!(services.irc_handle.read().await.is_none());
+        assert!(services.eventsub_handle.read().await.is_none());
+
+        let restarted = restart_state_at(&state);
+        let restarted_identity = live_identity_snapshot(&restarted, &services).await;
+        assert_eq!(restarted_identity.mode, TwitchActiveMode::Local);
+        assert!(restarted_identity.twitch_tokens.access_token.is_none());
+        assert!(!tokens_saved(
+            &restarted.personal_tokens.read().await.clone()
+        ));
+        stop_all_platform_workers(&state, &services).await;
+    }
+
+    async fn spawn_mock_syndicate_refresh_error_server(
+        code: &str,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let code = code.to_string();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    let n = socket.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = serde_json::json!({
+                    "error": code,
+                    "message": format!("mock {code}")
+                });
+                let payload = body.to_string();
+                let resp = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+        (port, server)
+    }
+
+    #[tokio::test]
+    async fn personal_disconnect_validation_failure_personal_stays_removed() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let (port, server) = spawn_mock_syndicate_refresh_error_server("invalid_key").await;
+        let _env = ProductionTestEnvGuard::install(port);
+
+        let (state, services) = phase2_app().await;
+        install_delegated_session(&state, &services).await;
+        state.save_delegated().await.unwrap();
+        *state.personal_tokens.write().await = sample_personal();
+        state.save_twitch_tokens().await.unwrap();
+        *state.active_mode.write().await = TwitchActiveMode::Local;
+        state.save_active_mode().await.unwrap();
+        {
+            let mut tw = state.twitch.write().await;
+            tw.tokens = sample_personal();
+            tw.channel = Some("personal_login".into());
+            tw.connected = true;
+        }
+        services.bump_personal_token_generation();
+        let local_gen = services.personal_token_generation_current();
+        install_fake_personal_platform_workers(&state, &services, local_gen).await;
+
+        let err = disconnect_twitch(state.clone(), services.clone()).await;
+        assert!(err.is_err(), "delegated validation must fail: {err:?}");
+
+        let identity = live_identity_snapshot(&state, &services).await;
+        assert_eq!(identity.mode, TwitchActiveMode::Local);
+        assert!(identity.twitch_tokens.access_token.is_none());
+        assert!(!tokens_saved(&state.personal_tokens.read().await.clone()));
+        assert_ne!(
+            identity.twitch_tokens.access_token.as_deref(),
+            Some("personal-access")
+        );
+        assert!(state.delegated.read().await.is_none());
+        assert!(!state.paths.twitch_delegated.is_file());
+        assert!(services.irc_handle.read().await.is_none());
+        assert!(services.eventsub_handle.read().await.is_none());
+
+        let restarted = restart_state_at(&state);
+        let restarted_identity = live_identity_snapshot(&restarted, &services).await;
+        assert_eq!(restarted_identity.mode, TwitchActiveMode::Local);
+        assert!(restarted_identity.twitch_tokens.access_token.is_none());
+        assert!(!tokens_saved(
+            &restarted.personal_tokens.read().await.clone()
+        ));
+        assert!(read_delegated_disk(&restarted).is_none());
+
+        server.abort();
+        stop_all_platform_workers(&state, &services).await;
     }
 
     #[tokio::test]
