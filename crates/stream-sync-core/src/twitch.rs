@@ -169,7 +169,9 @@ impl TwitchServices {
     }
 
     pub(crate) fn bump_personal_token_generation(&self) -> u64 {
-        self.personal_token_generation.fetch_add(1, Ordering::SeqCst) + 1
+        self.personal_token_generation
+            .fetch_add(1, Ordering::SeqCst)
+            + 1
     }
 
     pub(crate) fn personal_token_generation_current(&self) -> u64 {
@@ -1223,14 +1225,18 @@ pub async fn apply_set_token(
         let mut tw = state.twitch.write().await;
         clear_live_runtime_fields(&mut tw);
         tw.tokens = tokens;
-        (previous_mode, state.current_delegated_generation(), local_gen)
+        (
+            previous_mode,
+            state.current_delegated_generation(),
+            local_gen,
+        )
     };
-    let previous_owner = if previous_mode == TwitchActiveMode::Delegated && previous_delegated_generation > 0
-    {
-        Some(WorkerOwner::delegated(previous_delegated_generation))
-    } else {
-        None
-    };
+    let previous_owner =
+        if previous_mode == TwitchActiveMode::Delegated && previous_delegated_generation > 0 {
+            Some(WorkerOwner::delegated(previous_delegated_generation))
+        } else {
+            None
+        };
     transition_platform_twitch_workers(
         state.clone(),
         services.clone(),
@@ -1380,7 +1386,8 @@ async fn sync_kick_for_active_identity(state: Arc<AppState>, services: Arc<Twitc
     match mode {
         TwitchActiveMode::Delegated => {
             let generation = state.current_delegated_generation();
-            crate::kick::sync_live_identity_for_generation(state, generation, Some(&services)).await;
+            crate::kick::sync_live_identity_for_generation(state, generation, Some(&services))
+                .await;
         }
         TwitchActiveMode::Local => {
             crate::kick::sync_live_identity_for_local(state).await;
@@ -1426,10 +1433,7 @@ async fn disconnect_twitch_inner(
                     let mut tw = state.twitch.write().await;
                     clear_live_runtime_fields(&mut tw);
                     tw.tokens = personal;
-                    (
-                        services.bump_personal_token_generation(),
-                        generation,
-                    )
+                    (services.bump_personal_token_generation(), generation)
                 };
                 transition_platform_twitch_workers(
                     state.clone(),
@@ -1475,9 +1479,14 @@ async fn disconnect_twitch_inner(
                     intent,
                 )
                 .await?;
-                let generation =
-                    commit_delegated_activation(&state, &services, intent, validated, Some(&session))
-                        .await?;
+                let generation = commit_delegated_activation(
+                    &state,
+                    &services,
+                    intent,
+                    validated,
+                    Some(&session),
+                )
+                .await?;
                 run_delegated_activation_post_commit(state.clone(), services, generation, intent)
                     .await;
             } else {
@@ -3236,8 +3245,7 @@ async fn start_irc(
                             if !state_irc.session_still_current(generation).await {
                                 break;
                             }
-                            let is_self =
-                                msg.sender.login.eq_ignore_ascii_case(&broadcaster_login);
+                            let is_self = msg.sender.login.eq_ignore_ascii_case(&broadcaster_login);
                             if is_self {
                                 store_broadcaster_user_state(
                                     &state_irc,
@@ -3296,8 +3304,7 @@ async fn start_irc(
                             );
                         }
                         ServerMessage::Privmsg(msg) => {
-                            let is_self =
-                                msg.sender.login.eq_ignore_ascii_case(&broadcaster_login);
+                            let is_self = msg.sender.login.eq_ignore_ascii_case(&broadcaster_login);
                             if is_self {
                                 store_broadcaster_user_state(
                                     &state_irc,

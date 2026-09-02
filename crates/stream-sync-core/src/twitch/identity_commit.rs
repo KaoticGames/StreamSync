@@ -15,12 +15,10 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::warn;
 
+use super::platform_workers::{start_platform_twitch_workers, transition_platform_twitch_workers};
 use super::{
     clear_live_runtime_fields, pause_apply_durable_gate, start_delegated_refresh_loop,
     start_delegated_watch_loop, TwitchServices, WorkerOwner,
-};
-use super::platform_workers::{
-    start_platform_twitch_workers, transition_platform_twitch_workers,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -364,18 +362,18 @@ pub(crate) async fn start_personal_twitch_clients(
     previous_mode: TwitchActiveMode,
     previous_delegated_generation: DelegatedGeneration,
 ) {
-    let previous_owner = if previous_mode == TwitchActiveMode::Delegated && previous_delegated_generation > 0
-    {
-        Some(WorkerOwner::delegated(previous_delegated_generation))
-    } else {
-        services
-            .irc_client
-            .read()
-            .await
-            .as_ref()
-            .map(|b| b.owner)
-            .filter(|owner| matches!(owner, WorkerOwner::Personal { .. }))
-    };
+    let previous_owner =
+        if previous_mode == TwitchActiveMode::Delegated && previous_delegated_generation > 0 {
+            Some(WorkerOwner::delegated(previous_delegated_generation))
+        } else {
+            services
+                .irc_client
+                .read()
+                .await
+                .as_ref()
+                .map(|b| b.owner)
+                .filter(|owner| matches!(owner, WorkerOwner::Personal { .. }))
+        };
     transition_platform_twitch_workers(
         state,
         services,
