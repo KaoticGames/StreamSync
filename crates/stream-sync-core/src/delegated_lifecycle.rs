@@ -14,6 +14,13 @@
 //! local revocation intent cannot be recovered solely from an unchanged credential file. That
 //! total-storage-failure + crash case is unavoidable without an independent durable authority
 //! source; do not claim crash-persistent local revocation when all durable writes fail.
+//!
+//! ## Constraint 9 manual boundary (Phase G)
+//!
+//! The lease deadline above bounds **local** fail-closed behavior when SSE push is missed.
+//! Closing constraint 9 end-to-end (live revoke across real Syndicate consumers, network-loss
+//! under production topology, restart after a remote revoke with no mocks) requires manual or CI
+//! Syndicate integration evidence — not mock-only unit/integration tests alone.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};

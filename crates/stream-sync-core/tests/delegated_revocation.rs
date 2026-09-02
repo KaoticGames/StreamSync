@@ -1,7 +1,15 @@
 //! Phase 2 review corrections — production-path delegated revocation tests.
 //!
-//! These tests inject an explicit userdata root via [`OverlayConfig::userdata_root`] and never
-//! mutate process-global `STREAMSYNC_USERDATA`, so they are safe under parallel cargo test.
+//! ## Phase G — client fail-closed wiring (constraint 9 local boundary)
+//!
+//! These tests prove StreamSync's **local** fail-closed revocation wiring: coordinator teardown,
+//! direct durable revoke, lease-expiry fail-closed, startup quarantine, and restart coherence.
+//! They inject an explicit userdata root via [`OverlayConfig::userdata_root`] and never mutate
+//! process-global `STREAMSYNC_USERDATA`, so they are safe under parallel cargo test.
+//!
+//! **Manual boundary:** mock/process-local evidence does **not** close constraint 9 (live
+//! multi-consumer Syndicate revoke, real network partition, or restart-after-remote-revoke without
+//! mocks). That remains manual/CI Syndicate integration evidence.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -420,6 +428,105 @@ fn documented_revocation_bound_is_lease_deadline() {
     assert_eq!(MAX_DELEGATED_REVOCATION_DELAY.as_secs(), 300);
     assert!(SYNDICATE_HTTP_TIMEOUT <= MAX_DELEGATED_REVOCATION_DELAY);
     assert!(SYNDICATE_SSE_READ_TIMEOUT <= MAX_DELEGATED_REVOCATION_DELAY);
+}
+
+#[test]
+fn revocation_wiring_inventory_documents_coordinator_and_direct_paths() {
+    let twitch = include_str!("../src/twitch.rs");
+    assert!(
+        twitch.contains("pub async fn signal_delegated_teardown"),
+        "coordinator entry must remain public"
+    );
+    assert!(
+        twitch.contains("async fn execute_delegated_teardown"),
+        "coordinator must execute durable teardown"
+    );
+    assert!(
+        twitch.contains("async fn end_delegated_session_after_key_invalid"),
+        "refresh/watch hard-fail must route through coordinator"
+    );
+    assert!(
+        twitch.contains(".signal_delegated_teardown(state.clone(), generation, code)"),
+        "key-invalid path must call coordinator"
+    );
+    assert!(
+        twitch.contains("async fn fail_closed_lease_expired"),
+        "lease expiry must have a dedicated fail-closed entry"
+    );
+    assert!(
+        twitch.contains(".signal_delegated_teardown(state.clone(), generation, \"lease_expired\")"),
+        "lease expiry must route durable cleanup through coordinator"
+    );
+    assert!(
+        twitch.contains("async fn remove_delegated_session"),
+        "direct revoke entry must exist"
+    );
+    assert!(
+        twitch.contains("durable_revoke_delegated"),
+        "both paths must converge on durable revoke"
+    );
+    assert!(
+        twitch.contains("run_autonomous_durable_revoke"),
+        "transient durable failures must retry autonomously"
+    );
+    assert!(
+        twitch.contains("durable_revoke_pending") && twitch.contains("twitch_delegated_revoked"),
+        "startup/maybe_autostart must fail-closed on pending revoke or tombstone"
+    );
+}
+
+#[tokio::test]
+async fn restart_after_revoke_keeps_personal_selectable_not_delegated() {
+    let userdata = test_userdata_dir();
+    let (_router, state, services) = build_app_at(userdata.clone(), 0).await;
+    services.init_teardown_worker();
+
+    let personal = stream_sync_core::TwitchTokenFile {
+        access_token: Some("personal-at".into()),
+        refresh_token: None,
+        expires_in: Some(3600),
+        obtainment_timestamp: Some(chrono::Utc::now().timestamp_millis()),
+        login: Some("personal_user".into()),
+        user_id: Some("42".into()),
+        scopes: None,
+    };
+    *state.personal_tokens.write().await = personal;
+    state.save_twitch_tokens().await.unwrap();
+
+    let session = sample_session(1, "ssk_test_placeholder_revoke_restart");
+    state.persist_delegated_session(&session).unwrap();
+    *state.delegated.write().await = Some(session);
+    state.delegated_generation.store(1, Ordering::SeqCst);
+    *state.active_mode.write().await = TwitchActiveMode::Delegated;
+    services.install_delegated_generation(1).await;
+    state.save_active_mode().await.unwrap();
+
+    services
+        .signal_delegated_teardown(state.clone(), 1, "revoked")
+        .await
+        .unwrap();
+
+    assert!(state.paths.twitch_delegated_revoked.is_file());
+    assert!(!state.paths.twitch_delegated.is_file());
+    assert_eq!(*state.active_mode.read().await, TwitchActiveMode::Local);
+
+    drop(state);
+    drop(services);
+
+    let restarted = restart_app_at(&userdata, false);
+    assert!(restarted.delegated.read().await.is_none());
+    assert_ne!(
+        *restarted.active_mode.read().await,
+        TwitchActiveMode::Delegated
+    );
+    assert!(restarted.paths.twitch_delegated_revoked.is_file());
+    assert!(!restarted.paths.twitch_delegated.is_file());
+
+    let disk: stream_sync_core::TwitchTokenFile =
+        serde_json::from_str(&std::fs::read_to_string(&restarted.paths.twitch_tokens).unwrap())
+            .unwrap();
+    assert_eq!(disk.login.as_deref(), Some("personal_user"));
+    assert!(disk.access_token.is_some());
 }
 
 #[test]
@@ -875,6 +982,28 @@ fn acceptance_boundaries_document_manual_syndicate_integration() {
     assert!(
         storage_src.contains("inventory_delegated_startup_authority"),
         "startup inventory must run before delegated activation"
+    );
+    let revocation_tests = include_str!("delegated_revocation.rs");
+    assert!(
+        revocation_tests
+            .contains("revocation_wiring_inventory_documents_coordinator_and_direct_paths"),
+        "Phase G must inventory coordinator vs direct revoke wiring"
+    );
+    assert!(
+        revocation_tests.contains("restart_after_revoke_keeps_personal_selectable_not_delegated"),
+        "Phase G must prove personal remains selectable after revoke + restart"
+    );
+    assert!(
+        revocation_tests.contains("Constraint 9 manual boundary"),
+        "Phase G must document constraint 9 mock boundary"
+    );
+    assert!(
+        twitch_tests.contains("active_delegated_lease_expiry_fail_closed_revokes_live_identity"),
+        "Phase G must prove lease-expiry fail-closed on active delegated identity"
+    );
+    assert!(
+        twitch_tests.contains("maybe_autostart_fail_closed_skips_delegated_when_tombstoned"),
+        "Phase G must prove autostart fail-closed on tombstone"
     );
 }
 

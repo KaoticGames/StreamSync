@@ -1734,6 +1734,10 @@ async fn strip_in_memory_delegated_authority(
 /// Absolute-lease fail-closed for *active* delegated mode.
 /// When Local with a saved takeover session, reinstalls inactive maintenance lease and does
 /// **not** revoke/delete the saved connection (identity switch ≠ revocation).
+///
+/// Phase G wiring: strips in-memory authority under `lifecycle_lock`, then routes durable
+/// cleanup through [`TwitchServices::signal_delegated_teardown`] (coordinator path). Direct
+/// revoke callers use [`remove_delegated_session`] → `durable_revoke_delegated` instead.
 async fn fail_closed_lease_expired(
     state: Arc<AppState>,
     services: Arc<TwitchServices>,
@@ -4771,6 +4775,63 @@ mod tests {
         assert!(services.irc_handle.read().await.is_none());
         assert!(services.eventsub_handle.read().await.is_none());
         assert!(state.kick_feed_handle.read().await.is_none());
+    }
+
+    /// Simulates network-loss / missed SSE: absolute lease deadline passes while delegated is active.
+    #[tokio::test]
+    async fn active_delegated_lease_expiry_fail_closed_revokes_live_identity() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let (state, services) = phase2_app().await;
+        install_delegated_session(&state, &services).await;
+        *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        state.save_active_mode().await.unwrap();
+        state.save_delegated().await.unwrap();
+        services.install_validated_authority_lease(1, None).await;
+        install_fake_platform_workers(&state, &services).await;
+
+        {
+            let mut lease = services.authority_lease.lock().await;
+            lease.set_deadline_for_test(std::time::Instant::now());
+        }
+        assert!(services.authority_lease_expired().await);
+
+        fail_closed_lease_expired(state.clone(), services.clone(), 1).await;
+
+        assert!(state.delegated.read().await.is_none());
+        assert!(!state.delegated_file_exists().await);
+        assert!(state.paths.twitch_delegated_revoked.is_file());
+        assert_eq!(*state.active_mode.read().await, TwitchActiveMode::Local);
+        assert!(services.irc_handle.read().await.is_none());
+        assert!(services.eventsub_handle.read().await.is_none());
+        assert!(state.kick_feed_handle.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn maybe_autostart_fail_closed_skips_delegated_when_tombstoned() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let (state, services) = phase2_app().await;
+        services.init_durable_revoke_worker();
+
+        let session = sample_delegated();
+        state.persist_delegated_session(&session).unwrap();
+        *state.delegated.write().await = Some(session);
+        state.delegated_generation.store(1, Ordering::SeqCst);
+        *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        state.save_active_mode().await.unwrap();
+        *state.personal_tokens.write().await = sample_personal();
+        state.save_twitch_tokens().await.unwrap();
+        crate::storage::write_delegated_revoked_tombstone(&state.paths.twitch_delegated_revoked)
+            .unwrap();
+
+        maybe_autostart(state.clone(), services.clone()).await;
+
+        assert_eq!(*state.active_mode.read().await, TwitchActiveMode::Local);
+        let lease = services.authority_lease.lock().await;
+        assert_ne!(
+            lease.phase(),
+            crate::delegated_lifecycle::AuthorityLeasePhase::Validated,
+            "tombstone must block delegated platform activation"
+        );
     }
 
     #[tokio::test]
