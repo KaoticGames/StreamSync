@@ -631,6 +631,117 @@ pub fn recover_delegated_replace_pending(delegated_path: &Path) -> Result<()> {
     );
 }
 
+/// Parse a committed delegated session from disk when it is safe to activate.
+pub fn committed_delegated_session_parse(
+    delegated_path: &Path,
+) -> Result<Option<crate::config_types::DelegatedSessionFile>> {
+    if !delegated_path.is_file() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(delegated_path)
+        .with_context(|| format!("read delegated session {}", delegated_path.display()))?;
+    let session: crate::config_types::DelegatedSessionFile = serde_json::from_str(&raw)
+        .with_context(|| format!("parse delegated session {}", delegated_path.display()))?;
+    if session.connection_key.is_empty() || session.access_token.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(session))
+}
+
+fn quarantine_delegated_primary_file(delegated_path: &Path) -> Result<()> {
+    if !delegated_path.is_file() {
+        return Ok(());
+    }
+    let quarantine = delegated_path.with_extension(format!("corrupt-{}", now_ts()));
+    fs::rename(delegated_path, &quarantine).with_context(|| {
+        format!(
+            "quarantine invalid delegated session {}",
+            delegated_path.display()
+        )
+    })?;
+    sync_parent_dir(delegated_path)?;
+    Ok(())
+}
+
+fn quarantine_delegated_startup_authority(delegated_path: &Path) -> Result<()> {
+    for variant in delegated_secret_variants(delegated_path)? {
+        if variant.is_file() {
+            remove_file_durable(&variant)?;
+        }
+    }
+    sync_parent_dir(delegated_path)?;
+    Ok(())
+}
+
+fn sweep_orphan_delegated_artifacts(delegated_path: &Path) -> Result<()> {
+    let replace_active = delegated_replace_pending_path(delegated_path).is_file();
+    if replace_active {
+        return Ok(());
+    }
+
+    let bak = delegated_path.with_extension("bak");
+    if bak.is_file() {
+        remove_file_durable(&bak)?;
+    }
+
+    let committing = delegated_committing_path(delegated_path);
+    if committing.is_file() {
+        remove_file_durable(&committing)?;
+    }
+
+    for variant in delegated_temp_and_quarantine_variants(delegated_path)? {
+        if variant.is_file() {
+            remove_file_durable(&variant)?;
+        }
+    }
+
+    sync_parent_dir(delegated_path)?;
+    Ok(())
+}
+
+/// Startup inventory for delegated authority artifacts.
+///
+/// Recover replace-pending transactions, quarantine orphans, and refuse to leave
+/// ambiguous half-written files that could be mistaken for committed authority.
+pub fn inventory_delegated_startup_authority(delegated_path: &Path) -> Result<()> {
+    let Some(parent) = delegated_path.parent() else {
+        return Ok(());
+    };
+    if !parent.exists() {
+        return Ok(());
+    }
+
+    if delegated_replace_pending_path(delegated_path).is_file() {
+        if let Err(err) = recover_delegated_replace_pending(delegated_path) {
+            tracing::warn!("delegated replace-pending recovery failed: {err:#}");
+            quarantine_delegated_startup_authority(delegated_path)?;
+            return Ok(());
+        }
+    }
+
+    sweep_orphan_delegated_artifacts(delegated_path)?;
+
+    if delegated_path.is_file() {
+        let loadable = match committed_delegated_session_parse(delegated_path) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(err) => {
+                tracing::warn!("delegated primary failed startup validation: {err:#}");
+                false
+            }
+        };
+        if !loadable {
+            tracing::warn!(
+                "delegated primary failed startup validation — quarantining {}",
+                delegated_path.display()
+            );
+            quarantine_delegated_primary_file(delegated_path)?;
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum WritePolicy<'a> {
     Plain,

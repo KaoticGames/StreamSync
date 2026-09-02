@@ -232,6 +232,12 @@ impl AppState {
         let revoked_tombstone = paths.twitch_delegated_revoked.is_file();
         let revoke_pending = paths.twitch_delegated_revoke_pending.is_file();
         let quarantine = revoked_tombstone || revoke_pending;
+        if !readonly && !quarantine {
+            if let Err(e) = storage::inventory_delegated_startup_authority(&paths.twitch_delegated)
+            {
+                tracing::warn!("delegated startup inventory failed: {e:#}");
+            }
+        }
         let replace_pending =
             storage::delegated_replace_pending_path(&paths.twitch_delegated).is_file();
         let delegated = if quarantine {
@@ -254,34 +260,15 @@ impl AppState {
                 );
                 None
             } else {
-                match storage::recover_delegated_replace_pending(&paths.twitch_delegated) {
-                    Ok(()) => {
-                        if paths.twitch_delegated.is_file() {
-                            read_json_for_mode(
-                                &paths.twitch_delegated,
-                                &DelegatedSessionFile::default(),
-                                readonly,
-                            )
-                            .ok()
-                            .filter(|d| !d.connection_key.is_empty() && !d.access_token.is_empty())
-                        } else {
-                            None
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("delegated replace-pending recovery failed: {e:#}");
-                        None
-                    }
-                }
+                tracing::warn!(
+                    "delegated replace-pending marker present after startup inventory — refusing delegated load"
+                );
+                None
             }
         } else if paths.twitch_delegated.is_file() {
-            read_json_for_mode(
-                &paths.twitch_delegated,
-                &DelegatedSessionFile::default(),
-                readonly,
-            )
-            .ok()
-            .filter(|d| !d.connection_key.is_empty() && !d.access_token.is_empty())
+            storage::committed_delegated_session_parse(&paths.twitch_delegated)
+                .ok()
+                .flatten()
         } else {
             None
         };

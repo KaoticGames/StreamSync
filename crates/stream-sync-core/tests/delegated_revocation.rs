@@ -872,6 +872,10 @@ fn acceptance_boundaries_document_manual_syndicate_integration() {
         storage_src.contains("delegated_committing_path"),
         "committing variant must be part of authority-bearing inventory"
     );
+    assert!(
+        storage_src.contains("inventory_delegated_startup_authority"),
+        "startup inventory must run before delegated activation"
+    );
 }
 
 #[tokio::test]
@@ -1067,4 +1071,86 @@ async fn startup_recovers_replace_pending_without_primary() {
     assert!(!committing.is_file());
     let loaded = state.delegated.read().await.clone().unwrap();
     assert_eq!(loaded.connection_key, "restored");
+}
+
+#[tokio::test]
+async fn startup_inventory_quarantines_orphan_delegated_tmp() {
+    let userdata = test_userdata_dir();
+    let primary = userdata.join("twitch-delegated.json");
+    let tmp = userdata.join(format!(
+        "twitch-delegated.tmp-{}-orphan",
+        std::process::id()
+    ));
+    std::fs::write(
+        &tmp,
+        br#"{"generation":99,"connection_key":"half","access_token":"half","client_id":"cid","channel_login":"c","channel_twitch_id":"1","twitch_expires_at":"2099-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    write_json(
+        &userdata.join("twitch-active-mode.json"),
+        &TwitchActiveModeFile {
+            mode: TwitchActiveMode::Delegated,
+        },
+    )
+    .unwrap();
+
+    let state = restart_app_at(&userdata, false);
+    assert!(!tmp.is_file(), "orphan tmp must be quarantined at startup");
+    assert!(!primary.is_file());
+    assert!(state.delegated.read().await.is_none());
+    assert_ne!(*state.active_mode.read().await, TwitchActiveMode::Delegated);
+}
+
+#[tokio::test]
+async fn startup_inventory_quarantines_committing_without_marker() {
+    let userdata = test_userdata_dir();
+    let primary = userdata.join("twitch-delegated.json");
+    let committing = primary.with_extension("committing");
+    std::fs::write(
+        &committing,
+        br#"{"generation":1,"connection_key":"staged","access_token":"at","client_id":"cid","channel_login":"c","channel_twitch_id":"1","twitch_expires_at":"2099-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    write_json(
+        &userdata.join("twitch-active-mode.json"),
+        &TwitchActiveModeFile {
+            mode: TwitchActiveMode::Delegated,
+        },
+    )
+    .unwrap();
+
+    let state = restart_app_at(&userdata, false);
+    assert!(!committing.is_file());
+    assert!(!primary.is_file());
+    assert!(state.delegated.read().await.is_none());
+    assert_ne!(*state.active_mode.read().await, TwitchActiveMode::Delegated);
+}
+
+#[tokio::test]
+async fn startup_inventory_quarantines_corrupt_delegated_primary() {
+    let userdata = test_userdata_dir();
+    let primary = userdata.join("twitch-delegated.json");
+    std::fs::write(&primary, br#"{"generation":1,"connection_key":"#).unwrap();
+    write_json(
+        &userdata.join("twitch-active-mode.json"),
+        &TwitchActiveModeFile {
+            mode: TwitchActiveMode::Delegated,
+        },
+    )
+    .unwrap();
+
+    let state = restart_app_at(&userdata, false);
+    assert!(!primary.is_file());
+    assert!(
+        std::fs::read_dir(&userdata)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .any(|p| p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("corrupt"))),
+        "corrupt delegated primary must be quarantined"
+    );
+    assert!(state.delegated.read().await.is_none());
+    assert_ne!(*state.active_mode.read().await, TwitchActiveMode::Delegated);
 }
