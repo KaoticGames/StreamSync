@@ -45,7 +45,8 @@ pub(crate) use identity_commit::{
     LiveApplySnapshot, PersonalTokensDurableSnapshot,
 };
 pub(crate) use platform_workers::{
-    current_live_worker_owner, start_platform_twitch_workers,
+    current_live_worker_owner, delegated_refresh_live_may_publish,
+    restart_delegated_refresh_platform_workers,
     stop_platform_twitch_workers_for_delegated_generation, stop_platform_twitch_workers_for_owner,
     transition_platform_twitch_workers, WorkerOwner,
 };
@@ -2458,27 +2459,6 @@ async fn delegated_refresh_may_commit(
     lease.allows_syndicate_revalidation(generation)
 }
 
-async fn delegated_refresh_live_may_publish(
-    state: &AppState,
-    services: &TwitchServices,
-    generation: DelegatedGeneration,
-) -> bool {
-    if !state.is_delegated_mode().await {
-        return false;
-    }
-    if state.current_delegated_generation() != generation {
-        return false;
-    }
-    if !state.session_still_current(generation).await {
-        return false;
-    }
-    if services.authority_lease_expired().await {
-        return false;
-    }
-    let lease = services.read_authority_lease().await;
-    lease.allows_platform_operations(generation)
-}
-
 /// Publish refreshed Twitch/Kick live state only when `generation` remains current.
 async fn publish_delegated_refresh_live_if_current(
     state: Arc<AppState>,
@@ -2497,19 +2477,14 @@ async fn publish_delegated_refresh_live_if_current(
                 tw.tokens = install_tokens_from_exchange(exchange);
             }
             info!("delegated Twitch token refreshed for {}", channel_login);
-            stop_platform_twitch_workers_for_delegated_generation(&services, generation).await;
-            delegated_refresh_live_may_publish(&state, &services, generation).await
+            true
         }
     };
 
     if should_restart_twitch {
-        start_platform_twitch_workers(
-            state.clone(),
-            services.clone(),
-            WorkerOwner::delegated(generation),
-            None,
-        )
-        .await;
+        refresh_twitch_publish_gate_pause_if_installed().await;
+        restart_delegated_refresh_platform_workers(state.clone(), services.clone(), generation)
+            .await;
     } else if state.session_still_current(generation).await {
         info!(
             "delegated Twitch token refreshed (inactive) for {}",

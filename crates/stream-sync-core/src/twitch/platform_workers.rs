@@ -65,6 +65,44 @@ pub(crate) async fn platform_workers_may_start(
     }
 }
 
+pub(crate) async fn delegated_refresh_live_may_publish(
+    state: &AppState,
+    services: &TwitchServices,
+    generation: DelegatedGeneration,
+) -> bool {
+    if !state.is_delegated_mode().await {
+        return false;
+    }
+    if state.current_delegated_generation() != generation {
+        return false;
+    }
+    if !state.session_still_current(generation).await {
+        return false;
+    }
+    if services.authority_lease_expired().await {
+        return false;
+    }
+    let lease = services.read_authority_lease().await;
+    lease.allows_platform_operations(generation)
+}
+
+/// Owner-scoped IRC/EventSub restart for delegated refresh live publication.
+pub(crate) async fn restart_delegated_refresh_platform_workers(
+    state: Arc<AppState>,
+    services: Arc<TwitchServices>,
+    generation: DelegatedGeneration,
+) {
+    let owner = WorkerOwner::delegated(generation);
+    if !delegated_refresh_live_may_publish(&state, &services, generation).await {
+        return;
+    }
+    stop_platform_twitch_workers_for_owner(&services, owner).await;
+    if !delegated_refresh_live_may_publish(&state, &services, generation).await {
+        return;
+    }
+    start_platform_twitch_workers(state, services, owner, None).await;
+}
+
 pub(crate) async fn stop_platform_twitch_workers_for_owner(
     services: &TwitchServices,
     owner: WorkerOwner,
