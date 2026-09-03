@@ -380,9 +380,14 @@ pub fn auth_url(state: &AppState, flow_nonce: &str) -> String {
 }
 
 pub async fn sync_live_identity(state: Arc<AppState>) {
+    let mode = *state.active_mode.read().await;
     let generation = state.current_delegated_generation();
-    if generation > 0 && state.session_still_current(generation).await {
-        sync_live_identity_for_generation(state, generation, None).await;
+    if mode == TwitchActiveMode::Delegated {
+        if generation > 0 && state.session_still_current(generation).await {
+            sync_live_identity_for_generation(state, generation, None).await;
+        }
+        // Delegated mode with gen>0 but session already cleared: do not fall through to
+        // unchecked restart_feed (would abort a concurrent winner's Kick handle).
         return;
     }
     sync_live_identity_unchecked(state).await;
