@@ -2221,6 +2221,16 @@ static REFRESH_LIVE_GATE: OnceLock<RefreshGateMutex<Option<RefreshCommitGateStat
 static REFRESH_TWITCH_PUBLISH_GATE: OnceLock<RefreshGateMutex<Option<RefreshCommitGateState>>> =
     OnceLock::new();
 
+/// Pause immediately before building-wide IRC/EventSub abort (pre-merge proof races).
+#[cfg(test)]
+static TEARDOWN_PLATFORM_STOP_GATE: OnceLock<RefreshGateMutex<Option<RefreshCommitGateState>>> =
+    OnceLock::new();
+
+/// Pause personal IRC after join, before publishing the client/handle (pre-merge proof races).
+#[cfg(test)]
+static PERSONAL_IRC_PUBLISH_GATE: OnceLock<RefreshGateMutex<Option<RefreshCommitGateState>>> =
+    OnceLock::new();
+
 #[cfg(test)]
 static APPLY_DURABLE_GATE: OnceLock<RefreshGateMutex<Option<ApplyDurableGateState>>> =
     OnceLock::new();
@@ -2255,6 +2265,8 @@ pub(crate) fn clear_refresh_twitch_gates_blocking() {
         REFRESH_COMMIT_GATE.get(),
         REFRESH_LIVE_GATE.get(),
         REFRESH_TWITCH_PUBLISH_GATE.get(),
+        TEARDOWN_PLATFORM_STOP_GATE.get(),
+        PERSONAL_IRC_PUBLISH_GATE.get(),
     ]
     .into_iter()
     .flatten()
@@ -2326,6 +2338,40 @@ pub(crate) async fn install_refresh_live_gate() -> (
     (RefreshGateCleanup, arrived_rx, resume_tx)
 }
 
+/// Pause teardown immediately before `stop_twitch_clients` aborts global IRC/EventSub slots.
+#[cfg(test)]
+pub(crate) async fn install_teardown_platform_stop_gate() -> (
+    RefreshGateCleanup,
+    oneshot::Receiver<()>,
+    oneshot::Sender<()>,
+) {
+    let (arrived_tx, arrived_rx) = oneshot::channel();
+    let (resume_tx, resume_rx) = oneshot::channel();
+    let slot = TEARDOWN_PLATFORM_STOP_GATE.get_or_init(|| RefreshGateMutex::new(None));
+    *slot.lock().unwrap() = Some(RefreshCommitGateState {
+        arrived: arrived_tx,
+        resume: resume_rx,
+    });
+    (RefreshGateCleanup, arrived_rx, resume_tx)
+}
+
+/// Pause personal IRC after channel join, before publishing client/handle into global slots.
+#[cfg(test)]
+pub(crate) async fn install_personal_irc_publish_gate() -> (
+    RefreshGateCleanup,
+    oneshot::Receiver<()>,
+    oneshot::Sender<()>,
+) {
+    let (arrived_tx, arrived_rx) = oneshot::channel();
+    let (resume_tx, resume_rx) = oneshot::channel();
+    let slot = PERSONAL_IRC_PUBLISH_GATE.get_or_init(|| RefreshGateMutex::new(None));
+    *slot.lock().unwrap() = Some(RefreshCommitGateState {
+        arrived: arrived_tx,
+        resume: resume_rx,
+    });
+    (RefreshGateCleanup, arrived_rx, resume_tx)
+}
+
 #[cfg(test)]
 async fn pause_refresh_gate(slot: Option<&RefreshGateMutex<Option<RefreshCommitGateState>>>) {
     let Some(slot) = slot else {
@@ -2357,6 +2403,16 @@ async fn refresh_twitch_publish_gate_pause_if_installed() {
     pause_refresh_gate(REFRESH_TWITCH_PUBLISH_GATE.get()).await;
 }
 
+#[cfg(test)]
+async fn teardown_platform_stop_gate_pause_if_installed() {
+    pause_refresh_gate(TEARDOWN_PLATFORM_STOP_GATE.get()).await;
+}
+
+#[cfg(test)]
+async fn personal_irc_publish_gate_pause_if_installed() {
+    pause_refresh_gate(PERSONAL_IRC_PUBLISH_GATE.get()).await;
+}
+
 #[cfg(not(test))]
 async fn refresh_commit_gate_pause_if_installed() {}
 
@@ -2365,6 +2421,12 @@ async fn refresh_live_gate_pause_if_installed() {}
 
 #[cfg(not(test))]
 async fn refresh_twitch_publish_gate_pause_if_installed() {}
+
+#[cfg(not(test))]
+async fn teardown_platform_stop_gate_pause_if_installed() {}
+
+#[cfg(not(test))]
+async fn personal_irc_publish_gate_pause_if_installed() {}
 
 #[cfg(test)]
 pub(crate) struct ApplyDurableGateCleanup;
@@ -3139,6 +3201,7 @@ fn observe_and_restart_finished_worker(
 }
 
 async fn stop_twitch_clients(services: &TwitchServices) {
+    teardown_platform_stop_gate_pause_if_installed().await;
     *services.irc_client.write().await = None;
     if let Some(h) = services.irc_handle.write().await.take() {
         h.abort();
@@ -3268,6 +3331,8 @@ async fn start_irc(
             let feed = state.feed.clone();
             let services_task = services.clone();
             client.join(channel.clone()).ok();
+            // Pre-merge proof: pause after unlocked join, before publishing into global slots.
+            personal_irc_publish_gate_pause_if_installed().await;
             let handle = tokio::spawn(async move {
                 while let Some(message) = incoming.recv().await {
                     if !services_task.personal_token_generation_still_current(local_gen) {
@@ -7506,6 +7571,313 @@ mod tests {
         let _guard = PHASE2_TEST_LOCK.lock().await;
         for _ in 0..20 {
             use_connection_delegated_post_commit_winner_survives_once().await;
+        }
+    }
+
+    fn assert_join_handle_alive(handle: &Option<tokio::task::JoinHandle<()>>, label: &str) {
+        let h = handle
+            .as_ref()
+            .unwrap_or_else(|| panic!("{label}: handle missing"));
+        assert!(
+            !h.is_finished(),
+            "{label}: winner handle was aborted by stale teardown/start"
+        );
+    }
+
+    /// Pre-merge proof: gen-1 teardown paused at `stop_twitch_clients` must not abort a personal winner.
+    async fn premerge_teardown_gen1_vs_personal_winner_once() {
+        let (state, services) = phase2_app().await;
+        services.init_teardown_worker();
+        activate_delegated_gen1(&state, &services).await;
+        // No personal tokens → execute takes the stop_twitch_clients branch.
+        *state.personal_tokens.write().await = TwitchTokenFile::default();
+
+        let (_gate, arrived_rx, resume_tx) = super::install_teardown_platform_stop_gate().await;
+        let state_t = state.clone();
+        let services_t = services.clone();
+        let teardown = tokio::spawn(async move {
+            services_t
+                .signal_delegated_teardown(state_t, 1, "revoked")
+                .await
+        });
+        gate_wait(
+            arrived_rx,
+            "teardown must pause before building-wide Twitch stop",
+        )
+        .await;
+
+        // Winner occupies the global slots while gen-1 teardown is mid-stop.
+        let local_gen = services.bump_personal_token_generation();
+        *state.active_mode.write().await = TwitchActiveMode::Local;
+        install_fake_personal_platform_workers(&state, &services, local_gen).await;
+        let winner = platform_worker_snapshot(&state, &services).await;
+        resume_tx.send(()).expect("resume teardown platform stop");
+        let _ = task_join_with_timeout(teardown, "teardown gen1").await;
+
+        assert_eq!(
+            platform_worker_snapshot(&state, &services).await,
+            winner,
+            "gen-1 teardown must not replace personal winner platform handles"
+        );
+        assert_join_handle_alive(&*services.irc_handle.read().await, "personal irc");
+        assert_join_handle_alive(&*services.eventsub_handle.read().await, "personal eventsub");
+        assert_join_handle_alive(&*state.kick_feed_handle.read().await, "personal kick feed");
+        stop_all_platform_workers(&state, &services).await;
+    }
+
+    #[tokio::test]
+    async fn premerge_teardown_gen1_vs_personal_winner_handles() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for _ in 0..20 {
+            premerge_teardown_gen1_vs_personal_winner_once().await;
+        }
+    }
+
+    /// Pre-merge proof: gen-1 teardown paused at `stop_twitch_clients` must not abort a gen-2 winner.
+    async fn premerge_teardown_gen1_vs_delegated_gen2_winner_once() {
+        let (state, services) = phase2_app().await;
+        services.init_teardown_worker();
+        activate_delegated_gen1(&state, &services).await;
+        *state.personal_tokens.write().await = TwitchTokenFile::default();
+
+        let (_gate, arrived_rx, resume_tx) = super::install_teardown_platform_stop_gate().await;
+        let state_t = state.clone();
+        let services_t = services.clone();
+        let teardown = tokio::spawn(async move {
+            services_t
+                .signal_delegated_teardown(state_t, 1, "revoked")
+                .await
+        });
+        gate_wait(
+            arrived_rx,
+            "teardown must pause before building-wide Twitch stop",
+        )
+        .await;
+
+        // Winner installs without taking lifecycle_lock (held by paused teardown).
+        state.publish_delegated_generation(2);
+        let mut session = sample_delegated();
+        session.generation = 2;
+        session.access_token = "gen2-token".into();
+        session.connection_key = "ssk_phase2_replacement_2".into();
+        session.kick_access_token = Some("gen2-token-kick".into());
+        *state.delegated.write().await = Some(session);
+        *state.active_mode.write().await = TwitchActiveMode::Delegated;
+        let winner = install_winner_platform_workers(&state, &services, 2).await;
+        resume_tx.send(()).expect("resume teardown platform stop");
+        let _ = task_join_with_timeout(teardown, "teardown gen1").await;
+
+        assert_eq!(
+            platform_worker_snapshot(&state, &services).await,
+            winner,
+            "gen-1 teardown must not replace delegated gen-2 winner handles"
+        );
+        assert_join_handle_alive(&*services.irc_handle.read().await, "gen2 irc");
+        assert_join_handle_alive(&*services.eventsub_handle.read().await, "gen2 eventsub");
+        assert_join_handle_alive(&*state.kick_feed_handle.read().await, "gen2 kick feed");
+        stop_all_platform_workers(&state, &services).await;
+    }
+
+    #[tokio::test]
+    async fn premerge_teardown_gen1_vs_delegated_gen2_winner_handles() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for _ in 0..20 {
+            premerge_teardown_gen1_vs_delegated_gen2_winner_once().await;
+        }
+    }
+
+    /// Pre-merge proof: after Local personal winner, gen-1 revoke must not abort personal Kick feed.
+    async fn premerge_teardown_after_local_switch_preserves_personal_kick_once() {
+        let (state, services) = phase2_app().await;
+        services.init_teardown_worker();
+        activate_delegated_gen1(&state, &services).await;
+        *state.personal_tokens.write().await = sample_personal();
+        state.save_twitch_tokens().await.unwrap();
+        *state.personal_kick.write().await = crate::config_types::KickTokenFile {
+            access_token: Some("personal-kick".into()),
+            kick_id: Some("pk1".into()),
+            ..Default::default()
+        };
+        state.save_kick_tokens().await.unwrap();
+
+        // Local winner already live; delegated gen/memory still 1 (saved takeover retained).
+        *state.active_mode.write().await = TwitchActiveMode::Local;
+        state.save_active_mode().await.unwrap();
+        {
+            let mut tw = state.twitch.write().await;
+            tw.tokens = sample_personal();
+        }
+        services.install_inactive_maintenance_lease(1).await;
+        let local_gen = services.bump_personal_token_generation();
+        install_fake_personal_platform_workers(&state, &services, local_gen).await;
+        let winner = platform_worker_snapshot(&state, &services).await;
+
+        services
+            .signal_delegated_teardown(state.clone(), 1, "revoked")
+            .await
+            .expect("teardown gen1 after local switch");
+
+        assert_eq!(
+            platform_worker_snapshot(&state, &services).await,
+            winner,
+            "gen-1 revoke after Local switch must leave personal platform handles alone"
+        );
+        assert_join_handle_alive(&*services.irc_handle.read().await, "personal irc");
+        assert_join_handle_alive(&*services.eventsub_handle.read().await, "personal eventsub");
+        assert_join_handle_alive(&*state.kick_feed_handle.read().await, "personal kick feed");
+        stop_all_platform_workers(&state, &services).await;
+    }
+
+    #[tokio::test]
+    async fn premerge_teardown_after_local_switch_preserves_personal_kick() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for _ in 0..20 {
+            premerge_teardown_after_local_switch_preserves_personal_kick_once().await;
+        }
+    }
+
+    /// Pre-merge proof: `sync_live_identity` while delegated is live must keep delegated Kick live.
+    async fn premerge_sync_live_identity_while_delegated_live_once() {
+        let (state, services) = phase2_app().await;
+        activate_delegated_gen1(&state, &services).await;
+        {
+            let mut d = state.delegated.write().await;
+            if let Some(s) = d.as_mut() {
+                s.kick_access_token = Some("delegated-kick".into());
+                s.kick_id = Some("k1".into());
+            }
+        }
+        let forever = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        *state.kick_feed_handle.write().await = Some(forever);
+        {
+            let mut k = state.kick.write().await;
+            k.tokens.access_token = Some("delegated-kick".into());
+            k.tokens.kick_id = Some("k1".into());
+            k.connected = true;
+        }
+
+        crate::kick::sync_live_identity(state.clone()).await;
+
+        assert_eq!(*state.active_mode.read().await, TwitchActiveMode::Delegated);
+        assert_eq!(
+            state.kick.read().await.tokens.access_token.as_deref(),
+            Some("delegated-kick")
+        );
+        assert!(
+            state.kick.read().await.tokens.is_linked(),
+            "delegated Kick must remain linked after sync_live_identity"
+        );
+        stop_all_platform_workers(&state, &services).await;
+    }
+
+    #[tokio::test]
+    async fn premerge_sync_live_identity_while_delegated_live() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for _ in 0..20 {
+            premerge_sync_live_identity_while_delegated_live_once().await;
+        }
+    }
+
+    /// Pre-merge proof: gen>0 but session gone must not fall through to unchecked feed abort.
+    async fn premerge_sync_live_identity_nonzero_gen_without_session_does_not_abort_feed_once() {
+        let (state, services) = phase2_app().await;
+        activate_delegated_gen1(&state, &services).await;
+        // Mid-teardown shape: generation still 1, memory already cleared.
+        *state.delegated.write().await = None;
+        let forever = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        let feed_id = forever.id();
+        *state.kick_feed_handle.write().await = Some(forever);
+        {
+            let mut k = state.kick.write().await;
+            k.tokens.access_token = Some("winner-kick".into());
+            k.tokens.kick_id = Some("w1".into());
+            k.connected = true;
+        }
+
+        crate::kick::sync_live_identity(state.clone()).await;
+
+        assert_eq!(
+            state.kick_feed_handle.read().await.as_ref().map(|h| h.id()),
+            Some(feed_id),
+            "unchecked Kick sync must not abort a live feed when generation is non-zero but session is gone"
+        );
+        assert_join_handle_alive(&*state.kick_feed_handle.read().await, "winner kick feed");
+        assert_eq!(
+            state.kick.read().await.tokens.access_token.as_deref(),
+            Some("winner-kick")
+        );
+        stop_all_platform_workers(&state, &services).await;
+    }
+
+    #[tokio::test]
+    async fn premerge_sync_live_identity_nonzero_gen_without_session_does_not_abort_feed() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for _ in 0..20 {
+            premerge_sync_live_identity_nonzero_gen_without_session_does_not_abort_feed_once()
+                .await;
+        }
+    }
+
+    /// Pre-merge proof: superseded personal IRC must not publish into the winner's slot.
+    async fn premerge_personal_irc_superseded_before_publish_once() {
+        let (state, services) = phase2_app().await;
+        *state.personal_tokens.write().await = sample_personal();
+        state.save_twitch_tokens().await.unwrap();
+        *state.active_mode.write().await = TwitchActiveMode::Local;
+        state.save_active_mode().await.unwrap();
+        {
+            let mut tw = state.twitch.write().await;
+            tw.tokens = sample_personal();
+        }
+        let stale_gen = services.bump_personal_token_generation();
+        assert_eq!(stale_gen, 1);
+
+        let (_gate, arrived_rx, resume_tx) = super::install_personal_irc_publish_gate().await;
+        let state_s = state.clone();
+        let services_s = services.clone();
+        let stale_start = tokio::spawn(async move {
+            start_irc(state_s, services_s, WorkerOwner::personal(stale_gen)).await
+        });
+        gate_wait(
+            arrived_rx,
+            "personal IRC must pause after join before publish",
+        )
+        .await;
+
+        let winner_gen = services.bump_personal_token_generation();
+        install_fake_personal_platform_workers(&state, &services, winner_gen).await;
+        let winner = platform_worker_snapshot(&state, &services).await;
+        let winner_owner = services.irc_client.read().await.as_ref().map(|b| b.owner);
+        resume_tx.send(()).expect("resume personal IRC publish");
+        let _ = task_join_with_timeout(stale_start, "stale personal IRC start").await;
+
+        assert_eq!(
+            platform_worker_snapshot(&state, &services).await.irc,
+            winner.irc,
+            "superseded personal IRC must not replace winner IRC handle"
+        );
+        assert_eq!(
+            services.irc_client.read().await.as_ref().map(|b| b.owner),
+            winner_owner,
+            "superseded personal IRC must not overwrite winner owner bundle"
+        );
+        assert_join_handle_alive(&*services.irc_handle.read().await, "winner personal irc");
+        stop_all_platform_workers(&state, &services).await;
+    }
+
+    #[tokio::test]
+    async fn premerge_personal_irc_superseded_before_publish_does_not_install() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        for _ in 0..20 {
+            premerge_personal_irc_superseded_before_publish_once().await;
         }
     }
 }
