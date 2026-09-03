@@ -1727,8 +1727,10 @@ async fn strip_in_memory_delegated_authority(
         tw.tokens = TwitchTokenFile::default();
     }
     stop_delegated_worker_handles(&services.refresh_handle, &services.watch_handle, None).await;
-    stop_twitch_clients(services).await;
+    // Kick first, before the platform-stop gate, so a concurrent winner that installs during
+    // the Twitch stop pause is not aborted by this teardown.
     crate::kick::teardown_delegated_kick_live(state).await;
+    stop_twitch_clients_for_delegated_generation(services, generation).await;
 }
 
 /// Absolute-lease fail-closed for *active* delegated mode.
@@ -1889,6 +1891,9 @@ async fn execute_delegated_teardown(
         let disk_delegated = disk_active_mode_is_delegated(&state);
         let need_mode = mem_delegated || disk_delegated;
         if need_mode && state.current_delegated_generation() == generation {
+            // Tear down Kick under the lock before the Twitch stop gate so a concurrent
+            // winner installing during that pause is not aborted afterward.
+            crate::kick::teardown_delegated_kick_live(&state).await;
             let personal = state.personal_tokens.read().await.clone();
             if tokens_saved(&personal) {
                 {
@@ -1901,7 +1906,7 @@ async fn execute_delegated_teardown(
                     return Err(e.to_string());
                 }
             } else {
-                stop_twitch_clients(&services).await;
+                stop_twitch_clients_for_delegated_generation(&services, generation).await;
                 let mut tw = state.twitch.write().await;
                 tw.tokens = TwitchTokenFile::default();
                 clear_live_runtime_fields(&mut tw);
@@ -1916,7 +1921,6 @@ async fn execute_delegated_teardown(
     };
 
     // 5. Fallback/restart personal after mode persisted.
-    crate::kick::teardown_delegated_kick_live(&state).await;
     if need_personal_fallback && state.current_delegated_generation() == generation {
         let personal_ok = tokens_saved(&state.personal_tokens.read().await.clone());
         if personal_ok {
@@ -1929,9 +1933,14 @@ async fn execute_delegated_teardown(
                 None,
             )
             .await;
+            sync_kick_for_active_identity(state.clone(), services).await;
         }
-        sync_kick_for_active_identity(state.clone(), services).await;
-    } else if state.current_delegated_generation() == generation {
+        // No personal: Kick was already cleared under the lock before the Twitch stop gate.
+        // Do not unchecked-restart afterward (would abort a concurrent winner's Kick feed).
+    } else if state.current_delegated_generation() == generation
+        && *state.active_mode.read().await == TwitchActiveMode::Delegated
+    {
+        crate::kick::teardown_delegated_kick_live(&state).await;
         crate::kick::sync_live_identity_for_generation(state, generation, Some(&services)).await;
     }
     Ok(())
@@ -2338,7 +2347,7 @@ pub(crate) async fn install_refresh_live_gate() -> (
     (RefreshGateCleanup, arrived_rx, resume_tx)
 }
 
-/// Pause teardown immediately before `stop_twitch_clients` aborts global IRC/EventSub slots.
+/// Pause teardown immediately before owner-scoped IRC/EventSub stop for a revoked generation.
 #[cfg(test)]
 pub(crate) async fn install_teardown_platform_stop_gate() -> (
     RefreshGateCleanup,
@@ -3200,16 +3209,13 @@ fn observe_and_restart_finished_worker(
     });
 }
 
-async fn stop_twitch_clients(services: &TwitchServices) {
+/// Stop IRC/EventSub only when owned by `generation` (never a newer personal/delegated winner).
+async fn stop_twitch_clients_for_delegated_generation(
+    services: &TwitchServices,
+    generation: DelegatedGeneration,
+) {
     teardown_platform_stop_gate_pause_if_installed().await;
-    *services.irc_client.write().await = None;
-    if let Some(h) = services.irc_handle.write().await.take() {
-        h.abort();
-    }
-    if let Some(h) = services.eventsub_handle.write().await.take() {
-        h.abort();
-    }
-    *services.eventsub_owner.write().await = None;
+    stop_platform_twitch_workers_for_delegated_generation(services, generation).await;
 }
 
 async fn start_irc(
@@ -4731,7 +4737,16 @@ mod tests {
                 }
             })
         };
+        let generation = state.current_delegated_generation().max(1);
+        let snap = services.authority_lease_snapshot_public().await;
+        services
+            .install_irc_bundle_for_test(
+                PlatformCredentialProvenance::Delegated { snap },
+                WorkerOwner::delegated(generation),
+            )
+            .await;
         *services.irc_handle.write().await = Some(forever());
+        *services.eventsub_owner.write().await = Some(WorkerOwner::delegated(generation));
         *services.eventsub_handle.write().await = Some(forever());
         *state.kick_feed_handle.write().await = Some(forever());
         {
@@ -6118,7 +6133,15 @@ mod tests {
                 }
             })
         };
+        let snap = services.authority_lease_snapshot_public().await;
+        services
+            .install_irc_bundle_for_test(
+                PlatformCredentialProvenance::Delegated { snap },
+                WorkerOwner::delegated(generation),
+            )
+            .await;
         *services.irc_handle.write().await = Some(forever());
+        *services.eventsub_owner.write().await = Some(WorkerOwner::delegated(generation));
         *services.eventsub_handle.write().await = Some(forever());
         *state.kick_feed_handle.write().await = Some(forever());
         *services.refresh_handle.write().await = Some(GenerationTask {
