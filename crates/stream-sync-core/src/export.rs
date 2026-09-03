@@ -190,10 +190,16 @@ mod tests {
     use super::*;
     use crate::storage::StoragePaths;
     use std::io::Read;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static EXPORT_TEST_SEQ: AtomicU64 = AtomicU64::new(0);
 
     fn temp_paths() -> (std::path::PathBuf, StoragePaths) {
-        let root =
-            std::env::temp_dir().join(format!("stream-sync-export-test-{}", std::process::id()));
+        let n = EXPORT_TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "stream-sync-export-test-{}-{n}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("mkdir");
         fs::write(root.join("overlay-config.json"), r#"{"profiles":{}}"#).unwrap();
@@ -207,11 +213,14 @@ mod tests {
             twitch_tokens: root.join("twitch-tokens.json"),
             kick_tokens: root.join("kick-tokens.json"),
             twitch_delegated: root.join("twitch-delegated.json"),
+            twitch_delegated_revoked: root.join("twitch-delegated.revoked"),
+            twitch_delegated_revoke_pending: root.join("twitch-delegated.revoke-pending"),
             twitch_active_mode: root.join("twitch-active-mode.json"),
             fonts_dir: root.join("fonts"),
             events_media_dir: root.join("events-media"),
             control_token: root.join("control-token.txt"),
             dock_credentials: root.join("dock-credentials.json"),
+            twitch_tokens_rollback_pending: root.join("twitch-tokens.rollback-pending"),
         };
         (root, paths)
     }

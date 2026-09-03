@@ -224,6 +224,23 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn write_secret_file_does_not_chmod_parent_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = std::env::temp_dir();
+        let mode_before = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        let path = parent.join(format!(
+            "streamsync-dock-parent-mode-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        storage::write_secret_file(&path, b"secret").unwrap();
+        let mode_after = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_before, mode_after);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn dock_token_cannot_look_like_master() {
         let path = tmp_path();
         let _ = std::fs::remove_file(&path);

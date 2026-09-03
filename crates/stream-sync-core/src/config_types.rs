@@ -361,8 +361,11 @@ pub struct TwitchTokenFile {
 }
 
 /// Persisted Syndicate connection-key (takeover) session. Not mixed into personal tokens.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct DelegatedSessionFile {
+    /// Monotonic session generation — stale workers must not mutate a newer session.
+    #[serde(default)]
+    pub generation: u64,
     pub connection_key: String,
     pub client_id: String,
     pub access_token: String,

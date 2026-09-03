@@ -458,6 +458,7 @@ async fn api_status(State(ctx): State<ServerContext>) -> Json<Value> {
             .and_then(|d| d.kick_id.clone())
             .is_some();
     Json(json!({
+        "identityRecoveryRequired": ctx.state.identity_recovery_required(),
         "twitch": {
             "connected": tw.connected,
             "channel": tw.channel,
@@ -1518,12 +1519,22 @@ async fn post_remove_connection(
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn post_disconnect(State(ctx): State<ServerContext>) -> Json<Value> {
+async fn post_disconnect(State(ctx): State<ServerContext>) -> Response {
     if ctx.state.readonly {
-        return Json(json!({ "ok": false, "error": "readonly" }));
+        return Json(json!({ "ok": false, "error": "readonly" })).into_response();
     }
-    let _ = twitch::disconnect_twitch(ctx.state.clone(), ctx.twitch.clone()).await;
-    Json(json!({ "ok": true }))
+    match twitch::disconnect_twitch(ctx.state.clone(), ctx.twitch.clone()).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "ok": false,
+                "error": "disconnect_failed",
+                "message": e.to_string(),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_kick_auth_url(State(ctx): State<ServerContext>) -> Json<Value> {

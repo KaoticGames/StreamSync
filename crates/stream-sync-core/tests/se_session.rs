@@ -1,6 +1,8 @@
 //! StreamElements session file I/O (no live SE API).
 
-use stream_sync_core::{get_paths, se_clear_session, se_load_session, se_save_session, SeSession};
+use stream_sync_core::{
+    paths_for_root, se_clear_session, se_load_session, se_save_session, SeSession,
+};
 
 #[test]
 fn se_session_save_load_clear() {
@@ -10,9 +12,8 @@ fn se_session_save_load_clear() {
         chrono::Utc::now().timestamp_millis()
     ));
     std::fs::create_dir_all(&dir).expect("temp dir");
-    std::env::set_var("STREAMSYNC_USERDATA", dir.to_str().unwrap());
 
-    let paths = get_paths().expect("paths");
+    let paths = paths_for_root(&dir, false).expect("paths");
     let session = SeSession {
         jwt: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0In0.test".into(),
         account_id: "account123".into(),

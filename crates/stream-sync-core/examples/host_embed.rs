@@ -17,6 +17,7 @@ async fn main() -> anyhow::Result<()> {
         port: 4041,
         repo_root: repo,
         readonly: true,
+        userdata_root: None,
     };
 
     OverlayServer::new(config).run().await

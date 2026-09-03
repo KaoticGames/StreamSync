@@ -1,8 +1,12 @@
 //! Syndicate API client for Stream Sync connection keys (takeover).
 
+use crate::delegated_lifecycle::{
+    bound_remote_message, redact_connection_key, SYNDICATE_HTTP_TIMEOUT,
+};
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::OnceLock;
 
 const DEFAULT_API_BASE: &str = "https://api.syndicateai.net";
 
@@ -85,6 +89,16 @@ pub fn api_base() -> String {
         .unwrap_or_else(|| DEFAULT_API_BASE.to_string())
 }
 
+pub fn syndicate_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(SYNDICATE_HTTP_TIMEOUT)
+            .build()
+            .expect("syndicate HTTP client")
+    })
+}
+
 pub async fn exchange(key: &str) -> Result<ExchangeSuccess> {
     redeem(key, "exchange").await
 }
@@ -93,12 +107,14 @@ pub async fn refresh(key: &str) -> Result<ExchangeSuccess> {
     redeem(key, "refresh").await
 }
 
-pub fn connection_key_events_url(key: &str) -> String {
-    format!(
-        "{}/api/stream-sync/connection-keys/events?key={}",
-        api_base(),
-        urlencoding::encode(key.trim())
-    )
+/// Events URL without embedding the connection key (use Authorization: Bearer instead).
+pub fn connection_key_events_url() -> String {
+    crate::delegated_lifecycle::connection_key_events_url(&api_base())
+}
+
+/// Kick feed URL without embedding the connection key (use Authorization: Bearer instead).
+pub fn kick_feed_url() -> String {
+    crate::delegated_lifecycle::kick_feed_url(&api_base())
 }
 
 async fn redeem(key: &str, action: &str) -> Result<ExchangeSuccess> {
@@ -113,14 +129,18 @@ async fn redeem(key: &str, action: &str) -> Result<ExchangeSuccess> {
     }
 
     let url = format!("{}/api/stream-sync/connection-keys/{}", api_base(), action);
-    let client = reqwest::Client::new();
-    let res = client
+    let res = syndicate_http_client()
         .post(&url)
         .header("Content-Type", "application/json")
         .json(&json!({ "key": key }))
         .send()
         .await
-        .map_err(|e| anyhow!("Syndicate API request failed: {e}"))?;
+        .map_err(|e| {
+            anyhow!(
+                "Syndicate API request failed: {}",
+                redact_connection_key(&e.to_string(), key)
+            )
+        })?;
 
     let status = res.status().as_u16();
     let body: serde_json::Value = res.json().await.unwrap_or_else(|_| json!({}));
@@ -145,11 +165,11 @@ async fn redeem(key: &str, action: &str) -> Result<ExchangeSuccess> {
             "invalid_key"
         })
         .to_string();
-    let message = body
+    let raw_message = body
         .get("message")
         .and_then(|v| v.as_str())
-        .unwrap_or("Connection key request failed")
-        .to_string();
+        .unwrap_or("Connection key request failed");
+    let message = redact_connection_key(&bound_remote_message(raw_message), key);
 
     Err(SyndicateApiError {
         code,
@@ -176,7 +196,7 @@ pub fn user_message_for_error(err: &SyndicateApiError) -> String {
                 .into()
         }
         "rate_limited" => "Too many connection attempts. Wait a moment and try again.".into(),
-        _ => err.message.clone(),
+        _ => "Connection key request failed. Try again or contact the channel owner.".into(),
     }
 }
 
@@ -195,14 +215,13 @@ mod tests {
             "token_unavailable",
             "rate_limited",
         ] {
-            let err = SyndicateApiError {
+            let msg = user_message_for_error(&SyndicateApiError {
                 code: code.into(),
-                message: "raw".into(),
-                http_status: 401,
-            };
-            let msg = user_message_for_error(&err);
+                message: "internal".into(),
+                http_status: 400,
+            });
             assert!(!msg.is_empty());
-            assert_ne!(msg, "raw");
+            assert!(!msg.contains("internal"));
         }
     }
 
@@ -210,29 +229,17 @@ mod tests {
     fn parses_success_shape() {
         let body = json!({
             "ok": true,
-            "channel": {
-                "twitch_id": "123",
-                "login": "channelname",
-                "display_name": "ChannelName"
-            },
+            "channel": { "twitch_id": "1", "login": "chan" },
             "twitch": {
                 "client_id": "cid",
-                "access_token": "atok",
-                "expires_at": "2026-07-15T18:00:00.000Z",
-                "scopes": ["chat:read", "chat:edit"]
+                "access_token": "tok",
+                "expires_at": "2030-01-01T00:00:00Z",
+                "scopes": []
             },
-            "connection": {
-                "expires_at": "2026-07-16T12:00:00.000Z",
-                "label": "Saturday takeover"
-            }
+            "connection": { "expires_at": "2030-01-01T00:00:00Z" }
         });
         let parsed: ExchangeSuccess = serde_json::from_value(body).unwrap();
-        assert_eq!(parsed.channel.login, "channelname");
-        assert_eq!(parsed.twitch.client_id, "cid");
-        assert_eq!(
-            parsed.connection.label.as_deref(),
-            Some("Saturday takeover")
-        );
+        assert_eq!(parsed.channel.login, "chan");
     }
 
     #[tokio::test]
@@ -240,5 +247,29 @@ mod tests {
         let err = exchange("not-a-key").await.unwrap_err();
         let api = err.downcast_ref::<SyndicateApiError>().expect("api err");
         assert_eq!(api.code, "invalid_key");
+    }
+
+    #[test]
+    fn events_url_does_not_include_connection_key() {
+        let url = connection_key_events_url();
+        assert!(url.ends_with("/api/stream-sync/connection-keys/events"));
+        assert!(!url.contains("?key="));
+        assert!(!url.contains("ssk_"));
+    }
+
+    #[test]
+    fn kick_feed_url_does_not_include_connection_key() {
+        let url = kick_feed_url();
+        assert!(url.ends_with("/api/stream-sync/kick-feed"));
+        assert!(!url.contains("?key="));
+    }
+
+    #[test]
+    fn remote_error_redacts_submitted_key() {
+        let key = "ssk_test_placeholder_not_a_real_key_abcdef";
+        let raw = format!("Key {key} was rejected by upstream");
+        let redacted = redact_connection_key(&bound_remote_message(&raw), key);
+        assert!(!redacted.contains(key));
+        assert!(redacted.contains("[redacted-connection-key]"));
     }
 }

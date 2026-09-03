@@ -7,6 +7,8 @@ mod app_state;
 mod broadcast;
 mod config_types;
 mod control_plane;
+mod delegated_lifecycle;
+mod delegated_refresh_observability;
 mod dock_capability;
 mod export;
 mod kick;
@@ -18,6 +20,13 @@ mod store_lock;
 mod streamelements;
 mod syndicate_connection;
 mod twitch;
+
+pub use delegated_lifecycle::{
+    redact_connection_key, AuthorityLeaseSnapshot, TeardownPhase, MAX_DELEGATED_REVOCATION_DELAY,
+    SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,
+};
+pub use syndicate_connection::connection_key_events_url;
+pub use twitch::{disconnect_twitch, TwitchServices};
 
 pub use streamelements::{
     clear_session as se_clear_session, load_session as se_load_session, map_overlay_to_profile,
@@ -34,12 +43,20 @@ pub use control_plane::{
 };
 pub use dock_capability::{DockCredential, DockCredentialStore};
 pub use export::{build_backup_zip, BackupManifest};
+pub use kick::sync_live_identity;
 pub use oauth_pending::{OAuthProvider, PendingLoginStore, LOGIN_NONCE_HEADER};
 pub use routes::BUILD_ROUTER_ROUTE_IDS;
 pub use storage::{
     bootstrap_twitch_env_from_rust, get_paths, is_stream_sync_ui_bundle, is_stream_sync_workspace,
-    legacy_electron_user_data, load_streamsync_dotenv, resolve_repo_root, resolve_ui_assets_root,
-    rust_dotenv_path, rust_workspace_root, write_secret_file, StoragePaths,
+    legacy_electron_user_data, load_streamsync_dotenv, paths_for_root, resolve_repo_root,
+    resolve_ui_assets_root, rust_dotenv_path, rust_workspace_root, write_secret_file, StoragePaths,
+};
+pub use storage::{
+    committed_delegated_session_parse, delegated_committing_path, delegated_replace_pending_path,
+    delegated_temp_and_quarantine_variants, inventory_delegated_startup_authority,
+    recover_delegated_replace_pending, remove_file_durable, write_authority_bearing_secret,
+    write_delegated_revoke_pending, write_delegated_revoked_tombstone,
+    write_identity_rollback_pending, write_json, INJECT_COMMITTING_REMOVE_FAILURE,
 };
 
 /// Back-compat alias.
@@ -60,6 +77,8 @@ pub struct OverlayConfig {
     pub repo_root: PathBuf,
     /// When true, refuse mutating writes (safe A/B against live userData).
     pub readonly: bool,
+    /// Optional explicit userdata root (tests). When set, ignores `STREAMSYNC_USERDATA`.
+    pub userdata_root: Option<PathBuf>,
 }
 
 impl Default for OverlayConfig {
@@ -74,6 +93,7 @@ impl Default for OverlayConfig {
                 .ok()
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            userdata_root: None,
         }
     }
 }
@@ -92,7 +112,9 @@ impl OverlayServer {
     pub async fn build_app(
         &self,
     ) -> anyhow::Result<(axum::Router, Arc<AppState>, Arc<twitch::TwitchServices>)> {
-        let paths = if self.config.readonly {
+        let paths = if let Some(root) = &self.config.userdata_root {
+            storage::paths_for_root(root, self.config.readonly)?
+        } else if self.config.readonly {
             storage::get_paths_readonly()?
         } else {
             storage::get_paths()?
@@ -104,6 +126,9 @@ impl OverlayServer {
             self.config.readonly,
         )?;
         let twitch = Arc::new(twitch::TwitchServices::new());
+        twitch.init_teardown_worker();
+        twitch.init_durable_revoke_worker();
+        state.bind_twitch_services(&twitch);
         let ctx = ServerContext {
             state: state.clone(),
             twitch: twitch.clone(),

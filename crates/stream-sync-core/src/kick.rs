@@ -2,19 +2,328 @@
 
 use crate::app_state::{live_kick_tokens, AppState};
 use crate::broadcast::make_platform_dock_event;
-use crate::config_types::{DelegatedSessionFile, KickTokenFile};
+use crate::config_types::{DelegatedSessionFile, KickTokenFile, TwitchActiveMode};
+use crate::delegated_lifecycle::{AbortOnDrop, DelegatedGeneration};
 use crate::syndicate_connection::{self, ExchangeSuccess};
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::{HashSet, VecDeque};
-use std::sync::Arc;
-use std::sync::{Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::Mutex as RefreshGateMutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tracing::{info, warn};
 
 const KICK_CHAT_URL: &str = "https://api.kick.com/public/v1/chat";
+
+#[cfg(test)]
+static REFRESH_KICK_TOKEN_GATE: OnceLock<RefreshGateMutex<Option<KickRefreshGateState>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static REFRESH_KICK_FEED_TAKE_GATE: OnceLock<RefreshGateMutex<Option<KickRefreshGateState>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static REFRESH_KICK_FEED_PUBLISH_GATE: OnceLock<RefreshGateMutex<Option<KickRefreshGateState>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+struct KickRefreshGateState {
+    arrived: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+pub(crate) async fn install_refresh_kick_token_gate() -> (
+    crate::twitch::RefreshGateCleanup,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (arrived_rx, resume_tx) = install_kick_refresh_gate(
+        REFRESH_KICK_TOKEN_GATE.get_or_init(|| RefreshGateMutex::new(None)),
+    )
+    .await;
+    (crate::twitch::RefreshGateCleanup, arrived_rx, resume_tx)
+}
+
+#[cfg(test)]
+pub(crate) async fn install_refresh_kick_feed_take_gate() -> (
+    crate::twitch::RefreshGateCleanup,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (arrived_rx, resume_tx) = install_kick_refresh_gate(
+        REFRESH_KICK_FEED_TAKE_GATE.get_or_init(|| RefreshGateMutex::new(None)),
+    )
+    .await;
+    (crate::twitch::RefreshGateCleanup, arrived_rx, resume_tx)
+}
+
+#[cfg(test)]
+pub(crate) async fn install_refresh_kick_feed_publish_gate() -> (
+    crate::twitch::RefreshGateCleanup,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (arrived_rx, resume_tx) = install_kick_refresh_gate(
+        REFRESH_KICK_FEED_PUBLISH_GATE.get_or_init(|| RefreshGateMutex::new(None)),
+    )
+    .await;
+    (crate::twitch::RefreshGateCleanup, arrived_rx, resume_tx)
+}
+
+#[cfg(test)]
+pub(crate) fn clear_refresh_kick_gates_blocking() {
+    for slot in [
+        REFRESH_KICK_TOKEN_GATE.get(),
+        REFRESH_KICK_FEED_TAKE_GATE.get(),
+        REFRESH_KICK_FEED_PUBLISH_GATE.get(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(mut guard) = slot.lock() {
+            *guard = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn install_kick_refresh_gate(
+    slot: &RefreshGateMutex<Option<KickRefreshGateState>>,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    *slot.lock().unwrap() = Some(KickRefreshGateState {
+        arrived: arrived_tx,
+        resume: resume_rx,
+    });
+    (arrived_rx, resume_tx)
+}
+
+#[cfg(test)]
+async fn pause_kick_refresh_gate(slot: Option<&RefreshGateMutex<Option<KickRefreshGateState>>>) {
+    let Some(slot) = slot else {
+        return;
+    };
+    let gate = {
+        let mut guard = slot.lock().unwrap();
+        guard.take()
+    };
+    let Some(gate) = gate else {
+        return;
+    };
+    let _ = gate.arrived.send(());
+    let _ = gate.resume.await;
+}
+
+#[cfg(test)]
+async fn refresh_kick_token_gate_pause_if_installed() {
+    pause_kick_refresh_gate(REFRESH_KICK_TOKEN_GATE.get()).await;
+}
+
+#[cfg(test)]
+async fn refresh_kick_feed_gate_pause_before_take_if_installed() {
+    pause_kick_refresh_gate(REFRESH_KICK_FEED_TAKE_GATE.get()).await;
+}
+
+#[cfg(test)]
+async fn refresh_kick_feed_gate_pause_before_publish_if_installed() {
+    pause_kick_refresh_gate(REFRESH_KICK_FEED_PUBLISH_GATE.get()).await;
+}
+
+#[cfg(not(test))]
+async fn refresh_kick_token_gate_pause_if_installed() {}
+
+#[cfg(not(test))]
+async fn refresh_kick_feed_gate_pause_before_take_if_installed() {}
+
+#[cfg(not(test))]
+async fn refresh_kick_feed_gate_pause_before_publish_if_installed() {}
+
+/// Kick chat credential captured atomically with provenance.
+#[derive(Debug, Clone)]
+pub struct KickChatCredential {
+    pub access_token: String,
+    pub kick_id: String,
+}
+
+/// Atomically selected Kick credentials with provenance (B1).
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // connection_key/feed_ticket are part of the atomic barrier bundle.
+pub enum KickCredentialSelection {
+    Local {
+        chat: KickChatCredential,
+        feed_ticket: Option<String>,
+    },
+    Delegated {
+        snap: crate::delegated_lifecycle::AuthorityLeaseSnapshot,
+        connection_key: String,
+        chat: KickChatCredential,
+    },
+}
+
+impl KickCredentialSelection {
+    pub fn provenance(&self) -> crate::twitch::PlatformCredentialProvenance {
+        match self {
+            Self::Local { .. } => crate::twitch::PlatformCredentialProvenance::Local,
+            Self::Delegated { snap, .. } => {
+                crate::twitch::PlatformCredentialProvenance::Delegated { snap: *snap }
+            }
+        }
+    }
+}
+
+/// Atomically selected Kick feed connection parameters.
+#[derive(Debug, Clone)]
+pub struct KickFeedSelection {
+    pub url: String,
+    pub auth: Option<String>,
+    pub redact_key: Option<String>,
+    pub snap: Option<crate::delegated_lifecycle::AuthorityLeaseSnapshot>,
+}
+
+/// Select Kick chat credentials under the lifecycle fence.
+pub async fn select_kick_credentials(
+    state: &AppState,
+    services: &crate::twitch::TwitchServices,
+) -> Result<KickCredentialSelection> {
+    state.ensure_identity_coherent_for_platform()?;
+    let _lifecycle = services.lock_lifecycle().await;
+    let mode = *state.active_mode.read().await;
+    if mode == crate::config_types::TwitchActiveMode::Delegated {
+        let session = state
+            .delegated
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("Delegated Kick session unavailable"))?;
+        let snap = services.authority_lease_snapshot_public().await;
+        {
+            let lease = services.read_authority_lease().await;
+            if !lease.allows_platform_operations(snap.generation)
+                || lease.snapshot().generation != snap.generation
+                || lease.snapshot().deadline != snap.deadline
+            {
+                return Err(anyhow!("Delegated authority expired or superseded"));
+            }
+        }
+        if !state.session_still_current(snap.generation).await {
+            return Err(anyhow!("Delegated authority expired or superseded"));
+        }
+        let access = session
+            .kick_access_token
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("Kick is not connected"))?;
+        let kick_id = session
+            .kick_id
+            .clone()
+            .ok_or_else(|| anyhow!("Kick is not connected"))?;
+        return Ok(KickCredentialSelection::Delegated {
+            snap,
+            connection_key: session.connection_key.clone(),
+            chat: KickChatCredential {
+                access_token: access,
+                kick_id,
+            },
+        });
+    }
+    let tokens = state.kick.read().await.tokens.clone();
+    let access = tokens
+        .access_token
+        .clone()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("Kick is not connected"))?;
+    let kick_id = tokens
+        .kick_id
+        .clone()
+        .ok_or_else(|| anyhow!("Kick is not connected"))?;
+    Ok(KickCredentialSelection::Local {
+        chat: KickChatCredential {
+            access_token: access,
+            kick_id,
+        },
+        feed_ticket: tokens.feed_ticket.filter(|s| !s.is_empty()),
+    })
+}
+
+/// Select Kick feed URL/auth/snapshot under one lifecycle transaction.
+pub async fn select_kick_feed_connect(
+    state: &AppState,
+    services: &crate::twitch::TwitchServices,
+) -> Option<KickFeedSelection> {
+    if state.identity_recovery_required() {
+        return None;
+    }
+    let _lifecycle = services.lock_lifecycle().await;
+    let mode = *state.active_mode.read().await;
+    if mode == crate::config_types::TwitchActiveMode::Delegated {
+        let session = state.delegated.read().await.clone()?;
+        if session.kick_id.as_ref().is_none_or(|s| s.is_empty())
+            || session.connection_key.is_empty()
+        {
+            return None;
+        }
+        let snap = services.authority_lease_snapshot_public().await;
+        if !services.syndicate_revalidation_still_valid(snap).await {
+            return None;
+        }
+        let key = session.connection_key.clone();
+        return Some(KickFeedSelection {
+            url: syndicate_connection::kick_feed_url(),
+            auth: Some(crate::delegated_lifecycle::connection_key_authorization(
+                &key,
+            )),
+            redact_key: Some(key),
+            snap: Some(snap),
+        });
+    }
+    let tokens = state.kick.read().await.tokens.clone();
+    let ticket = tokens.feed_ticket.filter(|s| !s.is_empty())?;
+    Some(KickFeedSelection {
+        url: format!(
+            "{}/api/stream-sync/kick-feed?ticket={}",
+            syndicate_connection::api_base(),
+            urlencoding::encode(&ticket)
+        ),
+        auth: None,
+        redact_key: None,
+        snap: None,
+    })
+}
+
+/// Merge a Syndicate exchange into a saved delegated session (all Twitch/Kick fields).
+pub fn merge_delegated_session_from_exchange(
+    mut session: DelegatedSessionFile,
+    exchange: &syndicate_connection::ExchangeSuccess,
+) -> DelegatedSessionFile {
+    session.client_id = exchange.twitch.client_id.clone();
+    session.access_token = exchange.twitch.access_token.clone();
+    session.channel_login = exchange.channel.login.clone();
+    session.channel_twitch_id = exchange.channel.twitch_id.clone();
+    session.display_name = exchange.channel.display_name.clone();
+    session.label = exchange.connection.label.clone();
+    session.scopes = exchange.twitch.scopes.clone();
+    session.twitch_expires_at = exchange.twitch.expires_at.clone();
+    session.connection_expires_at = exchange.connection.expires_at.clone();
+    apply_kick_to_delegated(&mut session, exchange);
+    session
+}
+
+#[cfg(test)]
+pub fn delegated_session_matches_exchange(
+    session: &DelegatedSessionFile,
+    exchange: &syndicate_connection::ExchangeSuccess,
+) -> bool {
+    &merge_delegated_session_from_exchange(session.clone(), exchange) == session
+}
 
 pub fn apply_kick_to_delegated(session: &mut DelegatedSessionFile, exchange: &ExchangeSuccess) {
     match kick_from_exchange(exchange) {
@@ -72,6 +381,151 @@ pub fn auth_url(state: &AppState, flow_nonce: &str) -> String {
 
 pub async fn sync_live_identity(state: Arc<AppState>) {
     let mode = *state.active_mode.read().await;
+    let generation = state.current_delegated_generation();
+    if mode == TwitchActiveMode::Delegated {
+        if generation > 0 && state.session_still_current(generation).await {
+            sync_live_identity_for_generation(state, generation, None).await;
+        }
+        // Delegated mode with gen>0 but session already cleared: do not fall through to
+        // unchecked restart_feed (would abort a concurrent winner's Kick handle).
+        return;
+    }
+    sync_live_identity_unchecked(state).await;
+}
+
+/// Publish personal Kick live state when Local mode is active (no delegated generation fence).
+pub async fn sync_live_identity_for_local(state: Arc<AppState>) {
+    sync_live_identity_unchecked(state).await;
+}
+
+const KICK_FEED_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Unconditionally stop the Kick feed and clear delegated live identity (revocation/teardown).
+pub async fn teardown_delegated_kick_live(state: &AppState) {
+    if let Some(handle) = state.kick_feed_handle.write().await.take() {
+        handle.abort();
+        let _ = tokio::time::timeout(KICK_FEED_STOP_TIMEOUT, handle).await;
+    }
+    let mut k = state.kick.write().await;
+    k.tokens = KickTokenFile::default();
+    k.connected = false;
+}
+
+fn kick_generation_may_publish(
+    state: &AppState,
+    generation: DelegatedGeneration,
+    mode: TwitchActiveMode,
+    delegated: Option<&DelegatedSessionFile>,
+) -> bool {
+    state.current_delegated_generation() == generation
+        && delegated.is_some_and(|s| s.generation == generation)
+        && matches!(mode, TwitchActiveMode::Delegated)
+}
+
+/// Publish Kick live tokens/feed only when `generation` is still the active delegated session.
+pub async fn sync_live_identity_for_generation(
+    state: Arc<AppState>,
+    generation: DelegatedGeneration,
+    services: Option<&crate::twitch::TwitchServices>,
+) {
+    if let Some(services) = services {
+        sync_live_identity_for_generation_locked(state, services, generation).await;
+        return;
+    }
+    if !state.session_still_current(generation).await {
+        return;
+    }
+    let mode = *state.active_mode.read().await;
+    let delegated = state.delegated.read().await.clone();
+    let personal = state.personal_kick.read().await.clone();
+    let live = live_kick_tokens(mode, delegated.as_ref(), &personal);
+    if !state.session_still_current(generation).await {
+        return;
+    }
+    {
+        let mut k = state.kick.write().await;
+        k.tokens = live;
+        if !k.tokens.is_linked() {
+            k.connected = false;
+        }
+    }
+    restart_feed_for_generation(state, generation, None).await;
+}
+
+async fn sync_live_identity_for_generation_locked(
+    state: Arc<AppState>,
+    services: &crate::twitch::TwitchServices,
+    generation: DelegatedGeneration,
+) {
+    refresh_kick_token_gate_pause_if_installed().await;
+
+    let planned = {
+        let _lifecycle = services.lock_lifecycle().await;
+        let mode = *state.active_mode.read().await;
+        let delegated = state.delegated.read().await.clone();
+        if !kick_generation_may_publish(&state, generation, mode, delegated.as_ref()) {
+            return;
+        }
+        let personal = state.personal_kick.read().await.clone();
+        let live = live_kick_tokens(mode, delegated.as_ref(), &personal);
+        let linked = live.is_linked();
+        (live, linked)
+    };
+
+    let old_feed;
+    {
+        let _lifecycle = services.lock_lifecycle().await;
+        let mode = *state.active_mode.read().await;
+        let delegated = state.delegated.read().await.clone();
+        if !kick_generation_may_publish(&state, generation, mode, delegated.as_ref()) {
+            return;
+        }
+        {
+            let mut k = state.kick.write().await;
+            k.tokens = planned.0;
+            if !planned.1 {
+                k.connected = false;
+            }
+        }
+        old_feed = state
+            .kick_feed_handle
+            .write()
+            .await
+            .take()
+            .map(AbortOnDrop::new);
+    }
+
+    refresh_kick_feed_gate_pause_before_take_if_installed().await;
+
+    if !planned.1 {
+        return;
+    }
+
+    let (grant_tx, grant_rx) = tokio::sync::oneshot::channel();
+    let state2 = state.clone();
+    let pending = tokio::spawn(async move {
+        if grant_rx.await.is_err() {
+            return;
+        }
+        feed_loop_for_generation(state2, generation).await;
+    });
+
+    refresh_kick_feed_gate_pause_before_publish_if_installed().await;
+
+    let _lifecycle = services.lock_lifecycle().await;
+    let mode = *state.active_mode.read().await;
+    let delegated = state.delegated.read().await.clone();
+    if !kick_generation_may_publish(&state, generation, mode, delegated.as_ref()) {
+        pending.abort();
+        return;
+    }
+    drop(old_feed);
+    let _ = grant_tx.send(());
+    *state.kick_feed_handle.write().await = Some(pending);
+}
+
+async fn sync_live_identity_unchecked(state: Arc<AppState>) {
+    let mode = *state.active_mode.read().await;
     let delegated = state.delegated.read().await.clone();
     let personal = state.personal_kick.read().await.clone();
     let live = live_kick_tokens(mode, delegated.as_ref(), &personal);
@@ -83,6 +537,43 @@ pub async fn sync_live_identity(state: Arc<AppState>) {
         }
     }
     restart_feed(state).await;
+}
+
+async fn restart_feed_for_generation(
+    state: Arc<AppState>,
+    generation: DelegatedGeneration,
+    services: Option<&crate::twitch::TwitchServices>,
+) {
+    if let Some(services) = services {
+        sync_live_identity_for_generation_locked(state, services, generation).await;
+        return;
+    }
+    if !state.session_still_current(generation).await {
+        return;
+    }
+    let linked = state.kick.read().await.tokens.is_linked();
+    if !state.session_still_current(generation).await {
+        return;
+    }
+    if let Some(h) = state.kick_feed_handle.write().await.take() {
+        h.abort();
+    }
+    if !state.session_still_current(generation).await {
+        return;
+    }
+    if !linked {
+        state.kick.write().await.connected = false;
+        return;
+    }
+    let state2 = state.clone();
+    let handle = tokio::spawn(async move {
+        feed_loop(state2).await;
+    });
+    if !state.session_still_current(generation).await {
+        handle.abort();
+        return;
+    }
+    *state.kick_feed_handle.write().await = Some(handle);
 }
 
 async fn restart_feed(state: Arc<AppState>) {
@@ -109,15 +600,23 @@ pub async fn apply_personal_bundle(state: Arc<AppState>, tokens: KickTokenFile) 
     if !tokens.is_linked() {
         return Err(anyhow!("Kick bundle missing access token or user id"));
     }
+    let previous = state.personal_kick.read().await.clone();
     *state.personal_kick.write().await = tokens;
-    state.save_kick_tokens().await?;
+    if let Err(e) = state.save_kick_tokens().await {
+        *state.personal_kick.write().await = previous;
+        return Err(e);
+    }
     sync_live_identity(state).await;
     Ok(())
 }
 
 pub async fn disconnect_personal(state: Arc<AppState>) -> Result<()> {
+    let previous = state.personal_kick.read().await.clone();
     *state.personal_kick.write().await = KickTokenFile::default();
-    state.save_kick_tokens().await?;
+    if let Err(e) = state.save_kick_tokens().await {
+        *state.personal_kick.write().await = previous;
+        return Err(e);
+    }
     sync_live_identity(state).await;
     Ok(())
 }
@@ -246,121 +745,235 @@ pub async fn send_chat_from_dock(state: Arc<AppState>, message: &str) -> Result<
     if trimmed.is_empty() {
         return Ok(());
     }
-    ensure_fresh_personal_token(&state).await.ok();
-    let tokens = state.kick.read().await.tokens.clone();
-    let access = tokens
-        .access_token
-        .clone()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("Kick is not connected"))?;
-    let kick_id = tokens
-        .kick_id
-        .clone()
-        .ok_or_else(|| anyhow!("Kick is not connected"))?;
-    let broadcaster_user_id: i64 = kick_id.parse().unwrap_or(0);
-    let res = reqwest::Client::new()
-        .post(KICK_CHAT_URL)
-        .header("Authorization", format!("Bearer {access}"))
-        .header("Content-Type", "application/json")
-        .json(&json!({
-            "content": trimmed.chars().take(500).collect::<String>(),
-            "type": "user",
-            "broadcaster_user_id": broadcaster_user_id,
-        }))
-        .send()
-        .await?;
-    if !res.status().is_success() {
-        let text = res.text().await.unwrap_or_default();
-        return Err(anyhow!("Kick chat send failed: {text}"));
+    state.ensure_identity_coherent_for_platform()?;
+    if !state.is_delegated_mode().await {
+        ensure_fresh_personal_token(&state).await.ok();
+    }
+    let services = state
+        .twitch_services()
+        .ok_or_else(|| anyhow!("Delegated authority unavailable"))?;
+    let selection = select_kick_credentials(&state, &services).await?;
+    let provenance = selection.provenance();
+    let (access, broadcaster_user_id) = match selection {
+        KickCredentialSelection::Local { chat, .. }
+        | KickCredentialSelection::Delegated { chat, .. } => {
+            (chat.access_token, chat.kick_id.parse().unwrap_or(0))
+        }
+    };
+    let send_fut = async move {
+        let res = reqwest::Client::new()
+            .post(KICK_CHAT_URL)
+            .header("Authorization", format!("Bearer {access}"))
+            .header("Content-Type", "application/json")
+            .json(&json!({
+                "content": trimmed.chars().take(500).collect::<String>(),
+                "type": "user",
+                "broadcaster_user_id": broadcaster_user_id,
+            }))
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow!("Kick chat send failed: {text}"));
+        }
+        Ok(())
+    };
+    if let Some(services) = state.twitch_services() {
+        services
+            .race_delegated_platform_with_provenance(&state, provenance, send_fut)
+            .await??
+    } else {
+        match provenance {
+            crate::twitch::PlatformCredentialProvenance::Local => send_fut.await?,
+            crate::twitch::PlatformCredentialProvenance::Delegated { .. } => {
+                return Err(anyhow!("Delegated authority unavailable"));
+            }
+        }
     }
     Ok(())
 }
 
-async fn feed_url(state: &AppState) -> Option<String> {
-    let delegated_mode = state.is_delegated_mode().await;
-    if delegated_mode {
-        let d = state.delegated.read().await;
-        if let Some(sess) = d.as_ref() {
-            if sess.kick_id.as_ref().is_some_and(|s| !s.is_empty())
-                && !sess.connection_key.is_empty()
-            {
-                return Some(format!(
-                    "{}/api/stream-sync/kick-feed?key={}",
-                    syndicate_connection::api_base(),
-                    urlencoding::encode(&sess.connection_key)
-                ));
-            }
-        }
-    }
-    let tokens = state.kick.read().await.tokens.clone();
-    let ticket = tokens.feed_ticket.filter(|s| !s.is_empty())?;
-    Some(format!(
-        "{}/api/stream-sync/kick-feed?ticket={}",
-        syndicate_connection::api_base(),
-        urlencoding::encode(&ticket)
-    ))
+async fn feed_loop_for_generation(state: Arc<AppState>, generation: DelegatedGeneration) {
+    feed_loop_inner(state, Some(generation)).await;
 }
 
 async fn feed_loop(state: Arc<AppState>) {
+    feed_loop_inner(state, None).await;
+}
+
+async fn feed_loop_inner(state: Arc<AppState>, generation: Option<DelegatedGeneration>) {
     loop {
-        let Some(url) = feed_url(&state).await else {
+        if let Some(gen) = generation {
+            if !state.session_still_current(gen).await {
+                break;
+            }
+        }
+        let Some(services) = state.twitch_services() else {
             state.kick.write().await.connected = false;
             tokio::time::sleep(Duration::from_secs(8)).await;
             continue;
         };
-        match consume_sse(state.clone(), &url).await {
+        let Some(sel) = select_kick_feed_connect(&state, &services).await else {
+            state.kick.write().await.connected = false;
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            continue;
+        };
+        match consume_sse(
+            state.clone(),
+            &sel.url,
+            sel.auth.as_deref(),
+            sel.snap,
+            generation,
+        )
+        .await
+        {
             Ok(()) => info!("Kick feed SSE ended"),
-            Err(e) => warn!("Kick feed SSE error: {e:#}"),
+            Err(e) => {
+                let msg = sel
+                    .redact_key
+                    .as_deref()
+                    .map(|k| {
+                        crate::delegated_lifecycle::redact_connection_key(&format!("{e:#}"), k)
+                    })
+                    .unwrap_or_else(|| format!("{e:#}"));
+                let msg = msg.replace("Bearer ", "Bearer [redacted]");
+                warn!("Kick feed SSE error: {msg}");
+            }
         }
         state.kick.write().await.connected = false;
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
-async fn consume_sse(state: Arc<AppState>, url: &str) -> Result<()> {
-    let res = reqwest::Client::new()
+async fn consume_sse(
+    state: Arc<AppState>,
+    url: &str,
+    auth: Option<&str>,
+    snap: Option<crate::delegated_lifecycle::AuthorityLeaseSnapshot>,
+    generation: Option<DelegatedGeneration>,
+) -> Result<()> {
+    if generation.is_some() {
+        crate::delegated_refresh_observability::record_kick_sse_connect();
+    }
+    let mut req = syndicate_connection::syndicate_http_client()
         .get(url)
-        .header("Accept", "text/event-stream")
-        .send()
-        .await?;
+        .header("Accept", "text/event-stream");
+    if let Some(token) = auth {
+        req = req.header("Authorization", token);
+    }
+    let send_fut = req.send();
+    let res = if let Some(snap) = snap {
+        let Some(services) = state.twitch_services() else {
+            return Err(anyhow!("Delegated authority unavailable"));
+        };
+        services
+            .race_delegated_platform_with_snapshot(&state, snap, send_fut)
+            .await??
+    } else {
+        send_fut.await?
+    };
     if !res.status().is_success() {
         return Err(anyhow!("Kick feed HTTP {}", res.status()));
+    }
+    if let Some(snap) = snap {
+        if let Some(services) = state.twitch_services() {
+            services.validate_delegated_snapshot(snap).await?;
+        }
     }
     state.kick.write().await.connected = true;
     let mut stream = res.bytes_stream();
     let mut buf = String::new();
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(idx) = buf.find("\n\n") {
-            let frame = buf[..idx].to_string();
-            buf = buf[idx + 2..].to_string();
-            if let Some(event) = parse_sse_data(&frame) {
-                fanout_kick_event(&state, event).await;
+    loop {
+        if let Some(snap) = snap {
+            let Some(services) = state.twitch_services() else {
+                return Err(anyhow!("Delegated authority unavailable"));
+            };
+            services.validate_delegated_snapshot(snap).await?;
+            let remaining = snap
+                .deadline
+                .saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!("Delegated authority expired during feed"));
+            }
+            let read_budget = remaining.min(crate::delegated_lifecycle::SYNDICATE_SSE_READ_TIMEOUT);
+            let chunk = match tokio::time::timeout(read_budget, stream.next()).await {
+                Ok(c) => c,
+                Err(_) => {
+                    // Deadline or read budget elapsed — revalidate before treating as soft timeout.
+                    services.validate_delegated_snapshot(snap).await?;
+                    return Err(anyhow!("Kick feed read timeout"));
+                }
+            };
+            let Some(chunk) = chunk else {
+                return Err(anyhow!("Kick feed stream ended"));
+            };
+            let bytes = chunk?;
+            let frames = crate::delegated_lifecycle::append_sse_chunk(
+                &mut buf,
+                &String::from_utf8_lossy(&bytes),
+            )
+            .map_err(|_| anyhow!("Kick feed buffer overflow"))?;
+            for frame in frames {
+                services.validate_delegated_snapshot(snap).await?;
+                if let Some(event) = crate::delegated_lifecycle::parse_sse_json_data(&frame) {
+                    fanout_kick_event(&state, event, Some(snap)).await?;
+                }
+            }
+        } else {
+            let chunk = tokio::time::timeout(
+                crate::delegated_lifecycle::SYNDICATE_SSE_READ_TIMEOUT,
+                stream.next(),
+            )
+            .await
+            .map_err(|_| anyhow!("Kick feed read timeout"))?;
+            let Some(chunk) = chunk else {
+                return Err(anyhow!("Kick feed stream ended"));
+            };
+            let bytes = chunk?;
+            let frames = crate::delegated_lifecycle::append_sse_chunk(
+                &mut buf,
+                &String::from_utf8_lossy(&bytes),
+            )
+            .map_err(|_| anyhow!("Kick feed buffer overflow"))?;
+            for frame in frames {
+                if let Some(event) = crate::delegated_lifecycle::parse_sse_json_data(&frame) {
+                    fanout_kick_event(&state, event, None).await?;
+                }
             }
         }
     }
-    Ok(())
 }
 
-fn parse_sse_data(frame: &str) -> Option<Value> {
-    let mut data = String::new();
-    for line in frame.lines() {
-        let line = line.trim_end();
-        if let Some(rest) = line.strip_prefix("data:") {
-            if !data.is_empty() {
-                data.push('\n');
+async fn fanout_kick_event(
+    state: &AppState,
+    raw: Value,
+    snap: Option<crate::delegated_lifecycle::AuthorityLeaseSnapshot>,
+) -> Result<()> {
+    async fn deliver(
+        state: &AppState,
+        event: Value,
+        snap: Option<crate::delegated_lifecycle::AuthorityLeaseSnapshot>,
+    ) -> Result<()> {
+        if let Some(snap) = snap {
+            let Some(services) = state.twitch_services() else {
+                return Err(anyhow!("Delegated authority unavailable"));
+            };
+            services.validate_delegated_snapshot(snap).await?;
+            let services = services.clone();
+            let ok = state
+                .feed
+                .broadcast_all_while(&event, || services.delegated_send_gate_still_valid(snap))
+                .await;
+            if !ok {
+                return Err(anyhow!("Delegated authority expired during fan-out"));
             }
-            data.push_str(rest.trim_start());
+            services.validate_delegated_snapshot(snap).await?;
+        } else {
+            state.feed.broadcast_all(&event).await;
         }
+        Ok(())
     }
-    if data.is_empty() {
-        return None;
-    }
-    serde_json::from_str(&data).ok()
-}
 
-async fn fanout_kick_event(state: &AppState, raw: Value) {
     if raw.get("type").and_then(|v| v.as_str()) == Some("chat") {
         let message_id = raw
             .get("message_id")
@@ -368,10 +981,9 @@ async fn fanout_kick_event(state: &AppState, raw: Value) {
             .unwrap_or("")
             .to_string();
         if !message_id.is_empty() && mark_kick_message_seen(&message_id) {
-            return;
+            return Ok(());
         }
-        state.feed.broadcast_all(&normalize_kick_chat(&raw)).await;
-        return;
+        return deliver(state, normalize_kick_chat(&raw), snap).await;
     }
     let kind = raw
         .get("kind")
@@ -379,7 +991,7 @@ async fn fanout_kick_event(state: &AppState, raw: Value) {
         .unwrap_or("")
         .to_string();
     if kind.is_empty() {
-        return;
+        return Ok(());
     }
     let user = raw
         .get("user_login")
@@ -387,58 +999,84 @@ async fn fanout_kick_event(state: &AppState, raw: Value) {
         .unwrap_or("someone");
     match kind.as_str() {
         "follow" => {
-            emit_alert(state, "follow", json!({ "name": user })).await;
-            state
-                .feed
-                .broadcast_all(&make_platform_dock_event(
+            emit_alert(state, "follow", json!({ "name": user }), snap).await?;
+            deliver(
+                state,
+                make_platform_dock_event(
                     "kick",
                     "follow",
                     &format!("{user} followed"),
                     Some("Follow"),
                     None,
-                ))
-                .await;
+                ),
+                snap,
+            )
+            .await
         }
         "sub" => {
-            emit_alert(state, "sub", json!({ "name": user, "amount": "1000" })).await;
-            state
-                .feed
-                .broadcast_all(&make_platform_dock_event(
+            emit_alert(
+                state,
+                "sub",
+                json!({ "name": user, "amount": "1000" }),
+                snap,
+            )
+            .await?;
+            deliver(
+                state,
+                make_platform_dock_event(
                     "kick",
                     "sub",
                     &format!("{user} subscribed"),
                     Some("Sub"),
                     None,
-                ))
-                .await;
+                ),
+                snap,
+            )
+            .await
         }
         "sub_gift" => {
             let count = raw.get("count").cloned().unwrap_or(json!(1));
-            emit_alert(state, "gift", json!({ "name": user, "amount": count })).await;
-            state
-                .feed
-                .broadcast_all(&make_platform_dock_event(
+            emit_alert(
+                state,
+                "gift",
+                json!({ "name": user, "amount": count }),
+                snap,
+            )
+            .await?;
+            deliver(
+                state,
+                make_platform_dock_event(
                     "kick",
                     "gift",
                     &format!("{user} gifted {count}"),
                     Some("Gift"),
                     None,
-                ))
-                .await;
+                ),
+                snap,
+            )
+            .await
         }
         "kicks" => {
             let amount = raw.get("amount").cloned().unwrap_or(json!(0));
-            emit_alert(state, "bits", json!({ "name": user, "amount": amount })).await;
-            state
-                .feed
-                .broadcast_all(&make_platform_dock_event(
+            emit_alert(
+                state,
+                "bits",
+                json!({ "name": user, "amount": amount }),
+                snap,
+            )
+            .await?;
+            deliver(
+                state,
+                make_platform_dock_event(
                     "kick",
                     "kicks",
                     &format!("{user} gifted {amount} Kicks"),
                     Some("Kicks"),
                     None,
-                ))
-                .await;
+                ),
+                snap,
+            )
+            .await
         }
         "redemption" => {
             let title = raw
@@ -450,44 +1088,62 @@ async fn fanout_kick_event(state: &AppState, raw: Value) {
             if !input.is_empty() {
                 detail.push_str(&format!(": {input}"));
             }
-            state
-                .feed
-                .broadcast_all(&make_platform_dock_event(
-                    "kick",
-                    "redeem",
-                    &detail,
-                    Some("Reward"),
-                    None,
-                ))
-                .await;
+            deliver(
+                state,
+                make_platform_dock_event("kick", "redeem", &detail, Some("Reward"), None),
+                snap,
+            )
+            .await
         }
         "stream" => {
             let label = raw.get("label").and_then(|v| v.as_str()).unwrap_or("live");
-            state
-                .feed
-                .broadcast_all(&make_platform_dock_event(
+            deliver(
+                state,
+                make_platform_dock_event(
                     "kick",
                     "announce",
                     &format!("Kick stream {label}"),
                     Some("Live"),
                     None,
-                ))
-                .await;
+                ),
+                snap,
+            )
+            .await
         }
-        _ => {}
+        _ => Ok(()),
     }
 }
 
-async fn emit_alert(state: &AppState, event_type: &str, variables: Value) {
-    state
-        .feed
-        .broadcast_all(&json!({
-            "type": "event-alert",
-            "platform": "kick",
-            "eventType": event_type,
-            "data": { "variables": variables },
-        }))
-        .await;
+async fn emit_alert(
+    state: &AppState,
+    event_type: &str,
+    variables: Value,
+    snap: Option<crate::delegated_lifecycle::AuthorityLeaseSnapshot>,
+) -> Result<()> {
+    let event = json!({
+        "type": "event-alert",
+        "platform": "kick",
+        "eventType": event_type,
+        "data": { "variables": variables },
+    });
+    if let Some(snap) = snap {
+        let Some(services) = state.twitch_services() else {
+            return Err(anyhow!("Delegated authority unavailable"));
+        };
+        services.validate_delegated_snapshot(snap).await?;
+        let services = services.clone();
+        let ok = state
+            .feed
+            .broadcast_all_while(&event, || services.delegated_send_gate_still_valid(snap))
+            .await;
+        if !ok {
+            return Err(anyhow!("Delegated authority expired during fan-out"));
+        }
+        services.validate_delegated_snapshot(snap).await?;
+    } else {
+        state.feed.broadcast_all(&event).await;
+    }
+    Ok(())
 }
 
 fn normalize_kick_chat(raw: &Value) -> Value {
@@ -676,5 +1332,201 @@ mod tests {
         apply_kick_to_delegated(&mut session, &exchange);
         assert_eq!(session.kick_id.as_deref(), Some("99"));
         assert_eq!(session.kick_access_token.as_deref(), Some("ktok"));
+    }
+
+    async fn kick_feed_app() -> (Arc<AppState>, Arc<crate::twitch::TwitchServices>) {
+        let userdata = std::env::temp_dir().join(format!(
+            "streamsync-kick-feed-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_dir_all(&userdata);
+        std::fs::create_dir_all(&userdata).unwrap();
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .to_path_buf();
+        let (_router, state, services) = crate::OverlayServer::new(crate::OverlayConfig {
+            port: 0,
+            repo_root,
+            readonly: false,
+            userdata_root: Some(userdata),
+        })
+        .build_app()
+        .await
+        .expect("build_app");
+        (state, services)
+    }
+
+    #[tokio::test]
+    async fn select_kick_credentials_matches_active_mode_provenance() {
+        let (state, services) = kick_feed_app().await;
+        *state.active_mode.write().await = crate::TwitchActiveMode::Delegated;
+        services.install_delegated_generation(1).await;
+        services.install_validated_authority_lease(1, None).await;
+        state
+            .delegated_generation
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        *state.delegated.write().await = Some(DelegatedSessionFile {
+            generation: 1,
+            connection_key: "ssk_test_placeholder_kick_atomic".into(),
+            kick_id: Some("99".into()),
+            kick_access_token: Some("kick-at".into()),
+            ..Default::default()
+        });
+        sync_live_identity(state.clone()).await;
+        let delegated = select_kick_credentials(&state, &services)
+            .await
+            .expect("delegated kick selection");
+        assert!(matches!(
+            delegated.provenance(),
+            crate::twitch::PlatformCredentialProvenance::Delegated { .. }
+        ));
+
+        *state.active_mode.write().await = crate::TwitchActiveMode::Local;
+        {
+            let mut k = state.kick.write().await;
+            k.tokens.access_token = Some("local-kick".into());
+            k.tokens.kick_id = Some("42".into());
+        }
+        let local = select_kick_credentials(&state, &services)
+            .await
+            .expect("local kick selection");
+        assert!(matches!(
+            local.provenance(),
+            crate::twitch::PlatformCredentialProvenance::Local
+        ));
+    }
+
+    #[tokio::test]
+    async fn delegated_feed_connect_hang_rejected_at_deadline() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            loop {
+                if socket.read(&mut buf).await.unwrap_or(0) == 0 {
+                    break;
+                }
+            }
+        });
+        let (state, services) = kick_feed_app().await;
+        *state.active_mode.write().await = crate::TwitchActiveMode::Delegated;
+        services
+            .set_authority_deadline_for_test(
+                1,
+                std::time::Instant::now() + Duration::from_millis(40),
+            )
+            .await;
+        let snap = services.authority_lease_snapshot_public().await;
+        let url = format!("http://127.0.0.1:{port}/kick-feed");
+        let err = consume_sse(state, &url, Some("Bearer ssk_test"), Some(snap), None)
+            .await
+            .expect_err("hung connect must fail at lease deadline");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Delegated authority") || msg.contains("expired"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_feed_rejects_frame_after_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(headers).await;
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let payload = b"data: {\"type\":\"chat\",\"user\":\"late\",\"message\":\"x\",\"message_id\":\"late-1\"}\n\n";
+            let chunk = format!(
+                "{:x}\r\n{}\r\n0\r\n\r\n",
+                payload.len(),
+                String::from_utf8_lossy(payload)
+            );
+            let _ = socket.write_all(chunk.as_bytes()).await;
+        });
+
+        let (state, services) = kick_feed_app().await;
+        *state.active_mode.write().await = crate::TwitchActiveMode::Delegated;
+        services
+            .set_authority_deadline_for_test(
+                1,
+                std::time::Instant::now() + Duration::from_millis(40),
+            )
+            .await;
+        let snap = services.authority_lease_snapshot_public().await;
+        let url = format!("http://127.0.0.1:{port}/kick-feed");
+        let result = consume_sse(state, &url, Some("Bearer ssk_test"), Some(snap), None).await;
+        assert!(
+            result.is_err(),
+            "frame after lease deadline must not complete successfully: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_feed_rejects_generation_change_mid_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n";
+            let _ = socket.write_all(headers).await;
+            let _ = gate_rx.await;
+            let payload =
+                b"data: {\"type\":\"chat\",\"user\":\"x\",\"message\":\"y\",\"message_id\":\"g-1\"}\n\n";
+            let chunk = format!(
+                "{:x}\r\n{}\r\n",
+                payload.len(),
+                String::from_utf8_lossy(payload)
+            );
+            let _ = socket.write_all(chunk.as_bytes()).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let (state, services) = kick_feed_app().await;
+        *state.active_mode.write().await = crate::TwitchActiveMode::Delegated;
+        services.install_validated_authority_lease(1, None).await;
+        let snap = services.authority_lease_snapshot_public().await;
+        let url = format!("http://127.0.0.1:{port}/kick-feed");
+        let services2 = services.clone();
+        let pending = tokio::spawn(async move {
+            consume_sse(state, &url, Some("Bearer ssk_test"), Some(snap), None).await
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        services2.clear_authority_lease().await;
+        let _ = gate_tx.send(());
+        let result = pending.await.unwrap();
+        assert!(
+            result.is_err(),
+            "generation/lease clear mid-stream must reject further delivery: {result:?}"
+        );
     }
 }
