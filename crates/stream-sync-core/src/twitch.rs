@@ -3334,76 +3334,87 @@ async fn start_irc(
             let broadcaster_login = login.clone();
             let state_irc = state.clone();
             let channel_log = channel.clone();
+            let channel_join = channel.clone();
             let feed = state.feed.clone();
             let services_task = services.clone();
-            client.join(channel.clone()).ok();
-            // Pre-merge proof: pause after unlocked join, before publishing into global slots.
+            // Pause before lock+publish so proof races can install a winner first.
             personal_irc_publish_gate_pause_if_installed().await;
-            let handle = tokio::spawn(async move {
-                while let Some(message) = incoming.recv().await {
-                    if !services_task.personal_token_generation_still_current(local_gen) {
-                        break;
+
+            let (grant_tx, grant_rx) = oneshot::channel();
+            {
+                let _lifecycle = services.lock_lifecycle().await;
+                if !services.personal_token_generation_still_current(local_gen) {
+                    return Ok(());
+                }
+                if *state.active_mode.read().await != TwitchActiveMode::Local {
+                    return Ok(());
+                }
+                let provenance = services
+                    .select_platform_credentials_under_lock(&state)
+                    .await?
+                    .provenance();
+                let handle = tokio::spawn(async move {
+                    if grant_rx.await.is_err() {
+                        return;
                     }
-                    if *state_irc.active_mode.read().await != TwitchActiveMode::Local {
-                        break;
+                    client.join(channel_join.clone()).ok();
+                    *services_task.irc_client.write().await = Some(IrcClientBundle {
+                        client,
+                        provenance,
+                        owner,
+                    });
+                    {
+                        let mut tw = state_irc.twitch.write().await;
+                        tw.connected = true;
+                        tw.channel = Some(channel_join);
                     }
-                    match message {
-                        ServerMessage::GlobalUserState(msg) => {
-                            store_broadcaster_user_state(
-                                &state_irc,
-                                msg.name_color.as_ref(),
-                                Some(msg.user_name.as_str()),
-                                &msg.badges,
-                            );
+                    while let Some(message) = incoming.recv().await {
+                        if !services_task.personal_token_generation_still_current(local_gen) {
+                            break;
                         }
-                        ServerMessage::UserState(msg) => {
-                            store_broadcaster_user_state(
-                                &state_irc,
-                                msg.name_color.as_ref(),
-                                Some(msg.user_name.as_str()),
-                                &msg.badges,
-                            );
+                        if *state_irc.active_mode.read().await != TwitchActiveMode::Local {
+                            break;
                         }
-                        ServerMessage::Privmsg(msg) => {
-                            let is_self = msg.sender.login.eq_ignore_ascii_case(&broadcaster_login);
-                            if is_self {
+                        match message {
+                            ServerMessage::GlobalUserState(msg) => {
                                 store_broadcaster_user_state(
                                     &state_irc,
                                     msg.name_color.as_ref(),
-                                    Some(msg.sender.name.as_str()),
+                                    Some(msg.user_name.as_str()),
                                     &msg.badges,
                                 );
                             }
-                            let evt = privmsg_to_chat_event(&msg, is_self);
-                            feed.broadcast_all(&evt).await;
+                            ServerMessage::UserState(msg) => {
+                                store_broadcaster_user_state(
+                                    &state_irc,
+                                    msg.name_color.as_ref(),
+                                    Some(msg.user_name.as_str()),
+                                    &msg.badges,
+                                );
+                            }
+                            ServerMessage::Privmsg(msg) => {
+                                let is_self =
+                                    msg.sender.login.eq_ignore_ascii_case(&broadcaster_login);
+                                if is_self {
+                                    store_broadcaster_user_state(
+                                        &state_irc,
+                                        msg.name_color.as_ref(),
+                                        Some(msg.sender.name.as_str()),
+                                        &msg.badges,
+                                    );
+                                }
+                                let evt = privmsg_to_chat_event(&msg, is_self);
+                                feed.broadcast_all(&evt).await;
+                            }
+                            ServerMessage::Notice(_) => {}
+                            _ => {}
                         }
-                        ServerMessage::Notice(_) => {}
-                        _ => {}
                     }
-                }
-                info!("IRC incoming ended for {channel_log}");
-            });
-
-            let provenance = {
-                let _lifecycle = services.lock_lifecycle().await;
-                services
-                    .select_platform_credentials_under_lock(&state)
-                    .await?
-                    .provenance()
-            };
-            *services.irc_client.write().await = Some(IrcClientBundle {
-                client,
-                provenance,
-                owner,
-            });
-
-            {
-                let mut tw = state.twitch.write().await;
-                tw.connected = true;
-                tw.channel = Some(channel.clone());
+                    info!("IRC incoming ended for {channel_log}");
+                });
+                *services.irc_handle.write().await = Some(handle);
+                let _ = grant_tx.send(());
             }
-
-            *services.irc_handle.write().await = Some(handle);
             refresh_broadcaster_chat_color(&state).await;
             Ok(())
         }
