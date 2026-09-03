@@ -1058,20 +1058,15 @@ async fn fanout_kick_event(
         }
         "kicks" => {
             let amount = raw.get("amount").cloned().unwrap_or(json!(0));
-            emit_alert(
-                state,
-                "bits",
-                json!({ "name": user, "amount": amount }),
-                snap,
-            )
-            .await?;
+            let mapped = map_kick_kicks(user, &amount);
+            emit_alert(state, mapped.overlay_event_type, mapped.variables, snap).await?;
             deliver(
                 state,
                 make_platform_dock_event(
                     "kick",
-                    "kicks",
-                    &format!("{user} gifted {amount} Kicks"),
-                    Some("Kicks"),
+                    mapped.dock_event_type,
+                    &mapped.dock_detail,
+                    Some(mapped.dock_label),
                     None,
                 ),
                 snap,
@@ -1111,6 +1106,27 @@ async fn fanout_kick_event(
             .await
         }
         _ => Ok(()),
+    }
+}
+
+/// Map Kick `kicks` into overlay + dock shapes.
+/// Overlay uses `cheer` (shared Twitch cheer profiles); dock stays Kick-labeled `kicks`.
+/// Variables keep `name` + `amount` so cheer amount-threshold picker rules still apply.
+struct KickKicksMapped {
+    overlay_event_type: &'static str,
+    variables: Value,
+    dock_event_type: &'static str,
+    dock_label: &'static str,
+    dock_detail: String,
+}
+
+fn map_kick_kicks(user: &str, amount: &Value) -> KickKicksMapped {
+    KickKicksMapped {
+        overlay_event_type: "cheer",
+        variables: json!({ "name": user, "amount": amount }),
+        dock_event_type: "kicks",
+        dock_label: "Kicks",
+        dock_detail: format!("{user} gifted {amount} Kicks"),
     }
 }
 
@@ -1283,6 +1299,42 @@ mod tests {
         assert_eq!(out["messageId"], json!("msg-1"));
         assert_eq!(out["user"]["kickBadges"][0]["type"], json!("moderator"));
         assert_eq!(out["user"]["badgesRaw"]["moderator"], json!("1"));
+    }
+
+    #[test]
+    fn kick_kicks_overlay_alert_uses_cheer_with_amount() {
+        let amount = json!(100);
+        let mapped = map_kick_kicks("bob", &amount);
+        let alert = json!({
+            "type": "event-alert",
+            "platform": "kick",
+            "eventType": mapped.overlay_event_type,
+            "data": { "variables": mapped.variables },
+        });
+        assert_eq!(alert["eventType"], json!("cheer"));
+        assert_ne!(alert["eventType"], json!("bits"));
+        assert_eq!(alert["data"]["variables"]["name"], json!("bob"));
+        assert_eq!(alert["data"]["variables"]["amount"], json!(100));
+    }
+
+    #[test]
+    fn kick_kicks_dock_stays_kicks_not_bits_or_cheer() {
+        let amount = json!(250);
+        let mapped = map_kick_kicks("carol", &amount);
+        let dock = make_platform_dock_event(
+            "kick",
+            mapped.dock_event_type,
+            &mapped.dock_detail,
+            Some(mapped.dock_label),
+            None,
+        );
+        assert_eq!(dock["type"], json!("dock-event"));
+        assert_eq!(dock["platform"], json!("kick"));
+        assert_eq!(dock["eventType"], json!("kicks"));
+        assert_ne!(dock["eventType"], json!("bits"));
+        assert_ne!(dock["eventType"], json!("cheer"));
+        assert_eq!(dock["label"], json!("Kicks"));
+        assert_eq!(dock["detail"], json!("carol gifted 250 Kicks"));
     }
 
     #[test]
