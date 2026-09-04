@@ -332,9 +332,8 @@ pub fn resolve_events_overlay_profile(stored: Option<Value>) -> Value {
 }
 
 /// Known events overlay event keys (studio / runtime picker).
-pub const EVENTS_OVERLAY_EVENT_KEYS: &[&str] = &[
-    "follow", "sub", "resub", "gift", "cheer", "raid", "redeem",
-];
+pub const EVENTS_OVERLAY_EVENT_KEYS: &[&str] =
+    &["follow", "sub", "resub", "gift", "cheer", "raid", "redeem"];
 
 /// Validate a profile before persisting a POST `/api/events/overlay-config` write.
 ///
@@ -500,9 +499,7 @@ fn validate_duration_sec(ctx: &str, duration: &Value) -> Result<(), String> {
         return Err(format!("{ctx}.durationSec must be a finite number"));
     };
     if n < 0.0 {
-        return Err(format!(
-            "{ctx}.durationSec must be non-negative (got {n})"
-        ));
+        return Err(format!("{ctx}.durationSec must be non-negative (got {n})"));
     }
     Ok(())
 }
@@ -707,10 +704,7 @@ mod events_overlay_write_validation_tests {
             json!({}),
         ));
         let err = try_store_profile(&mut store, "bad", bad).expect_err("must reject");
-        assert!(
-            err.contains("trigger.value"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("trigger.value"), "unexpected error: {err}");
         assert!(!store.contains_key("bad"));
         assert!(store.contains_key("keep"));
     }
@@ -722,10 +716,7 @@ mod events_overlay_write_validation_tests {
             json!({ "durationSec": -1 }),
         ));
         let err = validate_events_overlay_profile_write(&bad).expect_err("must reject");
-        assert!(
-            err.contains("durationSec"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("durationSec"), "unexpected error: {err}");
     }
 
     #[test]

@@ -3886,8 +3886,7 @@ async fn handle_eventsub_notification(
             .await;
         }
         "channel.subscribe" => {
-            let Some((overlay_ty, dock_ty)) =
-                map_twitch_sub_gift_alert_types(sub_type, event)
+            let Some((overlay_ty, dock_ty)) = map_twitch_sub_gift_alert_types(sub_type, event)
             else {
                 // Gifted recipient: skip normal sub alert; gift comes from
                 // channel.subscription.gift.
@@ -3970,8 +3969,7 @@ async fn handle_eventsub_notification(
             .await;
         }
         "channel.subscription.gift" => {
-            let Some((overlay_ty, dock_ty)) =
-                map_twitch_sub_gift_alert_types(sub_type, event)
+            let Some((overlay_ty, dock_ty)) = map_twitch_sub_gift_alert_types(sub_type, event)
             else {
                 return;
             };
@@ -4517,7 +4515,10 @@ mod tests {
             "is_gift": true,
         });
         let mapped = map_twitch_sub_gift_alert_types("channel.subscribe", &event);
-        assert!(mapped.is_none(), "gifted subscribe must not emit sub overlay/dock");
+        assert!(
+            mapped.is_none(),
+            "gifted subscribe must not emit sub overlay/dock"
+        );
     }
 
     #[test]
