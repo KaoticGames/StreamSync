@@ -234,7 +234,7 @@ async fn csp_response_headers(
         };
         Some(format!(
             "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; \
-             connect-src 'self' ws://127.0.0.1:{0} ws://localhost:{0}; \
+             connect-src 'self' ws://127.0.0.1:{0} ws://localhost:{0} ipc: http://ipc.localhost https://ipc.localhost; \
              img-src 'self' data: https:; font-src 'self' data:; media-src 'self'; \
              object-src 'none'; frame-src 'self'; base-uri 'none'; form-action 'self'; {frame_policy}",
             state.port
