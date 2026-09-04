@@ -355,7 +355,9 @@ fn validate_events_map(events: &Value) -> Result<(), String> {
     };
     for (key, event_cfg) in map {
         if !EVENTS_OVERLAY_EVENT_KEYS.contains(&key.as_str()) {
-            return Err(format!("unknown event key: {key}"));
+            // Existing studio / SE profiles may carry extra keys. Persist them;
+            // do not fail the whole write.
+            continue;
         }
         validate_event_config(key, event_cfg)?;
     }
@@ -751,15 +753,36 @@ mod events_overlay_write_validation_tests {
     }
 
     #[test]
-    fn unknown_event_key_rejected() {
-        let bad = json!({
+    fn unknown_event_key_does_not_fail_write() {
+        let ok = json!({
             "events": {
                 "follow": { "variations": [] },
                 "mystery": { "variations": [] }
             }
         });
-        let err = validate_events_overlay_profile_write(&bad).expect_err("must reject");
-        assert!(err.contains("unknown event key"), "unexpected: {err}");
+        assert!(validate_events_overlay_profile_write(&ok).is_ok());
+    }
+
+    #[test]
+    fn studio_default_variation_shape_is_accepted() {
+        let profile = json!({
+            "version": 1,
+            "stage": { "w": 1280, "h": 720, "grid": true, "zoom": 1 },
+            "events": {
+                "follow": { "variations": [{
+                    "id": "base",
+                    "name": "Base Alert",
+                    "trigger": { "mode": "none", "value": null, "tier": null },
+                    "chancePct": null,
+                    "durationSec": 6,
+                    "placement": {
+                        "image": { "x": 120, "y": 140, "w": 320, "h": 320 },
+                        "text": { "x": 500, "y": 170, "w": 520, "h": 180 }
+                    }
+                }]}
+            }
+        });
+        assert!(validate_events_overlay_profile_write(&profile).is_ok());
     }
 
     #[test]
