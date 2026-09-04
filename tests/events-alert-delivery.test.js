@@ -39,8 +39,21 @@ function createDeferredPlayOne() {
   return { playOne, started, completed, resolve };
 }
 
-describe("StreamSyncAlertDelivery FIFO (Pass 1 — expected to fail)", () => {
-  it("three rapid alerts complete in enqueue order A then B then C", async () => {
+function trackSettled(promise) {
+  const state = { settled: false };
+  promise.then(
+    () => {
+      state.settled = true;
+    },
+    () => {
+      state.settled = true;
+    }
+  );
+  return state;
+}
+
+describe("StreamSyncAlertDelivery FIFO (Pass 2)", () => {
+  it("serializes rapid enqueue: only one playOne in flight; completions A→B→C", async () => {
     const { playOne, started, completed, resolve } = createDeferredPlayOne();
     const delivery = deliveryApi.createDelivery({ playOne });
 
@@ -49,24 +62,38 @@ describe("StreamSyncAlertDelivery FIFO (Pass 1 — expected to fail)", () => {
     const pB = delivery.enqueue({ id: "B" });
     const pC = delivery.enqueue({ id: "C" });
 
-    // Overlap proof: all three playOne calls start before any finishes.
-    assert.deepEqual(
-      started,
-      ["A", "B", "C"],
-      "Pass 1 models today's bug: concurrent playOne starts for A, B, and C"
-    );
+    const settledA = trackSettled(pA);
+    const settledB = trackSettled(pB);
+    const settledC = trackSettled(pC);
+    await Promise.resolve();
+
+    // Only A started until A is resolved; B and C wait in the FIFO.
+    assert.deepEqual(started, ["A"], "only A playOne starts while A is in flight");
     assert.deepEqual(completed, [], "nothing should have finished yet");
+    assert.equal(settledA.settled, false, "enqueue A still pending until playOne resolves");
+    assert.equal(settledB.settled, false, "enqueue B still pending");
+    assert.equal(settledC.settled, false, "enqueue C still pending");
 
-    // Finish out of enqueue order — legal under concurrent play, illegal under FIFO.
-    resolve("C");
-    resolve("B");
+    // C's playOne must not have started — resolving C is impossible until A and B finish.
+    assert.equal(started.includes("C"), false, "C playOne must not start before A and B");
+
     resolve("A");
+    await pA;
+    assert.equal(settledA.settled, true);
+    assert.deepEqual(started, ["A", "B"], "B starts only after A finishes");
+    assert.deepEqual(completed, ["A"]);
+    assert.equal(settledB.settled, false, "B enqueue still pending while B playOne runs");
+    assert.equal(started.includes("C"), false, "C still must not have started");
 
+    resolve("B");
+    await pB;
+    assert.deepEqual(started, ["A", "B", "C"], "C starts only after B finishes");
+    assert.deepEqual(completed, ["A", "B"]);
+    assert.equal(settledC.settled, false, "C enqueue still pending until C playOne resolves");
+
+    resolve("C");
     await Promise.all([pA, pB, pC]);
 
-    // Required FIFO contract (Pass 2+): completion must be A → B → C.
-    // Pass 1 delivery starts all plays at once, so completions follow resolve
-    // order C → B → A and this assertion fails on purpose.
     assert.deepEqual(
       completed,
       ["A", "B", "C"],

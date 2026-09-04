@@ -21,8 +21,11 @@
   })();
 
   let cfg = null;
-  let hideTimer = null;
   let audio = null;
+
+  function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
 
     // -------------------------
   // On-screen debug logger (OBS-friendly)
@@ -764,8 +767,6 @@
   }
 
   function hideAll() {
-    if (hideTimer) clearTimeout(hideTimer);
-
     try {
       if (audio) {
         audio.pause();
@@ -861,23 +862,39 @@
     fitTextToBox(textEl, maxFs);
     applyAnimToEl(textEl, "in", anim, stageSize);
 
-    // duration (effective)
+    // duration (effective) — await display, exit animation, then cleanup before resolve
     const durMs = clamp(effectiveDurationSec(eventType, v) * 1000, 800, 30000);
     const outAnimMs = animSpeedToDurationMs(anim.out, anim.animSpeed);
 
-    hideTimer = setTimeout(() => {
-      if (imgEl) {
-        clearAnimClasses(imgEl);
-        applyAnimToEl(imgEl, "out", anim, stageSize);
-      }
-      if (textEl) {
-        clearAnimClasses(textEl);
-        applyAnimToEl(textEl, "out", anim, stageSize);
-      }
+    await delay(durMs);
 
-      setTimeout(() => hideAll(), outAnimMs + 30);
-    }, durMs);
+    if (imgEl) {
+      clearAnimClasses(imgEl);
+      applyAnimToEl(imgEl, "out", anim, stageSize);
+    }
+    if (textEl) {
+      clearAnimClasses(textEl);
+      applyAnimToEl(textEl, "out", anim, stageSize);
+    }
+
+    await delay(outAnimMs + 30);
+    hideAll();
   }
+
+  // -------------------------
+  // Serialized alert delivery (FIFO, one worker)
+  // -------------------------
+
+  const alertDelivery = window.StreamSyncAlertDelivery.createDelivery({
+    playOne(alert) {
+      return showAlert(
+        alert.eventType,
+        alert.variables,
+        alert.variationId,
+        alert.soundVolumeOverride
+      );
+    },
+  });
 
   // -------------------------
   // WebSocket feed
@@ -917,7 +934,12 @@
       const variationId = msg.variationId || null;
       const soundVolumeOverride = extractSoundVolume(msg);
 
-      showAlert(eventType, vars, variationId, soundVolumeOverride);
+      alertDelivery.enqueue({
+        eventType,
+        variables: vars,
+        variationId,
+        soundVolumeOverride,
+      });
     });
 
     ws.addEventListener("close", () => setTimeout(connect, 1000));

@@ -1,5 +1,5 @@
-// Alert delivery queue surface (events overlay). Pass 1 models today's overlap:
-// enqueue starts playOne immediately without waiting for a prior play to finish.
+// Alert delivery queue (events overlay). Pass 2: one FIFO queue + one worker.
+// enqueue never starts playOne while another playOne is in flight.
 (function (root) {
   /**
    * @param {{ playOne: (alert: unknown) => Promise<unknown> | unknown }} options
@@ -10,10 +10,34 @@
       throw new TypeError("createDelivery requires playOne(alert)");
     }
 
+    /** @type {{ alert: unknown, resolve: (v: unknown) => void, reject: (e: unknown) => void }[]} */
+    const pending = [];
+    let busy = false;
+
     function enqueue(alert) {
-      // Mirror events-overlay.js WS handler: call showAlert / play without await,
-      // so rapid alerts start concurrently and clobber each other.
-      return Promise.resolve(playOne(alert));
+      return new Promise((resolve, reject) => {
+        pending.push({ alert, resolve, reject });
+        drain();
+      });
+    }
+
+    function drain() {
+      if (busy) return;
+      const next = pending.shift();
+      if (!next) return;
+      busy = true;
+      Promise.resolve(playOne(next.alert)).then(
+        (value) => {
+          next.resolve(value);
+          busy = false;
+          drain();
+        },
+        (err) => {
+          next.reject(err);
+          busy = false;
+          drain();
+        }
+      );
     }
 
     return { enqueue };

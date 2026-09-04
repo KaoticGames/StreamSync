@@ -45,6 +45,7 @@
       "../../events-dock-config.js": "events-dock-config.js",
       "../../events-overlay-config.js": "events-overlay-config.js",
       "../../events-variation-picker.js": "events-variation-picker.js",
+      "../../events-alert-delivery.js": "events-alert-delivery.js",
       "../../events-overlay.js": "events-overlay.js",
       "../../events-se-import.js": "events-se-import.js",
       "../../streamelements-auth-inject.js": "streamelements-auth-inject.js"
