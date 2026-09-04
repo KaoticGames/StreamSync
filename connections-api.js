@@ -207,10 +207,10 @@
   }
 
   async function seOpenAccountPage() {
-    if (global.electronAPI?.openSeAccountPage) {
-      return global.electronAPI.openSeAccountPage();
-    }
     const url = "https://streamelements.com/dashboard/account/channels";
+    if (global.electronAPI?.openExternal) {
+      return global.electronAPI.openExternal(url);
+    }
     const opened = global.open(url, "_blank", "noopener,noreferrer");
     if (!opened) throw new Error("Popup blocked — allow popups for Stream Sync.");
   }
