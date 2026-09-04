@@ -1592,6 +1592,251 @@ mod tests {
         );
     }
 
+    /// Parent cheer values in `se_alertbox_cheer_partial_overrides.json` — deliberately
+    /// distinct from StreamSync hard defaults (duration 6, empty sound, cheer default
+    /// message, Montserrat / 54 / 800 / #ffffff).
+    const PARTIAL_PARENT_MESSAGE: &str = "[name] cheered x[amount]";
+    const PARTIAL_PARENT_DURATION: u64 = 12;
+    const PARTIAL_PARENT_SOUND: &str =
+        "https://cdn.streamelements.com/uploads/parent-cheer.mp3";
+    const PARTIAL_PARENT_SOUND_VOL: u64 = 40;
+    const PARTIAL_PARENT_GRAPHICS: &str =
+        "https://cdn.streamelements.com/uploads/parent-cheer.webm";
+    /// 72px at 1920×1080 → scaled by 2/3 on the 1280×720 stage.
+    const PARTIAL_PARENT_FONT_SIZE: u64 = 48;
+    const PARTIAL_PARENT_FONT_FAMILY: &str = "Oswald, system-ui, sans-serif";
+    const PARTIAL_PARENT_FONT_WEIGHT: u64 = 600;
+    const PARTIAL_PARENT_TEXT_COLOR: &str = "#ffcc00";
+
+    fn load_partial_override_cheer_variations() -> Vec<Value> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("se_mapper_fixtures")
+            .join("se_alertbox_cheer_partial_overrides.json");
+        let raw = std::fs::read_to_string(&path).expect("partial override fixture");
+        let overlay: Value = serde_json::from_str(&raw).expect("json");
+        let (_pid, profile, warnings) = map_overlay_to_profile(&overlay);
+        let vars = profile
+            .pointer("/events/cheer/variations")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            vars.len(),
+            5,
+            "expected base + 4 partial SE variations: {warnings:?}"
+        );
+        vars
+    }
+
+    fn assert_inherits_parent_message_duration_sound_typography(v: &Value, label: &str) {
+        assert_eq!(
+            v.pointer("/message").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_MESSAGE),
+            "{label}: message should inherit parent SE text, not cheer hard default"
+        );
+        assert_eq!(
+            v.pointer("/durationSec").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_DURATION),
+            "{label}: duration should inherit parent SE duration, not hard default 6"
+        );
+        assert_eq!(
+            v.pointer("/sound/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_SOUND),
+            "{label}: sound URL should inherit parent SE audio"
+        );
+        assert_eq!(
+            v.pointer("/sound/volume").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_SOUND_VOL),
+            "{label}: sound volume should inherit parent SE audio"
+        );
+        assert_eq!(
+            v.pointer("/text/fontFamily").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_FONT_FAMILY),
+            "{label}: typography should inherit parent SE text css"
+        );
+        assert_eq!(
+            v.pointer("/text/fontSize").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_FONT_SIZE),
+            "{label}: fontSize should inherit parent SE text css (scaled)"
+        );
+        assert_eq!(
+            v.pointer("/text/fontWeight").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_FONT_WEIGHT),
+            "{label}: fontWeight should inherit parent SE text css"
+        );
+        assert_eq!(
+            v.pointer("/text/color").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_TEXT_COLOR),
+            "{label}: text color should inherit parent SE text css"
+        );
+    }
+
+    #[test]
+    fn partial_override_graphics_only_inherits_parent_fields() {
+        let vars = load_partial_override_cheer_variations();
+        let v = &vars[1];
+        assert_eq!(
+            v.pointer("/image/value").and_then(|x| x.as_str()),
+            Some("https://cdn.streamelements.com/uploads/override-graphics.webm"),
+            "graphics-only: overridden graphics must come from the variation"
+        );
+        assert_inherits_parent_message_duration_sound_typography(v, "graphics-only");
+    }
+
+    #[test]
+    fn partial_override_audio_only_inherits_parent_fields() {
+        let vars = load_partial_override_cheer_variations();
+        let v = &vars[2];
+        assert_eq!(
+            v.pointer("/sound/value").and_then(|x| x.as_str()),
+            Some("https://cdn.streamelements.com/uploads/override-audio.mp3"),
+            "audio-only: overridden sound URL must come from the variation"
+        );
+        assert_eq!(
+            v.pointer("/sound/volume").and_then(|x| x.as_u64()),
+            Some(75),
+            "audio-only: overridden sound volume must come from the variation"
+        );
+        assert_eq!(
+            v.pointer("/image/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_GRAPHICS),
+            "audio-only: graphics should inherit parent SE graphics"
+        );
+        assert_eq!(
+            v.pointer("/message").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_MESSAGE),
+            "audio-only: message should inherit parent SE text, not cheer hard default"
+        );
+        assert_eq!(
+            v.pointer("/durationSec").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_DURATION),
+            "audio-only: duration should inherit parent SE duration, not hard default 6"
+        );
+        assert_eq!(
+            v.pointer("/text/fontFamily").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_FONT_FAMILY),
+            "audio-only: typography should inherit parent SE text css"
+        );
+        assert_eq!(
+            v.pointer("/text/fontSize").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_FONT_SIZE),
+            "audio-only: fontSize should inherit parent SE text css (scaled)"
+        );
+        assert_eq!(
+            v.pointer("/text/fontWeight").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_FONT_WEIGHT),
+            "audio-only: fontWeight should inherit parent SE text css"
+        );
+        assert_eq!(
+            v.pointer("/text/color").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_TEXT_COLOR),
+            "audio-only: text color should inherit parent SE text css"
+        );
+    }
+
+    #[test]
+    fn partial_override_message_only_inherits_parent_fields() {
+        let vars = load_partial_override_cheer_variations();
+        let v = &vars[3];
+        assert_eq!(
+            v.pointer("/message").and_then(|x| x.as_str()),
+            Some("[name] hit 300 bits!"),
+            "message-only: overridden message must come from the variation"
+        );
+        assert_eq!(
+            v.pointer("/image/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_GRAPHICS),
+            "message-only: graphics should inherit parent SE graphics"
+        );
+        assert_eq!(
+            v.pointer("/durationSec").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_DURATION),
+            "message-only: duration should inherit parent SE duration, not hard default 6"
+        );
+        assert_eq!(
+            v.pointer("/sound/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_SOUND),
+            "message-only: sound URL should inherit parent SE audio"
+        );
+        assert_eq!(
+            v.pointer("/sound/volume").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_SOUND_VOL),
+            "message-only: sound volume should inherit parent SE audio"
+        );
+        assert_eq!(
+            v.pointer("/text/fontFamily").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_FONT_FAMILY),
+            "message-only: typography should inherit parent SE text css"
+        );
+        assert_eq!(
+            v.pointer("/text/fontSize").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_FONT_SIZE),
+            "message-only: fontSize should inherit parent SE text css (scaled)"
+        );
+        assert_eq!(
+            v.pointer("/text/fontWeight").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_FONT_WEIGHT),
+            "message-only: fontWeight should inherit parent SE text css"
+        );
+        assert_eq!(
+            v.pointer("/text/color").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_TEXT_COLOR),
+            "message-only: text color should inherit parent SE text css"
+        );
+    }
+
+    #[test]
+    fn partial_override_duration_only_inherits_parent_fields() {
+        let vars = load_partial_override_cheer_variations();
+        let v = &vars[4];
+        assert_eq!(
+            v.pointer("/durationSec").and_then(|x| x.as_u64()),
+            Some(18),
+            "duration-only: overridden duration must come from the variation"
+        );
+        assert_eq!(
+            v.pointer("/image/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_GRAPHICS),
+            "duration-only: graphics should inherit parent SE graphics"
+        );
+        assert_eq!(
+            v.pointer("/message").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_MESSAGE),
+            "duration-only: message should inherit parent SE text, not cheer hard default"
+        );
+        assert_eq!(
+            v.pointer("/sound/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_SOUND),
+            "duration-only: sound URL should inherit parent SE audio"
+        );
+        assert_eq!(
+            v.pointer("/sound/volume").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_SOUND_VOL),
+            "duration-only: sound volume should inherit parent SE audio"
+        );
+        assert_eq!(
+            v.pointer("/text/fontFamily").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_FONT_FAMILY),
+            "duration-only: typography should inherit parent SE text css"
+        );
+        assert_eq!(
+            v.pointer("/text/fontSize").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_FONT_SIZE),
+            "duration-only: fontSize should inherit parent SE text css (scaled)"
+        );
+        assert_eq!(
+            v.pointer("/text/fontWeight").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_FONT_WEIGHT),
+            "duration-only: fontWeight should inherit parent SE text css"
+        );
+        assert_eq!(
+            v.pointer("/text/color").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_TEXT_COLOR),
+            "duration-only: text color should inherit parent SE text css"
+        );
+    }
+
     #[test]
     fn map_subscriber_variations_to_sub_resub_gift() {
         let overlay = json!({
