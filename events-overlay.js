@@ -107,18 +107,26 @@
 
   function applyVars(str, vars) {
     const v = vars || {};
-    return String(str || "").replace(
-      /\[(name|user|amount|months|reward|input|recipient)\]/g,
-      (_, key) => {
-        if (key === "user") {
-          return v.user != null
-            ? String(v.user)
-            : v.name != null
-              ? String(v.name)
-              : "";
-        }
-        return v[key] == null ? "" : String(v[key]);
+    function resolve(key) {
+      if (key === "name" || key === "user") {
+        const primary = v[key];
+        const alias = key === "name" ? v.user : v.name;
+        if (primary != null) return String(primary);
+        if (alias != null) return String(alias);
+        return "";
       }
+      if (key === "input" || key === "message") {
+        const primary = v[key];
+        const alias = key === "input" ? v.message : v.input;
+        if (primary != null) return String(primary);
+        if (alias != null) return String(alias);
+        return "";
+      }
+      return v[key] == null ? "" : String(v[key]);
+    }
+    return String(str || "").replace(
+      /\[(name|user|amount|months|reward|input|recipient|message|tier|sender|items|currency)\]/g,
+      (_, key) => resolve(key)
     );
   }
 

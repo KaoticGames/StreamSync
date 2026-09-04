@@ -570,6 +570,16 @@ fn map_widget(
         }
     }
 
+    // SE keys without a shipped overlay type: skip + warn (no silent aliases).
+    for (se_key, warning) in SE_SKIPPED_EVENT_KEYS {
+        let Some(event_cfg) = vars.get(*se_key) else {
+            continue;
+        };
+        if se_event_cfg_enabled(event_cfg) {
+            warnings.push((*warning).into());
+        }
+    }
+
     for (se_key, ss_key) in SE_EVENT_KEYS {
         let Some(event_cfg) = vars.get(*se_key) else {
             continue;
@@ -582,7 +592,7 @@ fn map_widget(
             continue;
         }
         let mut mapped = Vec::new();
-        map_se_event_variations(event_cfg, bounds, ss_key, scale, &mut mapped);
+        map_se_event_variations(event_cfg, bounds, ss_key, scale, &mut mapped, warnings);
         if mapped.is_empty() {
             continue;
         }
@@ -599,17 +609,33 @@ fn map_widget(
     }
 }
 
+/// SE alert keys we deliberately do not map to overlay event types.
+const SE_SKIPPED_EVENT_KEYS: &[(&str, &str)] = &[
+    (
+        "tip",
+        "Skipped StreamElements tip/donation alert (tips are not configured as overlay events).",
+    ),
+    (
+        "purchase",
+        "Skipped StreamElements purchase alert (no overlay redeem configuration).",
+    ),
+    (
+        "redemption",
+        "Skipped StreamElements redemption alert (no overlay redeem configuration).",
+    ),
+    (
+        "merch",
+        "Skipped StreamElements merch alert (no overlay redeem configuration).",
+    ),
+];
+
 const SE_EVENT_KEYS: &[(&str, &str)] = &[
     ("follower", "follow"),
     ("subscriber", "sub"),
     ("raid", "raid"),
     ("cheer", "cheer"),
-    ("tip", "cheer"),
     ("gift", "gift"),
     ("gifted", "gift"),
-    ("purchase", "redeem"),
-    ("redemption", "redeem"),
-    ("merch", "redeem"),
 ];
 
 /// Stream Sync variation trigger: mode, numeric value, optional tier (1–3).
@@ -650,6 +676,7 @@ fn map_subscriber_se_event(
             "Base alert",
             None,
             Some(("none".into(), None, None)),
+            warnings,
         );
         push_event_variation(events, "sub", base);
     }
@@ -669,6 +696,7 @@ fn map_subscriber_se_event(
             .get("settings")
             .filter(|v| v.is_object())
             .unwrap_or(se_var);
+        let merged = merge_se_parent_with_variation_settings(event_cfg, settings);
         let name = se_var
             .get("name")
             .and_then(|v| v.as_str())
@@ -682,13 +710,14 @@ fn map_subscriber_se_event(
             routed_resub += 1;
         }
         let variation = variation_from_se_settings(
-            settings,
+            &merged,
             bounds,
             ss_key,
             scale,
             name,
             chance,
             Some(trigger),
+            warnings,
         );
         push_event_variation(events, ss_key, variation);
     }
@@ -815,6 +844,7 @@ fn map_se_event_variations(
     ss_key: &str,
     scale: &StageScale,
     out: &mut Vec<Value>,
+    warnings: &mut Vec<String>,
 ) {
     // Stream Sync expects index 0 = base (trigger "none"). SE stores that on the parent event,
     // not in `variations[]` — mirror `map_subscriber_se_event` so trigger tests match correctly.
@@ -826,6 +856,7 @@ fn map_se_event_variations(
         "Base alert",
         None,
         Some(("none".to_string(), None, None)),
+        warnings,
     ));
 
     let Some(se_vars) = event_cfg
@@ -844,6 +875,7 @@ fn map_se_event_variations(
             .get("settings")
             .filter(|v| v.is_object())
             .unwrap_or(se_var);
+        let merged = merge_se_parent_with_variation_settings(event_cfg, settings);
         let name = se_var
             .get("name")
             .and_then(|v| v.as_str())
@@ -851,15 +883,57 @@ fn map_se_event_variations(
         let chance = se_var.get("chance").and_then(|v| v.as_u64());
         let trigger = map_se_variation_trigger(se_var);
         out.push(variation_from_se_settings(
-            settings,
+            &merged,
             bounds,
             ss_key,
             scale,
             name,
             chance,
             Some(trigger),
+            warnings,
         ));
     }
+}
+
+/// Deep-merge parent SE event presentation with variation `settings`.
+/// Variation wins on present keys; `text` / `audio` / `graphics` / `animation` merge field-wise
+/// so partial overrides keep unresolved parent fields. Result is fully resolved (no inherit markers).
+fn merge_se_parent_with_variation_settings(parent: &Value, variation_settings: &Value) -> Value {
+    let mut merged = match parent.as_object() {
+        Some(obj) => {
+            let mut out = obj.clone();
+            out.remove("variations");
+            Value::Object(out)
+        }
+        None => json!({}),
+    };
+
+    let Some(var_obj) = variation_settings.as_object() else {
+        return merged;
+    };
+    let Some(merged_obj) = merged.as_object_mut() else {
+        return variation_settings.clone();
+    };
+
+    for (key, var_val) in var_obj {
+        let nest = matches!(key.as_str(), "text" | "audio" | "graphics" | "animation");
+        if nest {
+            if let (Some(parent_nested), Some(var_nested)) = (
+                merged_obj.get(key).and_then(|v| v.as_object()),
+                var_val.as_object(),
+            ) {
+                let mut nested = parent_nested.clone();
+                for (nk, nv) in var_nested {
+                    nested.insert(nk.clone(), nv.clone());
+                }
+                merged_obj.insert(key.clone(), Value::Object(nested));
+                continue;
+            }
+        }
+        merged_obj.insert(key.clone(), var_val.clone());
+    }
+
+    merged
 }
 
 fn map_se_variation_trigger(se_var: &Value) -> VariationTrigger {
@@ -959,6 +1033,7 @@ fn parse_css_px(v: Option<&Value>) -> Option<f64> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn variation_from_se_settings(
     cfg: &Value,
     bounds: (f64, f64, f64, f64),
@@ -967,6 +1042,7 @@ fn variation_from_se_settings(
     variation_name: &str,
     chance_pct: Option<u64>,
     trigger: Option<VariationTrigger>,
+    warnings: &mut Vec<String>,
 ) -> Value {
     let (x, y, w, h) = bounds;
     let default_msg = match event_key {
@@ -980,7 +1056,7 @@ fn variation_from_se_settings(
         _ => "[name] triggered an alert!",
     };
 
-    let message = extract_message(cfg).unwrap_or_else(|| default_msg.to_string());
+    let message = extract_message(cfg, warnings).unwrap_or_else(|| default_msg.to_string());
     let visual_url = extract_visual_url(cfg);
     let (sound_url, sound_volume) = extract_audio(cfg);
 
@@ -1042,7 +1118,7 @@ fn variation_from_se_settings(
     })
 }
 
-fn extract_message(cfg: &Value) -> Option<String> {
+fn extract_message(cfg: &Value, warnings: &mut Vec<String>) -> Option<String> {
     let candidates = [
         cfg.pointer("/text/message"),
         cfg.get("message"),
@@ -1051,7 +1127,8 @@ fn extract_message(cfg: &Value) -> Option<String> {
     ];
     for c in candidates {
         if let Some(s) = c.and_then(|v| v.as_str()) {
-            let t = se_template_to_ss(s);
+            let (t, tok_warnings) = se_template_to_ss(s);
+            warnings.extend(tok_warnings);
             if !t.is_empty() {
                 return Some(t);
             }
@@ -1128,11 +1205,17 @@ fn extract_text_style(cfg: &Value, scale: &StageScale) -> (String, u64, u64, Str
     (family, scale.scale_font(size), weight, color)
 }
 
-fn se_template_to_ss(s: &str) -> String {
+/// Convert StreamElements `{token}` / `{{token}}` templates to StreamSync `[token]` form.
+/// Unknown SE tokens are stripped (not invented) and reported via the returned warnings
+/// plus `tracing::warn!`.
+fn se_template_to_ss(s: &str) -> (String, Vec<String>) {
     let mut out = s.to_string();
+    // Longer / double-brace forms first so `{{name}}` is not partially eaten by `{name}`.
     let pairs = [
         ("{{name}}", "[name]"),
         ("{name}", "[name]"),
+        ("{{user}}", "[name]"),
+        ("{user}", "[name]"),
         ("{{amount}}", "[amount]"),
         ("{amount}", "[amount]"),
         ("{{months}}", "[months]"),
@@ -1141,6 +1224,8 @@ fn se_template_to_ss(s: &str) -> String {
         ("{tier}", "[tier]"),
         ("{{message}}", "[message]"),
         ("{message}", "[message]"),
+        ("{{announcement}}", "[message]"),
+        ("{announcement}", "[message]"),
         ("{{reward}}", "[reward]"),
         ("{reward}", "[reward]"),
         ("{{sender}}", "[sender]"),
@@ -1149,13 +1234,65 @@ fn se_template_to_ss(s: &str) -> String {
         ("{items}", "[items]"),
         ("{{currency}}", "[currency]"),
         ("{currency}", "[currency]"),
-        ("{{announcement}}", "[message]"),
-        ("{announcement}", "[message]"),
+        ("{{recipient}}", "[recipient]"),
+        ("{recipient}", "[recipient]"),
+        ("{{input}}", "[input]"),
+        ("{input}", "[input]"),
     ];
     for (from, to) in pairs {
         out = out.replace(from, to);
     }
-    out
+    strip_unknown_se_tokens(out)
+}
+
+/// Remove leftover `{token}` / `{{token}}` spans; each unique token name yields one warning.
+fn strip_unknown_se_tokens(s: String) -> (String, Vec<String>) {
+    let mut out = String::with_capacity(s.len());
+    let mut warnings = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let double = i + 1 < bytes.len() && bytes[i + 1] == b'{';
+        let content_start = if double { i + 2 } else { i + 1 };
+        let mut j = content_start;
+        while j < bytes.len() && bytes[j] != b'}' {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            // Unclosed brace — keep as literal.
+            out.push('{');
+            i += 1;
+            continue;
+        }
+        let mut end = j + 1;
+        if double {
+            if end < bytes.len() && bytes[end] == b'}' {
+                end += 1;
+            } else {
+                // `{{…}` without closing `}}` — keep opening brace literal.
+                out.push('{');
+                i += 1;
+                continue;
+            }
+        }
+        let token: String = s[content_start..j].chars().collect();
+        let token_trim = token.trim();
+        if !token_trim.is_empty() && !warnings.iter().any(|w: &String| w.contains(token_trim)) {
+            let warn = format!(
+                "Unknown StreamElements token {{{token_trim}}} stripped from alert message."
+            );
+            tracing::warn!("{warn}");
+            warnings.push(warn);
+        }
+        // Strip the whole `{…}` / `{{…}}` span (do not invent a substitute).
+        i = end;
+    }
+    (out, warnings)
 }
 
 fn find_url_string(cfg: &Value, keys: &[&str]) -> String {
@@ -1472,19 +1609,224 @@ mod tests {
 
     #[test]
     fn should_localize_remote_http_only() {
+        // Remote https → download into events-media; local/loopback/data: stay put.
         assert!(should_localize_url(
             "https://cdn.streamelements.com/static/upload/alert.png"
         ));
         assert!(!should_localize_url("/events-media/profile/alert.png"));
+        assert!(!should_localize_url("http://127.0.0.1/alert.png"));
         assert!(!should_localize_url(
             "http://127.0.0.1:4040/events-media/x.png"
         ));
+        assert!(!should_localize_url("data:image/png;base64,iVBORw0KGgo="));
         assert!(!should_localize_url(""));
+    }
+
+    /// Overlay-config JSON must never gain `data:` media payloads — extract_* only
+    /// accepts http(s), and variation_from_se_settings always emits `type: "url"`.
+    #[test]
+    fn map_overlay_to_profile_never_emits_data_uri_media() {
+        let overlay = json!({
+            "_id": "data-uri-1",
+            "name": "Data URI Alerts",
+            "settings": { "width": 1280, "height": 720 },
+            "widgets": [{
+                "type": "se-widget-alert-box",
+                "css": { "left": "0px", "top": "0px", "width": "400px", "height": "300px" },
+                "variables": {
+                    "follower": {
+                        "enabled": true,
+                        "duration": 6,
+                        "graphics": {
+                            "src": "data:image/png;base64,iVBORw0KGgo="
+                        },
+                        "audio": {
+                            "src": "data:audio/mpeg;base64,//uQx",
+                            "volume": 1.0
+                        },
+                        "text": { "message": "{name} followed" },
+                        "variations": [{
+                            "enabled": true,
+                            "name": "data override",
+                            "condition": "EXACT",
+                            "requirement": 1,
+                            "chance": 100,
+                            "settings": {
+                                "graphics": {
+                                    "src": "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+                                },
+                                "audio": {
+                                    "src": "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEA",
+                                    "volume": 0.5
+                                }
+                            }
+                        }]
+                    }
+                }
+            }]
+        });
+        let (_pid, profile, _) = map_overlay_to_profile(&overlay);
+        assert_no_data_uri_media_in_profile(&profile);
+        let img = profile
+            .pointer("/events/follow/variations/0/image/value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("missing");
+        let snd = profile
+            .pointer("/events/follow/variations/0/sound/value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("missing");
+        assert_eq!(img, "", "data: graphics must be dropped, not embedded");
+        assert_eq!(snd, "", "data: audio must be dropped, not embedded");
+        assert_eq!(
+            profile
+                .pointer("/events/follow/variations/0/image/type")
+                .and_then(|v| v.as_str()),
+            Some("url")
+        );
+        assert_eq!(
+            profile
+                .pointer("/events/follow/variations/0/sound/type")
+                .and_then(|v| v.as_str()),
+            Some("url")
+        );
+    }
+
+    fn assert_no_data_uri_media_in_profile(profile: &Value) {
+        let Some(events) = profile.get("events").and_then(|v| v.as_object()) else {
+            return;
+        };
+        for (event_key, event_val) in events {
+            let Some(vars) = event_val.get("variations").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for (i, var) in vars.iter().enumerate() {
+                for kind in ["image", "sound"] {
+                    let value = var
+                        .pointer(&format!("/{kind}/value"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    assert!(
+                        !value.starts_with("data:"),
+                        "{event_key} variation {i} {kind} must not be a data: URI: {value}"
+                    );
+                    let ty = var
+                        .pointer(&format!("/{kind}/type"))
+                        .and_then(|v| v.as_str());
+                    if ty.is_some() {
+                        assert_eq!(
+                            ty,
+                            Some("url"),
+                            "{event_key} variation {i} {kind} type must stay url, not data"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
     fn se_template_replaces_placeholders() {
-        assert_eq!(se_template_to_ss("{{name}} followed!"), "[name] followed!");
+        let (out, warnings) = se_template_to_ss("{{name}} followed!");
+        assert_eq!(out, "[name] followed!");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn se_template_canonicalizes_user_to_name() {
+        let (out, warnings) = se_template_to_ss("{user} followed!");
+        assert_eq!(out, "[name] followed!");
+        assert!(warnings.is_empty(), "{{user}}: {warnings:?}");
+
+        let (out2, warnings2) = se_template_to_ss("{{user}} just followed");
+        assert_eq!(out2, "[name] just followed");
+        assert!(warnings2.is_empty(), "{{user}}: {warnings2:?}");
+    }
+
+    #[test]
+    fn se_template_maps_known_hardening_tokens() {
+        let cases = [
+            ("{name}", "[name]"),
+            ("{user}", "[name]"),
+            ("{amount}", "[amount]"),
+            ("{months}", "[months]"),
+            ("{tier}", "[tier]"),
+            ("{message}", "[message]"),
+            ("{announcement}", "[message]"),
+            ("{reward}", "[reward]"),
+            ("{sender}", "[sender]"),
+            ("{items}", "[items]"),
+            ("{currency}", "[currency]"),
+            ("{recipient}", "[recipient]"),
+            ("{input}", "[input]"),
+            ("{{name}}", "[name]"),
+            ("{{user}}", "[name]"),
+            ("{{recipient}}", "[recipient]"),
+            ("{{input}}", "[input]"),
+            ("{{announcement}}", "[message]"),
+        ];
+        for (se, ss) in cases {
+            let (out, warnings) = se_template_to_ss(se);
+            assert_eq!(out, ss, "token {se}");
+            assert!(
+                warnings.is_empty(),
+                "known token {se} should not warn: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn se_template_strips_unknown_tokens_and_warns() {
+        let (out, warnings) = se_template_to_ss("{name} hit {foo} bits!");
+        assert_eq!(out, "[name] hit  bits!");
+        assert!(
+            warnings.iter().any(|w| w.contains("foo")),
+            "warning must mention unknown token: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("name")),
+            "known tokens must not warn: {warnings:?}"
+        );
+
+        let (out2, warnings2) = se_template_to_ss("Thanks {{bar}}!");
+        assert_eq!(out2, "Thanks !");
+        assert!(
+            warnings2.iter().any(|w| w.contains("bar")),
+            "double-brace unknown must warn: {warnings2:?}"
+        );
+    }
+
+    #[test]
+    fn map_overlay_unknown_se_token_lands_in_warnings() {
+        let overlay = json!({
+            "_id": "tok1",
+            "name": "Token Alerts",
+            "settings": { "width": 1280, "height": 720 },
+            "widgets": [{
+                "type": "se-widget-alert-box",
+                "css": { "left": "0px", "top": "0px", "width": "400px", "height": "300px" },
+                "variables": {
+                    "follower": {
+                        "enabled": true,
+                        "duration": 6,
+                        "text": { "message": "{user} did {mystery} today" },
+                        "variations": []
+                    }
+                }
+            }]
+        });
+        let (_pid, profile, warnings) = map_overlay_to_profile(&overlay);
+        let msg = profile
+            .pointer("/events/follow/variations/0/message")
+            .and_then(|v| v.as_str())
+            .expect("follow message");
+        assert_eq!(msg, "[name] did  today");
+        assert!(
+            warnings.iter().any(|w| w.contains("mystery")),
+            "map_overlay_to_profile warnings must mention stripped token: {warnings:?}"
+        );
+        // Do not invent meaning or fall back to a different template.
+        assert!(!msg.contains("mystery"));
+        assert!(!msg.contains("[mystery]"));
     }
 
     #[test]
@@ -1589,6 +1931,316 @@ mod tests {
         assert_eq!(
             v1000.pointer("/trigger/value").and_then(|x| x.as_u64()),
             Some(1000)
+        );
+    }
+
+    /// Parent cheer values in `se_alertbox_cheer_partial_overrides.json` — deliberately
+    /// distinct from StreamSync hard defaults (duration 6, empty sound, cheer default
+    /// message, Montserrat / 54 / 800 / #ffffff).
+    const PARTIAL_PARENT_MESSAGE: &str = "[name] cheered x[amount]";
+    const PARTIAL_PARENT_DURATION: u64 = 12;
+    const PARTIAL_PARENT_SOUND: &str = "https://cdn.streamelements.com/uploads/parent-cheer.mp3";
+    const PARTIAL_PARENT_SOUND_VOL: u64 = 40;
+    const PARTIAL_PARENT_GRAPHICS: &str =
+        "https://cdn.streamelements.com/uploads/parent-cheer.webm";
+    /// 72px at 1920×1080 → scaled by 2/3 on the 1280×720 stage.
+    const PARTIAL_PARENT_FONT_SIZE: u64 = 48;
+    const PARTIAL_PARENT_FONT_FAMILY: &str = "Oswald, system-ui, sans-serif";
+    const PARTIAL_PARENT_FONT_WEIGHT: u64 = 600;
+    const PARTIAL_PARENT_TEXT_COLOR: &str = "#ffcc00";
+
+    fn load_partial_override_cheer_variations() -> Vec<Value> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("se_mapper_fixtures")
+            .join("se_alertbox_cheer_partial_overrides.json");
+        let raw = std::fs::read_to_string(&path).expect("partial override fixture");
+        let overlay: Value = serde_json::from_str(&raw).expect("json");
+        let (_pid, profile, warnings) = map_overlay_to_profile(&overlay);
+        let vars = profile
+            .pointer("/events/cheer/variations")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            vars.len(),
+            5,
+            "expected base + 4 partial SE variations: {warnings:?}"
+        );
+        vars
+    }
+
+    fn assert_inherits_parent_message_duration_sound_typography(v: &Value, label: &str) {
+        assert_eq!(
+            v.pointer("/message").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_MESSAGE),
+            "{label}: message should inherit parent SE text, not cheer hard default"
+        );
+        assert_eq!(
+            v.pointer("/durationSec").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_DURATION),
+            "{label}: duration should inherit parent SE duration, not hard default 6"
+        );
+        assert_eq!(
+            v.pointer("/sound/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_SOUND),
+            "{label}: sound URL should inherit parent SE audio"
+        );
+        assert_eq!(
+            v.pointer("/sound/volume").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_SOUND_VOL),
+            "{label}: sound volume should inherit parent SE audio"
+        );
+        assert_eq!(
+            v.pointer("/text/fontFamily").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_FONT_FAMILY),
+            "{label}: typography should inherit parent SE text css"
+        );
+        assert_eq!(
+            v.pointer("/text/fontSize").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_FONT_SIZE),
+            "{label}: fontSize should inherit parent SE text css (scaled)"
+        );
+        assert_eq!(
+            v.pointer("/text/fontWeight").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_FONT_WEIGHT),
+            "{label}: fontWeight should inherit parent SE text css"
+        );
+        assert_eq!(
+            v.pointer("/text/color").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_TEXT_COLOR),
+            "{label}: text color should inherit parent SE text css"
+        );
+    }
+
+    #[test]
+    fn partial_override_graphics_only_inherits_parent_fields() {
+        let vars = load_partial_override_cheer_variations();
+        let v = &vars[1];
+        assert_eq!(
+            v.pointer("/image/value").and_then(|x| x.as_str()),
+            Some("https://cdn.streamelements.com/uploads/override-graphics.webm"),
+            "graphics-only: overridden graphics must come from the variation"
+        );
+        assert_inherits_parent_message_duration_sound_typography(v, "graphics-only");
+    }
+
+    #[test]
+    fn partial_override_audio_only_inherits_parent_fields() {
+        let vars = load_partial_override_cheer_variations();
+        let v = &vars[2];
+        assert_eq!(
+            v.pointer("/sound/value").and_then(|x| x.as_str()),
+            Some("https://cdn.streamelements.com/uploads/override-audio.mp3"),
+            "audio-only: overridden sound URL must come from the variation"
+        );
+        assert_eq!(
+            v.pointer("/sound/volume").and_then(|x| x.as_u64()),
+            Some(75),
+            "audio-only: overridden sound volume must come from the variation"
+        );
+        assert_eq!(
+            v.pointer("/image/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_GRAPHICS),
+            "audio-only: graphics should inherit parent SE graphics"
+        );
+        assert_eq!(
+            v.pointer("/message").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_MESSAGE),
+            "audio-only: message should inherit parent SE text, not cheer hard default"
+        );
+        assert_eq!(
+            v.pointer("/durationSec").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_DURATION),
+            "audio-only: duration should inherit parent SE duration, not hard default 6"
+        );
+        assert_eq!(
+            v.pointer("/text/fontFamily").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_FONT_FAMILY),
+            "audio-only: typography should inherit parent SE text css"
+        );
+        assert_eq!(
+            v.pointer("/text/fontSize").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_FONT_SIZE),
+            "audio-only: fontSize should inherit parent SE text css (scaled)"
+        );
+        assert_eq!(
+            v.pointer("/text/fontWeight").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_FONT_WEIGHT),
+            "audio-only: fontWeight should inherit parent SE text css"
+        );
+        assert_eq!(
+            v.pointer("/text/color").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_TEXT_COLOR),
+            "audio-only: text color should inherit parent SE text css"
+        );
+    }
+
+    #[test]
+    fn partial_override_message_only_inherits_parent_fields() {
+        let vars = load_partial_override_cheer_variations();
+        let v = &vars[3];
+        assert_eq!(
+            v.pointer("/message").and_then(|x| x.as_str()),
+            Some("[name] hit 300 bits!"),
+            "message-only: overridden message must come from the variation"
+        );
+        assert_eq!(
+            v.pointer("/image/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_GRAPHICS),
+            "message-only: graphics should inherit parent SE graphics"
+        );
+        assert_eq!(
+            v.pointer("/durationSec").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_DURATION),
+            "message-only: duration should inherit parent SE duration, not hard default 6"
+        );
+        assert_eq!(
+            v.pointer("/sound/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_SOUND),
+            "message-only: sound URL should inherit parent SE audio"
+        );
+        assert_eq!(
+            v.pointer("/sound/volume").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_SOUND_VOL),
+            "message-only: sound volume should inherit parent SE audio"
+        );
+        assert_eq!(
+            v.pointer("/text/fontFamily").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_FONT_FAMILY),
+            "message-only: typography should inherit parent SE text css"
+        );
+        assert_eq!(
+            v.pointer("/text/fontSize").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_FONT_SIZE),
+            "message-only: fontSize should inherit parent SE text css (scaled)"
+        );
+        assert_eq!(
+            v.pointer("/text/fontWeight").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_FONT_WEIGHT),
+            "message-only: fontWeight should inherit parent SE text css"
+        );
+        assert_eq!(
+            v.pointer("/text/color").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_TEXT_COLOR),
+            "message-only: text color should inherit parent SE text css"
+        );
+    }
+
+    #[test]
+    fn partial_override_duration_only_inherits_parent_fields() {
+        let vars = load_partial_override_cheer_variations();
+        let v = &vars[4];
+        assert_eq!(
+            v.pointer("/durationSec").and_then(|x| x.as_u64()),
+            Some(18),
+            "duration-only: overridden duration must come from the variation"
+        );
+        assert_eq!(
+            v.pointer("/image/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_GRAPHICS),
+            "duration-only: graphics should inherit parent SE graphics"
+        );
+        assert_eq!(
+            v.pointer("/message").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_MESSAGE),
+            "duration-only: message should inherit parent SE text, not cheer hard default"
+        );
+        assert_eq!(
+            v.pointer("/sound/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_SOUND),
+            "duration-only: sound URL should inherit parent SE audio"
+        );
+        assert_eq!(
+            v.pointer("/sound/volume").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_SOUND_VOL),
+            "duration-only: sound volume should inherit parent SE audio"
+        );
+        assert_eq!(
+            v.pointer("/text/fontFamily").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_FONT_FAMILY),
+            "duration-only: typography should inherit parent SE text css"
+        );
+        assert_eq!(
+            v.pointer("/text/fontSize").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_FONT_SIZE),
+            "duration-only: fontSize should inherit parent SE text css (scaled)"
+        );
+        assert_eq!(
+            v.pointer("/text/fontWeight").and_then(|x| x.as_u64()),
+            Some(PARTIAL_PARENT_FONT_WEIGHT),
+            "duration-only: fontWeight should inherit parent SE text css"
+        );
+        assert_eq!(
+            v.pointer("/text/color").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_TEXT_COLOR),
+            "duration-only: text color should inherit parent SE text css"
+        );
+    }
+
+    /// Partial overrides must keep parent http(s) image/sound so `localize_profile_media`
+    /// can download them into `/events-media/` (never data: blobs in overlay-config).
+    #[test]
+    fn partial_override_inherited_media_urls_are_localizable() {
+        let vars = load_partial_override_cheer_variations();
+        for (i, v) in vars.iter().enumerate() {
+            let img = v
+                .pointer("/image/value")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let snd = v
+                .pointer("/sound/value")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            assert!(
+                !img.starts_with("data:"),
+                "variation {i} image must not be data: URI"
+            );
+            assert!(
+                !snd.starts_with("data:"),
+                "variation {i} sound must not be data: URI"
+            );
+            assert!(
+                !img.is_empty() && should_localize_url(img),
+                "variation {i} image must stay remote http(s) for localize: {img}"
+            );
+            assert!(
+                !snd.is_empty() && should_localize_url(snd),
+                "variation {i} sound must stay remote http(s) for localize: {snd}"
+            );
+            assert_eq!(
+                v.pointer("/image/type").and_then(|x| x.as_str()),
+                Some("url")
+            );
+            assert_eq!(
+                v.pointer("/sound/type").and_then(|x| x.as_str()),
+                Some("url")
+            );
+        }
+        // Explicit inherit cases: graphics-only keeps parent sound; audio-only keeps parent image.
+        assert_eq!(
+            vars[1].pointer("/sound/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_SOUND)
+        );
+        assert_eq!(
+            vars[2].pointer("/image/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_GRAPHICS)
+        );
+        assert_eq!(
+            vars[3].pointer("/image/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_GRAPHICS)
+        );
+        assert_eq!(
+            vars[3].pointer("/sound/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_SOUND)
+        );
+        assert_eq!(
+            vars[4].pointer("/image/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_GRAPHICS)
+        );
+        assert_eq!(
+            vars[4].pointer("/sound/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_SOUND)
         );
     }
 
@@ -1707,6 +2359,164 @@ mod tests {
             "raid should not use host message, got {raid_msg}"
         );
         assert!(!raid_msg.to_lowercase().contains("hosting"));
+    }
+
+    /// Tip-only widget: SE tip must not silently alias into overlay `cheer`.
+    #[test]
+    fn enabled_tip_skips_without_cheer_from_tip() {
+        const TIP_MSG: &str = "{name} tipped ${amount} donation!";
+        const TIP_GFX: &str = "https://cdn.example.com/tip-donation.webm";
+        let overlay = json!({
+            "_id": "tiponly1",
+            "name": "Tip Only",
+            "settings": { "width": 1280, "height": 720 },
+            "widgets": [{
+                "type": "se-widget-alert-box",
+                "css": { "left": "0px", "top": "0px", "width": "400px", "height": "300px" },
+                "variables": {
+                    "tip": {
+                        "enabled": true,
+                        "duration": 8,
+                        "text": { "message": TIP_MSG },
+                        "graphics": { "src": TIP_GFX },
+                        "audio": { "src": "https://cdn.example.com/tip.mp3", "volume": 1 },
+                        "variations": []
+                    }
+                }
+            }]
+        });
+        let (_pid, profile, warnings) = map_overlay_to_profile(&overlay);
+        let warn_blob = warnings.join(" | ").to_lowercase();
+        assert!(
+            warn_blob.contains("tip") && warn_blob.contains("donation"),
+            "warning must mention tip/donation skip: {warnings:?}"
+        );
+        assert!(
+            warn_blob.contains("skip"),
+            "warning must indicate skip: {warnings:?}"
+        );
+
+        let cheer_vars = profile
+            .pointer("/events/cheer/variations")
+            .and_then(|v| v.as_array())
+            .expect("default or mapped cheer variations");
+        for (i, v) in cheer_vars.iter().enumerate() {
+            let msg = v.pointer("/message").and_then(|x| x.as_str()).unwrap_or("");
+            assert!(
+                !msg.to_lowercase().contains("tipped") && !msg.to_lowercase().contains("donation"),
+                "cheer[{i}] must not come from tip: {msg}"
+            );
+            let img = v
+                .pointer("/image/value")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            assert_ne!(
+                img, TIP_GFX,
+                "cheer[{i}] must not use tip donation graphics"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_merch_or_purchase_skips_without_overlay_redeem() {
+        const MERCH_MSG: &str = "{name} bought merch!";
+        const MERCH_GFX: &str = "https://cdn.example.com/merch-store.webm";
+        const PURCHASE_MSG: &str = "{name} completed a purchase!";
+        let overlay = json!({
+            "_id": "merch1",
+            "name": "Merch Purchase",
+            "settings": { "width": 1280, "height": 720 },
+            "widgets": [{
+                "type": "se-widget-alert-box",
+                "css": { "left": "0px", "top": "0px", "width": "400px", "height": "300px" },
+                "variables": {
+                    "merch": {
+                        "enabled": true,
+                        "text": { "message": MERCH_MSG },
+                        "graphics": { "src": MERCH_GFX },
+                        "variations": []
+                    },
+                    "purchase": {
+                        "enabled": true,
+                        "text": { "message": PURCHASE_MSG },
+                        "graphics": { "src": "https://cdn.example.com/purchase.webm" },
+                        "variations": []
+                    }
+                }
+            }]
+        });
+        let (_pid, profile, warnings) = map_overlay_to_profile(&overlay);
+        let warn_blob = warnings.join(" | ").to_lowercase();
+        assert!(
+            (warn_blob.contains("merch") || warn_blob.contains("purchase"))
+                && warn_blob.contains("skip"),
+            "warning must mention merch/purchase skip: {warnings:?}"
+        );
+
+        let redeem_vars = profile
+            .pointer("/events/redeem/variations")
+            .and_then(|v| v.as_array())
+            .expect("default or mapped redeem variations");
+        for (i, v) in redeem_vars.iter().enumerate() {
+            let msg = v
+                .pointer("/message")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            assert!(
+                !msg.contains("merch") && !msg.contains("purchase") && !msg.contains("bought"),
+                "redeem[{i}] must not come from SE merch/purchase: {msg}"
+            );
+            let img = v
+                .pointer("/image/value")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            assert_ne!(img, MERCH_GFX, "redeem[{i}] must not use merch graphics");
+        }
+    }
+
+    #[test]
+    fn cheer_only_widget_still_maps_cheer() {
+        let overlay = json!({
+            "_id": "cheeronly1",
+            "name": "Cheer Only",
+            "settings": { "width": 1280, "height": 720 },
+            "widgets": [{
+                "type": "se-widget-alert-box",
+                "css": { "left": "0px", "top": "0px", "width": "400px", "height": "300px" },
+                "variables": {
+                    "cheer": {
+                        "enabled": true,
+                        "duration": 7,
+                        "text": { "message": "{name} cheered {amount} bits!" },
+                        "graphics": { "src": "https://cdn.example.com/bits.webm" },
+                        "audio": { "src": "https://cdn.example.com/bits.mp3", "volume": 1 },
+                        "variations": []
+                    }
+                }
+            }]
+        });
+        let (_pid, profile, warnings) = map_overlay_to_profile(&overlay);
+        let vars = profile
+            .pointer("/events/cheer/variations")
+            .and_then(|v| v.as_array())
+            .expect("cheer variations");
+        assert!(
+            !vars.is_empty(),
+            "cheer SE key must still map to cheer: {warnings:?}"
+        );
+        let msg = vars[0]
+            .pointer("/message")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        assert!(
+            msg.contains("cheered") && msg.contains("[amount]"),
+            "expected mapped cheer message, got {msg}"
+        );
+        assert_eq!(
+            vars[0].pointer("/image/value").and_then(|x| x.as_str()),
+            Some("https://cdn.example.com/bits.webm")
+        );
     }
 
     #[test]
