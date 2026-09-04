@@ -1616,14 +1616,122 @@ mod tests {
 
     #[test]
     fn should_localize_remote_http_only() {
+        // Remote https → download into events-media; local/loopback/data: stay put.
         assert!(should_localize_url(
             "https://cdn.streamelements.com/static/upload/alert.png"
         ));
         assert!(!should_localize_url("/events-media/profile/alert.png"));
+        assert!(!should_localize_url("http://127.0.0.1/alert.png"));
         assert!(!should_localize_url(
             "http://127.0.0.1:4040/events-media/x.png"
         ));
+        assert!(!should_localize_url("data:image/png;base64,iVBORw0KGgo="));
         assert!(!should_localize_url(""));
+    }
+
+    /// Overlay-config JSON must never gain `data:` media payloads — extract_* only
+    /// accepts http(s), and variation_from_se_settings always emits `type: "url"`.
+    #[test]
+    fn map_overlay_to_profile_never_emits_data_uri_media() {
+        let overlay = json!({
+            "_id": "data-uri-1",
+            "name": "Data URI Alerts",
+            "settings": { "width": 1280, "height": 720 },
+            "widgets": [{
+                "type": "se-widget-alert-box",
+                "css": { "left": "0px", "top": "0px", "width": "400px", "height": "300px" },
+                "variables": {
+                    "follower": {
+                        "enabled": true,
+                        "duration": 6,
+                        "graphics": {
+                            "src": "data:image/png;base64,iVBORw0KGgo="
+                        },
+                        "audio": {
+                            "src": "data:audio/mpeg;base64,//uQx",
+                            "volume": 1.0
+                        },
+                        "text": { "message": "{name} followed" },
+                        "variations": [{
+                            "enabled": true,
+                            "name": "data override",
+                            "condition": "EXACT",
+                            "requirement": 1,
+                            "chance": 100,
+                            "settings": {
+                                "graphics": {
+                                    "src": "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+                                },
+                                "audio": {
+                                    "src": "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEA",
+                                    "volume": 0.5
+                                }
+                            }
+                        }]
+                    }
+                }
+            }]
+        });
+        let (_pid, profile, _) = map_overlay_to_profile(&overlay);
+        assert_no_data_uri_media_in_profile(&profile);
+        let img = profile
+            .pointer("/events/follow/variations/0/image/value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("missing");
+        let snd = profile
+            .pointer("/events/follow/variations/0/sound/value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("missing");
+        assert_eq!(img, "", "data: graphics must be dropped, not embedded");
+        assert_eq!(snd, "", "data: audio must be dropped, not embedded");
+        assert_eq!(
+            profile
+                .pointer("/events/follow/variations/0/image/type")
+                .and_then(|v| v.as_str()),
+            Some("url")
+        );
+        assert_eq!(
+            profile
+                .pointer("/events/follow/variations/0/sound/type")
+                .and_then(|v| v.as_str()),
+            Some("url")
+        );
+    }
+
+    fn assert_no_data_uri_media_in_profile(profile: &Value) {
+        let Some(events) = profile.get("events").and_then(|v| v.as_object()) else {
+            return;
+        };
+        for (event_key, event_val) in events {
+            let Some(vars) = event_val
+                .get("variations")
+                .and_then(|v| v.as_array())
+            else {
+                continue;
+            };
+            for (i, var) in vars.iter().enumerate() {
+                for kind in ["image", "sound"] {
+                    let value = var
+                        .pointer(&format!("/{kind}/value"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    assert!(
+                        !value.starts_with("data:"),
+                        "{event_key} variation {i} {kind} must not be a data: URI: {value}"
+                    );
+                    let ty = var
+                        .pointer(&format!("/{kind}/type"))
+                        .and_then(|v| v.as_str());
+                    if ty.is_some() {
+                        assert_eq!(
+                            ty,
+                            Some("url"),
+                            "{event_key} variation {i} {kind} type must stay url, not data"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2078,6 +2186,72 @@ mod tests {
             v.pointer("/text/color").and_then(|x| x.as_str()),
             Some(PARTIAL_PARENT_TEXT_COLOR),
             "duration-only: text color should inherit parent SE text css"
+        );
+    }
+
+    /// Partial overrides must keep parent http(s) image/sound so `localize_profile_media`
+    /// can download them into `/events-media/` (never data: blobs in overlay-config).
+    #[test]
+    fn partial_override_inherited_media_urls_are_localizable() {
+        let vars = load_partial_override_cheer_variations();
+        for (i, v) in vars.iter().enumerate() {
+            let img = v
+                .pointer("/image/value")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let snd = v
+                .pointer("/sound/value")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            assert!(
+                !img.starts_with("data:"),
+                "variation {i} image must not be data: URI"
+            );
+            assert!(
+                !snd.starts_with("data:"),
+                "variation {i} sound must not be data: URI"
+            );
+            assert!(
+                !img.is_empty() && should_localize_url(img),
+                "variation {i} image must stay remote http(s) for localize: {img}"
+            );
+            assert!(
+                !snd.is_empty() && should_localize_url(snd),
+                "variation {i} sound must stay remote http(s) for localize: {snd}"
+            );
+            assert_eq!(
+                v.pointer("/image/type").and_then(|x| x.as_str()),
+                Some("url")
+            );
+            assert_eq!(
+                v.pointer("/sound/type").and_then(|x| x.as_str()),
+                Some("url")
+            );
+        }
+        // Explicit inherit cases: graphics-only keeps parent sound; audio-only keeps parent image.
+        assert_eq!(
+            vars[1].pointer("/sound/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_SOUND)
+        );
+        assert_eq!(
+            vars[2].pointer("/image/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_GRAPHICS)
+        );
+        assert_eq!(
+            vars[3].pointer("/image/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_GRAPHICS)
+        );
+        assert_eq!(
+            vars[3].pointer("/sound/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_SOUND)
+        );
+        assert_eq!(
+            vars[4].pointer("/image/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_GRAPHICS)
+        );
+        assert_eq!(
+            vars[4].pointer("/sound/value").and_then(|x| x.as_str()),
+            Some(PARTIAL_PARENT_SOUND)
         );
     }
 
