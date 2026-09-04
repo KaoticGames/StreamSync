@@ -1089,6 +1089,10 @@ async fn events_studio_csp_allows_same_origin_embed() {
         .expect("CSP response header");
     assert!(csp.contains("frame-ancestors 'self'"));
     assert!(!csp.contains("frame-ancestors 'none'"));
+    assert!(
+        csp.contains("http://ipc.localhost"),
+        "desktop studio must allow Tauri IPC (create/save/test-alert)"
+    );
 }
 
 #[tokio::test]
