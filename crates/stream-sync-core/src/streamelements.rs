@@ -582,7 +582,7 @@ fn map_widget(
             continue;
         }
         let mut mapped = Vec::new();
-        map_se_event_variations(event_cfg, bounds, ss_key, scale, &mut mapped);
+        map_se_event_variations(event_cfg, bounds, ss_key, scale, &mut mapped, warnings);
         if mapped.is_empty() {
             continue;
         }
@@ -650,6 +650,7 @@ fn map_subscriber_se_event(
             "Base alert",
             None,
             Some(("none".into(), None, None)),
+            warnings,
         );
         push_event_variation(events, "sub", base);
     }
@@ -690,6 +691,7 @@ fn map_subscriber_se_event(
             name,
             chance,
             Some(trigger),
+            warnings,
         );
         push_event_variation(events, ss_key, variation);
     }
@@ -816,6 +818,7 @@ fn map_se_event_variations(
     ss_key: &str,
     scale: &StageScale,
     out: &mut Vec<Value>,
+    warnings: &mut Vec<String>,
 ) {
     // Stream Sync expects index 0 = base (trigger "none"). SE stores that on the parent event,
     // not in `variations[]` — mirror `map_subscriber_se_event` so trigger tests match correctly.
@@ -827,6 +830,7 @@ fn map_se_event_variations(
         "Base alert",
         None,
         Some(("none".to_string(), None, None)),
+        warnings,
     ));
 
     let Some(se_vars) = event_cfg
@@ -860,6 +864,7 @@ fn map_se_event_variations(
             name,
             chance,
             Some(trigger),
+            warnings,
         ));
     }
 }
@@ -1013,6 +1018,7 @@ fn variation_from_se_settings(
     variation_name: &str,
     chance_pct: Option<u64>,
     trigger: Option<VariationTrigger>,
+    warnings: &mut Vec<String>,
 ) -> Value {
     let (x, y, w, h) = bounds;
     let default_msg = match event_key {
@@ -1026,7 +1032,8 @@ fn variation_from_se_settings(
         _ => "[name] triggered an alert!",
     };
 
-    let message = extract_message(cfg).unwrap_or_else(|| default_msg.to_string());
+    let message =
+        extract_message(cfg, warnings).unwrap_or_else(|| default_msg.to_string());
     let visual_url = extract_visual_url(cfg);
     let (sound_url, sound_volume) = extract_audio(cfg);
 
@@ -1088,7 +1095,7 @@ fn variation_from_se_settings(
     })
 }
 
-fn extract_message(cfg: &Value) -> Option<String> {
+fn extract_message(cfg: &Value, warnings: &mut Vec<String>) -> Option<String> {
     let candidates = [
         cfg.pointer("/text/message"),
         cfg.get("message"),
@@ -1097,7 +1104,8 @@ fn extract_message(cfg: &Value) -> Option<String> {
     ];
     for c in candidates {
         if let Some(s) = c.and_then(|v| v.as_str()) {
-            let t = se_template_to_ss(s);
+            let (t, tok_warnings) = se_template_to_ss(s);
+            warnings.extend(tok_warnings);
             if !t.is_empty() {
                 return Some(t);
             }
@@ -1174,11 +1182,17 @@ fn extract_text_style(cfg: &Value, scale: &StageScale) -> (String, u64, u64, Str
     (family, scale.scale_font(size), weight, color)
 }
 
-fn se_template_to_ss(s: &str) -> String {
+/// Convert StreamElements `{token}` / `{{token}}` templates to StreamSync `[token]` form.
+/// Unknown SE tokens are stripped (not invented) and reported via the returned warnings
+/// plus `tracing::warn!`.
+fn se_template_to_ss(s: &str) -> (String, Vec<String>) {
     let mut out = s.to_string();
+    // Longer / double-brace forms first so `{{name}}` is not partially eaten by `{name}`.
     let pairs = [
         ("{{name}}", "[name]"),
         ("{name}", "[name]"),
+        ("{{user}}", "[name]"),
+        ("{user}", "[name]"),
         ("{{amount}}", "[amount]"),
         ("{amount}", "[amount]"),
         ("{{months}}", "[months]"),
@@ -1187,6 +1201,8 @@ fn se_template_to_ss(s: &str) -> String {
         ("{tier}", "[tier]"),
         ("{{message}}", "[message]"),
         ("{message}", "[message]"),
+        ("{{announcement}}", "[message]"),
+        ("{announcement}", "[message]"),
         ("{{reward}}", "[reward]"),
         ("{reward}", "[reward]"),
         ("{{sender}}", "[sender]"),
@@ -1195,13 +1211,69 @@ fn se_template_to_ss(s: &str) -> String {
         ("{items}", "[items]"),
         ("{{currency}}", "[currency]"),
         ("{currency}", "[currency]"),
-        ("{{announcement}}", "[message]"),
-        ("{announcement}", "[message]"),
+        ("{{recipient}}", "[recipient]"),
+        ("{recipient}", "[recipient]"),
+        ("{{input}}", "[input]"),
+        ("{input}", "[input]"),
     ];
     for (from, to) in pairs {
         out = out.replace(from, to);
     }
-    out
+    strip_unknown_se_tokens(out)
+}
+
+/// Remove leftover `{token}` / `{{token}}` spans; each unique token name yields one warning.
+fn strip_unknown_se_tokens(s: String) -> (String, Vec<String>) {
+    let mut out = String::with_capacity(s.len());
+    let mut warnings = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let double = i + 1 < bytes.len() && bytes[i + 1] == b'{';
+        let content_start = if double { i + 2 } else { i + 1 };
+        let mut j = content_start;
+        while j < bytes.len() && bytes[j] != b'}' {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            // Unclosed brace — keep as literal.
+            out.push('{');
+            i += 1;
+            continue;
+        }
+        let mut end = j + 1;
+        if double {
+            if end < bytes.len() && bytes[end] == b'}' {
+                end += 1;
+            } else {
+                // `{{…}` without closing `}}` — keep opening brace literal.
+                out.push('{');
+                i += 1;
+                continue;
+            }
+        }
+        let token: String = s[content_start..j].chars().collect();
+        let token_trim = token.trim();
+        if !token_trim.is_empty()
+            && !warnings
+                .iter()
+                .any(|w: &String| w.contains(token_trim))
+        {
+            let warn = format!(
+                "Unknown StreamElements token {{{token_trim}}} stripped from alert message."
+            );
+            tracing::warn!("{warn}");
+            warnings.push(warn);
+        }
+        // Strip the whole `{…}` / `{{…}}` span (do not invent a substitute).
+        i = end;
+    }
+    (out, warnings)
 }
 
 fn find_url_string(cfg: &Value, keys: &[&str]) -> String {
@@ -1530,7 +1602,107 @@ mod tests {
 
     #[test]
     fn se_template_replaces_placeholders() {
-        assert_eq!(se_template_to_ss("{{name}} followed!"), "[name] followed!");
+        let (out, warnings) = se_template_to_ss("{{name}} followed!");
+        assert_eq!(out, "[name] followed!");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn se_template_canonicalizes_user_to_name() {
+        let (out, warnings) = se_template_to_ss("{user} followed!");
+        assert_eq!(out, "[name] followed!");
+        assert!(warnings.is_empty(), "{{user}}: {warnings:?}");
+
+        let (out2, warnings2) = se_template_to_ss("{{user}} just followed");
+        assert_eq!(out2, "[name] just followed");
+        assert!(warnings2.is_empty(), "{{user}}: {warnings2:?}");
+    }
+
+    #[test]
+    fn se_template_maps_known_hardening_tokens() {
+        let cases = [
+            ("{name}", "[name]"),
+            ("{user}", "[name]"),
+            ("{amount}", "[amount]"),
+            ("{months}", "[months]"),
+            ("{tier}", "[tier]"),
+            ("{message}", "[message]"),
+            ("{announcement}", "[message]"),
+            ("{reward}", "[reward]"),
+            ("{sender}", "[sender]"),
+            ("{items}", "[items]"),
+            ("{currency}", "[currency]"),
+            ("{recipient}", "[recipient]"),
+            ("{input}", "[input]"),
+            ("{{name}}", "[name]"),
+            ("{{user}}", "[name]"),
+            ("{{recipient}}", "[recipient]"),
+            ("{{input}}", "[input]"),
+            ("{{announcement}}", "[message]"),
+        ];
+        for (se, ss) in cases {
+            let (out, warnings) = se_template_to_ss(se);
+            assert_eq!(out, ss, "token {se}");
+            assert!(
+                warnings.is_empty(),
+                "known token {se} should not warn: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn se_template_strips_unknown_tokens_and_warns() {
+        let (out, warnings) = se_template_to_ss("{name} hit {foo} bits!");
+        assert_eq!(out, "[name] hit  bits!");
+        assert!(
+            warnings.iter().any(|w| w.contains("foo")),
+            "warning must mention unknown token: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("name")),
+            "known tokens must not warn: {warnings:?}"
+        );
+
+        let (out2, warnings2) = se_template_to_ss("Thanks {{bar}}!");
+        assert_eq!(out2, "Thanks !");
+        assert!(
+            warnings2.iter().any(|w| w.contains("bar")),
+            "double-brace unknown must warn: {warnings2:?}"
+        );
+    }
+
+    #[test]
+    fn map_overlay_unknown_se_token_lands_in_warnings() {
+        let overlay = json!({
+            "_id": "tok1",
+            "name": "Token Alerts",
+            "settings": { "width": 1280, "height": 720 },
+            "widgets": [{
+                "type": "se-widget-alert-box",
+                "css": { "left": "0px", "top": "0px", "width": "400px", "height": "300px" },
+                "variables": {
+                    "follower": {
+                        "enabled": true,
+                        "duration": 6,
+                        "text": { "message": "{user} did {mystery} today" },
+                        "variations": []
+                    }
+                }
+            }]
+        });
+        let (_pid, profile, warnings) = map_overlay_to_profile(&overlay);
+        let msg = profile
+            .pointer("/events/follow/variations/0/message")
+            .and_then(|v| v.as_str())
+            .expect("follow message");
+        assert_eq!(msg, "[name] did  today");
+        assert!(
+            warnings.iter().any(|w| w.contains("mystery")),
+            "map_overlay_to_profile warnings must mention stripped token: {warnings:?}"
+        );
+        // Do not invent meaning or fall back to a different template.
+        assert!(!msg.contains("mystery"));
+        assert!(!msg.contains("[mystery]"));
     }
 
     #[test]
