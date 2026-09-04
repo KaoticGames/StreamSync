@@ -6,6 +6,14 @@
   function eventPlatform(payload) {
     return payload && payload.platform ? String(payload.platform) : "twitch";
   }
+  // Events overlay plays Twitch + Kick alerts. Do not drop Kick because the
+  // OBS URL defaults to platform=twitch (that filter is for docks, not alerts).
+  function shouldPlayEventAlert(payload) {
+    const plat = eventPlatform(payload);
+    if (plat === "twitch" || plat === "kick") return true;
+    if (DOCK_PLATFORM && plat === DOCK_PLATFORM) return true;
+    return false;
+  }
 
   const stage = document.getElementById("stage");
   const imgEl = document.getElementById("imgEl");
@@ -24,7 +32,19 @@
   let audio = null;
 
   // Monotonic play generation — stale async must not mutate a newer alert.
-  const alertGen = window.StreamSyncAlertDelivery.createGenerationGate();
+  // If events-alert-delivery.js failed to load (OBS cache), keep the overlay alive.
+  const deliveryApi = window.StreamSyncAlertDelivery;
+  const alertGen =
+    deliveryApi && typeof deliveryApi.createGenerationGate === "function"
+      ? deliveryApi.createGenerationGate()
+      : {
+          begin() {
+            return 1;
+          },
+          isCurrent() {
+            return true;
+          },
+        };
 
   /** Resolves true only if gen is still current when the timer fires. */
   function delayIfCurrent(ms, gen) {
@@ -915,17 +935,29 @@
   // Serialized alert delivery (FIFO, one worker)
   // -------------------------
 
-  const alertDelivery = window.StreamSyncAlertDelivery.createDelivery({
-    maxPending: 32,
-    playOne(alert) {
-      return showAlert(
-        alert.eventType,
-        alert.variables,
-        alert.variationId,
-        alert.soundVolumeOverride
-      );
-    },
-  });
+  const alertDelivery =
+    deliveryApi && typeof deliveryApi.createDelivery === "function"
+      ? deliveryApi.createDelivery({
+          maxPending: 32,
+          playOne(alert) {
+            return showAlert(
+              alert.eventType,
+              alert.variables,
+              alert.variationId,
+              alert.soundVolumeOverride
+            );
+          },
+        })
+      : {
+          enqueue(alert) {
+            return showAlert(
+              alert.eventType,
+              alert.variables,
+              alert.variationId,
+              alert.soundVolumeOverride
+            );
+          },
+        };
 
   // -------------------------
   // WebSocket feed
@@ -953,7 +985,7 @@
       }
 
       if (msg.type !== "event-alert") return;
-      if (eventPlatform(msg) !== DOCK_PLATFORM) return;
+      if (!shouldPlayEventAlert(msg)) return;
 
       if (!cfg) {
         try {

@@ -1697,9 +1697,9 @@ async fn post_events_overlay_config(
     State(ctx): State<ServerContext>,
     Query(q): Query<ProfileQuery>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Response {
     if ctx.state.readonly {
-        return Err(readonly_status());
+        return readonly_status().into_response();
     }
     let profile_id = q
         .profile
@@ -1707,16 +1707,26 @@ async fn post_events_overlay_config(
         .or_else(|| body.get("profileId").and_then(|v| v.as_str()))
         .unwrap_or("default")
         .to_string();
-    let config = body
-        .get("config")
-        .or_else(|| body.get("profile"))
-        .cloned()
-        .ok_or(StatusCode::BAD_REQUEST)?;
+    let Some(config) = body.get("config").or_else(|| body.get("profile")).cloned() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "config required" })),
+        )
+            .into_response();
+    };
     if !config.is_object() {
-        return Err(StatusCode::BAD_REQUEST);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "config must be an object" })),
+        )
+            .into_response();
     }
-    if validate_events_overlay_profile_write(&config).is_err() {
-        return Err(StatusCode::BAD_REQUEST);
+    if let Err(err) = validate_events_overlay_profile_write(&config) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err })),
+        )
+            .into_response();
     }
     ctx.state
         .events_overlay_config
@@ -1724,10 +1734,9 @@ async fn post_events_overlay_config(
         .await
         .profiles
         .insert(profile_id.clone(), config);
-    ctx.state
-        .save_events_overlay()
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if ctx.state.save_events_overlay().await.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     ctx.state
         .feed
         .broadcast_all(&json!({
@@ -1735,7 +1744,7 @@ async fn post_events_overlay_config(
             "profileId": profile_id,
         }))
         .await;
-    Ok(Json(json!({ "ok": true, "profileId": profile_id })))
+    Json(json!({ "ok": true, "profileId": profile_id })).into_response()
 }
 
 #[derive(Deserialize)]
