@@ -21,8 +21,19 @@
   })();
 
   let cfg = null;
-  let hideTimer = null;
   let audio = null;
+
+  // Monotonic play generation — stale async must not mutate a newer alert.
+  const alertGen = window.StreamSyncAlertDelivery.createGenerationGate();
+
+  /** Resolves true only if gen is still current when the timer fires. */
+  function delayIfCurrent(ms, gen) {
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        resolve(alertGen.isCurrent(gen));
+      }, ms);
+    });
+  }
 
     // -------------------------
   // On-screen debug logger (OBS-friendly)
@@ -572,9 +583,16 @@
       const w = Number(weight);
       const useW = Number.isFinite(w) ? w : 400;
 
-      // Load + wait until ready
-      await document.fonts.load(`${useW} 32px "${fam}"`);
-      await document.fonts.ready;
+      // Race load against ~1.5s — never hang the alert on a stuck font.
+      // Caller still checks generation after this returns.
+      const loadPromise = (async () => {
+        await document.fonts.load(`${useW} 32px "${fam}"`);
+        await document.fonts.ready;
+      })();
+      const timeoutPromise = new Promise((resolve) => {
+        setTimeout(resolve, 1500);
+      });
+      await Promise.race([loadPromise, timeoutPromise]);
     } catch {
       // ignore
     }
@@ -764,8 +782,6 @@
   }
 
   function hideAll() {
-    if (hideTimer) clearTimeout(hideTimer);
-
     try {
       if (audio) {
         audio.pause();
@@ -804,6 +820,8 @@
     dlog("VAR  TEXT", v?.text || null);
     dlog("TEFF TEXT", tEff || null);
 
+    // New accepted play — bump gen so any in-flight stale play stops mutating.
+    const gen = alertGen.begin();
     hideAll();
 
     const anim = effectiveAnimationInOut(eventType, v);
@@ -818,8 +836,11 @@
         if (soundVolumeOverride != null) vol = soundVolumeOverride;
         audio.volume = vol;
         await audio.play();
+        if (!alertGen.isCurrent(gen)) return;
       }
     } catch {}
+
+    if (!alertGen.isCurrent(gen)) return;
 
     // --- VISUAL (image or video; placement from base) ---
     const imgSrc = effectiveImageSrc(eventType, v);
@@ -847,6 +868,7 @@
         : (meta.googleFamily || tEff.fontFamily || "");
 
     await waitForFont(waitFam, tEff.fontWeight || 400);
+    if (!alertGen.isCurrent(gen)) return;
 
     // Apply style after font is ready
     applyTextStyleFromText(tEff);
@@ -857,31 +879,60 @@
     // Configured fontSize is the max; shrink to fit the fixed placement box.
     // Double-rAF so OBS/Chromium finishes layout before measuring.
     const maxFs = tEff.fontSize || 54;
-    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const rafStillCurrent = await new Promise((resolve) => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          resolve(alertGen.isCurrent(gen));
+        });
+      });
+    });
+    if (!rafStillCurrent) return;
     fitTextToBox(textEl, maxFs);
     applyAnimToEl(textEl, "in", anim, stageSize);
 
-    // duration (effective)
-    const durMs = clamp(effectiveDurationSec(eventType, v) * 1000, 800, 30000);
+    // duration (effective) — await display, exit animation, then cleanup before resolve
+    const durMs = window.StreamSyncAlertDelivery.clampDurationMs(
+      effectiveDurationSec(eventType, v) * 1000
+    );
     const outAnimMs = animSpeedToDurationMs(anim.out, anim.animSpeed);
 
-    hideTimer = setTimeout(() => {
-      if (imgEl) {
-        clearAnimClasses(imgEl);
-        applyAnimToEl(imgEl, "out", anim, stageSize);
-      }
-      if (textEl) {
-        clearAnimClasses(textEl);
-        applyAnimToEl(textEl, "out", anim, stageSize);
-      }
+    if (!(await delayIfCurrent(durMs, gen))) return;
 
-      setTimeout(() => hideAll(), outAnimMs + 30);
-    }, durMs);
+    if (imgEl) {
+      clearAnimClasses(imgEl);
+      applyAnimToEl(imgEl, "out", anim, stageSize);
+    }
+    if (textEl) {
+      clearAnimClasses(textEl);
+      applyAnimToEl(textEl, "out", anim, stageSize);
+    }
+
+    if (!(await delayIfCurrent(outAnimMs + 30, gen))) return;
+    hideAll();
   }
+
+  // -------------------------
+  // Serialized alert delivery (FIFO, one worker)
+  // -------------------------
+
+  const alertDelivery = window.StreamSyncAlertDelivery.createDelivery({
+    maxPending: 32,
+    playOne(alert) {
+      return showAlert(
+        alert.eventType,
+        alert.variables,
+        alert.variationId,
+        alert.soundVolumeOverride
+      );
+    },
+  });
 
   // -------------------------
   // WebSocket feed
   // -------------------------
+  // Reconnect only reopens the socket. Do NOT hideAll, do NOT create a new
+  // delivery worker, do NOT clear the queue or reset generation — the
+  // module-level alertDelivery + alertGen above must survive reconnect.
 
   function connect() {
     const ws = new WebSocket(wsUrl);
@@ -917,9 +968,15 @@
       const variationId = msg.variationId || null;
       const soundVolumeOverride = extractSoundVolume(msg);
 
-      showAlert(eventType, vars, variationId, soundVolumeOverride);
+      alertDelivery.enqueue({
+        eventType,
+        variables: vars,
+        variationId,
+        soundVolumeOverride,
+      });
     });
 
+    // Socket only — do not touch alertDelivery / alertGen / hideAll.
     ws.addEventListener("close", () => setTimeout(connect, 1000));
   }
 
