@@ -97,7 +97,12 @@
       kickConnect,
       purgeLogs: () => invoke("purge_logs"),
       checkForUpdates: () => invoke("check_for_updates"),
-      openSeAccountPage: (flow) => invoke("open_se_account_page", { flow }),
+      openSeAccountPage: (flow) => {
+        if (typeof flow !== "string" || !flow.startsWith("ssl_")) {
+          return Promise.reject(new Error("missing_login_flow"));
+        }
+        return invoke("open_se_account_page", { flow });
+      },
       exportBackup: () => invoke("export_backup"),
     };
 

@@ -848,25 +848,11 @@ document.addEventListener("DOMContentLoaded", () => {
     const SE_ACCOUNT_URL = "https://streamelements.com/dashboard/account/channels";
 
     async function openSeAccountPageAction() {
-      if (window.electronAPI?.openSeAccountPage) {
-        try {
-          const response = await window.streamSyncControlApi.privilegedFetch(
-            "/api/streamelements/begin-login"
-          );
-          const login = await response.json().catch(() => ({}));
-          if (!response.ok || !String(login.flowNonce || "").startsWith("ssl_")) {
-            throw new Error(login.error || "Unable to begin StreamElements login");
-          }
-          return await window.electronAPI.openSeAccountPage(login.flowNonce);
-        } catch (err) {
-          console.warn("[Connections] openSeAccountPage IPC failed:", err);
-        }
+      if (window.electronAPI?.openExternal) {
+        return window.electronAPI.openExternal(SE_ACCOUNT_URL);
       }
       if (typeof window.streamSyncConnections?.seOpenAccountPage === "function") {
         return window.streamSyncConnections.seOpenAccountPage();
-      }
-      if (window.electronAPI?.openExternal) {
-        return window.electronAPI.openExternal(SE_ACCOUNT_URL);
       }
       const opened = window.open(SE_ACCOUNT_URL, "_blank", "noopener,noreferrer");
       if (!opened) {

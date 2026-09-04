@@ -843,6 +843,44 @@ fn frontend_dock_and_login_wiring_is_scoped() {
 }
 
 #[test]
+fn connections_open_account_page_uses_system_browser_not_flowless_ipc() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .unwrap();
+    let connections = std::fs::read_to_string(root.join("connections-api.js")).unwrap();
+    let se_open = connections
+        .split("async function seOpenAccountPage()")
+        .nth(1)
+        .expect("seOpenAccountPage")
+        .split("  // Capture-phase delegation")
+        .next()
+        .unwrap();
+    assert!(
+        se_open.contains("openExternal"),
+        "connections Open account page must open the system browser"
+    );
+    assert!(
+        !se_open.contains("openSeAccountPage()"),
+        "must not invoke open_se_account_page without a login flow"
+    );
+
+    let renderer = std::fs::read_to_string(root.join("renderer.js")).unwrap();
+    let action = renderer
+        .split("async function openSeAccountPageAction()")
+        .nth(1)
+        .expect("openSeAccountPageAction")
+        .split("if (btnSeOpen)")
+        .next()
+        .unwrap();
+    assert!(action.contains("openExternal(SE_ACCOUNT_URL)"));
+    assert!(
+        !action.contains("openSeAccountPage(login.flowNonce)"),
+        "Connections JWT copy path is the system browser, not the inject webview"
+    );
+}
+
+#[test]
 fn channel_point_private_input_is_profile_scoped() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let twitch = std::fs::read_to_string(root.join("src/twitch.rs")).unwrap();
