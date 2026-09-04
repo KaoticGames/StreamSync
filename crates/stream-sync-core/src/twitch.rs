@@ -3805,6 +3805,26 @@ pub fn format_gift_dock_detail(
     format!("{gifter} gifted a sub")
 }
 
+/// Overlay + dock event types for Twitch subscribe/gift EventSub notifications.
+/// `channel.subscribe` with `is_gift: true` emits nothing — the gift alert comes from
+/// `channel.subscription.gift`.
+fn map_twitch_sub_gift_alert_types(
+    subscription_type: &str,
+    event: &Value,
+) -> Option<(&'static str, &'static str)> {
+    match subscription_type {
+        "channel.subscribe" => {
+            if event.get("is_gift").and_then(|v| v.as_bool()) == Some(true) {
+                None
+            } else {
+                Some(("sub", "sub"))
+            }
+        }
+        "channel.subscription.gift" => Some(("gift", "gift")),
+        _ => None,
+    }
+}
+
 fn value_display_string(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
@@ -3866,6 +3886,13 @@ async fn handle_eventsub_notification(
             .await;
         }
         "channel.subscribe" => {
+            let Some((overlay_ty, dock_ty)) =
+                map_twitch_sub_gift_alert_types(sub_type, event)
+            else {
+                // Gifted recipient: skip normal sub alert; gift comes from
+                // channel.subscription.gift.
+                return;
+            };
             let user = event
                 .get("user_name")
                 .and_then(|v| v.as_str())
@@ -3874,12 +3901,12 @@ async fn handle_eventsub_notification(
             feed
                 .broadcast_all(&json!({
                     "type": "event-alert",
-                    "eventType": "sub",
+                    "eventType": overlay_ty,
                     "data": { "variables": normalize_event_variables(&json!({ "name": user, "amount": tier })) },
                 }))
                 .await;
             feed.broadcast_all(&make_dock_event(
-                "sub",
+                dock_ty,
                 &format_sub_dock_detail(user, &tier),
                 Some("Sub"),
                 None,
@@ -3943,6 +3970,11 @@ async fn handle_eventsub_notification(
             .await;
         }
         "channel.subscription.gift" => {
+            let Some((overlay_ty, dock_ty)) =
+                map_twitch_sub_gift_alert_types(sub_type, event)
+            else {
+                return;
+            };
             let gifter = event
                 .get("user_name")
                 .and_then(|v| v.as_str())
@@ -3961,12 +3993,12 @@ async fn handle_eventsub_notification(
             }));
             feed.broadcast_all(&json!({
                 "type": "event-alert",
-                "eventType": "gift",
+                "eventType": overlay_ty,
                 "data": { "variables": vars },
             }))
             .await;
             feed.broadcast_all(&make_dock_event(
-                "gift",
+                dock_ty,
                 &format_gift_dock_detail(gifter, &total, &tier, recipient),
                 Some("Gift"),
                 None,
@@ -4475,6 +4507,93 @@ mod tests {
         assert_eq!(code, "revoked");
         assert!(message.contains("revoked"));
         assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn gifted_channel_subscribe_emits_no_sub_overlay_or_dock() {
+        let event = json!({
+            "user_name": "recipient",
+            "tier": "1000",
+            "is_gift": true,
+        });
+        let mapped = map_twitch_sub_gift_alert_types("channel.subscribe", &event);
+        assert!(mapped.is_none(), "gifted subscribe must not emit sub overlay/dock");
+    }
+
+    #[test]
+    fn non_gift_channel_subscribe_emits_sub_overlay_and_dock() {
+        let with_false = json!({
+            "user_name": "alice",
+            "tier": "1000",
+            "is_gift": false,
+        });
+        assert_eq!(
+            map_twitch_sub_gift_alert_types("channel.subscribe", &with_false),
+            Some(("sub", "sub"))
+        );
+        let absent = json!({
+            "user_name": "bob",
+            "tier": "2000",
+        });
+        assert_eq!(
+            map_twitch_sub_gift_alert_types("channel.subscribe", &absent),
+            Some(("sub", "sub"))
+        );
+    }
+
+    #[test]
+    fn channel_subscription_gift_emits_exactly_one_gift_no_sub() {
+        let event = json!({
+            "user_name": "gifter",
+            "recipient_user_name": "recipient",
+            "total": 1,
+            "tier": "1000",
+        });
+        let mapped = map_twitch_sub_gift_alert_types("channel.subscription.gift", &event)
+            .expect("gift notification must map");
+        let overlay = [mapped.0];
+        let dock = [mapped.1];
+        assert_eq!(overlay.iter().filter(|t| **t == "gift").count(), 1);
+        assert_eq!(dock.iter().filter(|t| **t == "gift").count(), 1);
+        assert_eq!(overlay.iter().filter(|t| **t == "sub").count(), 0);
+        assert_eq!(dock.iter().filter(|t| **t == "sub").count(), 0);
+        assert_eq!(mapped, ("gift", "gift"));
+    }
+
+    #[test]
+    fn gifted_sub_pair_yields_one_gift_zero_sub_alerts() {
+        // Twitch sends both channel.subscribe (is_gift) and channel.subscription.gift.
+        let notifications = [
+            (
+                "channel.subscribe",
+                json!({
+                    "user_name": "recipient",
+                    "tier": "1000",
+                    "is_gift": true,
+                }),
+            ),
+            (
+                "channel.subscription.gift",
+                json!({
+                    "user_name": "gifter",
+                    "recipient_user_name": "recipient",
+                    "total": 1,
+                    "tier": "1000",
+                }),
+            ),
+        ];
+        let mut overlays = Vec::new();
+        let mut docks = Vec::new();
+        for (sub_type, event) in &notifications {
+            if let Some((overlay, dock)) = map_twitch_sub_gift_alert_types(sub_type, event) {
+                overlays.push(overlay);
+                docks.push(dock);
+            }
+        }
+        assert_eq!(overlays.iter().filter(|t| **t == "gift").count(), 1);
+        assert_eq!(docks.iter().filter(|t| **t == "gift").count(), 1);
+        assert_eq!(overlays.iter().filter(|t| **t == "sub").count(), 0);
+        assert_eq!(docks.iter().filter(|t| **t == "sub").count(), 0);
     }
 
     fn make_emote(id: &str, start: usize, end_exclusive: usize) -> Emote {
