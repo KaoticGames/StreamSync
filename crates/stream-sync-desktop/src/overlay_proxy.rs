@@ -98,8 +98,12 @@ pub fn validate_overlay_api_path(path: &str) -> Result<String, String> {
     if !path.starts_with("/api/") {
         return Err("path_not_allowlisted".into());
     }
+    let (path_only, query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
     let mut normalized = String::new();
-    for (i, seg) in path.split('/').enumerate() {
+    for (i, seg) in path_only.split('/').enumerate() {
         if seg.is_empty() {
             if i == 0 {
                 normalized.push('/');
@@ -117,15 +121,23 @@ pub fn validate_overlay_api_path(path: &str) -> Result<String, String> {
     if normalized.is_empty() {
         normalized.push('/');
     }
+    if let Some(q) = query {
+        if q.contains('#') || q.contains('\\') || q.contains("://") {
+            return Err("unsafe_query".into());
+        }
+        normalized.push('?');
+        normalized.push_str(q);
+    }
     Ok(normalized)
 }
 
 pub fn validate_allowlisted_api(method: &str, path: &str) -> Result<(), String> {
     let method = method.trim().to_ascii_uppercase();
     let path = validate_overlay_api_path(path)?;
+    let path_no_query = path.split_once('?').map(|(p, _)| p).unwrap_or(path.as_str());
     if OVERLAY_API_ALLOWLIST
         .iter()
-        .any(|(m, p)| *m == method.as_str() && *p == path.as_str())
+        .any(|(m, p)| *m == method.as_str() && *p == path_no_query)
     {
         Ok(())
     } else {
@@ -316,5 +328,20 @@ mod tests {
         assert!(validate_allowlisted_api("POST", "/api/streamelements/session").is_ok());
         assert!(validate_allowlisted_api("POST", "/api/twitch/set-token").is_err());
         assert!(validate_allowlisted_api("GET", "/api/admin/secret").is_err());
+        assert!(
+            validate_allowlisted_api("POST", "/api/events/overlay-config?profile=profile-3")
+                .is_ok(),
+            "studio create/save includes ?profile="
+        );
+        assert!(validate_allowlisted_api(
+            "GET",
+            "/api/events/overlay-config?profile=default"
+        )
+        .is_ok());
+        assert!(validate_allowlisted_api(
+            "POST",
+            "/api/admin/secret?profile=default"
+        )
+        .is_err());
     }
 }
