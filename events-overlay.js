@@ -907,6 +907,7 @@
   // -------------------------
 
   const alertDelivery = window.StreamSyncAlertDelivery.createDelivery({
+    maxPending: 32,
     playOne(alert) {
       return showAlert(
         alert.eventType,

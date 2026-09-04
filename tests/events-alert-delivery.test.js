@@ -102,6 +102,85 @@ describe("StreamSyncAlertDelivery FIFO (Pass 2)", () => {
   });
 });
 
+describe("StreamSyncAlertDelivery bounded pending queue (Pass 4)", () => {
+  it("drops newest when 32 pending + 1 in flight; active play and FIFO hold", async () => {
+    const { playOne, started, completed, resolve } = createDeferredPlayOne();
+    const drops = [];
+    const warns = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => {
+      warns.push(args);
+    };
+
+    try {
+      const delivery = deliveryApi.createDelivery({
+        playOne,
+        maxPending: 32,
+        onDrop(info) {
+          drops.push(info);
+        },
+      });
+
+      // 1 in flight + 32 pending = capacity full; next enqueue is drop-newest.
+      const accepted = [];
+      for (let i = 0; i < 33; i++) {
+        const id = `a${i}`;
+        accepted.push({ id, p: delivery.enqueue({ id, eventType: "cheer" }) });
+      }
+      await Promise.resolve();
+
+      assert.deepEqual(started, ["a0"], "only first alert is in flight");
+      assert.equal(started.length, 1, "exactly one playOne in flight");
+
+      const droppedId = "drop-me";
+      const pDrop = delivery.enqueue({ id: droppedId, eventType: "cheer" });
+      let dropErr;
+      try {
+        await pDrop;
+      } catch (e) {
+        dropErr = e;
+      }
+
+      assert.ok(dropErr, "dropped enqueue must reject");
+      assert.match(
+        String(dropErr && dropErr.message),
+        /queue_full_drop_newest/,
+        "reject Error message must include queue_full_drop_newest"
+      );
+      assert.equal(started.includes(droppedId), false, "dropped id must never playOne");
+      assert.equal(warns.length >= 1, true, "console.warn must be invoked on drop");
+      assert.equal(
+        warns.some((args) => args.some((a) => String(a).includes("queue_full_drop_newest"))),
+        true,
+        "console.warn must include queue_full_drop_newest"
+      );
+      assert.equal(drops.length, 1, "onDrop hook must fire");
+      assert.equal(drops[0].reason, "queue_full_drop_newest");
+      assert.equal(drops[0].pending, 32);
+      assert.equal(drops[0].eventType, "cheer");
+      assert.equal(drops[0].alert.id, droppedId);
+
+      // Drain FIFO of accepted alerts; dropped never appears.
+      for (const { id, p } of accepted) {
+        assert.equal(
+          started[started.length - 1],
+          id,
+          `playOne head must be ${id} before resolve`
+        );
+        resolve(id);
+        await p;
+      }
+
+      const acceptedIds = accepted.map((x) => x.id);
+      assert.deepEqual(completed, acceptedIds, "accepted complete in FIFO order");
+      assert.equal(started.includes(droppedId), false, "dropped id still never playOne'd");
+      assert.deepEqual(started, acceptedIds, "playOne order matches accepted FIFO");
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+});
+
 describe("StreamSyncAlertDelivery generation gate (Pass 3)", () => {
   it("stale play continuation must not mutate after a newer gen begins", async () => {
     const gate = deliveryApi.createGenerationGate();
