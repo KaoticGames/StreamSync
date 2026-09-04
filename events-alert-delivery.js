@@ -1,6 +1,7 @@
 // Alert delivery queue (events overlay).
 // Pass 2: one FIFO queue + one worker.
 // Pass 3: monotonic generation gate so stale async cannot mutate a newer alert.
+// Pass 5: clampDurationMs shared with overlay; queue survives WS reconnect.
 (function (root) {
   /**
    * Monotonic play generation. Call begin() when an accepted play starts
@@ -22,6 +23,21 @@
     }
 
     return { begin, isCurrent };
+  }
+
+  /** Overlay display duration bounds (ms). Matches events-overlay showAlert. */
+  const DURATION_MS_MIN = 800;
+  const DURATION_MS_MAX = 30000;
+
+  /**
+   * Clamp alert display duration to overlay bounds [800, 30000] ms.
+   * @param {unknown} ms
+   * @returns {number}
+   */
+  function clampDurationMs(ms) {
+    const n = Number(ms);
+    if (Number.isNaN(n)) return DURATION_MS_MIN;
+    return Math.max(DURATION_MS_MIN, Math.min(DURATION_MS_MAX, n));
   }
 
   /** Default max waiting alerts (not including the active play). Drop-newest. */
@@ -111,5 +127,6 @@
   root.StreamSyncAlertDelivery = {
     createDelivery,
     createGenerationGate,
+    clampDurationMs,
   };
 })(typeof window !== "undefined" ? window : globalThis);

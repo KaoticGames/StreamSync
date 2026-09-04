@@ -238,3 +238,97 @@ describe("StreamSyncAlertDelivery generation gate (Pass 3)", () => {
     );
   });
 });
+
+describe("StreamSyncAlertDelivery edge lifecycle (Pass 5)", () => {
+  it("playOne rejection: B still plays; queue does not stick busy", async () => {
+    const started = [];
+    const completed = [];
+    /** @type {((err: Error) => void) | null} */
+    let rejectA = null;
+    /** @type {(() => void) | null} */
+    let resolveB = null;
+
+    function playOne(alert) {
+      const id = alert.id;
+      started.push(id);
+      if (id === "A") {
+        return new Promise((_, reject) => {
+          rejectA = reject;
+        });
+      }
+      return new Promise((resolve) => {
+        resolveB = () => {
+          completed.push(id);
+          resolve();
+        };
+      });
+    }
+
+    const delivery = deliveryApi.createDelivery({ playOne });
+    const pA = delivery.enqueue({ id: "A" });
+    const pB = delivery.enqueue({ id: "B" });
+    await Promise.resolve();
+
+    assert.deepEqual(started, ["A"], "only A starts while in flight");
+    assert.ok(rejectA, "A playOne must expose reject");
+
+    rejectA(new Error("playOne A failed"));
+    let aErr;
+    try {
+      await pA;
+    } catch (e) {
+      aErr = e;
+    }
+    assert.ok(aErr, "enqueue A must reject when playOne rejects");
+    assert.match(String(aErr && aErr.message), /playOne A failed/);
+
+    // Microtask: drain must clear busy and start B.
+    await Promise.resolve();
+    assert.deepEqual(started, ["A", "B"], "B must start after A rejects");
+    assert.ok(resolveB, "B playOne must have started");
+
+    resolveB();
+    await pB;
+    assert.deepEqual(completed, ["B"], "B completes after A rejection");
+    assert.deepEqual(started, ["A", "B"], "no stuck re-play of A");
+  });
+
+  it("same delivery instance survives simulated reconnect; in-flight A then C", async () => {
+    const { playOne, started, completed, resolve } = createDeferredPlayOne();
+    // One module-level delivery — reconnect must not create a new worker.
+    const delivery = deliveryApi.createDelivery({ playOne });
+
+    const pA = delivery.enqueue({ id: "A" });
+    await Promise.resolve();
+    assert.deepEqual(started, ["A"], "A in flight before reconnect");
+
+    // Simulated WS close/reconnect: overlay only reopens the socket; it must
+    // NOT clear the queue, reset generation, or replace alertDelivery.
+    // Enqueue C on the same instance while A is still playing.
+    const pC = delivery.enqueue({ id: "C" });
+    await Promise.resolve();
+
+    assert.deepEqual(started, ["A"], "reconnect must not interrupt in-flight A");
+    assert.equal(started.includes("C"), false, "C waits until A finishes");
+
+    resolve("A");
+    await pA;
+    assert.deepEqual(completed, ["A"], "in-flight A completes after reconnect");
+    assert.deepEqual(started, ["A", "C"], "C starts only after A on same queue");
+
+    resolve("C");
+    await pC;
+    assert.deepEqual(completed, ["A", "C"], "C plays after A; queue not reset");
+  });
+
+  it("clampDurationMs matches overlay bounds 800..30000", () => {
+    assert.equal(typeof deliveryApi.clampDurationMs, "function");
+    assert.equal(deliveryApi.clampDurationMs(0), 800);
+    assert.equal(deliveryApi.clampDurationMs(799), 800);
+    assert.equal(deliveryApi.clampDurationMs(800), 800);
+    assert.equal(deliveryApi.clampDurationMs(6000), 6000);
+    assert.equal(deliveryApi.clampDurationMs(30000), 30000);
+    assert.equal(deliveryApi.clampDurationMs(999999), 30000);
+    assert.equal(deliveryApi.clampDurationMs(Number.NaN), 800);
+  });
+});

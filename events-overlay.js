@@ -583,9 +583,16 @@
       const w = Number(weight);
       const useW = Number.isFinite(w) ? w : 400;
 
-      // Load + wait until ready
-      await document.fonts.load(`${useW} 32px "${fam}"`);
-      await document.fonts.ready;
+      // Race load against ~1.5s — never hang the alert on a stuck font.
+      // Caller still checks generation after this returns.
+      const loadPromise = (async () => {
+        await document.fonts.load(`${useW} 32px "${fam}"`);
+        await document.fonts.ready;
+      })();
+      const timeoutPromise = new Promise((resolve) => {
+        setTimeout(resolve, 1500);
+      });
+      await Promise.race([loadPromise, timeoutPromise]);
     } catch {
       // ignore
     }
@@ -884,7 +891,9 @@
     applyAnimToEl(textEl, "in", anim, stageSize);
 
     // duration (effective) — await display, exit animation, then cleanup before resolve
-    const durMs = clamp(effectiveDurationSec(eventType, v) * 1000, 800, 30000);
+    const durMs = window.StreamSyncAlertDelivery.clampDurationMs(
+      effectiveDurationSec(eventType, v) * 1000
+    );
     const outAnimMs = animSpeedToDurationMs(anim.out, anim.animSpeed);
 
     if (!(await delayIfCurrent(durMs, gen))) return;
@@ -921,6 +930,9 @@
   // -------------------------
   // WebSocket feed
   // -------------------------
+  // Reconnect only reopens the socket. Do NOT hideAll, do NOT create a new
+  // delivery worker, do NOT clear the queue or reset generation — the
+  // module-level alertDelivery + alertGen above must survive reconnect.
 
   function connect() {
     const ws = new WebSocket(wsUrl);
@@ -964,6 +976,7 @@
       });
     });
 
+    // Socket only — do not touch alertDelivery / alertGen / hideAll.
     ws.addEventListener("close", () => setTimeout(connect, 1000));
   }
 
