@@ -1033,6 +1033,7 @@ fn parse_css_px(v: Option<&Value>) -> Option<f64> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn variation_from_se_settings(
     cfg: &Value,
     bounds: (f64, f64, f64, f64),
