@@ -570,6 +570,16 @@ fn map_widget(
         }
     }
 
+    // SE keys without a shipped overlay type: skip + warn (no silent aliases).
+    for (se_key, warning) in SE_SKIPPED_EVENT_KEYS {
+        let Some(event_cfg) = vars.get(*se_key) else {
+            continue;
+        };
+        if se_event_cfg_enabled(event_cfg) {
+            warnings.push((*warning).into());
+        }
+    }
+
     for (se_key, ss_key) in SE_EVENT_KEYS {
         let Some(event_cfg) = vars.get(*se_key) else {
             continue;
@@ -599,17 +609,33 @@ fn map_widget(
     }
 }
 
+/// SE alert keys we deliberately do not map to overlay event types.
+const SE_SKIPPED_EVENT_KEYS: &[(&str, &str)] = &[
+    (
+        "tip",
+        "Skipped StreamElements tip/donation alert (tips are not configured as overlay events).",
+    ),
+    (
+        "purchase",
+        "Skipped StreamElements purchase alert (no overlay redeem configuration).",
+    ),
+    (
+        "redemption",
+        "Skipped StreamElements redemption alert (no overlay redeem configuration).",
+    ),
+    (
+        "merch",
+        "Skipped StreamElements merch alert (no overlay redeem configuration).",
+    ),
+];
+
 const SE_EVENT_KEYS: &[(&str, &str)] = &[
     ("follower", "follow"),
     ("subscriber", "sub"),
     ("raid", "raid"),
     ("cheer", "cheer"),
-    ("tip", "cheer"),
     ("gift", "gift"),
     ("gifted", "gift"),
-    ("purchase", "redeem"),
-    ("redemption", "redeem"),
-    ("merch", "redeem"),
 ];
 
 /// Stream Sync variation trigger: mode, numeric value, optional tier (1–3).
@@ -2170,6 +2196,170 @@ mod tests {
             "raid should not use host message, got {raid_msg}"
         );
         assert!(!raid_msg.to_lowercase().contains("hosting"));
+    }
+
+    /// Tip-only widget: SE tip must not silently alias into overlay `cheer`.
+    #[test]
+    fn enabled_tip_skips_without_cheer_from_tip() {
+        const TIP_MSG: &str = "{name} tipped ${amount} donation!";
+        const TIP_GFX: &str = "https://cdn.example.com/tip-donation.webm";
+        let overlay = json!({
+            "_id": "tiponly1",
+            "name": "Tip Only",
+            "settings": { "width": 1280, "height": 720 },
+            "widgets": [{
+                "type": "se-widget-alert-box",
+                "css": { "left": "0px", "top": "0px", "width": "400px", "height": "300px" },
+                "variables": {
+                    "tip": {
+                        "enabled": true,
+                        "duration": 8,
+                        "text": { "message": TIP_MSG },
+                        "graphics": { "src": TIP_GFX },
+                        "audio": { "src": "https://cdn.example.com/tip.mp3", "volume": 1 },
+                        "variations": []
+                    }
+                }
+            }]
+        });
+        let (_pid, profile, warnings) = map_overlay_to_profile(&overlay);
+        let warn_blob = warnings.join(" | ").to_lowercase();
+        assert!(
+            warn_blob.contains("tip") && warn_blob.contains("donation"),
+            "warning must mention tip/donation skip: {warnings:?}"
+        );
+        assert!(
+            warn_blob.contains("skip"),
+            "warning must indicate skip: {warnings:?}"
+        );
+
+        let cheer_vars = profile
+            .pointer("/events/cheer/variations")
+            .and_then(|v| v.as_array())
+            .expect("default or mapped cheer variations");
+        for (i, v) in cheer_vars.iter().enumerate() {
+            let msg = v
+                .pointer("/message")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            assert!(
+                !msg.to_lowercase().contains("tipped")
+                    && !msg.to_lowercase().contains("donation"),
+                "cheer[{i}] must not come from tip: {msg}"
+            );
+            let img = v
+                .pointer("/image/value")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            assert_ne!(
+                img, TIP_GFX,
+                "cheer[{i}] must not use tip donation graphics"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_merch_or_purchase_skips_without_overlay_redeem() {
+        const MERCH_MSG: &str = "{name} bought merch!";
+        const MERCH_GFX: &str = "https://cdn.example.com/merch-store.webm";
+        const PURCHASE_MSG: &str = "{name} completed a purchase!";
+        let overlay = json!({
+            "_id": "merch1",
+            "name": "Merch Purchase",
+            "settings": { "width": 1280, "height": 720 },
+            "widgets": [{
+                "type": "se-widget-alert-box",
+                "css": { "left": "0px", "top": "0px", "width": "400px", "height": "300px" },
+                "variables": {
+                    "merch": {
+                        "enabled": true,
+                        "text": { "message": MERCH_MSG },
+                        "graphics": { "src": MERCH_GFX },
+                        "variations": []
+                    },
+                    "purchase": {
+                        "enabled": true,
+                        "text": { "message": PURCHASE_MSG },
+                        "graphics": { "src": "https://cdn.example.com/purchase.webm" },
+                        "variations": []
+                    }
+                }
+            }]
+        });
+        let (_pid, profile, warnings) = map_overlay_to_profile(&overlay);
+        let warn_blob = warnings.join(" | ").to_lowercase();
+        assert!(
+            (warn_blob.contains("merch") || warn_blob.contains("purchase"))
+                && warn_blob.contains("skip"),
+            "warning must mention merch/purchase skip: {warnings:?}"
+        );
+
+        let redeem_vars = profile
+            .pointer("/events/redeem/variations")
+            .and_then(|v| v.as_array())
+            .expect("default or mapped redeem variations");
+        for (i, v) in redeem_vars.iter().enumerate() {
+            let msg = v
+                .pointer("/message")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            assert!(
+                !msg.contains("merch") && !msg.contains("purchase") && !msg.contains("bought"),
+                "redeem[{i}] must not come from SE merch/purchase: {msg}"
+            );
+            let img = v
+                .pointer("/image/value")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            assert_ne!(img, MERCH_GFX, "redeem[{i}] must not use merch graphics");
+        }
+    }
+
+    #[test]
+    fn cheer_only_widget_still_maps_cheer() {
+        let overlay = json!({
+            "_id": "cheeronly1",
+            "name": "Cheer Only",
+            "settings": { "width": 1280, "height": 720 },
+            "widgets": [{
+                "type": "se-widget-alert-box",
+                "css": { "left": "0px", "top": "0px", "width": "400px", "height": "300px" },
+                "variables": {
+                    "cheer": {
+                        "enabled": true,
+                        "duration": 7,
+                        "text": { "message": "{name} cheered {amount} bits!" },
+                        "graphics": { "src": "https://cdn.example.com/bits.webm" },
+                        "audio": { "src": "https://cdn.example.com/bits.mp3", "volume": 1 },
+                        "variations": []
+                    }
+                }
+            }]
+        });
+        let (_pid, profile, warnings) = map_overlay_to_profile(&overlay);
+        let vars = profile
+            .pointer("/events/cheer/variations")
+            .and_then(|v| v.as_array())
+            .expect("cheer variations");
+        assert!(
+            !vars.is_empty(),
+            "cheer SE key must still map to cheer: {warnings:?}"
+        );
+        let msg = vars[0]
+            .pointer("/message")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        assert!(
+            msg.contains("cheered") && msg.contains("[amount]"),
+            "expected mapped cheer message, got {msg}"
+        );
+        assert_eq!(
+            vars[0]
+                .pointer("/image/value")
+                .and_then(|x| x.as_str()),
+            Some("https://cdn.example.com/bits.webm")
+        );
     }
 
     #[test]
