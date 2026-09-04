@@ -669,6 +669,7 @@ fn map_subscriber_se_event(
             .get("settings")
             .filter(|v| v.is_object())
             .unwrap_or(se_var);
+        let merged = merge_se_parent_with_variation_settings(event_cfg, settings);
         let name = se_var
             .get("name")
             .and_then(|v| v.as_str())
@@ -682,7 +683,7 @@ fn map_subscriber_se_event(
             routed_resub += 1;
         }
         let variation = variation_from_se_settings(
-            settings,
+            &merged,
             bounds,
             ss_key,
             scale,
@@ -844,6 +845,7 @@ fn map_se_event_variations(
             .get("settings")
             .filter(|v| v.is_object())
             .unwrap_or(se_var);
+        let merged = merge_se_parent_with_variation_settings(event_cfg, settings);
         let name = se_var
             .get("name")
             .and_then(|v| v.as_str())
@@ -851,7 +853,7 @@ fn map_se_event_variations(
         let chance = se_var.get("chance").and_then(|v| v.as_u64());
         let trigger = map_se_variation_trigger(se_var);
         out.push(variation_from_se_settings(
-            settings,
+            &merged,
             bounds,
             ss_key,
             scale,
@@ -860,6 +862,50 @@ fn map_se_event_variations(
             Some(trigger),
         ));
     }
+}
+
+/// Deep-merge parent SE event presentation with variation `settings`.
+/// Variation wins on present keys; `text` / `audio` / `graphics` / `animation` merge field-wise
+/// so partial overrides keep unresolved parent fields. Result is fully resolved (no inherit markers).
+fn merge_se_parent_with_variation_settings(parent: &Value, variation_settings: &Value) -> Value {
+    let mut merged = match parent.as_object() {
+        Some(obj) => {
+            let mut out = obj.clone();
+            out.remove("variations");
+            Value::Object(out)
+        }
+        None => json!({}),
+    };
+
+    let Some(var_obj) = variation_settings.as_object() else {
+        return merged;
+    };
+    let Some(merged_obj) = merged.as_object_mut() else {
+        return variation_settings.clone();
+    };
+
+    for (key, var_val) in var_obj {
+        let nest = matches!(
+            key.as_str(),
+            "text" | "audio" | "graphics" | "animation"
+        );
+        if nest {
+            if let (Some(parent_nested), Some(var_nested)) = (
+                merged_obj.get(key).and_then(|v| v.as_object()),
+                var_val.as_object(),
+            ) {
+                let mut nested = parent_nested.clone();
+                for (nk, nv) in var_nested {
+                    nested.insert(nk.clone(), nv.clone());
+                }
+                merged_obj.insert(key.clone(), Value::Object(nested));
+                continue;
+            }
+        }
+        merged_obj.insert(key.clone(), var_val.clone());
+    }
+
+    merged
 }
 
 fn map_se_variation_trigger(se_var: &Value) -> VariationTrigger {
