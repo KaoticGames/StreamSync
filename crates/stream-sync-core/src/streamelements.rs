@@ -916,10 +916,7 @@ fn merge_se_parent_with_variation_settings(parent: &Value, variation_settings: &
     };
 
     for (key, var_val) in var_obj {
-        let nest = matches!(
-            key.as_str(),
-            "text" | "audio" | "graphics" | "animation"
-        );
+        let nest = matches!(key.as_str(), "text" | "audio" | "graphics" | "animation");
         if nest {
             if let (Some(parent_nested), Some(var_nested)) = (
                 merged_obj.get(key).and_then(|v| v.as_object()),
@@ -1058,8 +1055,7 @@ fn variation_from_se_settings(
         _ => "[name] triggered an alert!",
     };
 
-    let message =
-        extract_message(cfg, warnings).unwrap_or_else(|| default_msg.to_string());
+    let message = extract_message(cfg, warnings).unwrap_or_else(|| default_msg.to_string());
     let visual_url = extract_visual_url(cfg);
     let (sound_url, sound_volume) = extract_audio(cfg);
 
@@ -1285,11 +1281,7 @@ fn strip_unknown_se_tokens(s: String) -> (String, Vec<String>) {
         }
         let token: String = s[content_start..j].chars().collect();
         let token_trim = token.trim();
-        if !token_trim.is_empty()
-            && !warnings
-                .iter()
-                .any(|w: &String| w.contains(token_trim))
-        {
+        if !token_trim.is_empty() && !warnings.iter().any(|w: &String| w.contains(token_trim)) {
             let warn = format!(
                 "Unknown StreamElements token {{{token_trim}}} stripped from alert message."
             );
@@ -1703,10 +1695,7 @@ mod tests {
             return;
         };
         for (event_key, event_val) in events {
-            let Some(vars) = event_val
-                .get("variations")
-                .and_then(|v| v.as_array())
-            else {
+            let Some(vars) = event_val.get("variations").and_then(|v| v.as_array()) else {
                 continue;
             };
             for (i, var) in vars.iter().enumerate() {
@@ -1949,8 +1938,7 @@ mod tests {
     /// message, Montserrat / 54 / 800 / #ffffff).
     const PARTIAL_PARENT_MESSAGE: &str = "[name] cheered x[amount]";
     const PARTIAL_PARENT_DURATION: u64 = 12;
-    const PARTIAL_PARENT_SOUND: &str =
-        "https://cdn.streamelements.com/uploads/parent-cheer.mp3";
+    const PARTIAL_PARENT_SOUND: &str = "https://cdn.streamelements.com/uploads/parent-cheer.mp3";
     const PARTIAL_PARENT_SOUND_VOL: u64 = 40;
     const PARTIAL_PARENT_GRAPHICS: &str =
         "https://cdn.streamelements.com/uploads/parent-cheer.webm";
@@ -2412,13 +2400,9 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("default or mapped cheer variations");
         for (i, v) in cheer_vars.iter().enumerate() {
-            let msg = v
-                .pointer("/message")
-                .and_then(|x| x.as_str())
-                .unwrap_or("");
+            let msg = v.pointer("/message").and_then(|x| x.as_str()).unwrap_or("");
             assert!(
-                !msg.to_lowercase().contains("tipped")
-                    && !msg.to_lowercase().contains("donation"),
+                !msg.to_lowercase().contains("tipped") && !msg.to_lowercase().contains("donation"),
                 "cheer[{i}] must not come from tip: {msg}"
             );
             let img = v
@@ -2529,9 +2513,7 @@ mod tests {
             "expected mapped cheer message, got {msg}"
         );
         assert_eq!(
-            vars[0]
-                .pointer("/image/value")
-                .and_then(|x| x.as_str()),
+            vars[0].pointer("/image/value").and_then(|x| x.as_str()),
             Some("https://cdn.example.com/bits.webm")
         );
     }

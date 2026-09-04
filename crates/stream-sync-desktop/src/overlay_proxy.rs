@@ -134,7 +134,10 @@ pub fn validate_overlay_api_path(path: &str) -> Result<String, String> {
 pub fn validate_allowlisted_api(method: &str, path: &str) -> Result<(), String> {
     let method = method.trim().to_ascii_uppercase();
     let path = validate_overlay_api_path(path)?;
-    let path_no_query = path.split_once('?').map(|(p, _)| p).unwrap_or(path.as_str());
+    let path_no_query = path
+        .split_once('?')
+        .map(|(p, _)| p)
+        .unwrap_or(path.as_str());
     if OVERLAY_API_ALLOWLIST
         .iter()
         .any(|(m, p)| *m == method.as_str() && *p == path_no_query)
@@ -333,15 +336,9 @@ mod tests {
                 .is_ok(),
             "studio create/save includes ?profile="
         );
-        assert!(validate_allowlisted_api(
-            "GET",
-            "/api/events/overlay-config?profile=default"
-        )
-        .is_ok());
-        assert!(validate_allowlisted_api(
-            "POST",
-            "/api/admin/secret?profile=default"
-        )
-        .is_err());
+        assert!(
+            validate_allowlisted_api("GET", "/api/events/overlay-config?profile=default").is_ok()
+        );
+        assert!(validate_allowlisted_api("POST", "/api/admin/secret?profile=default").is_err());
     }
 }
