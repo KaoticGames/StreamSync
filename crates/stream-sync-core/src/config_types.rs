@@ -331,6 +331,208 @@ pub fn resolve_events_overlay_profile(stored: Option<Value>) -> Value {
     }
 }
 
+/// Known events overlay event keys (studio / runtime picker).
+pub const EVENTS_OVERLAY_EVENT_KEYS: &[&str] =
+    &["follow", "sub", "resub", "gift", "cheer", "raid", "redeem"];
+
+/// Validate a profile before persisting a POST `/api/events/overlay-config` write.
+///
+/// Fail-closed on malformed trigger / chance / duration / placement fields so the
+/// variation picker never sees garbage. Unknown presentation fields are left alone.
+pub fn validate_events_overlay_profile_write(config: &Value) -> Result<(), String> {
+    let Some(obj) = config.as_object() else {
+        return Err("config must be a JSON object".into());
+    };
+    if let Some(events) = obj.get("events") {
+        validate_events_map(events)?;
+    }
+    Ok(())
+}
+
+fn validate_events_map(events: &Value) -> Result<(), String> {
+    let Some(map) = events.as_object() else {
+        return Err("config.events must be an object".into());
+    };
+    for (key, event_cfg) in map {
+        if !EVENTS_OVERLAY_EVENT_KEYS.contains(&key.as_str()) {
+            return Err(format!("unknown event key: {key}"));
+        }
+        validate_event_config(key, event_cfg)?;
+    }
+    Ok(())
+}
+
+fn validate_event_config(event_key: &str, event_cfg: &Value) -> Result<(), String> {
+    let Some(obj) = event_cfg.as_object() else {
+        return Err(format!("events.{event_key} must be an object"));
+    };
+    let Some(variations) = obj.get("variations") else {
+        return Err(format!("events.{event_key}.variations is required"));
+    };
+    let Some(arr) = variations.as_array() else {
+        return Err(format!("events.{event_key}.variations must be an array"));
+    };
+    for (i, var) in arr.iter().enumerate() {
+        validate_variation(event_key, i, var)?;
+    }
+    Ok(())
+}
+
+fn validate_variation(event_key: &str, index: usize, var: &Value) -> Result<(), String> {
+    let ctx = format!("events.{event_key}.variations[{index}]");
+    let Some(obj) = var.as_object() else {
+        return Err(format!("{ctx} must be an object"));
+    };
+    if let Some(trigger) = obj.get("trigger") {
+        validate_trigger(&ctx, trigger)?;
+    }
+    if let Some(chance) = obj.get("chancePct").or_else(|| obj.get("chance")) {
+        validate_chance(&ctx, chance)?;
+    }
+    if let Some(duration) = obj.get("durationSec") {
+        validate_duration_sec(&ctx, duration)?;
+    }
+    if let Some(placement) = obj.get("placement") {
+        validate_placement(&ctx, placement)?;
+    }
+    Ok(())
+}
+
+fn validate_trigger(ctx: &str, trigger: &Value) -> Result<(), String> {
+    let Some(obj) = trigger.as_object() else {
+        return Err(format!("{ctx}.trigger must be an object"));
+    };
+    let mode = match obj.get("mode") {
+        None | Some(Value::Null) => "none",
+        Some(Value::String(s)) => s.as_str(),
+        Some(_) => return Err(format!("{ctx}.trigger.mode must be a string")),
+    };
+    match mode {
+        "none" | "exact" | "min" => {}
+        other => {
+            return Err(format!(
+                "{ctx}.trigger.mode must be none|exact|min (got {other})"
+            ));
+        }
+    }
+    if mode == "exact" || mode == "min" {
+        let Some(value) = obj.get("value") else {
+            return Err(format!(
+                "{ctx}.trigger.value is required when mode is {mode}"
+            ));
+        };
+        if coerce_trigger_threshold(value).is_none() {
+            return Err(format!(
+                "{ctx}.trigger.value must be a finite number or numeric string when mode is {mode}"
+            ));
+        }
+    }
+    if let Some(tier) = obj.get("tier") {
+        if !tier.is_null() && normalize_trigger_tier(tier).is_none() {
+            return Err(format!(
+                "{ctx}.trigger.tier must be 1|2|3 or Twitch 1000|2000|3000"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Coerce finite numbers and numeric strings; reject objects/arrays/empty/non-finite.
+fn coerce_trigger_threshold(val: &Value) -> Option<f64> {
+    match val {
+        Value::Number(n) => n.as_f64().filter(|f| f.is_finite()),
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let n: f64 = trimmed.parse().ok()?;
+            n.is_finite().then_some(n)
+        }
+        _ => None,
+    }
+}
+
+fn normalize_trigger_tier(val: &Value) -> Option<u8> {
+    let n = match val {
+        Value::Number(num) => num.as_f64()?,
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            trimmed.parse::<f64>().ok()?
+        }
+        _ => return None,
+    };
+    if !n.is_finite() || n.fract() != 0.0 {
+        return None;
+    }
+    match n as i64 {
+        1 | 1000 => Some(1),
+        2 | 2000 => Some(2),
+        3 | 3000 => Some(3),
+        _ => None,
+    }
+}
+
+fn validate_chance(ctx: &str, chance: &Value) -> Result<(), String> {
+    if chance.is_null() {
+        return Ok(());
+    }
+    let Some(n) = chance.as_f64().filter(|f| f.is_finite()) else {
+        return Err(format!("{ctx}.chance/chancePct must be a finite number"));
+    };
+    if !(0.0..=100.0).contains(&n) {
+        return Err(format!(
+            "{ctx}.chance/chancePct must be between 0 and 100 (got {n})"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_duration_sec(ctx: &str, duration: &Value) -> Result<(), String> {
+    if duration.is_null() {
+        return Ok(());
+    }
+    let Some(n) = duration.as_f64().filter(|f| f.is_finite()) else {
+        return Err(format!("{ctx}.durationSec must be a finite number"));
+    };
+    if n < 0.0 {
+        return Err(format!("{ctx}.durationSec must be non-negative (got {n})"));
+    }
+    Ok(())
+}
+
+fn validate_placement(ctx: &str, placement: &Value) -> Result<(), String> {
+    let Some(obj) = placement.as_object() else {
+        return Err(format!("{ctx}.placement must be an object"));
+    };
+    for key in ["image", "text"] {
+        if let Some(rect) = obj.get(key) {
+            validate_placement_rect(&format!("{ctx}.placement.{key}"), rect)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_placement_rect(ctx: &str, rect: &Value) -> Result<(), String> {
+    let Some(obj) = rect.as_object() else {
+        return Err(format!("{ctx} must be an object"));
+    };
+    for key in ["x", "y", "w", "h"] {
+        match obj.get(key) {
+            None => return Err(format!("{ctx}.{key} is required")),
+            Some(v) => {
+                if v.as_f64().filter(|f| f.is_finite()).is_none() {
+                    return Err(format!("{ctx}.{key} must be a finite number"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Default for EventsOverlayConfigFile {
     fn default() -> Self {
         let mut profiles = HashMap::new();
@@ -437,4 +639,144 @@ pub enum TwitchActiveMode {
 pub struct TwitchActiveModeFile {
     #[serde(default)]
     pub mode: TwitchActiveMode,
+}
+
+#[cfg(test)]
+mod events_overlay_write_validation_tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn cheer_variation(trigger: Value, extras: Value) -> Value {
+        let mut v = json!({
+            "id": "v1",
+            "name": "Test",
+            "trigger": trigger,
+            "durationSec": 6,
+            "message": "[name] cheered!",
+            "placement": {
+                "image": { "x": 1, "y": 2, "w": 3, "h": 4 },
+                "text": { "x": 5, "y": 6, "w": 7, "h": 8 }
+            }
+        });
+        if let (Some(obj), Some(extra)) = (v.as_object_mut(), extras.as_object()) {
+            for (k, val) in extra {
+                obj.insert(k.clone(), val.clone());
+            }
+        }
+        v
+    }
+
+    fn profile_with_cheer_variation(variation: Value) -> Value {
+        json!({
+            "version": 1,
+            "stage": { "w": 1280, "h": 720 },
+            "events": {
+                "cheer": { "variations": [variation] }
+            }
+        })
+    }
+
+    /// Mirrors POST handler: validate then insert; on Err leave map unchanged.
+    fn try_store_profile(
+        store: &mut HashMap<String, Value>,
+        profile_id: &str,
+        config: Value,
+    ) -> Result<(), String> {
+        validate_events_overlay_profile_write(&config)?;
+        store.insert(profile_id.to_string(), config);
+        Ok(())
+    }
+
+    #[test]
+    fn valid_default_shaped_profile_accepted() {
+        let profile = default_events_overlay_profile();
+        assert!(validate_events_overlay_profile_write(&profile).is_ok());
+    }
+
+    #[test]
+    fn invalid_trigger_value_rejected_and_not_stored() {
+        let mut store = HashMap::new();
+        store.insert("keep".into(), json!({ "version": 1 }));
+
+        let bad = profile_with_cheer_variation(cheer_variation(
+            json!({ "mode": "exact", "value": "nope" }),
+            json!({}),
+        ));
+        let err = try_store_profile(&mut store, "bad", bad).expect_err("must reject");
+        assert!(err.contains("trigger.value"), "unexpected error: {err}");
+        assert!(!store.contains_key("bad"));
+        assert!(store.contains_key("keep"));
+    }
+
+    #[test]
+    fn invalid_duration_rejected() {
+        let bad = profile_with_cheer_variation(cheer_variation(
+            json!({ "mode": "none", "value": null }),
+            json!({ "durationSec": -1 }),
+        ));
+        let err = validate_events_overlay_profile_write(&bad).expect_err("must reject");
+        assert!(err.contains("durationSec"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn unknown_presentation_field_round_trips() {
+        let mut profile = default_events_overlay_profile();
+        profile
+            .pointer_mut("/events/cheer/variations/0")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "customShaderPreset".into(),
+                json!({ "glow": true, "intensity": 0.42 }),
+            );
+
+        validate_events_overlay_profile_write(&profile).expect("valid");
+
+        let mut store = HashMap::new();
+        try_store_profile(&mut store, "p1", profile.clone()).expect("store");
+        let stored = store.get("p1").expect("stored");
+        assert_eq!(
+            stored.pointer("/events/cheer/variations/0/customShaderPreset"),
+            Some(&json!({ "glow": true, "intensity": 0.42 }))
+        );
+        // Presentation fields from the default shape remain intact.
+        assert!(stored
+            .pointer("/events/cheer/variations/0/animation")
+            .is_some());
+        assert!(stored
+            .pointer("/events/cheer/variations/0/text/fontMeta")
+            .is_some());
+    }
+
+    #[test]
+    fn unknown_event_key_rejected() {
+        let bad = json!({
+            "events": {
+                "follow": { "variations": [] },
+                "mystery": { "variations": [] }
+            }
+        });
+        let err = validate_events_overlay_profile_write(&bad).expect_err("must reject");
+        assert!(err.contains("unknown event key"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn exact_mode_accepts_numeric_string_value() {
+        let ok = profile_with_cheer_variation(cheer_variation(
+            json!({ "mode": "exact", "value": "100" }),
+            json!({}),
+        ));
+        assert!(validate_events_overlay_profile_write(&ok).is_ok());
+    }
+
+    #[test]
+    fn twitch_tier_codes_accepted() {
+        let ok = profile_with_cheer_variation(cheer_variation(
+            json!({ "mode": "none", "tier": 2000 }),
+            json!({}),
+        ));
+        assert!(validate_events_overlay_profile_write(&ok).is_ok());
+    }
 }

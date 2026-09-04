@@ -62,6 +62,18 @@
     return Number(v.amount) || 0;
   }
 
+  /** Coerce finite numbers and numeric strings; reject objects/arrays/empty/non-finite. */
+  function coerceTriggerThreshold(val) {
+    if (typeof val === "number") return Number.isFinite(val) ? val : NaN;
+    if (typeof val === "string") {
+      const trimmed = val.trim();
+      if (trimmed === "") return NaN;
+      const n = Number(trimmed);
+      return Number.isFinite(n) ? n : NaN;
+    }
+    return NaN;
+  }
+
   function variationMatchesTrigger(v, eventType, variables) {
     const t = v?.trigger || {};
     const eventTier = normalizeTier(variables?.tier ?? variables?.amount);
@@ -75,10 +87,13 @@
     if (eventType === "gift") {
       const qty = eventNumericValue(eventType, variables);
       const mode = t.mode || "none";
-      const val = t.value;
+      const val = coerceTriggerThreshold(t.value);
       let qtyOk = true;
-      if (mode === "exact" && Number.isFinite(val)) qtyOk = qty === val;
-      else if (mode === "min" && Number.isFinite(val)) qtyOk = qty >= val;
+      if (mode === "exact") {
+        qtyOk = Number.isFinite(val) && qty === val;
+      } else if (mode === "min") {
+        qtyOk = Number.isFinite(val) && qty >= val;
+      }
 
       const reqTier = Number(t.tier);
       let tierOk = true;
@@ -88,11 +103,17 @@
     }
 
     const mode = t.mode || "none";
-    const val = t.value;
+    const val = coerceTriggerThreshold(t.value);
     const num = eventNumericValue(eventType, variables);
     if (mode === "none") return true;
-    if (mode === "exact" && Number.isFinite(val)) return num === val;
-    if (mode === "min" && Number.isFinite(val)) return num >= val;
+    if (mode === "exact") {
+      if (!Number.isFinite(val)) return false;
+      return num === val;
+    }
+    if (mode === "min") {
+      if (!Number.isFinite(val)) return false;
+      return num >= val;
+    }
     return true;
   }
 
@@ -113,14 +134,14 @@
       const num = eventNumericValue(eventType, variables);
       let bestThreshold = -Infinity;
       for (const v of min) {
-        const val = v?.trigger?.value;
+        const val = coerceTriggerThreshold(v?.trigger?.value);
         if (Number.isFinite(val) && num >= val && val > bestThreshold) {
           bestThreshold = val;
         }
       }
       if (Number.isFinite(bestThreshold)) {
         const top = min.filter(
-          (v) => Number.isFinite(v?.trigger?.value) && v.trigger.value === bestThreshold
+          (v) => coerceTriggerThreshold(v?.trigger?.value) === bestThreshold
         );
         if (top.length) return top;
       }

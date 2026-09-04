@@ -4,7 +4,7 @@ use crate::app_state::{normalize_chat_profile_id, AppState};
 use crate::broadcast::{make_dock_event, FeedAudience};
 use crate::config_types::{
     normalize_display_mode, normalize_popup_duration, resolve_events_overlay_profile,
-    ChatOverlayProfile,
+    validate_events_overlay_profile_write, ChatOverlayProfile,
 };
 use crate::control_plane::{self, cors_layer, MEDIA_UPLOAD_BODY_LIMIT, PRIVILEGED_JSON_BODY_LIMIT};
 use crate::kick;
@@ -1713,6 +1713,9 @@ async fn post_events_overlay_config(
         .cloned()
         .ok_or(StatusCode::BAD_REQUEST)?;
     if !config.is_object() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if validate_events_overlay_profile_write(&config).is_err() {
         return Err(StatusCode::BAD_REQUEST);
     }
     ctx.state

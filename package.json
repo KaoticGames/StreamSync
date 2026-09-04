@@ -8,7 +8,7 @@
     "dev:watch": "node scripts/dev.js --watch",
     "prepare-release": "node scripts/prepare-release.js",
     "build": "npm run prepare-release && node scripts/build.js",
-    "test": "node scripts/check-privileged-fetch.js && cargo test --workspace"
+    "test": "node scripts/check-privileged-fetch.js && (cargo test --workspace; c=$?; node --test tests/events-variation-picker.test.js; j=$?; echo \"Summary: cargo exit=$c; js exit=$j\"; exit $(( c != 0 || j != 0 ? 1 : 0 )))"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"
