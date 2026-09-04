@@ -23,8 +23,16 @@
   let cfg = null;
   let audio = null;
 
-  function delay(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  // Monotonic play generation — stale async must not mutate a newer alert.
+  const alertGen = window.StreamSyncAlertDelivery.createGenerationGate();
+
+  /** Resolves true only if gen is still current when the timer fires. */
+  function delayIfCurrent(ms, gen) {
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        resolve(alertGen.isCurrent(gen));
+      }, ms);
+    });
   }
 
     // -------------------------
@@ -805,6 +813,8 @@
     dlog("VAR  TEXT", v?.text || null);
     dlog("TEFF TEXT", tEff || null);
 
+    // New accepted play — bump gen so any in-flight stale play stops mutating.
+    const gen = alertGen.begin();
     hideAll();
 
     const anim = effectiveAnimationInOut(eventType, v);
@@ -819,8 +829,11 @@
         if (soundVolumeOverride != null) vol = soundVolumeOverride;
         audio.volume = vol;
         await audio.play();
+        if (!alertGen.isCurrent(gen)) return;
       }
     } catch {}
+
+    if (!alertGen.isCurrent(gen)) return;
 
     // --- VISUAL (image or video; placement from base) ---
     const imgSrc = effectiveImageSrc(eventType, v);
@@ -848,6 +861,7 @@
         : (meta.googleFamily || tEff.fontFamily || "");
 
     await waitForFont(waitFam, tEff.fontWeight || 400);
+    if (!alertGen.isCurrent(gen)) return;
 
     // Apply style after font is ready
     applyTextStyleFromText(tEff);
@@ -858,7 +872,14 @@
     // Configured fontSize is the max; shrink to fit the fixed placement box.
     // Double-rAF so OBS/Chromium finishes layout before measuring.
     const maxFs = tEff.fontSize || 54;
-    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const rafStillCurrent = await new Promise((resolve) => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          resolve(alertGen.isCurrent(gen));
+        });
+      });
+    });
+    if (!rafStillCurrent) return;
     fitTextToBox(textEl, maxFs);
     applyAnimToEl(textEl, "in", anim, stageSize);
 
@@ -866,7 +887,7 @@
     const durMs = clamp(effectiveDurationSec(eventType, v) * 1000, 800, 30000);
     const outAnimMs = animSpeedToDurationMs(anim.out, anim.animSpeed);
 
-    await delay(durMs);
+    if (!(await delayIfCurrent(durMs, gen))) return;
 
     if (imgEl) {
       clearAnimClasses(imgEl);
@@ -877,7 +898,7 @@
       applyAnimToEl(textEl, "out", anim, stageSize);
     }
 
-    await delay(outAnimMs + 30);
+    if (!(await delayIfCurrent(outAnimMs + 30, gen))) return;
     hideAll();
   }
 

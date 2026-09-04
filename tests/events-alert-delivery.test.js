@@ -101,3 +101,61 @@ describe("StreamSyncAlertDelivery FIFO (Pass 2)", () => {
     );
   });
 });
+
+describe("StreamSyncAlertDelivery generation gate (Pass 3)", () => {
+  it("stale play continuation must not mutate after a newer gen begins", async () => {
+    const gate = deliveryApi.createGenerationGate();
+    assert.ok(gate, "createGenerationGate must be exported");
+
+    const mutations = [];
+    /** @type {((v?: unknown) => void) | null} */
+    let resolveAwaitA = null;
+    const awaitPointA = new Promise((resolve) => {
+      resolveAwaitA = resolve;
+    });
+
+    // Mirrors overlay showAlert: begin() at play start, check after each await
+    // before mutating DOM/audio for this play.
+    async function playWithGate(id, awaitPoint) {
+      const gen = gate.begin();
+      mutations.push(`${id}:start`);
+
+      await awaitPoint;
+      if (!gate.isCurrent(gen)) {
+        mutations.push(`${id}:stale-bail`);
+        return { completed: false, gen };
+      }
+
+      mutations.push(`${id}:mutate`);
+      return { completed: true, gen };
+    }
+
+    const pA = playWithGate("A", awaitPointA);
+    await Promise.resolve();
+
+    assert.deepEqual(mutations, ["A:start"], "A has begun and is parked at await");
+    assert.equal(gate.isCurrent(1), true);
+
+    // Newer play bumps gen (as hideAll / accepted play start does).
+    const pB = playWithGate("B", Promise.resolve());
+    const resultB = await pB;
+
+    assert.equal(resultB.completed, true, "B owns the slot and may mutate");
+    assert.equal(resultB.gen, 2);
+    assert.deepEqual(mutations, ["A:start", "B:start", "B:mutate"]);
+    assert.equal(gate.isCurrent(1), false, "A's gen is no longer current");
+    assert.equal(gate.isCurrent(2), true);
+
+    // Stale continuation of A resumes — must not record a mutation / complete as owner.
+    resolveAwaitA();
+    const resultA = await pA;
+
+    assert.equal(resultA.completed, false, "stale A must not complete as slot owner");
+    assert.equal(resultA.gen, 1);
+    assert.deepEqual(
+      mutations,
+      ["A:start", "B:start", "B:mutate", "A:stale-bail"],
+      "A must bail without a mutate after B began"
+    );
+  });
+});
