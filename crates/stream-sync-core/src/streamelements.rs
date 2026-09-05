@@ -1033,13 +1033,79 @@ fn parse_css_px(v: Option<&Value>) -> Option<f64> {
     }
 }
 
-/// SE alert text is drawn on the graphic (banner bar), not beside it.
-fn text_over_image_box(x: f64, y: f64, w: f64, h: f64) -> (f64, f64, f64, f64) {
-    let text_w = w.max(80.0);
-    let text_h = (h * 0.45).clamp(40.0, 220.0);
-    let text_x = x;
-    let text_y = y + ((h - text_h) / 2.0).max(0.0);
+/// SE alert text is HTML inside the widget, not a StreamSync rectangle.
+/// Size the SS text box from the message + font; place it with scaled text.css margins.
+fn text_box_from_se(
+    img_x: f64,
+    img_y: f64,
+    img_w: f64,
+    img_h: f64,
+    message: &str,
+    font_size: f64,
+    scale: &StageScale,
+    cfg: &Value,
+) -> (f64, f64, f64, f64) {
+    let max_name = cfg
+        .get("maxUsernameLength")
+        .and_then(value_as_f64)
+        .map(|n| n.round() as usize);
+    let mut text_w = estimate_message_width(message, font_size, max_name);
+    text_w = text_w.min(img_w.max(80.0)).max(80.0);
+    let text_h = (font_size * 1.65).clamp(40.0, img_h.max(40.0));
+
+    let mt = se_text_css_margin(cfg, "margin-top") * scale.sy();
+    let ml = se_text_css_margin(cfg, "margin-left") * scale.sx();
+
+    let mut text_x = img_x + ((img_w - text_w) / 2.0) + ml;
+    // Column layout: text starts below the graphic, then margin-top (often negative) pulls it on.
+    let mut text_y = img_y + img_h + mt;
+    if se_alert_layout(cfg) != "textUnder" {
+        // Keep overlay/column text on the graphic when the margin would leave the box.
+        if text_y + text_h < img_y || text_y > img_y + img_h {
+            text_y = img_y + ((img_h - text_h) / 2.0) + mt;
+        }
+    }
+    if text_x + text_w > img_x + img_w {
+        text_x = (img_x + img_w - text_w).max(img_x);
+    }
+    if text_x < img_x {
+        text_x = img_x;
+    }
+    if text_y < img_y {
+        text_y = img_y;
+    }
+    if text_y + text_h > img_y + img_h {
+        text_y = (img_y + img_h - text_h).max(img_y);
+    }
     (text_x, text_y, text_w, text_h)
+}
+
+fn estimate_message_width(message: &str, font_size: f64, max_name: Option<usize>) -> f64 {
+    let name_n = max_name.unwrap_or(12).clamp(4, 32);
+    let name = "X".repeat(name_n);
+    let rendered = message.replace("[name]", &name).replace("[user]", &name);
+    let n = rendered.chars().filter(|c| !c.is_control()).count().max(8);
+    (font_size * 0.62 * n as f64).clamp(80.0, 1600.0)
+}
+
+fn se_text_css_margin(cfg: &Value, key: &str) -> f64 {
+    cfg.pointer("/text/css")
+        .and_then(|css| css.get(key))
+        .and_then(|v| parse_css_px(Some(v)))
+        .unwrap_or(0.0)
+}
+
+fn se_alert_layout(cfg: &Value) -> &'static str {
+    let raw = cfg
+        .get("layout")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match raw.as_str() {
+        "row" | "side" | "horizontal" | "textside" => "textSide",
+        "under" | "below" | "textunder" => "textUnder",
+        _ => "textOver",
+    }
 }
 
 /// SE `graphics.size` is percent of the alertbox widget (packs often stretch the
@@ -1116,7 +1182,26 @@ fn se_graphic_pixel_size(cfg: &Value) -> Option<(f64, f64)> {
 }
 
 fn apply_image_and_text_rects(variation: &mut Value, x: f64, y: f64, w: f64, h: f64) {
-    let (tx, ty, tw, th) = text_over_image_box(x, y, w, h);
+    let prev_tw = variation
+        .pointer("/placement/text/w")
+        .and_then(value_as_f64);
+    let prev_th = variation
+        .pointer("/placement/text/h")
+        .and_then(value_as_f64);
+    let (tx, ty, tw, th) = match (prev_tw, prev_th) {
+        (Some(tw), Some(th)) => {
+            let tw = tw.min(w).max(40.0);
+            let th = th.min(h).max(40.0);
+            let tx = x + ((w - tw) / 2.0).max(0.0);
+            let ty = y + ((h - th) / 2.0).max(0.0);
+            (tx, ty, tw, th)
+        }
+        _ => {
+            let tx = x;
+            let ty = y + ((h * 0.55) - 40.0).max(0.0);
+            (tx, ty, w.max(80.0), (h * 0.45).clamp(40.0, 220.0))
+        }
+    };
     if let Some(img) = variation.pointer_mut("/placement/image") {
         *img = json!({
             "x": x.round(),
@@ -1180,7 +1265,9 @@ fn variation_from_se_settings(
         Some((mw, mh)) => contain_fit_rect(x, y, w, h, mw, mh),
         None => (x, y, w, h),
     };
-    let (text_x, text_y, text_w, text_h) = text_over_image_box(x, y, w, h);
+    let layout = se_alert_layout(cfg);
+    let (text_x, text_y, text_w, text_h) =
+        text_box_from_se(x, y, w, h, &message, font_size as f64, scale, cfg);
 
     json!({
         "id": format!("var-{}", Uuid::new_v4()),
@@ -1200,7 +1287,7 @@ fn variation_from_se_settings(
             "slideInDir": slide_in,
             "slideOutDir": slide_out,
         },
-        "layout": "textOver",
+        "layout": layout,
         "message": message,
         "durationSec": duration,
         "text": {
@@ -1291,15 +1378,29 @@ fn extract_text_style(cfg: &Value, scale: &StageScale) -> (String, u64, u64, Str
                 family = format!("{}, system-ui, sans-serif", f.trim().trim_matches('"'));
             }
         }
-        if let Some(px) = css.get("font-size").and_then(|v| v.as_str()) {
-            if let Ok(n) = px.trim().trim_end_matches("px").parse::<f64>() {
-                size = n.round().clamp(12.0, 120.0) as u64;
-            }
+        if let Some(n) = css.get("font-size").and_then(value_as_f64).or_else(|| {
+            css.get("font-size")
+                .and_then(|v| v.as_str())
+                .and_then(|px| px.trim().trim_end_matches("px").parse::<f64>().ok())
+        }) {
+            size = n.round().clamp(12.0, 120.0) as u64;
         }
-        if let Some(w) = css.get("font-weight").and_then(|v| v.as_str()) {
-            if let Ok(n) = w.parse::<u64>() {
-                weight = n.clamp(100, 900);
+        match css.get("font-weight") {
+            Some(Value::String(w)) => {
+                let wl = w.to_ascii_lowercase();
+                weight = match wl.as_str() {
+                    "bold" => 700,
+                    "normal" => 400,
+                    "light" => 300,
+                    _ => w.parse::<u64>().ok().unwrap_or(weight).clamp(100, 900),
+                };
             }
+            Some(v) => {
+                if let Some(n) = value_as_f64(v) {
+                    weight = n.round().clamp(100.0, 900.0) as u64;
+                }
+            }
+            None => {}
         }
         if let Some(c) = css.get("color").and_then(|v| v.as_str()) {
             if !c.trim().is_empty() {
@@ -2227,12 +2328,14 @@ mod tests {
             "image box should contain-fit 800×400 into the scaled widget, got w={iw}"
         );
         assert!(
-            (tw - iw).abs() < 2.0,
-            "text width {tw} must match image width {iw}, not the widget frame"
+            tw <= iw + 1.0,
+            "text width {tw} must not exceed image width {iw}"
         );
+        let tcx = tx + tw / 2.0;
+        let icx = ix + iw / 2.0;
         assert!(
-            (tx - ix).abs() < 2.0,
-            "text x {tx} must align with image x {ix}"
+            (tcx - icx).abs() < 8.0,
+            "text should stay centered on the image (tcx={tcx} icx={icx})"
         );
     }
 
@@ -2275,6 +2378,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!((tw - iw).abs() < 2.0, "text {tw} vs image {iw}");
         assert!(iw < 700.0, "png 800×400 should contain-fit, got {iw}");
+        assert!(tw <= iw + 1.0, "text {tw} must not exceed image {iw}");
+    }
+
+    #[test]
+    fn column_layout_uses_text_css_not_widget_width() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("se_mapper_fixtures")
+            .join("se_alertbox_column_margin.json");
+        let raw = std::fs::read_to_string(&path).expect("fixture");
+        let overlay: Value = serde_json::from_str(&raw).expect("json");
+        let (_pid, profile, _) = map_overlay_to_profile(&overlay);
+        let v = profile.pointer("/events/follow/variations/0").unwrap();
+        assert_eq!(v.get("layout").and_then(|x| x.as_str()), Some("textOver"));
+        assert_eq!(
+            v.pointer("/text/fontSize").and_then(|x| x.as_u64()),
+            Some(20),
+            "SE font-size 30 on 1080p → 20 on 720p"
+        );
+        let img = v.pointer("/placement/image").unwrap();
+        let txt = v.pointer("/placement/text").unwrap();
+        let iw = img.get("w").and_then(|x| x.as_f64()).unwrap();
+        let ih = img.get("h").and_then(|x| x.as_f64()).unwrap();
+        let iy = img.get("y").and_then(|x| x.as_f64()).unwrap();
+        let tw = txt.get("w").and_then(|x| x.as_f64()).unwrap();
+        let th = txt.get("h").and_then(|x| x.as_f64()).unwrap();
+        let ty = txt.get("y").and_then(|x| x.as_f64()).unwrap();
+        let tx = txt.get("x").and_then(|x| x.as_f64()).unwrap();
+        let ix = img.get("x").and_then(|x| x.as_f64()).unwrap();
+        assert!(
+            tw < iw * 0.55,
+            "text box must be message-sized, not the {iw}px widget (got tw={tw})"
+        );
+        assert!(tw < 520.0, "text box still far too wide: {tw}");
+        let tcx = tx + tw / 2.0;
+        let icx = ix + iw / 2.0;
+        assert!((tcx - icx).abs() < 12.0, "text centered on image");
+        assert!(
+            ty + th > iy && ty < iy + ih,
+            "margin-top should land the text on the graphic (ty={ty} image={iy}..{})",
+            iy + ih
+        );
     }
 
     #[test]
