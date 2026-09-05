@@ -1033,6 +1033,15 @@ fn parse_css_px(v: Option<&Value>) -> Option<f64> {
     }
 }
 
+/// SE alert text is drawn on the graphic (banner bar), not beside it.
+fn text_over_image_box(x: f64, y: f64, w: f64, h: f64) -> (f64, f64, f64, f64) {
+    let text_w = w.max(80.0);
+    let text_h = (h * 0.45).clamp(40.0, 220.0);
+    let text_x = x;
+    let text_y = y + ((h - text_h) / 2.0).max(0.0);
+    (text_x, text_y, text_w, text_h)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn variation_from_se_settings(
     cfg: &Value,
@@ -1073,8 +1082,7 @@ fn variation_from_se_settings(
     let (trigger_mode, trigger_value, trigger_tier) =
         trigger.unwrap_or_else(|| ("none".to_string(), None, None));
 
-    let gap = 40.0 * scale.sx();
-    let (text_x, text_y, text_w, text_h) = scale.scale_rect(x + w + gap, y + h * 0.1, 520.0, 180.0);
+    let (text_x, text_y, text_w, text_h) = text_over_image_box(x, y, w, h);
 
     json!({
         "id": format!("var-{}", Uuid::new_v4()),
@@ -1094,7 +1102,7 @@ fn variation_from_se_settings(
             "slideInDir": slide_in,
             "slideOutDir": slide_out,
         },
-        "layout": "textSide",
+        "layout": "textOver",
         "message": message,
         "durationSec": duration,
         "text": {
@@ -1886,6 +1894,57 @@ mod tests {
         assert!(x < 1280.0, "x should be on 720p stage, got {x}");
         assert!(x + w <= 1280.0, "image should fit in stage width");
         assert!((x - 640.0).abs() < 5.0, "center x expected ~640, got {x}");
+    }
+
+    #[test]
+    fn imported_alert_places_text_over_image_not_beside() {
+        let overlay = json!({
+            "_id": "abc",
+            "name": "HD Alerts",
+            "settings": { "width": 1920, "height": 1080 },
+            "widgets": [{
+                "type": "se-widget-alert-box",
+                "css": { "left": "960px", "top": "540px", "width": "400px", "height": "300px" },
+                "variables": {
+                    "follower": {
+                        "enabled": true,
+                        "duration": 6,
+                        "graphics": { "src": "https://cdn.example.com/v.webm" },
+                        "text": { "message": "{name} followed" },
+                        "variations": []
+                    }
+                }
+            }]
+        });
+        let (_pid, profile, _) = map_overlay_to_profile(&overlay);
+        let v = profile.pointer("/events/follow/variations/0").unwrap();
+        assert_eq!(
+            v.get("layout").and_then(|x| x.as_str()),
+            Some("textOver"),
+            "SE alert text sits on the graphic, not beside it"
+        );
+        let img = v.pointer("/placement/image").unwrap();
+        let txt = v.pointer("/placement/text").unwrap();
+        let ix = img.get("x").and_then(|x| x.as_f64()).unwrap();
+        let iy = img.get("y").and_then(|x| x.as_f64()).unwrap();
+        let iw = img.get("w").and_then(|x| x.as_f64()).unwrap();
+        let ih = img.get("h").and_then(|x| x.as_f64()).unwrap();
+        let tx = txt.get("x").and_then(|x| x.as_f64()).unwrap();
+        let ty = txt.get("y").and_then(|x| x.as_f64()).unwrap();
+        let tw = txt.get("w").and_then(|x| x.as_f64()).unwrap();
+        let th = txt.get("h").and_then(|x| x.as_f64()).unwrap();
+        let tcx = tx + tw / 2.0;
+        let tcy = ty + th / 2.0;
+        assert!(
+            tcx >= ix && tcx <= ix + iw,
+            "text center x {tcx} should lie on the image [{ix}..{}]",
+            ix + iw
+        );
+        assert!(
+            tcy >= iy && tcy <= iy + ih,
+            "text center y {tcy} should lie on the image [{iy}..{}]",
+            iy + ih
+        );
     }
 
     #[test]
