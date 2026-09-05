@@ -1077,6 +1077,64 @@ fn shrink_rect_centered(x: f64, y: f64, w: f64, h: f64, percent: f64) -> (f64, f
     (nx, ny, nw, nh)
 }
 
+/// object-fit:contain the media inside the widget frame (Studio does this visually).
+fn contain_fit_rect(
+    x: f64,
+    y: f64,
+    box_w: f64,
+    box_h: f64,
+    media_w: f64,
+    media_h: f64,
+) -> (f64, f64, f64, f64) {
+    if media_w < 8.0 || media_h < 8.0 || box_w < 8.0 || box_h < 8.0 {
+        return (x, y, box_w, box_h);
+    }
+    let scale = (box_w / media_w).min(box_h / media_h);
+    let nw = (media_w * scale).clamp(40.0, box_w);
+    let nh = (media_h * scale).clamp(40.0, box_h);
+    let nx = x + ((box_w - nw) / 2.0).max(0.0);
+    let ny = y + ((box_h - nh) / 2.0).max(0.0);
+    (nx, ny, nw, nh)
+}
+
+fn se_graphic_pixel_size(cfg: &Value) -> Option<(f64, f64)> {
+    let w = cfg
+        .pointer("/graphics/width")
+        .or_else(|| cfg.pointer("/graphics/original/width"))
+        .or_else(|| cfg.pointer("/image/width"))
+        .and_then(value_as_f64)?;
+    let h = cfg
+        .pointer("/graphics/height")
+        .or_else(|| cfg.pointer("/graphics/original/height"))
+        .or_else(|| cfg.pointer("/image/height"))
+        .and_then(value_as_f64)?;
+    if w >= 8.0 && h >= 8.0 {
+        Some((w, h))
+    } else {
+        None
+    }
+}
+
+fn apply_image_and_text_rects(variation: &mut Value, x: f64, y: f64, w: f64, h: f64) {
+    let (tx, ty, tw, th) = text_over_image_box(x, y, w, h);
+    if let Some(img) = variation.pointer_mut("/placement/image") {
+        *img = json!({
+            "x": x.round(),
+            "y": y.round(),
+            "w": w.round(),
+            "h": h.round()
+        });
+    }
+    if let Some(txt) = variation.pointer_mut("/placement/text") {
+        *txt = json!({
+            "x": tx.round(),
+            "y": ty.round(),
+            "w": tw.round(),
+            "h": th.round()
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn variation_from_se_settings(
     cfg: &Value,
@@ -1118,6 +1176,10 @@ fn variation_from_se_settings(
         trigger.unwrap_or_else(|| ("none".to_string(), None, None));
 
     let (x, y, w, h) = shrink_rect_centered(x, y, w, h, se_graphic_size_percent(cfg));
+    let (x, y, w, h) = match se_graphic_pixel_size(cfg) {
+        Some((mw, mh)) => contain_fit_rect(x, y, w, h, mw, mh),
+        None => (x, y, w, h),
+    };
     let (text_x, text_y, text_w, text_h) = text_over_image_box(x, y, w, h);
 
     json!({
@@ -1469,6 +1531,7 @@ pub async fn localize_profile_media(
                     saved += n;
                 }
             }
+            fit_variation_to_downloaded_image(&media_dir, var);
         }
     }
 
@@ -1555,6 +1618,98 @@ async fn download_media(
     let dest = media_dir.join(&filename);
     std::fs::write(&dest, &bytes).context("write file")?;
     Ok(format!("/events-media/{profile_id}/{filename}"))
+}
+
+fn fit_variation_to_downloaded_image(media_dir: &Path, variation: &mut Value) {
+    let url = variation
+        .pointer("/image/value")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let Some(path) = local_events_media_file(media_dir, url) else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let Some((mw, mh)) = raster_px(&bytes) else {
+        return;
+    };
+    let Some(img) = variation.pointer("/placement/image") else {
+        return;
+    };
+    let Some(x) = img.get("x").and_then(value_as_f64) else {
+        return;
+    };
+    let Some(y) = img.get("y").and_then(value_as_f64) else {
+        return;
+    };
+    let Some(w) = img.get("w").and_then(value_as_f64) else {
+        return;
+    };
+    let Some(h) = img.get("h").and_then(value_as_f64) else {
+        return;
+    };
+    let (nx, ny, nw, nh) = contain_fit_rect(x, y, w, h, mw as f64, mh as f64);
+    apply_image_and_text_rects(variation, nx, ny, nw, nh);
+}
+
+fn local_events_media_file(media_dir: &Path, url: &str) -> Option<PathBuf> {
+    if !url.contains("/events-media/") {
+        return None;
+    }
+    let name = url.split('?').next()?.rsplit('/').next()?;
+    if name.is_empty() || name.contains("..") {
+        return None;
+    }
+    let path = media_dir.join(name);
+    path.is_file().then_some(path)
+}
+
+fn raster_px(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() >= 24 && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+        let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+        return (w > 0 && h > 0).then_some((w, h));
+    }
+    if bytes.len() >= 10 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        let w = u16::from_le_bytes([bytes[6], bytes[7]]) as u32;
+        let h = u16::from_le_bytes([bytes[8], bytes[9]]) as u32;
+        return (w > 0 && h > 0).then_some((w, h));
+    }
+    if bytes.len() >= 30 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        if &bytes[12..16] == b"VP8X" && bytes.len() >= 30 {
+            let w = 1 + u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]);
+            let h = 1 + u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]);
+            return (w > 0 && h > 0).then_some((w, h));
+        }
+        if &bytes[12..16] == b"VP8 " && bytes.len() >= 30 {
+            let w = u16::from_le_bytes([bytes[26], bytes[27]]) as u32 & 0x3fff;
+            let h = u16::from_le_bytes([bytes[28], bytes[29]]) as u32 & 0x3fff;
+            return (w > 0 && h > 0).then_some((w, h));
+        }
+    }
+    if bytes.len() >= 4 && bytes[0] == 0xff && bytes[1] == 0xd8 {
+        let mut i = 2usize;
+        while i + 9 < bytes.len() {
+            if bytes[i] != 0xff {
+                i += 1;
+                continue;
+            }
+            let marker = bytes[i + 1];
+            if marker == 0xd8 || marker == 0xd9 || (0xd0..=0xd7).contains(&marker) {
+                i += 2;
+                continue;
+            }
+            let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+            if matches!(marker, 0xc0 | 0xc1 | 0xc2) && i + 8 < bytes.len() {
+                let h = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
+                let w = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]) as u32;
+                return (w > 0 && h > 0).then_some((w, h));
+            }
+            i += 2 + len;
+        }
+    }
+    None
 }
 
 fn url_basename_hint(url: &str) -> String {
@@ -2031,6 +2186,95 @@ mod tests {
             w < 900.0,
             "must not use the full 1280 widget frame as the graphic"
         );
+    }
+
+    #[test]
+    fn imported_text_box_matches_contained_graphic_not_widget_frame() {
+        // Wide widget + shorter-aspect PNG: Studio object-fit letterboxes the art.
+        // Text must use the contained visual box, not the full widget width.
+        let overlay = json!({
+            "_id": "abc",
+            "name": "HD Alerts",
+            "settings": { "width": 1920, "height": 1080 },
+            "widgets": [{
+                "type": "se-widget-alert-box",
+                "css": { "left": "0px", "top": "340px", "width": "1920px", "height": "400px" },
+                "variables": {
+                    "follower": {
+                        "enabled": true,
+                        "duration": 6,
+                        "graphics": {
+                            "src": "https://cdn.example.com/banner.png",
+                            "width": 800,
+                            "height": 400
+                        },
+                        "text": { "message": "{name} followed" },
+                        "variations": []
+                    }
+                }
+            }]
+        });
+        let (_pid, profile, _) = map_overlay_to_profile(&overlay);
+        let v = profile.pointer("/events/follow/variations/0").unwrap();
+        let img = v.pointer("/placement/image").unwrap();
+        let txt = v.pointer("/placement/text").unwrap();
+        let iw = img.get("w").and_then(|x| x.as_f64()).unwrap();
+        let tw = txt.get("w").and_then(|x| x.as_f64()).unwrap();
+        let ix = img.get("x").and_then(|x| x.as_f64()).unwrap();
+        let tx = txt.get("x").and_then(|x| x.as_f64()).unwrap();
+        assert!(
+            iw < 700.0,
+            "image box should contain-fit 800×400 into the scaled widget, got w={iw}"
+        );
+        assert!(
+            (tw - iw).abs() < 2.0,
+            "text width {tw} must match image width {iw}, not the widget frame"
+        );
+        assert!(
+            (tx - ix).abs() < 2.0,
+            "text x {tx} must align with image x {ix}"
+        );
+    }
+
+    #[test]
+    fn contain_fit_rect_letterboxes_wide_frame() {
+        let (x, y, w, h) = contain_fit_rect(0.0, 100.0, 1280.0, 267.0, 800.0, 400.0);
+        assert!((w - 533.4).abs() < 2.0, "got w={w}");
+        assert!((h - 267.0).abs() < 2.0, "got h={h}");
+        assert!((x - 373.3).abs() < 2.0, "got x={x}");
+        assert!((y - 100.0).abs() < 2.0, "got y={y}");
+    }
+
+    #[test]
+    fn fit_downloaded_png_snaps_text_to_visual_box() {
+        let dir = std::env::temp_dir().join(format!("ss-fit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(&[0, 0, 0, 13, b'I', b'H', b'D', b'R']);
+        png.extend_from_slice(&800u32.to_be_bytes());
+        png.extend_from_slice(&400u32.to_be_bytes());
+        png.extend_from_slice(&[8, 2, 0, 0, 0]);
+        png.extend_from_slice(&[0, 0, 0, 0]);
+        std::fs::write(dir.join("banner.png"), &png).unwrap();
+        let mut variation = json!({
+            "image": { "type": "url", "value": "/events-media/p/banner.png" },
+            "placement": {
+                "image": { "x": 0, "y": 100, "w": 1280, "h": 267 },
+                "text": { "x": 0, "y": 100, "w": 1280, "h": 120 }
+            }
+        });
+        fit_variation_to_downloaded_image(&dir, &mut variation);
+        let tw = variation
+            .pointer("/placement/text/w")
+            .and_then(|v| v.as_f64())
+            .unwrap();
+        let iw = variation
+            .pointer("/placement/image/w")
+            .and_then(|v| v.as_f64())
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!((tw - iw).abs() < 2.0, "text {tw} vs image {iw}");
+        assert!(iw < 700.0, "png 800×400 should contain-fit, got {iw}");
     }
 
     #[test]
