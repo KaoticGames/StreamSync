@@ -62,7 +62,7 @@
   </div>
 
   <!-- Shared privileged HTTP helper (must load before connections-api / config scripts) -->
-  <script src="control-api.js"></script>
+  <script src="control-api.js?v=no-anon-fetch-1"></script>
   <!-- Tauri bridge (no-op in browser/Electron); must load before overlay-client-config -->
   <script src="tauri-bridge.js"></script>
   <!-- Overlay URL (must load before config scripts) -->
@@ -75,7 +75,7 @@
   <script src="chat-overlay-config.js?v=font-preview-parity-14"></script>
   <script src="events-dock-config.js"></script>
   <script src="events-overlay-config.js?v=3"></script>
-  <script src="events-se-import.js?v=5"></script>
+  <script src="events-se-import.js?v=6"></script>
 
   <!-- Renderer logic -->
   <script src="renderer.js?v=1"></script>

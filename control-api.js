@@ -132,25 +132,12 @@
       return res;
     }
 
-    if (standaloneReadOnly && method !== "GET" && method !== "HEAD") {
-      const err = new Error("desktop_required_for_mutation");
-      err.code = "desktop_required";
-      throw err;
-    }
-
-    const url = `${overlayBase()}${safePath}`;
-    const headers = Object.assign({}, opts.headers || {});
-    if (opts.body && !headers["Content-Type"] && !headers["content-type"]) {
-      headers["Content-Type"] = "application/json";
-    }
-    const res = await fetch(url, Object.assign({}, opts, { headers }));
-    if (res.status === 401) {
-      const err = new Error("unauthorized");
-      err.code = "unauthorized";
-      err.status = 401;
-      throw err;
-    }
-    return res;
+    // Privileged /api/* must not fall through to cookie-less fetch — that 401s
+    // Import SE overlays (GET session/overlays) while Connections JWT save still
+    // works (POST session is OAuthCompletion and can pass origin-only middleware).
+    const err = new Error("Stream Sync control capability unavailable");
+    err.code = "no_native_invoke";
+    throw err;
   }
 
   global.streamSyncControlApi = {

@@ -329,6 +329,9 @@ mod tests {
         assert!(validate_allowlisted_api("POST", "/api/events/test-alert").is_ok());
         assert!(validate_allowlisted_api("POST", "/api/events/upload-media").is_ok());
         assert!(validate_allowlisted_api("POST", "/api/streamelements/session").is_ok());
+        assert!(validate_allowlisted_api("GET", "/api/streamelements/session").is_ok());
+        assert!(validate_allowlisted_api("GET", "/api/streamelements/overlays").is_ok());
+        assert!(validate_allowlisted_api("POST", "/api/streamelements/import").is_ok());
         assert!(validate_allowlisted_api("POST", "/api/twitch/set-token").is_err());
         assert!(validate_allowlisted_api("GET", "/api/admin/secret").is_err());
         assert!(
