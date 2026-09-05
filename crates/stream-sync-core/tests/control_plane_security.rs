@@ -881,6 +881,20 @@ fn connections_open_account_page_uses_system_browser_not_flowless_ipc() {
 }
 
 #[test]
+fn control_api_does_not_unauthenticated_fetch_privileged_routes() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .unwrap();
+    let control = std::fs::read_to_string(root.join("control-api.js")).unwrap();
+    assert!(
+        !control.contains("${overlayBase()}${safePath}"),
+        "privilegedFetch must not fall back to cookie-less fetch (Import SE 401)"
+    );
+    assert!(control.contains("no_native_invoke"));
+}
+
+#[test]
 fn channel_point_private_input_is_profile_scoped() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let twitch = std::fs::read_to_string(root.join("src/twitch.rs")).unwrap();

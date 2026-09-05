@@ -299,9 +299,16 @@
       renderOverlays(data.overlays || []);
       await refreshImportButton();
     } catch (e) {
-      if (e.status === 401 || String(e.message).includes("not_connected")) {
+      if (e.status === 401 || String(e.message).includes("not_connected") || e.code === "unauthorized") {
         setStatus(
           "StreamElements is not connected. Open Connections, save Account ID and JWT, then try again."
+        );
+      } else if (
+        e.code === "no_native_invoke" ||
+        String(e.message || "").includes("control capability")
+      ) {
+        setStatus(
+          "Import needs the Stream Sync desktop control API. Restart Stream Sync after updating, then try again."
         );
       } else {
         setStatus(`Failed to load overlays: ${e.message}`);
@@ -423,6 +430,15 @@
       }
       await loadOverlayList();
     } catch (e) {
+      if (
+        e.code === "no_native_invoke" ||
+        String(e.message || "").includes("control capability")
+      ) {
+        setStatus(
+          "Import needs the Stream Sync desktop control API. Restart Stream Sync after updating, then try again."
+        );
+        return;
+      }
       setStatus(`Error: ${e.message}`);
     }
   }
