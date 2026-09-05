@@ -1042,6 +1042,41 @@ fn text_over_image_box(x: f64, y: f64, w: f64, h: f64) -> (f64, f64, f64, f64) {
     (text_x, text_y, text_w, text_h)
 }
 
+/// SE `graphics.size` is percent of the alertbox widget (packs often stretch the
+/// widget to the full canvas and shrink the PNG inside it). Missing → 100%.
+fn se_graphic_size_percent(cfg: &Value) -> f64 {
+    let raw = cfg
+        .pointer("/graphics/size")
+        .or_else(|| cfg.pointer("/graphics/scale"))
+        .or_else(|| cfg.get("imageSize"))
+        .or_else(|| cfg.pointer("/layout/imageSize"));
+    let Some(n) = raw.and_then(value_as_f64).or_else(|| {
+        raw.and_then(|v| v.as_str())
+            .and_then(|s| s.trim().trim_end_matches('%').parse::<f64>().ok())
+    }) else {
+        return 100.0;
+    };
+    if n <= 0.0 {
+        return 100.0;
+    }
+    if n <= 1.0 {
+        return (n * 100.0).clamp(5.0, 100.0);
+    }
+    n.clamp(5.0, 100.0)
+}
+
+fn shrink_rect_centered(x: f64, y: f64, w: f64, h: f64, percent: f64) -> (f64, f64, f64, f64) {
+    let s = (percent / 100.0).clamp(0.05, 1.0);
+    if (s - 1.0).abs() < 0.001 {
+        return (x, y, w, h);
+    }
+    let nw = (w * s).max(40.0);
+    let nh = (h * s).max(40.0);
+    let nx = x + ((w - nw) / 2.0).max(0.0);
+    let ny = y + ((h - nh) / 2.0).max(0.0);
+    (nx, ny, nw, nh)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn variation_from_se_settings(
     cfg: &Value,
@@ -1082,6 +1117,7 @@ fn variation_from_se_settings(
     let (trigger_mode, trigger_value, trigger_tier) =
         trigger.unwrap_or_else(|| ("none".to_string(), None, None));
 
+    let (x, y, w, h) = shrink_rect_centered(x, y, w, h, se_graphic_size_percent(cfg));
     let (text_x, text_y, text_w, text_h) = text_over_image_box(x, y, w, h);
 
     json!({
@@ -1944,6 +1980,56 @@ mod tests {
             tcy >= iy && tcy <= iy + ih,
             "text center y {tcy} should lie on the image [{iy}..{}]",
             iy + ih
+        );
+    }
+
+    #[test]
+    fn imported_graphic_honors_se_size_percent_inside_widget() {
+        // Packs stretch the alertbox across the canvas; the PNG is `graphics.size`% of that frame.
+        let overlay = json!({
+            "_id": "abc",
+            "name": "HD Alerts",
+            "settings": { "width": 1920, "height": 1080 },
+            "widgets": [{
+                "type": "se-widget-alert-box",
+                "css": { "left": "0px", "top": "340px", "width": "1920px", "height": "400px" },
+                "variables": {
+                    "follower": {
+                        "enabled": true,
+                        "duration": 6,
+                        "graphics": {
+                            "src": "https://cdn.example.com/banner.png",
+                            "size": 50
+                        },
+                        "text": { "message": "{name} followed" },
+                        "variations": []
+                    }
+                }
+            }]
+        });
+        let (_pid, profile, _) = map_overlay_to_profile(&overlay);
+        let img = profile
+            .pointer("/events/follow/variations/0/placement/image")
+            .unwrap();
+        let w = img.get("w").and_then(|v| v.as_f64()).unwrap();
+        let h = img.get("h").and_then(|v| v.as_f64()).unwrap();
+        let x = img.get("x").and_then(|v| v.as_f64()).unwrap();
+        // 1920×400 @ 50% → 960×200 on SE; × 1280/1920 = 640×133.3 on SS.
+        assert!(
+            (w - 640.0).abs() < 8.0,
+            "image width should be half the scaled widget, got {w}"
+        );
+        assert!(
+            (h - 133.3).abs() < 8.0,
+            "image height should be half the scaled widget, got {h}"
+        );
+        assert!(
+            (x - 320.0).abs() < 8.0,
+            "image should stay centered in the widget, got x={x}"
+        );
+        assert!(
+            w < 900.0,
+            "must not use the full 1280 widget frame as the graphic"
         );
     }
 
