@@ -1,0 +1,68 @@
+{
+  "_id": "fixture-personalized-alerts",
+  "name": "Personalized Alerts",
+  "settings": {
+    "height": 1080,
+    "name": "1080p",
+    "width": 1920
+  },
+  "widgets": [
+    {
+      "type": "se-widget-alert-box",
+      "css": {
+        "height": 1262,
+        "left": "275.01px",
+        "opacity": 1,
+        "top": "189.48px",
+        "width": 1855,
+        "z-index": 2
+      },
+      "variables": {
+        "follower": {
+          "enabled": true,
+          "duration": 7,
+          "layout": "column",
+          "maxUsernameLength": 14,
+          "graphics": {
+            "src": "https://cdn.example.com/follow.webm",
+            "type": "video"
+          },
+          "audio": {
+            "src": "https://cdn.example.com/follow.mp3",
+            "volume": 0.5
+          },
+          "text": {
+            "animation": "pulse",
+            "css": {
+              "color": "rgb(193, 121, 221)",
+              "font-family": "Nunito",
+              "font-size": 30,
+              "font-weight": "bold",
+              "highlights": {
+                "color": "rgb(193, 121, 221)"
+              },
+              "margin-top": -415,
+              "message": {
+                "color": "#ffffff",
+                "font-family": "Nunito",
+                "font-size": 16,
+                "margin": "0 auto",
+                "padding-bottom": 0,
+                "padding-left": 0,
+                "padding-right": 0,
+                "padding-top": 0,
+                "text-align": "center",
+                "text-shadow": "rgba(0, 0, 0, 0.8) 1px 1px 1px"
+              },
+              "text-align": "center",
+              "text-shadow": "rgba(0, 0, 0, 0.8) 1px 1px 1px"
+            },
+            "enableShadow": true,
+            "message": "{name}'s Following!"
+          },
+          "variations": []
+        }
+      }
+    }
+  ]
+}
