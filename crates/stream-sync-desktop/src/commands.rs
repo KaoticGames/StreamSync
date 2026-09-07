@@ -109,8 +109,9 @@ pub fn pick_recording_folder(
     require_main_window(&window, state.overlay_port)?;
     Ok(rfd::FileDialog::new()
         .set_title("Choose Discord recording folder")
+        .set_parent(&window)
         .pick_folder()
-        .map(|p| p.display().to_string()))
+        .map(|p| p.to_string_lossy().into_owned()))
 }
 
 #[tauri::command]

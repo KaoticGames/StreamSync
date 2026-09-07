@@ -630,7 +630,12 @@ document.addEventListener("DOMContentLoaded", () => {
       );
 
       if (discordFolderInput && document.activeElement !== discordFolderInput) {
-        discordFolderInput.value = parentPath ? String(parentPath) : "";
+        // Never blank a just-picked path. Polling /api/status used to wipe
+        // the input every 5s before Save could run.
+        const serverPath = parentPath ? String(parentPath) : "";
+        if (serverPath) {
+          discordFolderInput.value = serverPath;
+        }
       }
       if (discordStatusFolder) {
         discordStatusFolder.textContent = folderSet
@@ -851,10 +856,21 @@ document.addEventListener("DOMContentLoaded", () => {
           }
           const selected =
             await window.streamSyncConnections.discordPickRecordingFolder();
-          if (selected && discordFolderInput) {
-            discordFolderInput.value = String(selected);
-            setDiscordFolderSaveStatus("", false);
+          if (!selected) {
+            setDiscordFolderSaveStatus("No folder selected.", true);
+            return;
           }
+          if (discordFolderInput) {
+            discordFolderInput.value = String(selected);
+          }
+          if (!window.streamSyncConnections?.discordSaveRecordingFolder) {
+            throw new Error("Discord recording folder API unavailable");
+          }
+          await window.streamSyncConnections.discordSaveRecordingFolder(
+            String(selected)
+          );
+          setDiscordFolderSaveStatus("Recording folder saved.", false);
+          setTimeout(fetchTwitchStatusOnce, 250);
         } catch (err) {
           setDiscordFolderSaveStatus(
             `Folder picker failed: ${err?.message || err}`,
