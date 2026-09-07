@@ -363,9 +363,11 @@ async fn poll_pending_chunk(key: &str) -> Result<PendingPoll> {
     }
 
     let retry_after = retry_after_from_value(&body);
-    let chunk = first_chunk_value(&body)
-        .map(parse_pending_chunk)
-        .transpose()?;
+    let chunk = if first_chunk_value(&body).is_some() {
+        Some(parse_pending_chunk(&flatten_pending_payload(&body))?)
+    } else {
+        None
+    };
     Ok(PendingPoll { retry_after, chunk })
 }
 
@@ -485,6 +487,8 @@ fn parse_pending_chunk(value: &Value) -> Result<PendingChunk> {
     let start_ms = find_i64(
         value,
         &[
+            "/chunk_start_ms",
+            "/chunkStartMs",
             "/start_ms",
             "/startMs",
             "/range/start_ms",
@@ -494,7 +498,15 @@ fn parse_pending_chunk(value: &Value) -> Result<PendingChunk> {
     );
     let end_ms = find_i64(
         value,
-        &["/end_ms", "/endMs", "/range/end_ms", "/range/endMs", "/end"],
+        &[
+            "/chunk_end_ms",
+            "/chunkEndMs",
+            "/end_ms",
+            "/endMs",
+            "/range/end_ms",
+            "/range/endMs",
+            "/end",
+        ],
     );
     let started_at = find_string(
         value,
@@ -570,6 +582,22 @@ fn first_chunk_value<'a>(body: &'a Value) -> Option<&'a Value> {
         .and_then(Value::as_array)
         .and_then(|arr| arr.first())
         .or_else(|| body.get("chunk"))
+}
+
+fn flatten_pending_payload(body: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    if let Some(session) = body.get("session").and_then(Value::as_object) {
+        for (k, v) in session {
+            out.insert(k.clone(), v.clone());
+        }
+        out.insert("session".into(), json!(session));
+    }
+    if let Some(chunk) = first_chunk_value(body).and_then(Value::as_object) {
+        for (k, v) in chunk {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    Value::Object(out)
 }
 
 fn retry_after_from_value(body: &Value) -> Duration {
@@ -843,5 +871,36 @@ mod tests {
         assert_eq!(silence_bytes_for_duration_ms(250), 48_000);
         assert_eq!(silence_bytes_for_duration_ms(1_000), 192_000);
         assert_eq!(silence_duration_ms(Some(1200), Some(1700)), 500);
+    }
+
+    #[test]
+    fn parses_syndicate_pending_payload_session_on_sibling() {
+        let body = json!({
+            "ok": true,
+            "session": {
+                "session_id": "s1",
+                "guild_id": "g1",
+                "guild_name": "Kaotic",
+                "channel_name": "General",
+                "started_at": "2026-09-07T02:00:00Z",
+                "stopped_at": null
+            },
+            "chunks": [{
+                "chunk_id": "c1",
+                "nick": "Fuki",
+                "chunk_start_ms": 0,
+                "chunk_end_ms": 300000,
+                "is_silence": true
+            }]
+        });
+        let chunk = parse_pending_chunk(&flatten_pending_payload(&body)).expect("parse");
+        assert_eq!(chunk.chunk_id, "c1");
+        assert_eq!(chunk.started_at, "2026-09-07T02:00:00Z");
+        assert_eq!(chunk.nick, "Fuki");
+        assert_eq!(chunk.channel_name, "General");
+        assert_eq!(chunk.guild_name, "Kaotic");
+        assert_eq!(chunk.start_ms, Some(0));
+        assert_eq!(chunk.end_ms, Some(300000));
+        assert!(chunk.is_silence);
     }
 }
