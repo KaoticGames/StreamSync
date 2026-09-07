@@ -74,7 +74,7 @@ pub const ROUTE_MANIFEST: &[(&str, &str, RoutePolicy)] = &[
     ),
     (
         "POST",
-        "/api/discord/connect-key/mint",
+        "/api/discord/connect-key/redeem",
         RoutePolicy::Privileged,
     ),
     (

@@ -571,6 +571,9 @@ pub struct DiscordVoiceConfigFile {
     pub device_id: String,
     #[serde(default)]
     pub recording_parent: Option<String>,
+    /// Consumed Discord pairing token (`sdk_…`). Used as Bearer for voice APIs.
+    #[serde(default)]
+    pub host_token: Option<String>,
 }
 
 /// Persisted Syndicate connection-key (takeover) session. Not mixed into personal tokens.

@@ -588,9 +588,9 @@ document.addEventListener("DOMContentLoaded", () => {
     const discordStatusLastWrite = document.getElementById("discord-status-last-write");
     const discordStatusLastError = document.getElementById("discord-status-last-error");
     const btnDiscordMintKey = document.getElementById("btn-discord-mint-key");
-    const btnDiscordCopyKey = document.getElementById("btn-discord-copy-key");
+    const discordConnectRow = document.getElementById("discord-connect-row");
+    const discordConnectKeyInput = document.getElementById("discord-connect-key");
     const discordConnectKeyOutput = document.getElementById("discord-connect-key-output");
-    let latestDiscordConnectKey = "";
 
     function applyKickStatus(status) {
       if (!kickStatusValue) return;
@@ -621,17 +621,21 @@ document.addEventListener("DOMContentLoaded", () => {
       const parentPath = discord.parentFolderPath || "";
       const lastWrite = discord.lastWrite || null;
       const lastError = discord.lastError || "";
-      const canMint = !!(
-        status &&
-        status.twitch &&
-        status.twitch.accounts &&
-        status.twitch.accounts.delegated &&
-        status.twitch.accounts.delegated.saved
-      );
-
+      const connected = !!discord.discordConnected;
+      if (discordConnectRow) {
+        discordConnectRow.style.display = folderSet ? "flex" : "none";
+      }
+      if (btnDiscordMintKey) {
+        btnDiscordMintKey.disabled = !folderSet;
+      }
+      if (discordConnectKeyOutput && !discordConnectKeyOutput.dataset.sticky) {
+        discordConnectKeyOutput.textContent = !folderSet
+          ? "Save a recording folder to unlock Discord connect."
+          : connected
+            ? "Discord is connected. Heartbeats will start while StreamSync is open."
+            : "Run /connect in Discord, paste the key, then press Connect Discord.";
+      }
       if (discordFolderInput && document.activeElement !== discordFolderInput) {
-        // Never blank a just-picked path. Polling /api/status used to wipe
-        // the input every 5s before Save could run.
         const serverPath = parentPath ? String(parentPath) : "";
         if (serverPath) {
           discordFolderInput.value = serverPath;
@@ -655,15 +659,6 @@ document.addEventListener("DOMContentLoaded", () => {
         discordStatusLastError.textContent = lastError
           ? `Last error: ${lastError}`
           : "";
-      }
-      if (btnDiscordMintKey) {
-        btnDiscordMintKey.disabled = !canMint;
-      }
-      if (!canMint && discordConnectKeyOutput) {
-        discordConnectKeyOutput.style.display = "block";
-        discordConnectKeyOutput.textContent =
-          "Paste a takeover key first, then mint a Discord connect key.";
-        if (btnDiscordCopyKey) btnDiscordCopyKey.style.display = "none";
       }
     }
 
@@ -905,71 +900,39 @@ document.addEventListener("DOMContentLoaded", () => {
 
     if (btnDiscordMintKey) {
       btnDiscordMintKey.addEventListener("click", async () => {
+        const key = discordConnectKeyInput?.value?.trim() || "";
+        if (!key) {
+          if (discordConnectKeyOutput) {
+            discordConnectKeyOutput.dataset.sticky = "1";
+            discordConnectKeyOutput.textContent =
+              "Paste the key from Discord /connect first.";
+          }
+          return;
+        }
         try {
-          if (!window.streamSyncConnections?.discordMintConnectKey) {
-            throw new Error("Discord connect key API unavailable");
+          if (!window.streamSyncConnections?.discordRedeemConnectKey) {
+            throw new Error("Discord connect API unavailable");
           }
           const statusRes = await window.streamSyncControlApi.privilegedFetch(
             "/api/status",
-            {
-              cache: "no-cache",
-            }
+            { cache: "no-cache" }
           );
           const statusJson = statusRes.ok ? await statusRes.json() : {};
           const deviceId = statusJson?.discordVoice?.deviceId || "";
-          const minted = await window.streamSyncConnections.discordMintConnectKey(
-            deviceId,
-            15
-          );
-          latestDiscordConnectKey = String(minted.key || "").trim();
-          if (!latestDiscordConnectKey) {
-            throw new Error("No key returned");
-          }
+          await window.streamSyncConnections.discordRedeemConnectKey(key, deviceId);
           if (discordConnectKeyOutput) {
-            const expires = minted.expires_at
-              ? ` (expires ${new Date(minted.expires_at).toLocaleTimeString()})`
-              : "";
-            discordConnectKeyOutput.style.display = "block";
-            discordConnectKeyOutput.textContent = `Key: ${latestDiscordConnectKey}${expires}`;
+            discordConnectKeyOutput.dataset.sticky = "1";
+            discordConnectKeyOutput.textContent = "Discord connected.";
           }
-          if (btnDiscordCopyKey) {
-            btnDiscordCopyKey.style.display = "inline-flex";
-          }
+          if (discordConnectKeyInput) discordConnectKeyInput.value = "";
+          setTimeout(fetchTwitchStatusOnce, 250);
         } catch (err) {
           if (discordConnectKeyOutput) {
-            discordConnectKeyOutput.style.display = "block";
+            discordConnectKeyOutput.dataset.sticky = "1";
             discordConnectKeyOutput.textContent = `Connect failed: ${
               err?.message || err
             }`;
           }
-          if (btnDiscordCopyKey) {
-            btnDiscordCopyKey.style.display = "none";
-          }
-        }
-      });
-    }
-
-    if (btnDiscordCopyKey) {
-      btnDiscordCopyKey.addEventListener("click", async () => {
-        if (!latestDiscordConnectKey) return;
-        try {
-          if (navigator.clipboard?.writeText) {
-            await navigator.clipboard.writeText(latestDiscordConnectKey);
-          } else {
-            const tmp = document.createElement("textarea");
-            tmp.value = latestDiscordConnectKey;
-            document.body.appendChild(tmp);
-            tmp.select();
-            document.execCommand("copy");
-            document.body.removeChild(tmp);
-          }
-          const original = btnDiscordCopyKey.textContent || "Copy";
-          btnDiscordCopyKey.textContent = "Copied!";
-          setTimeout(() => {
-            btnDiscordCopyKey.textContent = original;
-          }, 1000);
-        } catch (err) {
-          alert(`Copy failed: ${err?.message || err}`);
         }
       });
     }

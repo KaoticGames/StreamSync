@@ -131,12 +131,12 @@
     return data;
   }
 
-  async function discordMintConnectKey(deviceId, expiresInMinutes) {
-    const res = await privilegedFetch("/api/discord/connect-key/mint", {
+  async function discordRedeemConnectKey(key, deviceId) {
+    const res = await privilegedFetch("/api/discord/connect-key/redeem", {
       method: "POST",
       body: JSON.stringify({
+        key: String(key || "").trim(),
         device_id: String(deviceId || "").trim(),
-        expires_in_minutes: Number(expiresInMinutes || 15),
       }),
     });
     const data = await res.json().catch(() => ({}));
@@ -287,7 +287,7 @@
     useConnection,
     removeConnection,
     discordSaveRecordingFolder,
-    discordMintConnectKey,
+    discordRedeemConnectKey,
     discordPickRecordingFolder,
     connectWithKey,
     kickConnect,

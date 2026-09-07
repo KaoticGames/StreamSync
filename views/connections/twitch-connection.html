@@ -127,8 +127,8 @@
         Discord Voice Recordings
       </div>
       <div class="field-help small">
-        Stream Sync stores Syndicate Discord voice chunks locally on this machine. Pick your recording folder,
-        then mint a one-time connect key and run <strong>/connect &lt;key&gt;</strong> in Discord (Manage Server required).
+        Pick a recording folder first. Then in Discord run <strong>/connect</strong> (Manage Server).
+        Paste the private key here and press Connect Discord. Takeover keys are not used for this.
       </div>
 
       <div class="connection-row" style="margin-top: 0.6rem; align-items: stretch;">
@@ -152,15 +152,20 @@
       <div class="field-help small" id="discord-status-last-write"></div>
       <div class="field-help small" id="discord-status-last-error" style="color: #f87171;"></div>
 
-      <div class="connection-row" style="margin-top: 0.75rem; align-items: center;">
-        <button type="button" class="btn btn-primary" id="btn-discord-mint-key">
+      <div class="connection-row" id="discord-connect-row" style="margin-top: 0.75rem; align-items: stretch; display: none;">
+        <input
+          type="text"
+          id="discord-connect-key"
+          placeholder="sdk_…"
+          autocomplete="off"
+          spellcheck="false"
+          style="flex: 1; min-width: 0; padding: 0.5rem 0.65rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12); background: rgba(0,0,0,0.35); color: inherit; font-family: ui-monospace, monospace; font-size: 0.85rem;"
+        />
+        <button type="button" class="btn btn-primary" id="btn-discord-mint-key" style="margin-left: 0.5rem;">
           Connect Discord
         </button>
-        <button type="button" class="btn btn-secondary" id="btn-discord-copy-key" style="margin-left: 0.5rem; display: none;">
-          Copy
-        </button>
       </div>
-      <div class="field-help small" id="discord-connect-key-output" style="display: none; margin-top: 0.4rem; font-family: ui-monospace, monospace;"></div>
+      <div class="field-help small" id="discord-connect-key-output" style="margin-top: 0.4rem;"></div>
 
       <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 1.25rem 0 1rem;" />
 

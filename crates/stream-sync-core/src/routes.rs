@@ -75,7 +75,7 @@ pub const BUILD_ROUTER_ROUTE_IDS: &[(&str, &str)] = &[
     ("POST", "/api/twitch/set-token"),
     ("POST", "/api/twitch/connection-key"),
     ("POST", "/api/discord/recording-folder"),
-    ("POST", "/api/discord/connect-key/mint"),
+    ("POST", "/api/discord/connect-key/redeem"),
     ("POST", "/api/twitch/use-connection"),
     ("POST", "/api/twitch/remove-connection"),
     ("POST", "/api/twitch/disconnect"),
@@ -154,7 +154,7 @@ pub fn build_router(ctx: ServerContext) -> Router {
             post(post_discord_recording_folder),
         )
         .route(
-            "/api/discord/connect-key/mint",
+            "/api/discord/connect-key/redeem",
             post(post_discord_connect_key_mint),
         )
         .route("/api/twitch/use-connection", post(post_use_connection))
@@ -1546,11 +1546,10 @@ struct DiscordRecordingFolderBody {
 }
 
 #[derive(Debug, Deserialize)]
-struct DiscordMintConnectKeyBody {
+struct DiscordRedeemConnectKeyBody {
+    key: String,
     #[serde(default)]
     device_id: Option<String>,
-    #[serde(default)]
-    expires_in_minutes: Option<u16>,
 }
 
 async fn post_discord_recording_folder(
@@ -1577,30 +1576,29 @@ async fn post_discord_recording_folder(
 
 async fn post_discord_connect_key_mint(
     State(ctx): State<ServerContext>,
-    Json(body): Json<DiscordMintConnectKeyBody>,
+    Json(body): Json<DiscordRedeemConnectKeyBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if ctx.state.readonly {
         return Err(readonly_json());
     }
-    let ttl = body.expires_in_minutes.unwrap_or(15);
-    let minted =
-        crate::discord_voice::mint_connect_key(ctx.state.clone(), body.device_id.as_deref(), ttl)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "ok": false,
-                        "error": "mint_failed",
-                        "message": e.to_string(),
-                    })),
-                )
-            })?;
-    Ok(Json(json!({
-        "ok": true,
-        "key": minted.key,
-        "expires_at": minted.expires_at,
-    })))
+    crate::discord_voice::redeem_connect_key(
+        ctx.state.clone(),
+        &body.key,
+        body.device_id.as_deref(),
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "connect_failed",
+                "message": e.to_string(),
+            })),
+        )
+    })?;
+    crate::discord_voice::ensure_ingest_worker(ctx.state.clone(), ctx.twitch.clone()).await;
+    Ok(Json(json!({ "ok": true, "bound": true })))
 }
 
 fn parse_connection_mode(

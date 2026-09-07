@@ -28,12 +28,6 @@ const WAV_HEADER_SIZE: u64 = 44;
 const SILENCE_WRITE_CHUNK_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
-pub struct MintedConnectKey {
-    pub key: String,
-    pub expires_at: Option<String>,
-}
-
-#[derive(Debug, Clone)]
 struct PendingChunk {
     chunk_id: String,
     is_silence: bool,
@@ -67,6 +61,7 @@ pub async fn status_json(state: &AppState) -> Value {
         "parentFolderSet": parent.as_ref().is_some_and(|v| !v.trim().is_empty()),
         "parentFolderPath": parent,
         "parentFolderLabel": parent.as_ref().map(|v| parent_folder_label(v)),
+        "discordConnected": cfg.host_token.as_ref().is_some_and(|v| v.starts_with("sdk_")),
         "lastError": runtime.last_error,
         "lastWrite": runtime.last_write.as_ref().map(|w| {
             json!({
@@ -95,20 +90,14 @@ pub async fn save_recording_parent_folder(state: Arc<AppState>, path: &str) -> R
     Ok(())
 }
 
-pub async fn mint_connect_key(
+pub async fn redeem_connect_key(
     state: Arc<AppState>,
+    key: &str,
     requested_device_id: Option<&str>,
-    expires_in_minutes: u16,
-) -> Result<MintedConnectKey> {
-    let delegated = state
-        .delegated
-        .read()
-        .await
-        .clone()
-        .ok_or_else(|| anyhow!("Paste takeover key first."))?;
-    let key = delegated.connection_key.trim();
-    if !key.starts_with("ssk_") {
-        return Err(anyhow!("Paste takeover key first."));
+) -> Result<()> {
+    let trimmed = key.trim();
+    if !trimmed.starts_with("sdk_") {
+        return Err(anyhow!("Paste the key Discord showed after /connect."));
     }
     let stored = state.discord_voice_config.read().await.clone();
     let device_id = requested_device_id
@@ -118,29 +107,23 @@ pub async fn mint_connect_key(
         .to_string();
     if device_id.trim().is_empty() {
         return Err(anyhow!(
-            "Missing local device id for Discord connect key mint."
+            "Missing local device id for Discord connect."
         ));
     }
-    let ttl = if expires_in_minutes == 0 {
-        15
-    } else {
-        expires_in_minutes.min(120)
-    };
     let url = format!(
-        "{}/api/stream-sync/discord-connect-keys/mint",
+        "{}/api/stream-sync/discord-connect-keys/redeem",
         crate::syndicate_connection::api_base()
     );
     let res = crate::syndicate_connection::syndicate_http_client()
         .post(url)
-        .header("Authorization", connection_key_authorization(key))
         .header("Content-Type", "application/json")
         .json(&json!({
+            "key": trimmed,
             "device_id": device_id,
-            "expires_in_minutes": ttl,
         }))
         .send()
         .await
-        .map_err(|e| anyhow!("Discord connect key mint request failed: {e}"))?;
+        .map_err(|e| anyhow!("Discord connect request failed: {e}"))?;
 
     let status = res.status().as_u16();
     let body: Value = res.json().await.unwrap_or_else(|_| json!({}));
@@ -149,28 +132,19 @@ pub async fn mint_connect_key(
             .get("message")
             .or_else(|| body.get("error"))
             .and_then(Value::as_str)
-            .unwrap_or("Discord connect key mint failed.");
+            .unwrap_or("Discord connect failed.");
         return Err(anyhow!(detail.to_string()));
     }
-    let minted = [
-        body.get("key").and_then(Value::as_str),
-        body.get("connect_key").and_then(Value::as_str),
-        body.get("connection_key").and_then(Value::as_str),
-    ]
-    .into_iter()
-    .flatten()
-    .map(str::trim)
-    .find(|v| !v.is_empty())
-    .ok_or_else(|| anyhow!("Discord connect key mint succeeded but no key was returned."))?
-    .to_string();
-    let expires_at = body
-        .get("expires_at")
-        .and_then(Value::as_str)
-        .map(|v| v.to_string());
-    Ok(MintedConnectKey {
-        key: minted,
-        expires_at,
-    })
+    {
+        let mut cfg = state.discord_voice_config.write().await;
+        cfg.host_token = Some(trimmed.to_string());
+        if cfg.device_id.trim().is_empty() {
+            cfg.device_id = device_id;
+        }
+    }
+    state.save_discord_voice_config().await?;
+    clear_last_error(&state).await;
+    Ok(())
 }
 
 pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>) {
@@ -178,16 +152,17 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
 }
 
 pub async fn ensure_ingest_worker(state: Arc<AppState>, services: Arc<TwitchServices>) {
-    let generation = state
-        .delegated
+    let has_token = state
+        .discord_voice_config
         .read()
         .await
+        .host_token
         .as_ref()
-        .map(|s| s.generation)
-        .unwrap_or_else(|| state.current_delegated_generation());
-    if generation == 0 || !state.session_still_current(generation).await {
+        .is_some_and(|v| v.starts_with("sdk_"));
+    if !has_token {
         return;
     }
+    let generation = 1;
     clear_finished_generation_task(&services.discord_voice_handle, generation).await;
     let running = services
         .discord_voice_handle
@@ -205,7 +180,7 @@ pub async fn ensure_ingest_worker(state: Arc<AppState>, services: Arc<TwitchServ
         if grant_rx.await.is_err() {
             return;
         }
-        ingest_loop(state2.clone(), generation).await;
+        ingest_loop(state2.clone()).await;
         release_generation_slot_if_owned(&services2.discord_voice_handle, generation).await;
     });
     if install_generation_task(&services.discord_voice_handle, generation, handle).await {
@@ -228,26 +203,24 @@ pub async fn stop_ingest_worker_for_generation(
     }
 }
 
-async fn ingest_loop(state: Arc<AppState>, generation: u64) {
+async fn ingest_loop(state: Arc<AppState>) {
     let mut next_heartbeat = Instant::now();
     let mut active_files: HashMap<PathBuf, Instant> = HashMap::new();
     loop {
-        let delegated = state.delegated.read().await.clone();
-        let Some(session) = delegated else {
+        let cfg = state.discord_voice_config.read().await.clone();
+        let Some(key) = cfg
+            .host_token
+            .clone()
+            .filter(|v| v.starts_with("sdk_"))
+        else {
             break;
         };
-        if session.generation != generation || !state.session_still_current(generation).await {
-            break;
-        }
-
-        let cfg = state.discord_voice_config.read().await.clone();
         let parent_folder = cfg
             .recording_parent
             .clone()
             .filter(|v| !v.trim().is_empty());
         let parent_label = parent_folder.as_ref().map(|p| parent_folder_label(p));
         let device_id = cfg.device_id.clone();
-        let key = session.connection_key.clone();
 
         if Instant::now() >= next_heartbeat {
             if let Err(e) = post_host_state(
