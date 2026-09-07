@@ -68,6 +68,13 @@ pub fn build_backup_zip(paths: &StoragePaths, logs_dir: Option<&Path>) -> Result
             &paths.events_overlay_config,
             options,
         )?;
+        add_root_file(
+            &mut zip,
+            root,
+            "discord-voice-config.json",
+            &paths.discord_voice_config,
+            options,
+        )?;
         add_root_file(&mut zip, root, "profiles.json", &paths.profiles, options)?;
         // Intentionally exclude twitch-delegated.json — takeover keys must not leak via backup.
 
@@ -338,6 +345,7 @@ mod tests {
             dock_config: root.join("dock-config.json"),
             overlay_config: root.join("overlay-config.json"),
             events_overlay_config: root.join("events-overlay-config.json"),
+            discord_voice_config: root.join("discord-voice-config.json"),
             profiles: root.join("profiles.json"),
             tokens_dir: root.join("tokens"),
             twitch_tokens: root.join("twitch-tokens.json"),

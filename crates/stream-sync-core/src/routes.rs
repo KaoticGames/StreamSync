@@ -74,6 +74,8 @@ pub const BUILD_ROUTER_ROUTE_IDS: &[(&str, &str)] = &[
     ("POST", "/api/twitch/redeem"),
     ("POST", "/api/twitch/set-token"),
     ("POST", "/api/twitch/connection-key"),
+    ("POST", "/api/discord/recording-folder"),
+    ("POST", "/api/discord/connect-key/mint"),
     ("POST", "/api/twitch/use-connection"),
     ("POST", "/api/twitch/remove-connection"),
     ("POST", "/api/twitch/disconnect"),
@@ -147,6 +149,14 @@ pub fn build_router(ctx: ServerContext) -> Router {
         .route("/api/twitch/redeem", post(post_twitch_redeem))
         .route("/api/twitch/set-token", post(post_set_token))
         .route("/api/twitch/connection-key", post(post_connection_key))
+        .route(
+            "/api/discord/recording-folder",
+            post(post_discord_recording_folder),
+        )
+        .route(
+            "/api/discord/connect-key/mint",
+            post(post_discord_connect_key_mint),
+        )
         .route("/api/twitch/use-connection", post(post_use_connection))
         .route(
             "/api/twitch/remove-connection",
@@ -450,6 +460,7 @@ async fn api_status(State(ctx): State<ServerContext>) -> Json<Value> {
                 })
             })
             .unwrap_or_else(|| json!({ "connected": false }));
+    let discord_voice = crate::discord_voice::status_json(&ctx.state).await;
     let kick_tokens = ctx.state.kick.read().await.tokens.clone();
     let personal_kick = ctx.state.personal_kick.read().await.clone();
     let kick_via_takeover = takeover
@@ -499,6 +510,7 @@ async fn api_status(State(ctx): State<ServerContext>) -> Json<Value> {
             "viaTakeover": kick_via_takeover,
             "personalSaved": personal_kick.is_linked(),
         },
+        "discordVoice": discord_voice,
         "streamelements": se_connected,
     }))
 }
@@ -1526,6 +1538,69 @@ async fn post_connection_key(
     Ok(Json(
         json!({ "ok": true, "login": login, "takeover": true }),
     ))
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordRecordingFolderBody {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordMintConnectKeyBody {
+    #[serde(default)]
+    device_id: Option<String>,
+    #[serde(default)]
+    expires_in_minutes: Option<u16>,
+}
+
+async fn post_discord_recording_folder(
+    State(ctx): State<ServerContext>,
+    Json(body): Json<DiscordRecordingFolderBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if ctx.state.readonly {
+        return Err(readonly_json());
+    }
+    crate::discord_voice::save_recording_parent_folder(ctx.state.clone(), &body.path)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": "invalid_folder",
+                    "message": e.to_string(),
+                })),
+            )
+        })?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn post_discord_connect_key_mint(
+    State(ctx): State<ServerContext>,
+    Json(body): Json<DiscordMintConnectKeyBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if ctx.state.readonly {
+        return Err(readonly_json());
+    }
+    let ttl = body.expires_in_minutes.unwrap_or(15);
+    let minted =
+        crate::discord_voice::mint_connect_key(ctx.state.clone(), body.device_id.as_deref(), ttl)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": "mint_failed",
+                        "message": e.to_string(),
+                    })),
+                )
+            })?;
+    Ok(Json(json!({
+        "ok": true,
+        "key": minted.key,
+        "expires_at": minted.expires_at,
+    })))
 }
 
 fn parse_connection_mode(

@@ -23,6 +23,8 @@ const OVERLAY_API_ALLOWLIST: &[(&str, &str)] = &[
     ("GET", "/api/streamelements/overlays"),
     ("POST", "/api/twitch/disconnect"),
     ("POST", "/api/twitch/connection-key"),
+    ("POST", "/api/discord/recording-folder"),
+    ("POST", "/api/discord/connect-key/mint"),
     ("POST", "/api/twitch/use-connection"),
     ("POST", "/api/twitch/remove-connection"),
     ("POST", "/api/kick/disconnect"),

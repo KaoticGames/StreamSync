@@ -102,6 +102,18 @@ pub fn open_logs_folder(window: WebviewWindow, state: State<'_, AppState>) -> Re
 }
 
 #[tauri::command]
+pub fn pick_recording_folder(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    require_main_window(&window, state.overlay_port)?;
+    Ok(rfd::FileDialog::new()
+        .set_title("Choose Discord recording folder")
+        .pick_folder()
+        .map(|p| p.display().to_string()))
+}
+
+#[tauri::command]
 pub fn open_discord(
     window: WebviewWindow,
     state: State<'_, AppState>,

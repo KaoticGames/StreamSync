@@ -564,6 +564,15 @@ pub struct TwitchTokenFile {
     pub scopes: Option<Vec<String>>,
 }
 
+/// Persisted Discord voice ingest configuration (local recording destination + stable host id).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DiscordVoiceConfigFile {
+    #[serde(default)]
+    pub device_id: String,
+    #[serde(default)]
+    pub recording_parent: Option<String>,
+}
+
 /// Persisted Syndicate connection-key (takeover) session. Not mixed into personal tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct DelegatedSessionFile {

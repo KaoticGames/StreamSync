@@ -69,6 +69,16 @@ pub const ROUTE_MANIFEST: &[(&str, &str, RoutePolicy)] = &[
     ),
     (
         "POST",
+        "/api/discord/recording-folder",
+        RoutePolicy::Privileged,
+    ),
+    (
+        "POST",
+        "/api/discord/connect-key/mint",
+        RoutePolicy::Privileged,
+    ),
+    (
+        "POST",
         "/api/twitch/use-connection",
         RoutePolicy::Privileged,
     ),

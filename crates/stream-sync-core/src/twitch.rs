@@ -106,6 +106,7 @@ pub struct TwitchServices {
     eventsub_owner: RwLock<Option<WorkerOwner>>,
     refresh_handle: RwLock<Option<GenerationTask>>,
     watch_handle: RwLock<Option<GenerationTask>>,
+    pub discord_voice_handle: RwLock<Option<GenerationTask>>,
     pub teardown_coordinator: TeardownCoordinator,
     authority_lease: Mutex<AuthorityLease>,
     /// Monotonic apply-request fence; newer requests supersede older exchange completions.
@@ -142,6 +143,7 @@ impl TwitchServices {
             eventsub_owner: RwLock::new(None),
             refresh_handle: RwLock::new(None),
             watch_handle: RwLock::new(None),
+            discord_voice_handle: RwLock::new(None),
             teardown_coordinator: TeardownCoordinator::new(),
             authority_lease: Mutex::new(AuthorityLease::inactive()),
             apply_intent: AtomicU64::new(0),
@@ -1870,6 +1872,7 @@ async fn remove_delegated_session_locked(
             }
             stop_delegated_worker_handles(&services.refresh_handle, &services.watch_handle, except)
                 .await;
+            crate::discord_voice::stop_ingest_worker_for_generation(services, generation).await;
             return Err(e);
         }
     }
@@ -1887,11 +1890,13 @@ async fn remove_delegated_session_locked(
         *delegated = None;
     }
     stop_delegated_worker_handles(&services.refresh_handle, &services.watch_handle, except).await;
+    crate::discord_voice::stop_ingest_worker_for_generation(services, generation).await;
     Ok(())
 }
 
 async fn stop_delegated_tasks(services: &TwitchServices) {
     stop_delegated_worker_handles(&services.refresh_handle, &services.watch_handle, None).await;
+    crate::discord_voice::stop_ingest_worker_for_generation(services, 0).await;
 }
 
 fn disk_active_mode_is_delegated(state: &AppState) -> bool {
@@ -1939,6 +1944,7 @@ async fn strip_in_memory_delegated_authority(
         tw.tokens = TwitchTokenFile::default();
     }
     stop_delegated_worker_handles(&services.refresh_handle, &services.watch_handle, None).await;
+    crate::discord_voice::stop_ingest_worker_for_generation(services, generation).await;
     // Kick first, before the platform-stop gate, so a concurrent winner that installs during
     // the Twitch stop pause is not aborted by this teardown.
     crate::kick::teardown_delegated_kick_live(state).await;
@@ -2097,6 +2103,7 @@ async fn execute_delegated_teardown(
 
         // 3. Stop workers.
         stop_delegated_worker_handles(&services.refresh_handle, &services.watch_handle, None).await;
+        crate::discord_voice::stop_ingest_worker_for_generation(&services, generation).await;
 
         // 4. Mode persist: do not skip based solely on was_active after memory already cleared.
         let mem_delegated = *state.active_mode.read().await == TwitchActiveMode::Delegated;
@@ -2373,6 +2380,7 @@ async fn apply_exchange_session(
 
     crate::kick::sync_live_identity_for_generation(state.clone(), new_generation, Some(&services))
         .await;
+    crate::discord_voice::ensure_ingest_worker(state, services).await;
 
     Ok(())
 }
@@ -4576,6 +4584,9 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
             .as_ref()
             .map(|d| d.connection_key.clone())
     };
+    if delegated_key.is_some() {
+        crate::discord_voice::ensure_ingest_worker(state.clone(), services.clone()).await;
+    }
 
     // Prefer refreshing a saved takeover key so tokens stay valid even if inactive.
     if let Some(key) = delegated_key {

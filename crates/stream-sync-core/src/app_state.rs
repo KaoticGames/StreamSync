@@ -2,8 +2,9 @@
 
 use crate::broadcast::FeedHub;
 use crate::config_types::{
-    DelegatedSessionFile, DockConfigFile, EventsDockConfig, EventsOverlayConfigFile, KickTokenFile,
-    OverlayConfigFile, TwitchActiveMode, TwitchActiveModeFile, TwitchTokenFile,
+    DelegatedSessionFile, DiscordVoiceConfigFile, DockConfigFile, EventsDockConfig,
+    EventsOverlayConfigFile, KickTokenFile, OverlayConfigFile, TwitchActiveMode,
+    TwitchActiveModeFile, TwitchTokenFile,
 };
 use crate::secret_store::{
     SecretStore, KICK_PERSONAL_ACCESS_KEY, KICK_PERSONAL_FEED_TICKET_KEY,
@@ -398,6 +399,19 @@ pub struct KickRuntime {
     pub connected: bool,
 }
 
+#[derive(Clone, Default)]
+pub struct DiscordVoiceLastWrite {
+    pub at: Option<String>,
+    pub path: Option<String>,
+    pub bytes: Option<u64>,
+}
+
+#[derive(Clone, Default)]
+pub struct DiscordVoiceRuntime {
+    pub last_error: Option<String>,
+    pub last_write: Option<DiscordVoiceLastWrite>,
+}
+
 /// Deterministic failure injection for durable delegated-store operations (tests).
 #[derive(Default)]
 pub struct DurableFailureInject {
@@ -460,6 +474,8 @@ pub struct AppState {
     pub personal_kick: RwLock<KickTokenFile>,
     pub kick: RwLock<KickRuntime>,
     pub kick_feed_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
+    pub discord_voice_config: RwLock<DiscordVoiceConfigFile>,
+    pub discord_voice_runtime: RwLock<DiscordVoiceRuntime>,
     /// Per-installation localhost control capability (privileged routes + control socket).
     control_token: String,
     /// One-time OAuth completion nonces (never the master capability).
@@ -661,6 +677,17 @@ impl AppState {
         } else {
             live_kick_tokens(active_mode, delegated.as_ref(), &personal_kick)
         };
+        let mut discord_voice_config = read_json_for_mode(
+            &paths.discord_voice_config,
+            &DiscordVoiceConfigFile::default(),
+            readonly,
+        )?;
+        if discord_voice_config.device_id.trim().is_empty() {
+            discord_voice_config.device_id = stable_device_id_fallback();
+            if !readonly {
+                storage::write_json(&paths.discord_voice_config, &discord_voice_config)?;
+            }
+        }
         let control_token =
             crate::control_plane::load_control_token(&paths.control_token, readonly)?;
         let dock_credentials = if paths.dock_credentials.is_file() {
@@ -700,6 +727,8 @@ impl AppState {
                 connected: false,
             }),
             kick_feed_handle: RwLock::new(None),
+            discord_voice_config: RwLock::new(discord_voice_config),
+            discord_voice_runtime: RwLock::new(DiscordVoiceRuntime::default()),
             control_token,
             pending_logins: crate::oauth_pending::PendingLoginStore::new(),
             dock_credentials,
@@ -748,6 +777,14 @@ impl AppState {
         }
         let cfg = self.events_overlay_config.read().await;
         storage::write_json(&self.paths.events_overlay_config, &*cfg)
+    }
+
+    pub async fn save_discord_voice_config(&self) -> anyhow::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
+        let cfg = self.discord_voice_config.read().await;
+        storage::write_json(&self.paths.discord_voice_config, &*cfg)
     }
 
     pub async fn save_twitch_tokens(&self) -> anyhow::Result<()> {
@@ -1160,6 +1197,14 @@ fn align_localhost_redirect_port(uri: &str, port: u16) -> String {
         return format!("{scheme}://{host}:{port}{path}");
     }
     uri.to_string()
+}
+
+fn stable_device_id_fallback() -> String {
+    format!(
+        "ssdvc_{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 pub fn normalize_chat_profile_id(id: &str) -> String {

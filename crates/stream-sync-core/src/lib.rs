@@ -9,6 +9,7 @@ mod config_types;
 mod control_plane;
 mod delegated_lifecycle;
 mod delegated_refresh_observability;
+mod discord_voice;
 mod dock_capability;
 mod export;
 mod kick;
@@ -179,8 +180,9 @@ impl OverlayServer {
     pub async fn run(self) -> anyhow::Result<()> {
         let port = self.config.port;
         let (router, state, twitch) = self.build_app().await?;
-        twitch::maybe_autostart(state.clone(), twitch).await;
+        twitch::maybe_autostart(state.clone(), twitch.clone()).await;
         kick::maybe_autostart(state.clone()).await;
+        discord_voice::maybe_autostart(state.clone(), twitch).await;
 
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
