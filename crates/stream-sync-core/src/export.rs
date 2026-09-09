@@ -10,7 +10,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 const BACKUP_FORMAT: &str = "stream-sync-backup";
-const BACKUP_VERSION: u32 = 1;
+const BACKUP_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BackupManifest {
@@ -20,7 +20,7 @@ pub struct BackupManifest {
     pub app_version: String,
 }
 
-/// Build a ZIP containing Stream Sync user data (configs, fonts, media, imports, tokens, logs).
+/// Build a ZIP containing Stream Sync user data (configs, fonts, media, imports, logs).
 pub fn build_backup_zip(paths: &StoragePaths, logs_dir: Option<&Path>) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     {
@@ -59,37 +59,10 @@ pub fn build_backup_zip(paths: &StoragePaths, logs_dir: Option<&Path>) -> Result
             options,
         )?;
         add_root_file(&mut zip, root, "profiles.json", &paths.profiles, options)?;
-        add_root_file(
-            &mut zip,
-            root,
-            "twitch-tokens.json",
-            &paths.twitch_tokens,
-            options,
-        )?;
-        add_root_file(
-            &mut zip,
-            root,
-            "kick-tokens.json",
-            &paths.kick_tokens,
-            options,
-        )?;
         // Intentionally exclude twitch-delegated.json — takeover keys must not leak via backup.
-
-        let se_session = root.join("streamelements-session.json");
-        add_root_file(
-            &mut zip,
-            root,
-            "streamelements-session.json",
-            &se_session,
-            options,
-        )?;
-
-        let dotenv = root.join(".env");
-        add_root_file(&mut zip, root, ".env", &dotenv, options)?;
 
         add_dir_to_zip(&mut zip, root, &paths.fonts_dir, options)?;
         add_dir_to_zip(&mut zip, root, &paths.events_media_dir, options)?;
-        add_dir_to_zip(&mut zip, root, &paths.tokens_dir, options)?;
 
         let imports = root.join("imports");
         add_dir_to_zip(&mut zip, root, &imports, options)?;
@@ -173,6 +146,20 @@ fn walk_dir<W: Write + std::io::Seek>(
 
 fn should_skip_backup_path(path: &Path) -> bool {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if matches!(
+        name,
+        "twitch-tokens.json"
+            | "kick-tokens.json"
+            | "twitch-delegated.json"
+            | "streamelements-session.json"
+            | ".env"
+            | "control-token.txt"
+            | "dock-credentials.json"
+            | ".streamsync-secret-store"
+            | "tokens"
+    ) {
+        return true;
+    }
     if name.starts_with(".writetest") {
         return true;
     }
@@ -258,5 +245,77 @@ mod tests {
             archive.by_name("twitch-delegated.json").is_err(),
             "takeover session must not appear in backup zip"
         );
+    }
+
+    #[test]
+    fn backup_zip_excludes_reusable_credentials() {
+        let (root, paths) = temp_paths();
+
+        fs::write(&paths.twitch_tokens, r#"{"accessToken":"tok"}"#).unwrap();
+        fs::write(&paths.kick_tokens, r#"{"token":"kick"}"#).unwrap();
+        fs::write(root.join("streamelements-session.json"), r#"{"session":"secret"}"#).unwrap();
+        fs::write(root.join(".env"), "TWITCH_CLIENT_ID=abc").unwrap();
+        fs::write(
+            &paths.twitch_delegated,
+            r#"{"connection_key":"ssk_secret","access_token":"tok"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(&paths.tokens_dir).unwrap();
+        fs::write(paths.tokens_dir.join("control-token.txt"), "control").unwrap();
+        fs::write(&paths.control_token, "control").unwrap();
+        fs::write(&paths.dock_credentials, r#"{"dock":"secret"}"#).unwrap();
+        let secret_store = root.join(".streamsync-secret-store");
+        fs::create_dir_all(&secret_store).unwrap();
+        fs::write(secret_store.join("dummy"), "secret").unwrap();
+
+        fs::create_dir_all(&paths.events_media_dir).unwrap();
+        fs::write(paths.events_media_dir.join("foo.png"), "png").unwrap();
+        fs::create_dir_all(&paths.fonts_dir).unwrap();
+        fs::write(paths.fonts_dir.join("x.ttf"), "font").unwrap();
+        let imports_se = root.join("imports").join("streamelements");
+        fs::create_dir_all(&imports_se).unwrap();
+        fs::write(imports_se.join("abc.json"), r#"{"ok":true}"#).unwrap();
+
+        let zip_bytes = build_backup_zip(&paths, None).expect("zip");
+        let _ = fs::remove_dir_all(&root);
+
+        let cursor = std::io::Cursor::new(zip_bytes);
+        let mut archive = zip::ZipArchive::new(cursor).expect("open zip");
+        let mut names = Vec::new();
+        for i in 0..archive.len() {
+            let file = archive.by_index(i).expect("zip entry");
+            names.push(file.name().to_string());
+        }
+        let all_names = names.join("\n");
+
+        for forbidden in [
+            "twitch-tokens.json",
+            "kick-tokens.json",
+            "streamelements-session.json",
+            ".env",
+            "twitch-delegated.json",
+            "tokens/",
+            "control-token.txt",
+            "dock-credentials.json",
+            ".streamsync-secret-store",
+            ".streamsync-secret-store/dummy",
+        ] {
+            assert!(
+                !all_names.contains(forbidden),
+                "backup zip should exclude {forbidden}, got entries: {all_names}"
+            );
+        }
+
+        for expected in [
+            "overlay-config.json",
+            "events-media/foo.png",
+            "fonts/x.ttf",
+            "imports/streamelements/abc.json",
+        ] {
+            assert!(
+                all_names.contains(expected),
+                "backup zip should include {expected}, got entries: {all_names}"
+            );
+        }
     }
 }
