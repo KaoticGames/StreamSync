@@ -1033,8 +1033,13 @@ fn parse_css_px(v: Option<&Value>) -> Option<f64> {
     }
 }
 
+/// Studio `.text-box` padding — the SE font-size must fit *inside* this.
+const SS_TEXT_PAD_X: f64 = 14.0;
+const SS_TEXT_PAD_Y: f64 = 12.0;
+
 /// SE alert text is HTML inside the widget, not a StreamSync rectangle.
-/// Size the SS text box from the message + font; place it with scaled text.css margins.
+/// Size the SS text box from SE's font-size so overlay text-fit will not shrink it.
+/// Place textOver on the graphic (Studio preset position), not under the image box.
 fn text_box_from_se(
     img_x: f64,
     img_y: f64,
@@ -1049,21 +1054,17 @@ fn text_box_from_se(
         .get("maxUsernameLength")
         .and_then(value_as_f64)
         .map(|n| n.round() as usize);
-    let mut text_w = estimate_message_width(message, font_size, max_name);
+    let fs = font_size.max(12.0);
+    let mut text_w = estimate_message_width(message, fs, max_name) + SS_TEXT_PAD_X * 2.0;
     text_w = text_w.min(img_w.max(80.0)).max(80.0);
-    let text_h = (font_size * 1.65).clamp(40.0, img_h.max(40.0));
+    let text_h = (fs * 1.1 + SS_TEXT_PAD_Y * 2.0).clamp(40.0, img_h.max(40.0));
 
-    let mt = se_text_css_margin(cfg, "margin-top") * scale.sy();
     let ml = se_text_css_margin(cfg, "margin-left") * scale.sx();
 
     let mut text_x = img_x + ((img_w - text_w) / 2.0) + ml;
-    // Column layout: text starts below the graphic, then margin-top (often negative) pulls it on.
-    let mut text_y = img_y + img_h + mt;
-    if se_alert_layout(cfg) != "textUnder" {
-        // Keep overlay/column text on the graphic when the margin would leave the box.
-        if text_y + text_h < img_y || text_y > img_y + img_h {
-            text_y = img_y + ((img_h - text_h) / 2.0) + mt;
-        }
+    let mut text_y = img_y + ((img_h - text_h) / 2.0);
+    if se_alert_layout(cfg) == "textUnder" {
+        text_y = img_y + img_h + se_text_css_margin(cfg, "margin-top") * scale.sy();
     }
     if text_x + text_w > img_x + img_w {
         text_x = (img_x + img_w - text_w).max(img_x);
@@ -1074,7 +1075,7 @@ fn text_box_from_se(
     if text_y < img_y {
         text_y = img_y;
     }
-    if text_y + text_h > img_y + img_h {
+    if text_y + text_h > img_y + img_h && se_alert_layout(cfg) != "textUnder" {
         text_y = (img_y + img_h - text_h).max(img_y);
     }
     (text_x, text_y, text_w, text_h)
@@ -1085,7 +1086,7 @@ fn estimate_message_width(message: &str, font_size: f64, max_name: Option<usize>
     let name = "X".repeat(name_n);
     let rendered = message.replace("[name]", &name).replace("[user]", &name);
     let n = rendered.chars().filter(|c| !c.is_control()).count().max(8);
-    (font_size * 0.62 * n as f64).clamp(80.0, 1600.0)
+    (font_size * 0.72 * n as f64).clamp(80.0, 1600.0)
 }
 
 fn se_text_css_margin(cfg: &Value, key: &str) -> f64 {
@@ -2413,12 +2414,21 @@ mod tests {
         );
         assert!(tw < 520.0, "text box still far too wide: {tw}");
         let tcx = tx + tw / 2.0;
+        let tcy = ty + th / 2.0;
         let icx = ix + iw / 2.0;
+        let icy = iy + ih / 2.0;
         assert!((tcx - icx).abs() < 12.0, "text centered on image");
         assert!(
-            ty + th > iy && ty < iy + ih,
-            "margin-top should land the text on the graphic (ty={ty} image={iy}..{})",
-            iy + ih
+            (tcy - icy).abs() < ih * 0.2,
+            "textOver must sit on the graphic (same as Studio preset), not under it (tcy={tcy} icy={icy} ih={ih})"
+        );
+        let fs = v
+            .pointer("/text/fontSize")
+            .and_then(|x| x.as_f64())
+            .unwrap();
+        assert!(
+            th + 0.5 >= fs + 24.0,
+            "text box height {th} cannot fit SE font {fs} plus Studio padding 12+12"
         );
     }
 
