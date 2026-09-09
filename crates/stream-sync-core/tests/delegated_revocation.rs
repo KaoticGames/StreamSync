@@ -11,6 +11,8 @@
 //! multi-consumer Syndicate revoke, real network partition, or restart-after-remote-revoke without
 //! mocks). That remains manual/CI Syndicate integration evidence.
 
+use axum::body::Body;
+use axum::http::{header, Method, Request, StatusCode};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +23,7 @@ use stream_sync_core::{
     TwitchActiveMode, TwitchActiveModeFile, TwitchServices, MAX_DELEGATED_REVOCATION_DELAY,
     SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,
 };
+use tower::ServiceExt;
 
 static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -712,6 +715,91 @@ async fn durable_revoke_removes_delegated_bak_backup() {
     assert!(!bak.is_file());
     assert!(state.paths.twitch_delegated_revoked.is_file());
     assert!(!state.paths.twitch_delegated_revoke_pending.is_file());
+}
+
+#[tokio::test]
+async fn delegated_remove_connection_cleans_primary_and_legacy_bak() {
+    let (router, state, _services) = build_app(0).await;
+    let session = sample_session(1, "ssk_test_placeholder_remove_connection");
+    state.persist_delegated_session(&session).unwrap();
+
+    let bak = state.paths.twitch_delegated.with_extension("bak");
+    let legacy_json_bak = state.paths.twitch_delegated.with_extension("json.bak");
+    std::fs::write(
+        &bak,
+        b"{\"connection_key\":\"ssk_test_placeholder_remove_connection_bak\"}",
+    )
+    .unwrap();
+    std::fs::write(
+        &legacy_json_bak,
+        b"{\"connection_key\":\"ssk_test_placeholder_remove_connection_json_bak\"}",
+    )
+    .unwrap();
+
+    let origin = format!("http://127.0.0.1:{}", state.port);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/twitch/remove-connection")
+        .header(header::ORIGIN, origin)
+        .header(
+            stream_sync_core::CONTROL_TOKEN_HEADER,
+            state.control_token(),
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"mode":"delegated"}"#))
+        .unwrap();
+    let response = router.clone().oneshot(req).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert!(!state.paths.twitch_delegated.is_file());
+    assert!(!bak.is_file());
+    assert!(!legacy_json_bak.is_file());
+    assert!(state.paths.twitch_delegated_revoked.is_file());
+    assert!(!state.delegated_secret_files_remain().unwrap());
+}
+
+#[tokio::test]
+async fn delegated_revoke_cleans_inventoried_secret_variants_end_to_end() {
+    let (_router, state, _services) = build_app(0).await;
+    let session = sample_session(1, "ssk_test_placeholder_inventory_cleanup");
+    state.persist_delegated_session(&session).unwrap();
+
+    let committing = stream_sync_core::delegated_committing_path(&state.paths.twitch_delegated);
+    let replace_pending =
+        stream_sync_core::delegated_replace_pending_path(&state.paths.twitch_delegated);
+    let legacy_json_bak = state.paths.twitch_delegated.with_extension("json.bak");
+    let tmp = state
+        .paths
+        .twitch_delegated
+        .with_file_name(format!("twitch-delegated.tmp-{}-pass1", std::process::id()));
+    std::fs::write(
+        &committing,
+        b"{\"connection_key\":\"ssk_test_placeholder_inventory_committing\"}",
+    )
+    .unwrap();
+    std::fs::write(
+        &replace_pending,
+        br#"{"reason":"ssk_test_placeholder_inventory_replace_pending"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &tmp,
+        b"{\"connection_key\":\"ssk_test_placeholder_inventory_tmp\"}",
+    )
+    .unwrap();
+    std::fs::write(
+        &legacy_json_bak,
+        b"{\"connection_key\":\"ssk_test_placeholder_inventory_json_bak\"}",
+    )
+    .unwrap();
+
+    state.durable_revoke_delegated().await.unwrap();
+
+    assert!(!committing.is_file());
+    assert!(!replace_pending.is_file());
+    assert!(!tmp.is_file());
+    assert!(!legacy_json_bak.is_file());
+    assert!(!state.delegated_secret_files_remain().unwrap());
 }
 
 #[tokio::test]
