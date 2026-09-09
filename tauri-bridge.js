@@ -104,6 +104,7 @@
         return invoke("open_se_account_page", { flow });
       },
       exportBackup: () => invoke("export_backup"),
+      restoreBackup: () => invoke("restore_backup"),
     };
 
     console.log("[tauri-bridge] Stream Sync desktop APIs ready", cachedBase);

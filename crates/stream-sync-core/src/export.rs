@@ -2,12 +2,12 @@
 
 use crate::storage::StoragePaths;
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Write;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipWriter};
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 const BACKUP_FORMAT: &str = "stream-sync-backup";
 const BACKUP_VERSION: u32 = 2;
@@ -18,6 +18,16 @@ pub struct BackupManifest {
     pub version: u32,
     pub exported_at: String,
     pub app_version: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RestoreReport {
+    pub files_written: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackupManifestInput {
+    format: String,
 }
 
 /// Build a ZIP containing Stream Sync user data (configs, fonts, media, imports, logs).
@@ -74,6 +84,70 @@ pub fn build_backup_zip(paths: &StoragePaths, logs_dir: Option<&Path>) -> Result
         zip.finish().context("finish zip")?;
     }
     Ok(buf)
+}
+
+/// Restore a backup ZIP into userData (config/media/imports only).
+pub fn restore_backup_zip(paths: &StoragePaths, zip_bytes: &[u8]) -> Result<RestoreReport> {
+    let mut archive =
+        ZipArchive::new(std::io::Cursor::new(zip_bytes)).context("open backup zip")?;
+
+    let mut manifest_raw = String::new();
+    archive
+        .by_name("manifest.json")
+        .context("manifest.json missing from backup zip")?
+        .read_to_string(&mut manifest_raw)
+        .context("read manifest.json")?;
+    let manifest: BackupManifestInput =
+        serde_json::from_str(&manifest_raw).context("parse manifest.json")?;
+    if manifest.format != BACKUP_FORMAT {
+        anyhow::bail!(
+            "unsupported backup format: expected {}, got {}",
+            BACKUP_FORMAT,
+            manifest.format
+        );
+    }
+
+    // Validate all entry paths first so zip-slip fails before any writes happen.
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i).context("read zip entry metadata")?;
+        let name = entry.name();
+        if name == "manifest.json" {
+            continue;
+        }
+        sanitize_restore_relative_path(name)?;
+    }
+
+    let mut archive =
+        ZipArchive::new(std::io::Cursor::new(zip_bytes)).context("re-open backup zip")?;
+    let mut files_written = 0usize;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).context("read zip entry")?;
+        let name = entry.name().to_string();
+        if name == "manifest.json" {
+            continue;
+        }
+        let rel = sanitize_restore_relative_path(&name)?;
+        if should_skip_restore_path(&rel) || !is_restore_target_allowed(&rel) {
+            continue;
+        }
+
+        let target = paths.root.join(&rel);
+        if entry.is_dir() {
+            fs::create_dir_all(&target).with_context(|| format!("mkdir {}", target.display()))?;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+        }
+        let mut bytes = Vec::new();
+        entry
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read zip entry {}", name))?;
+        fs::write(&target, &bytes).with_context(|| format!("write {}", target.display()))?;
+        files_written += 1;
+    }
+
+    Ok(RestoreReport { files_written })
 }
 
 fn add_root_file<W: Write + std::io::Seek>(
@@ -172,10 +246,79 @@ fn should_skip_backup_path(path: &Path) -> bool {
     false
 }
 
+fn should_skip_restore_path(path: &Path) -> bool {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if should_skip_backup_path(&current) {
+            return true;
+        }
+    }
+    false
+}
+
+fn sanitize_restore_relative_path(raw: &str) -> Result<PathBuf> {
+    let normalized = raw.replace('\\', "/");
+    let path = normalized.trim();
+    if path.is_empty() {
+        anyhow::bail!("zip entry has empty path");
+    }
+    if path.starts_with('/') || path.starts_with("//") {
+        anyhow::bail!("zip entry path must be relative: {raw}");
+    }
+    if let Some(first) = path.split('/').next() {
+        if first.len() >= 2 {
+            let bytes = first.as_bytes();
+            if bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+                anyhow::bail!("zip entry path must not use windows drive prefix: {raw}");
+            }
+        }
+    }
+
+    let mut rel = PathBuf::new();
+    for part in path.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            anyhow::bail!("zip-slip path rejected: {raw}");
+        }
+        if part.contains(':') {
+            anyhow::bail!("zip entry path must not contain windows prefixes: {raw}");
+        }
+        rel.push(part);
+    }
+
+    if rel.as_os_str().is_empty() {
+        anyhow::bail!("zip entry has empty normalized path: {raw}");
+    }
+    Ok(rel)
+}
+
+fn is_restore_target_allowed(path: &Path) -> bool {
+    let components: Vec<_> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    if components.is_empty() {
+        return false;
+    }
+    if matches!(components[0], "fonts" | "events-media" | "imports") {
+        return true;
+    }
+    if components.len() != 1 {
+        return false;
+    }
+    matches!(
+        components[0],
+        "dock-config.json" | "overlay-config.json" | "events-overlay-config.json" | "profiles.json"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::StoragePaths;
+    use crate::storage::{paths_for_root, StoragePaths};
     use std::io::Read;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -253,7 +396,11 @@ mod tests {
 
         fs::write(&paths.twitch_tokens, r#"{"accessToken":"tok"}"#).unwrap();
         fs::write(&paths.kick_tokens, r#"{"token":"kick"}"#).unwrap();
-        fs::write(root.join("streamelements-session.json"), r#"{"session":"secret"}"#).unwrap();
+        fs::write(
+            root.join("streamelements-session.json"),
+            r#"{"session":"secret"}"#,
+        )
+        .unwrap();
         fs::write(root.join(".env"), "TWITCH_CLIENT_ID=abc").unwrap();
         fs::write(
             &paths.twitch_delegated,
@@ -317,5 +464,204 @@ mod tests {
                 "backup zip should include {expected}, got entries: {all_names}"
             );
         }
+    }
+
+    #[test]
+    fn restore_backup_roundtrip_keeps_config_media_and_imports() {
+        let (src_root, src_paths) = temp_paths();
+        let overlay_bytes = br#"{"profiles":{"chat-default":{"fontSize":14}}}"#.to_vec();
+        let events_overlay_bytes =
+            br#"{"profiles":{"default":{"profileName":"Default"}}}"#.to_vec();
+        let media_bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a];
+        let font_bytes = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let import_bytes = br#"{"overlayId":"abc","ok":true}"#.to_vec();
+
+        fs::write(&src_paths.overlay_config, &overlay_bytes).unwrap();
+        fs::write(&src_paths.events_overlay_config, &events_overlay_bytes).unwrap();
+        fs::create_dir_all(src_paths.events_media_dir.join("default")).unwrap();
+        fs::write(
+            src_paths.events_media_dir.join("default").join("alert.png"),
+            &media_bytes,
+        )
+        .unwrap();
+        fs::create_dir_all(&src_paths.fonts_dir).unwrap();
+        fs::write(src_paths.fonts_dir.join("test.ttf"), &font_bytes).unwrap();
+        let imports_dir = src_root.join("imports").join("streamelements");
+        fs::create_dir_all(&imports_dir).unwrap();
+        fs::write(imports_dir.join("overlay.json"), &import_bytes).unwrap();
+
+        let zip_bytes = build_backup_zip(&src_paths, None).expect("zip");
+
+        let n = EXPORT_TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let restore_root = std::env::temp_dir().join(format!(
+            "stream-sync-restore-test-{}-{n}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&restore_root);
+        fs::create_dir_all(&restore_root).unwrap();
+        let restore_paths = paths_for_root(&restore_root, false).expect("restore paths");
+
+        let report = restore_backup_zip(&restore_paths, &zip_bytes).expect("restore");
+        assert!(report.files_written >= 5);
+
+        assert_eq!(
+            fs::read(&restore_paths.overlay_config).unwrap(),
+            overlay_bytes
+        );
+        assert_eq!(
+            fs::read(&restore_paths.events_overlay_config).unwrap(),
+            events_overlay_bytes
+        );
+        assert_eq!(
+            fs::read(
+                restore_paths
+                    .events_media_dir
+                    .join("default")
+                    .join("alert.png")
+            )
+            .unwrap(),
+            media_bytes
+        );
+        assert_eq!(
+            fs::read(restore_paths.fonts_dir.join("test.ttf")).unwrap(),
+            font_bytes
+        );
+        assert_eq!(
+            fs::read(
+                restore_paths
+                    .root
+                    .join("imports")
+                    .join("streamelements")
+                    .join("overlay.json")
+            )
+            .unwrap(),
+            import_bytes
+        );
+
+        let _ = fs::remove_dir_all(src_root);
+        let _ = fs::remove_dir_all(restore_root);
+    }
+
+    #[test]
+    fn restore_backup_skips_reusable_credentials() {
+        let n = EXPORT_TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let restore_root = std::env::temp_dir().join(format!(
+            "stream-sync-restore-skip-test-{}-{n}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&restore_root);
+        fs::create_dir_all(&restore_root).unwrap();
+        let restore_paths = paths_for_root(&restore_root, false).expect("restore paths");
+
+        let mut buf = Vec::new();
+        {
+            let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            let manifest_json = serde_json::json!({
+                "format": BACKUP_FORMAT,
+                "version": BACKUP_VERSION,
+                "exported_at": "2026-01-01T00:00:00Z",
+                "app_version": "test",
+            })
+            .to_string();
+            write_zip_bytes(&mut zip, "manifest.json", manifest_json.as_bytes(), options).unwrap();
+            write_zip_bytes(&mut zip, "overlay-config.json", br#"{"ok":true}"#, options).unwrap();
+            for entry in [
+                "twitch-tokens.json",
+                "kick-tokens.json",
+                "streamelements-session.json",
+                ".env",
+                "twitch-delegated.json",
+                "control-token.txt",
+                "dock-credentials.json",
+                "tokens/x",
+                ".streamsync-secret-store/x",
+            ] {
+                write_zip_bytes(&mut zip, entry, b"secret", options).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+
+        let report = restore_backup_zip(&restore_paths, &buf).expect("restore");
+        assert_eq!(report.files_written, 1);
+        assert_eq!(
+            fs::read(&restore_paths.overlay_config).unwrap(),
+            br#"{"ok":true}"#
+        );
+
+        for forbidden in [
+            "twitch-tokens.json",
+            "kick-tokens.json",
+            "streamelements-session.json",
+            ".env",
+            "twitch-delegated.json",
+            "control-token.txt",
+            "dock-credentials.json",
+            "tokens/x",
+            ".streamsync-secret-store/x",
+        ] {
+            assert!(
+                !restore_root.join(forbidden).exists(),
+                "restore should skip {forbidden}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(restore_root);
+    }
+
+    #[test]
+    fn restore_backup_rejects_zip_slip() {
+        let n = EXPORT_TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let restore_root = std::env::temp_dir().join(format!(
+            "stream-sync-restore-slip-test-{}-{n}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&restore_root);
+        fs::create_dir_all(&restore_root).unwrap();
+        let restore_paths = paths_for_root(&restore_root, false).expect("restore paths");
+
+        let outside = restore_root
+            .parent()
+            .unwrap_or(std::path::Path::new("/tmp"))
+            .join("outside.txt");
+        let _ = fs::remove_file(&outside);
+
+        let mut buf = Vec::new();
+        {
+            let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            let manifest_json = serde_json::json!({
+                "format": BACKUP_FORMAT,
+                "version": BACKUP_VERSION,
+                "exported_at": "2026-01-01T00:00:00Z",
+                "app_version": "test",
+            })
+            .to_string();
+            write_zip_bytes(&mut zip, "manifest.json", manifest_json.as_bytes(), options).unwrap();
+            write_zip_bytes(&mut zip, "overlay-config.json", br#"{"ok":true}"#, options).unwrap();
+            write_zip_bytes(&mut zip, "../outside.txt", b"bad", options).unwrap();
+            zip.finish().unwrap();
+        }
+
+        let err = restore_backup_zip(&restore_paths, &buf).expect_err("zip-slip must fail");
+        assert!(
+            err.to_string().contains("zip-slip")
+                || err.to_string().contains("relative")
+                || err.to_string().contains("windows"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !outside.exists(),
+            "restore must not create files outside userdata"
+        );
+        assert!(
+            !restore_paths.overlay_config.exists(),
+            "restore should not write files when zip-slip is present"
+        );
+
+        let _ = fs::remove_file(outside);
+        let _ = fs::remove_dir_all(restore_root);
     }
 }

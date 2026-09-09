@@ -5,7 +5,7 @@ use crate::paths::legacy_user_data_dir;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use stream_sync_core::{build_backup_zip, get_paths};
+use stream_sync_core::{build_backup_zip, get_paths, restore_backup_zip};
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt;
 
@@ -31,6 +31,18 @@ pub struct ExportBackupResult {
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct RestoreBackupResult {
+    pub ok: bool,
+    pub cancelled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_written: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -277,6 +289,41 @@ pub fn export_backup(
         cancelled: false,
         path: Some(save_path.display().to_string()),
         bytes: Some(zip_bytes.len()),
+        error: None,
+    })
+}
+
+/// Restore user data from a backup ZIP selected via system file picker.
+#[tauri::command]
+pub fn restore_backup(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<RestoreBackupResult, String> {
+    require_main_window(&window, state.overlay_port)?;
+    let src = rfd::FileDialog::new()
+        .set_title("Select Stream Sync backup to restore")
+        .add_filter("Zip archive", &["zip"])
+        .pick_file();
+
+    let Some(src) = src else {
+        return Ok(RestoreBackupResult {
+            ok: false,
+            cancelled: true,
+            path: None,
+            files_written: None,
+            error: None,
+        });
+    };
+
+    let zip_bytes = std::fs::read(&src).map_err(|e| e.to_string())?;
+    let paths = get_paths().map_err(|e| e.to_string())?;
+    let report = restore_backup_zip(&paths, &zip_bytes).map_err(|e| e.to_string())?;
+
+    Ok(RestoreBackupResult {
+        ok: true,
+        cancelled: false,
+        path: Some(src.display().to_string()),
+        files_written: Some(report.files_written),
         error: None,
     })
 }

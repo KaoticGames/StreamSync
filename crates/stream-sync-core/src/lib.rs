@@ -43,7 +43,7 @@ pub use control_plane::{
     PRIVILEGED_JSON_BODY_LIMIT, WS_CONTROL_AUTH_TIMEOUT_MS,
 };
 pub use dock_capability::{DockCredential, DockCredentialStore};
-pub use export::{build_backup_zip, BackupManifest};
+pub use export::{build_backup_zip, restore_backup_zip, BackupManifest, RestoreReport};
 pub use kick::sync_live_identity;
 pub use oauth_pending::{OAuthProvider, PendingLoginStore, LOGIN_NONCE_HEADER};
 pub use routes::BUILD_ROUTER_ROUTE_IDS;
