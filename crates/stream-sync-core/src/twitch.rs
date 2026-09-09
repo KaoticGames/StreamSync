@@ -710,9 +710,10 @@ async fn select_helix_credentials(state: &AppState) -> Result<PlatformCredential
 }
 
 pub async fn validate_token(access_token: &str) -> Result<Value> {
+    let oauth_base = twitch_oauth_base_url();
     let client = reqwest::Client::new();
     let res = client
-        .get("https://id.twitch.tv/oauth2/validate")
+        .get(format!("{oauth_base}/oauth2/validate"))
         .header("Authorization", format!("OAuth {access_token}"))
         .send()
         .await?;
@@ -722,6 +723,149 @@ pub async fn validate_token(access_token: &str) -> Result<Value> {
         return Err(anyhow!("Twitch validate failed: {} {}", status, text));
     }
     Ok(res.json().await?)
+}
+
+fn twitch_oauth_base_url() -> String {
+    std::env::var("STREAMSYNC_TWITCH_OAUTH_BASE")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://id.twitch.tv".to_string())
+}
+
+#[derive(Debug, Clone)]
+pub struct TwitchCodeExchange {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_in: Option<i64>,
+    pub scopes: Option<Vec<String>>,
+    pub token_type: Option<String>,
+}
+
+pub async fn exchange_authorization_code(
+    state: &AppState,
+    code: &str,
+    code_verifier: &str,
+) -> Result<TwitchCodeExchange> {
+    if state.client_id.trim().is_empty() {
+        return Err(anyhow!("TWITCH_CLIENT_ID missing"));
+    }
+    let code = code.trim();
+    if code.is_empty() {
+        return Err(anyhow!("missing authorization code"));
+    }
+    let code_verifier = code_verifier.trim();
+    if code_verifier.is_empty() {
+        return Err(anyhow!("missing code verifier"));
+    }
+
+    let mut form = vec![
+        ("client_id", state.client_id.clone()),
+        ("grant_type", "authorization_code".to_string()),
+        ("code", code.to_string()),
+        ("redirect_uri", state.redirect_uri.clone()),
+        ("code_verifier", code_verifier.to_string()),
+    ];
+    if let Ok(secret) = std::env::var("TWITCH_CLIENT_SECRET") {
+        let secret = secret.trim();
+        if !secret.is_empty() {
+            form.push(("client_secret", secret.to_string()));
+        }
+    }
+
+    let oauth_base = twitch_oauth_base_url();
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("{oauth_base}/oauth2/token"))
+        .form(&form)
+        .send()
+        .await?;
+    let status = res.status();
+    let payload: Value = res.json().await?;
+    if !status.is_success() {
+        return Err(anyhow!(
+            "Twitch code exchange failed: {} {}",
+            status,
+            payload
+        ));
+    }
+    let access_token = payload
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow!("missing access_token in Twitch code exchange"))?
+        .to_string();
+    let refresh_token = payload
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(String::from);
+    let expires_in = payload.get("expires_in").and_then(|v| v.as_i64());
+    let scopes = payload
+        .get("scope")
+        .and_then(|v| v.as_array().cloned())
+        .map(|items| {
+            items
+                .into_iter()
+                .filter_map(|item| item.as_str().map(str::trim).map(String::from))
+                .filter(|scope| !scope.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|scopes| !scopes.is_empty())
+        .or_else(|| {
+            payload
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .map(|value| {
+                    value
+                        .split_whitespace()
+                        .map(str::trim)
+                        .filter(|scope| !scope.is_empty())
+                        .map(String::from)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|scopes| !scopes.is_empty())
+        });
+    let token_type = payload
+        .get("token_type")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(String::from);
+    Ok(TwitchCodeExchange {
+        access_token,
+        refresh_token,
+        expires_in,
+        scopes,
+        token_type,
+    })
+}
+
+pub async fn redeem_oauth_code(
+    state: Arc<AppState>,
+    services: Arc<TwitchServices>,
+    code: &str,
+    code_verifier: &str,
+) -> Result<()> {
+    let exchange = exchange_authorization_code(&state, code, code_verifier).await?;
+    let mut body = json!({
+        "accessToken": exchange.access_token,
+    });
+    if let Some(refresh) = exchange.refresh_token {
+        body["refreshToken"] = json!(refresh);
+    }
+    if let Some(expires_in) = exchange.expires_in {
+        body["expiresIn"] = json!(expires_in);
+    }
+    if let Some(scopes) = exchange.scopes {
+        body["scope"] = json!(scopes);
+    }
+    if let Some(token_type) = exchange.token_type {
+        body["tokenType"] = json!(token_type);
+    }
+    apply_set_token(state, services, body).await
 }
 
 pub async fn helix_get(state: &AppState, path: &str) -> Result<Value> {
@@ -1169,19 +1313,36 @@ pub async fn apply_set_token(
         .get("user_id")
         .and_then(|v| v.as_str())
         .map(String::from);
-    let expires_in = validated.get("expires_in").and_then(|v| v.as_i64());
+    let expires_in = validated
+        .get("expires_in")
+        .and_then(|v| v.as_i64())
+        .or_else(|| body.get("expiresIn").and_then(|v| v.as_i64()));
+    let refresh_token = body
+        .get("refreshToken")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(String::from);
+    let scopes = body
+        .get("scope")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::trim))
+                .filter(|scope| !scope.is_empty())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .filter(|scopes| !scopes.is_empty());
     let tokens = TwitchTokenFile {
         access_token: Some(access_token.to_string()),
-        refresh_token: None,
+        refresh_token,
         expires_in,
         obtainment_timestamp: Some(chrono::Utc::now().timestamp_millis()),
         login: login.clone(),
         user_id: user_id.clone(),
-        scopes: body.get("scope").and_then(|v| v.as_array()).map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect()
-        }),
+        scopes,
     };
     // Durable commit before live publish; restore personal token file if mode commit fails (B2).
     let (previous_mode, previous_delegated_generation, local_gen) = {

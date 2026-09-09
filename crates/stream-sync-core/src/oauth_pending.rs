@@ -1,6 +1,8 @@
 //! One-time OAuth completion nonces (not the master control capability).
 
 use crate::control_plane::constant_time_eq;
+use base64::Engine;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -43,6 +45,8 @@ struct PendingLogin {
     consumed: bool,
     reserved: bool,
     reserved_until: Option<Instant>,
+    code_verifier: Option<String>,
+    code_challenge: Option<String>,
 }
 
 /// In-memory single-use login nonces for OAuth callback completion.
@@ -58,6 +62,13 @@ impl PendingLoginStore {
 
     pub fn create(&self, provider: OAuthProvider) -> String {
         self.purge_expired();
+        let (code_verifier, code_challenge) = if provider == OAuthProvider::Twitch {
+            let verifier = generate_pkce_code_verifier();
+            let challenge = pkce_s256_challenge(&verifier);
+            (Some(verifier), Some(challenge))
+        } else {
+            (None, None)
+        };
         let nonce = format!(
             "ssl_{}{}",
             uuid::Uuid::new_v4().simple(),
@@ -72,9 +83,46 @@ impl PendingLoginStore {
                 consumed: false,
                 reserved: false,
                 reserved_until: None,
+                code_verifier,
+                code_challenge,
             },
         );
         nonce
+    }
+
+    pub fn pkce_challenge_for(&self, nonce: &str) -> Option<String> {
+        self.purge_expired();
+        let guard = self.inner.lock().expect("pending login lock");
+        guard
+            .get(nonce.trim())
+            .filter(|entry| !entry.consumed)
+            .and_then(|entry| entry.code_challenge.clone())
+    }
+
+    pub fn code_verifier_for(
+        &self,
+        provider: OAuthProvider,
+        nonce: &str,
+    ) -> Result<Option<String>, PendingLoginError> {
+        let nonce = nonce.trim();
+        if nonce.is_empty() {
+            return Err(PendingLoginError::Missing);
+        }
+        self.purge_expired();
+        let guard = self.inner.lock().expect("pending login lock");
+        let Some(entry) = guard.get(nonce) else {
+            return Err(PendingLoginError::Unknown);
+        };
+        if entry.provider != provider {
+            return Err(PendingLoginError::WrongProvider);
+        }
+        if entry.consumed {
+            return Err(PendingLoginError::Replayed);
+        }
+        if entry.created_at.elapsed() > LOGIN_NONCE_TTL && entry.reserved_until.is_none() {
+            return Err(PendingLoginError::Expired);
+        }
+        Ok(entry.code_verifier.clone())
     }
 
     /// Atomically validate and reserve a nonce while completion is in progress.
@@ -199,9 +247,29 @@ pub fn login_nonce_eq(a: &str, b: &str) -> bool {
     constant_time_eq(a.as_bytes(), b.as_bytes())
 }
 
+fn generate_pkce_code_verifier() -> String {
+    let mut bytes = [0u8; 48];
+    for chunk in bytes.chunks_mut(16) {
+        chunk.copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    }
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn pkce_s256_challenge(verifier: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    fn is_unreserved_ascii(value: &str) -> bool {
+        value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~'))
+    }
 
     #[test]
     fn consume_once_only() {
@@ -249,5 +317,32 @@ mod tests {
         store.reserve(OAuthProvider::Twitch, &n).unwrap();
         // Simulate slow provider/persistence — reservation must remain valid.
         assert!(store.commit(OAuthProvider::Twitch, &n).is_ok());
+    }
+
+    #[test]
+    fn pending_login_stores_pkce_verifier_and_challenge() {
+        let store = PendingLoginStore::new();
+        let nonce = store.create(OAuthProvider::Twitch);
+        let verifier = store
+            .code_verifier_for(OAuthProvider::Twitch, &nonce)
+            .expect("lookup verifier")
+            .expect("twitch verifier");
+        let challenge = store
+            .pkce_challenge_for(&nonce)
+            .expect("twitch challenge is present");
+
+        assert_ne!(verifier, nonce, "PKCE verifier must not reuse nonce");
+        assert!(
+            (43..=128).contains(&verifier.len()),
+            "verifier length must follow RFC 7636"
+        );
+        assert!(
+            is_unreserved_ascii(&verifier),
+            "verifier must be unreserved"
+        );
+
+        let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(verifier.as_bytes()));
+        assert_eq!(challenge, expected, "challenge must be S256(verifier)");
     }
 }

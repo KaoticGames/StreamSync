@@ -60,11 +60,8 @@ pub const ROUTE_MANIFEST: &[(&str, &str, RoutePolicy)] = &[
         RoutePolicy::Privileged,
     ),
     ("GET", "/api/twitch/auth-url", RoutePolicy::Privileged),
-    (
-        "POST",
-        "/api/twitch/set-token",
-        RoutePolicy::OAuthCompletion,
-    ),
+    ("POST", "/api/twitch/redeem", RoutePolicy::OAuthCompletion),
+    ("POST", "/api/twitch/set-token", RoutePolicy::Privileged),
     (
         "POST",
         "/api/twitch/connection-key",

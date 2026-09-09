@@ -93,6 +93,18 @@ fn evil_origin() -> &'static str {
     "https://example.invalid"
 }
 
+fn query_param(url: &str, key: &str) -> Option<String> {
+    let query = url.split_once('?')?.1;
+    for part in query.split('&') {
+        let mut kv = part.splitn(2, '=');
+        let k = kv.next().unwrap_or("");
+        if k == key {
+            return Some(kv.next().unwrap_or("").to_string());
+        }
+    }
+    None
+}
+
 async fn request_json(
     router: &axum::Router,
     method: Method,
@@ -262,6 +274,41 @@ async fn public_oauth_callbacks_exclude_master_token() {
 }
 
 #[tokio::test]
+async fn twitch_auth_url_uses_code_and_pkce_not_implicit() {
+    std::env::set_var("TWITCH_CLIENT_ID", "client_id_test_placeholder");
+    let port = 14159;
+    let (router, state) = test_app(port).await;
+    let (status, body, _) = request_json(
+        &router,
+        Method::GET,
+        "/api/twitch/auth-url",
+        Some(&trusted_origin(port)),
+        Some(state.control_token()),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let url = body.get("url").and_then(|v| v.as_str()).expect("auth URL");
+    let flow_nonce = body
+        .get("flowNonce")
+        .and_then(|v| v.as_str())
+        .expect("flow nonce");
+    assert!(url.contains("response_type=code"), "{url}");
+    assert!(url.contains("code_challenge="), "{url}");
+    assert!(url.contains("code_challenge_method=S256"), "{url}");
+    assert_eq!(
+        query_param(url, "state").as_deref(),
+        Some(flow_nonce),
+        "state must match flow nonce"
+    );
+    assert!(
+        !url.contains("response_type=token"),
+        "implicit flow must be closed"
+    );
+}
+
+#[tokio::test]
 async fn login_nonce_cannot_call_disconnect() {
     let port = 14146;
     let (router, state) = test_app(port).await;
@@ -288,15 +335,15 @@ async fn login_nonce_replay_and_wrong_provider_fail() {
     let nonce = state
         .pending_logins
         .create(stream_sync_core::OAuthProvider::Kick);
-    // Wrong provider endpoint (twitch set-token) with kick nonce.
+    // Wrong provider endpoint (twitch redeem) with kick nonce.
     let (status, body, _) = request_json(
         &router,
         Method::POST,
-        "/api/twitch/set-token",
+        "/api/twitch/redeem",
         Some(&trusted_origin(port)),
         None,
         Some(&nonce),
-        Some(json!({ "accessToken": "x", "flowNonce": nonce })),
+        Some(json!({ "code": "x", "flowNonce": nonce })),
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
@@ -304,6 +351,116 @@ async fn login_nonce_replay_and_wrong_provider_fail() {
         body.get("error"),
         Some(&json!("wrong_provider_login_nonce"))
     );
+}
+
+#[tokio::test]
+async fn oauth_code_callback_requires_matching_pending_transaction() {
+    let port = 14167;
+    let (router, state) = test_app_mode(port, false).await;
+
+    let (status_missing, body_missing, _) = request_json(
+        &router,
+        Method::POST,
+        "/api/twitch/redeem",
+        Some(&trusted_origin(port)),
+        None,
+        None,
+        Some(json!({ "code": "code_test_placeholder" })),
+    )
+    .await;
+    assert_eq!(
+        status_missing,
+        StatusCode::UNAUTHORIZED,
+        "body: {body_missing}"
+    );
+    assert_eq!(
+        body_missing.get("error"),
+        Some(&json!("missing_login_nonce"))
+    );
+
+    let unknown = "ssl_unknown_nonce_test_placeholder_aaaaaaaaaaaaaaaaaaaaaaaa";
+    let (status_unknown, body_unknown, _) = request_json(
+        &router,
+        Method::POST,
+        "/api/twitch/redeem",
+        Some(&trusted_origin(port)),
+        None,
+        Some(unknown),
+        Some(json!({ "code": "code_test_placeholder", "flowNonce": unknown })),
+    )
+    .await;
+    assert_eq!(
+        status_unknown,
+        StatusCode::UNAUTHORIZED,
+        "body: {body_unknown}"
+    );
+    assert_eq!(
+        body_unknown.get("error"),
+        Some(&json!("invalid_login_nonce"))
+    );
+
+    let wrong_provider = state
+        .pending_logins
+        .create(stream_sync_core::OAuthProvider::Kick);
+    let (status_wrong_provider, body_wrong_provider, _) = request_json(
+        &router,
+        Method::POST,
+        "/api/twitch/redeem",
+        Some(&trusted_origin(port)),
+        None,
+        Some(&wrong_provider),
+        Some(json!({ "code": "code_test_placeholder", "flowNonce": wrong_provider })),
+    )
+    .await;
+    assert_eq!(
+        status_wrong_provider,
+        StatusCode::UNAUTHORIZED,
+        "body: {body_wrong_provider}"
+    );
+    assert_eq!(
+        body_wrong_provider.get("error"),
+        Some(&json!("wrong_provider_login_nonce"))
+    );
+
+    let replay = state
+        .pending_logins
+        .create(stream_sync_core::OAuthProvider::Twitch);
+    state
+        .pending_logins
+        .reserve(stream_sync_core::OAuthProvider::Twitch, &replay)
+        .expect("reserve replay nonce");
+    state
+        .pending_logins
+        .commit(stream_sync_core::OAuthProvider::Twitch, &replay)
+        .expect("commit replay nonce");
+    let (status_replay, body_replay, _) = request_json(
+        &router,
+        Method::POST,
+        "/api/twitch/redeem",
+        Some(&trusted_origin(port)),
+        None,
+        Some(&replay),
+        Some(json!({ "code": "code_test_placeholder", "flowNonce": replay })),
+    )
+    .await;
+    assert_eq!(
+        status_replay,
+        StatusCode::UNAUTHORIZED,
+        "body: {body_replay}"
+    );
+    assert_eq!(
+        body_replay.get("error"),
+        Some(&json!("replayed_login_nonce"))
+    );
+
+    let persisted = state.personal_tokens.read().await.clone();
+    assert!(persisted.access_token.is_none(), "token must not persist");
+    assert!(
+        persisted.refresh_token.is_none(),
+        "refresh must not persist"
+    );
+    assert!(persisted.login.is_none(), "login must not persist");
+    assert!(persisted.user_id.is_none(), "user id must not persist");
 }
 
 #[tokio::test]

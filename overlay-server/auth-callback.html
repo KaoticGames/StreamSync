@@ -91,40 +91,41 @@
         }
       }
 
-      function parseAccessTokenFromHash() {
-        const hash = window.location.hash || "";
-        if (!hash.startsWith("#")) return null;
-
-        const params = new URLSearchParams(hash.slice(1));
-        const accessToken = params.get("access_token");
-        const scope = params.get("scope");
-        const tokenType = params.get("token_type");
-        const expiresIn = params.get("expires_in");
-        const flowNonce = params.get("state");
-
-        return { accessToken, scope, tokenType, expiresIn, flowNonce };
-      }
-
       async function main() {
-        const parsed = parseAccessTokenFromHash();
-        if (!parsed || !parsed.accessToken || !parsed.flowNonce) {
-          setStatus("Unable to read access token from Twitch.", true);
-          setDetails("Try closing this window and clicking Connect in Stream Sync again.");
+        const params = new URLSearchParams(window.location.search || "");
+        const flowNonce = (params.get("state") || "").trim();
+        const oauthError = (params.get("error") || "").trim();
+        if (oauthError) {
+          const detail = (params.get("error_description") || oauthError).trim();
+          setStatus("Twitch authorization failed.", true);
+          setDetails(detail || oauthError);
+          return;
+        }
+        if ((window.location.hash || "").includes("access_token=")) {
+          setStatus("Legacy implicit response rejected.", true);
+          setDetails("Restart Twitch connect in Stream Sync to use the secure PKCE flow.");
+          return;
+        }
+        const code = (params.get("code") || "").trim();
+        if (!flowNonce || !code) {
+          setStatus("Missing Twitch authorization code or state.", true);
+          setDetails("Close this tab and click Connect in Stream Sync again.");
           return;
         }
 
-        setStatus("Validating Twitch token…", false);
+        setStatus("Exchanging Twitch code…", false);
 
         try {
-          const res = await fetch("/api/twitch/set-token", {
+          const res = await fetch("/api/twitch/redeem", {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              "x-streamsync-login-nonce": parsed.flowNonce,
+              "x-streamsync-login-nonce": flowNonce,
             },
             body: JSON.stringify({
-              accessToken: parsed.accessToken,
-              flowNonce: parsed.flowNonce,
+              code,
+              flowNonce,
+              state: flowNonce,
             }),
           });
 
