@@ -15,6 +15,7 @@ mod kick;
 mod oauth_pending;
 mod route_manifest;
 mod routes;
+mod secret_store;
 mod storage;
 mod store_lock;
 mod streamelements;
@@ -46,6 +47,14 @@ pub use export::{build_backup_zip, BackupManifest};
 pub use kick::sync_live_identity;
 pub use oauth_pending::{OAuthProvider, PendingLoginStore, LOGIN_NONCE_HEADER};
 pub use routes::BUILD_ROUTER_ROUTE_IDS;
+pub use secret_store::{
+    fs_secret_store, memory_secret_store, runtime_secret_store, FailClosedSecretStore,
+    MemorySecretStore, SecretStore, FAIL_CLOSED_SECRET_STORE_MESSAGE, KICK_PERSONAL_ACCESS_KEY,
+    KICK_PERSONAL_FEED_TICKET_KEY, KICK_PERSONAL_REFRESH_KEY, STREAMELEMENTS_JWT_KEY,
+    TWITCH_DELEGATED_ACCESS_TOKEN_KEY, TWITCH_DELEGATED_CONNECTION_KEY,
+    TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY, TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY,
+    TWITCH_PERSONAL_ACCESS_KEY, TWITCH_PERSONAL_REFRESH_KEY,
+};
 pub use storage::{
     bootstrap_twitch_env_from_rust, get_paths, is_stream_sync_ui_bundle, is_stream_sync_workspace,
     legacy_electron_user_data, load_streamsync_dotenv, paths_for_root, resolve_repo_root,
@@ -69,7 +78,7 @@ use std::sync::Arc;
 use tracing::info;
 
 /// Server startup options (mirrors Electron `STREAMSYNC_*` env vars).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OverlayConfig {
     /// HTTP listen port (production and OBS use **4040**).
     pub port: u16,
@@ -79,6 +88,8 @@ pub struct OverlayConfig {
     pub readonly: bool,
     /// Optional explicit userdata root (tests). When set, ignores `STREAMSYNC_USERDATA`.
     pub userdata_root: Option<PathBuf>,
+    /// Optional secret-store override (tests can inject shared in-memory state).
+    pub secret_store: Option<Arc<dyn SecretStore>>,
 }
 
 impl Default for OverlayConfig {
@@ -94,7 +105,26 @@ impl Default for OverlayConfig {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             userdata_root: None,
+            secret_store: None,
         }
+    }
+}
+
+impl std::fmt::Debug for OverlayConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OverlayConfig")
+            .field("port", &self.port)
+            .field("repo_root", &self.repo_root)
+            .field("readonly", &self.readonly)
+            .field("userdata_root", &self.userdata_root)
+            .field(
+                "secret_store",
+                &self
+                    .secret_store
+                    .as_ref()
+                    .map(|_| "<redacted secret store override>"),
+            )
+            .finish()
     }
 }
 
@@ -119,11 +149,19 @@ impl OverlayServer {
         } else {
             storage::get_paths()?
         };
+        let secret_store = self.config.secret_store.clone().unwrap_or_else(|| {
+            if let Some(root) = &self.config.userdata_root {
+                secret_store::fs_secret_store(root)
+            } else {
+                secret_store::runtime_secret_store()
+            }
+        });
         let state = AppState::new(
             paths,
             self.config.repo_root.clone(),
             self.config.port,
             self.config.readonly,
+            secret_store,
         )?;
         let twitch = Arc::new(twitch::TwitchServices::new());
         twitch.init_teardown_worker();

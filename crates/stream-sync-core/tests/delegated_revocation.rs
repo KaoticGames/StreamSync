@@ -17,11 +17,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use stream_sync_core::{
-    connection_key_events_url, disconnect_twitch, paths_for_root, remove_file_durable,
-    sync_live_identity, write_delegated_revoke_pending, write_delegated_revoked_tombstone,
-    write_json, AppState, DelegatedSessionFile, OverlayConfig, OverlayServer, TeardownPhase,
-    TwitchActiveMode, TwitchActiveModeFile, TwitchServices, MAX_DELEGATED_REVOCATION_DELAY,
-    SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,
+    connection_key_events_url, disconnect_twitch, fs_secret_store, paths_for_root,
+    remove_file_durable, sync_live_identity, write_delegated_revoke_pending,
+    write_delegated_revoked_tombstone, write_json, AppState, DelegatedSessionFile, OverlayConfig,
+    OverlayServer, TeardownPhase, TwitchActiveMode, TwitchActiveModeFile, TwitchServices,
+    MAX_DELEGATED_REVOCATION_DELAY, SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,
 };
 use tower::ServiceExt;
 
@@ -52,6 +52,7 @@ async fn build_app_at(
         repo_root: repo_root(),
         readonly: false,
         userdata_root: Some(userdata),
+        secret_store: None,
     };
     OverlayServer::new(config)
         .build_app()
@@ -65,7 +66,8 @@ async fn build_app(port: u16) -> (axum::Router, Arc<AppState>, Arc<TwitchService
 
 fn restart_app_at(userdata: &std::path::Path, readonly: bool) -> Arc<AppState> {
     let paths = paths_for_root(userdata, readonly).expect("paths_for_root");
-    AppState::new(paths, repo_root(), 0, readonly).expect("AppState::new")
+    AppState::new(paths, repo_root(), 0, readonly, fs_secret_store(userdata))
+        .expect("AppState::new")
 }
 
 fn sample_delegated_json() -> serde_json::Value {
@@ -1092,9 +1094,10 @@ fn streamelements_session_save_and_clear_do_not_leave_bak() {
         captured_at: Some("2026-01-02T00:00:00Z".into()),
     };
 
-    stream_sync_core::se_save_session(&paths, &session_a).expect("save a");
-    stream_sync_core::se_save_session(&paths, &session_b).expect("save b");
-    stream_sync_core::se_clear_session(&paths).expect("clear");
+    let store = fs_secret_store(&userdata);
+    stream_sync_core::se_save_session(&paths, store.as_ref(), &session_a).expect("save a");
+    stream_sync_core::se_save_session(&paths, store.as_ref(), &session_b).expect("save b");
+    stream_sync_core::se_clear_session(&paths, store.as_ref()).expect("clear");
 
     let primary = userdata.join("streamelements-session.json");
     let bak = userdata.join("streamelements-session.bak");

@@ -435,17 +435,19 @@ async fn api_status(State(ctx): State<ServerContext>) -> Json<Value> {
         active == crate::config_types::TwitchActiveMode::Delegated && delegated.is_some();
     let personal_saved = personal.access_token.is_some() && personal.login.is_some();
     let delegated_saved = delegated.is_some();
-    let se_connected = streamelements::load_session(&ctx.state.paths)
-        .ok()
-        .flatten()
-        .map(|s| {
-            json!({
-                "connected": true,
-                "accountId": s.account_id,
-                "username": s.username,
+    let se_store = ctx.state.secret_store();
+    let se_connected =
+        streamelements::load_session(&ctx.state.paths, se_store.as_ref(), ctx.state.readonly)
+            .ok()
+            .flatten()
+            .map(|s| {
+                json!({
+                    "connected": true,
+                    "accountId": s.account_id,
+                    "username": s.username,
+                })
             })
-        })
-        .unwrap_or_else(|| json!({ "connected": false }));
+            .unwrap_or_else(|| json!({ "connected": false }));
     let kick_tokens = ctx.state.kick.read().await.tokens.clone();
     let personal_kick = ctx.state.personal_kick.read().await.clone();
     let kick_via_takeover = takeover
@@ -1763,7 +1765,8 @@ struct SeImportBody {
 }
 
 async fn get_se_session(State(ctx): State<ServerContext>) -> Json<Value> {
-    match streamelements::load_session(&ctx.state.paths) {
+    let se_store = ctx.state.secret_store();
+    match streamelements::load_session(&ctx.state.paths, se_store.as_ref(), ctx.state.readonly) {
         Ok(Some(mut s)) => {
             let mut username = s.username.clone();
             let missing_name = username
@@ -1775,7 +1778,8 @@ async fn get_se_session(State(ctx): State<ServerContext>) -> Json<Value> {
                     username = streamelements::display_name_from_channel(&profile);
                     if username.is_some() {
                         s.username = username.clone();
-                        let _ = streamelements::save_session(&ctx.state.paths, &s);
+                        let _ =
+                            streamelements::save_session(&ctx.state.paths, se_store.as_ref(), &s);
                     }
                 }
             }
@@ -1838,7 +1842,8 @@ async fn post_se_session(
     if let Ok(profile) = streamelements::fetch_channel_profile(&session).await {
         session.username = streamelements::display_name_from_channel(&profile);
     }
-    streamelements::save_session(&ctx.state.paths, &session).map_err(|_| {
+    let se_store = ctx.state.secret_store();
+    streamelements::save_session(&ctx.state.paths, se_store.as_ref(), &session).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "ok": false, "error": "save_failed" })),
@@ -1859,28 +1864,32 @@ async fn delete_se_session(State(ctx): State<ServerContext>) -> Json<Value> {
     if ctx.state.readonly {
         return Json(json!({ "ok": false, "error": "readonly" }));
     }
-    let _ = streamelements::clear_session(&ctx.state.paths);
+    let se_store = ctx.state.secret_store();
+    let _ = streamelements::clear_session(&ctx.state.paths, se_store.as_ref());
     Json(json!({ "ok": true, "connected": false }))
 }
 
 async fn get_se_overlays(State(ctx): State<ServerContext>) -> Json<Value> {
-    let session = match streamelements::load_session(&ctx.state.paths) {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            return Json(json!({
-                "ok": false,
-                "error": "not_connected",
-                "overlays": [],
-            }));
-        }
-        Err(e) => {
-            return Json(json!({
-                "ok": false,
-                "error": e.to_string(),
-                "overlays": [],
-            }));
-        }
-    };
+    let se_store = ctx.state.secret_store();
+    let session =
+        match streamelements::load_session(&ctx.state.paths, se_store.as_ref(), ctx.state.readonly)
+        {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return Json(json!({
+                    "ok": false,
+                    "error": "not_connected",
+                    "overlays": [],
+                }));
+            }
+            Err(e) => {
+                return Json(json!({
+                    "ok": false,
+                    "error": e.to_string(),
+                    "overlays": [],
+                }));
+            }
+        };
     let client = match SeClient::from_session(&session).await {
         Ok(c) => c,
         Err(e) => {
@@ -1911,9 +1920,11 @@ async fn post_se_import(
     if body.overlay_ids.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let session = streamelements::load_session(&ctx.state.paths)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let se_store = ctx.state.secret_store();
+    let session =
+        streamelements::load_session(&ctx.state.paths, se_store.as_ref(), ctx.state.readonly)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::UNAUTHORIZED)?;
     let client = SeClient::from_session(&session)
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;

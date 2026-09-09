@@ -49,6 +49,7 @@ async fn test_app_mode(
         repo_root,
         readonly,
         userdata_root: Some(userdata),
+        secret_store: None,
     };
     let (router, state, _) = OverlayServer::new(config)
         .build_app()

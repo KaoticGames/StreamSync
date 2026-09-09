@@ -4814,6 +4814,7 @@ mod tests {
             repo_root,
             readonly: false,
             userdata_root: Some(userdata),
+            secret_store: None,
         };
         let (_router, state, services) = crate::OverlayServer::new(config)
             .build_app()
@@ -6188,7 +6189,14 @@ mod tests {
     fn restart_state_at(state: &AppState) -> Arc<AppState> {
         let paths =
             crate::storage::paths_for_root(&state.paths.root, false).expect("paths_for_root");
-        AppState::new(paths, state.repo_root.clone(), 0, false).expect("AppState::new")
+        AppState::new(
+            paths,
+            state.repo_root.clone(),
+            0,
+            false,
+            crate::fs_secret_store(&state.paths.root),
+        )
+        .expect("AppState::new")
     }
 
     async fn activate_delegated_gen1(state: &AppState, services: &TwitchServices) {

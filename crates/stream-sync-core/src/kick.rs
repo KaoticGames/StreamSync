@@ -1404,6 +1404,7 @@ mod tests {
             repo_root,
             readonly: false,
             userdata_root: Some(userdata),
+            secret_store: None,
         })
         .build_app()
         .await

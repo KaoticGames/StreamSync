@@ -18,6 +18,7 @@ async fn main() -> anyhow::Result<()> {
         repo_root: repo,
         readonly: true,
         userdata_root: None,
+        secret_store: None,
     };
 
     OverlayServer::new(config).run().await

@@ -1,6 +1,7 @@
 //! StreamElements overlay import (kappa v2 API + mapper).
 
 use crate::config_types::default_events_overlay_profile;
+use crate::secret_store::{SecretStore, STREAMELEMENTS_JWT_KEY};
 use crate::storage::{self, StoragePaths};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -108,6 +109,7 @@ fn value_as_f64(v: &Value) -> Option<f64> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SeSession {
+    #[serde(default)]
     pub jwt: String,
     #[serde(rename = "accountId")]
     pub account_id: String,
@@ -172,24 +174,87 @@ pub fn imports_dir(paths: &StoragePaths) -> PathBuf {
     paths.root.join("imports").join("streamelements")
 }
 
-pub fn load_session(paths: &StoragePaths) -> Result<Option<SeSession>> {
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SeSessionMetadataFile {
+    #[serde(rename = "accountId", default)]
+    account_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(
+        rename = "capturedAt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    captured_at: Option<String>,
+}
+
+impl From<&SeSession> for SeSessionMetadataFile {
+    fn from(session: &SeSession) -> Self {
+        Self {
+            account_id: session.account_id.clone(),
+            username: session.username.clone(),
+            captured_at: session.captured_at.clone(),
+        }
+    }
+}
+
+fn nonempty_secret(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn read_secret(store: &dyn SecretStore, key: &str) -> Result<Option<String>> {
+    let Some(bytes) = store.get(key)? else {
+        return Ok(None);
+    };
+    let decoded =
+        String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("secret store value is not utf-8"))?;
+    Ok(nonempty_secret(&decoded))
+}
+
+pub fn load_session(
+    paths: &StoragePaths,
+    store: &dyn SecretStore,
+    readonly: bool,
+) -> Result<Option<SeSession>> {
     let p = session_path(paths);
     if !p.is_file() {
         return Ok(None);
     }
-    let s: SeSession = storage::read_json_or_default(&p, &SeSession::default())?;
+    let mut s: SeSession = storage::read_json_or_default(&p, &SeSession::default())?;
+    let mut migrated = false;
+    if let Some(legacy) = nonempty_secret(&s.jwt) {
+        store.set(STREAMELEMENTS_JWT_KEY, legacy.as_bytes())?;
+        migrated = true;
+    }
+    if let Some(from_store) = read_secret(store, STREAMELEMENTS_JWT_KEY)? {
+        s.jwt = from_store;
+    }
+    if migrated && !readonly {
+        storage::write_json(&p, &SeSessionMetadataFile::from(&s))?;
+    }
     if s.jwt.trim().is_empty() || s.account_id.trim().is_empty() {
         return Ok(None);
     }
     Ok(Some(s))
 }
 
-pub fn save_session(paths: &StoragePaths, session: &SeSession) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(session)?;
+pub fn save_session(
+    paths: &StoragePaths,
+    store: &dyn SecretStore,
+    session: &SeSession,
+) -> Result<()> {
+    store.set(STREAMELEMENTS_JWT_KEY, session.jwt.as_bytes())?;
+    let bytes = serde_json::to_vec_pretty(&SeSessionMetadataFile::from(session))?;
     storage::write_secret_file(&session_path(paths), &bytes)
 }
 
-pub fn clear_session(paths: &StoragePaths) -> Result<()> {
+pub fn clear_session(paths: &StoragePaths, store: &dyn SecretStore) -> Result<()> {
+    store.delete(STREAMELEMENTS_JWT_KEY)?;
     let p = session_path(paths);
     storage::remove_file_durable(&p)?;
     storage::remove_file_durable(&p.with_extension("bak"))?;

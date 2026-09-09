@@ -642,10 +642,12 @@ pub fn committed_delegated_session_parse(
         .with_context(|| format!("read delegated session {}", delegated_path.display()))?;
     let session: crate::config_types::DelegatedSessionFile = serde_json::from_str(&raw)
         .with_context(|| format!("parse delegated session {}", delegated_path.display()))?;
-    if session.connection_key.is_empty() || session.access_token.is_empty() {
-        return Ok(None);
+    let has_inline_secrets = !session.connection_key.is_empty() && !session.access_token.is_empty();
+    let has_metadata = !session.channel_login.is_empty() && !session.channel_twitch_id.is_empty();
+    if has_inline_secrets || has_metadata {
+        return Ok(Some(session));
     }
-    Ok(Some(session))
+    Ok(None)
 }
 
 fn quarantine_delegated_primary_file(delegated_path: &Path) -> Result<()> {

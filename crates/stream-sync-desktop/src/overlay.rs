@@ -59,6 +59,7 @@ pub fn spawn_overlay_server(ui_assets_root: PathBuf, port: u16) {
             repo_root: ui_assets_root,
             readonly: false,
             userdata_root: None,
+            secret_store: None,
         };
         if let Err(e) = OverlayServer::new(config).run().await {
             tracing::error!("overlay server exited: {e:#}");
