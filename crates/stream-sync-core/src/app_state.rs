@@ -426,7 +426,8 @@ impl AppState {
         )?;
         // Always persist personal OAuth separately — never write takeover tokens here.
         let personal = self.personal_tokens.read().await;
-        storage::write_json(&self.paths.twitch_tokens, &*personal)?;
+        let bytes = serde_json::to_vec_pretty(&*personal)?;
+        storage::write_secret_file(&self.paths.twitch_tokens, &bytes)?;
         if self.identity_rollback_pending() {
             self.clear_identity_rollback_pending()?;
         }
@@ -440,7 +441,8 @@ impl AppState {
         self.durable_fail
             .fail(&self.durable_fail.save_kick_tokens, "save_kick_tokens")?;
         let personal = self.personal_kick.read().await;
-        storage::write_json(&self.paths.kick_tokens, &*personal)
+        let bytes = serde_json::to_vec_pretty(&*personal)?;
+        storage::write_secret_file(&self.paths.kick_tokens, &bytes)
     }
 
     pub async fn save_delegated(&self) -> anyhow::Result<()> {

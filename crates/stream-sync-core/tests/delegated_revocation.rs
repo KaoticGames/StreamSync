@@ -1007,6 +1007,103 @@ async fn mode_save_failure_rolls_back_personal_token_file() {
     assert_eq!(reloaded.login.as_deref(), Some("user_a"));
 }
 
+#[tokio::test]
+async fn personal_twitch_save_does_not_leave_bak() {
+    let (_router, state, _services) = build_app(0).await;
+    let personal_a = stream_sync_core::TwitchTokenFile {
+        access_token: Some("ssk_test_placeholder_twitch_access_a".into()),
+        refresh_token: Some("ssk_test_placeholder_twitch_refresh_a".into()),
+        expires_in: Some(3600),
+        obtainment_timestamp: Some(chrono::Utc::now().timestamp_millis()),
+        login: Some("ssk_test_placeholder_twitch_login".into()),
+        user_id: Some("0".into()),
+        scopes: None,
+    };
+    let personal_b = stream_sync_core::TwitchTokenFile {
+        access_token: Some("ssk_test_placeholder_twitch_access_b".into()),
+        refresh_token: Some("ssk_test_placeholder_twitch_refresh_b".into()),
+        expires_in: Some(3600),
+        obtainment_timestamp: Some(chrono::Utc::now().timestamp_millis()),
+        login: Some("ssk_test_placeholder_twitch_login".into()),
+        user_id: Some("0".into()),
+        scopes: None,
+    };
+    *state.personal_tokens.write().await = personal_a;
+    state.save_twitch_tokens().await.unwrap();
+    *state.personal_tokens.write().await = personal_b;
+    state.save_twitch_tokens().await.unwrap();
+
+    let bak = state.paths.twitch_tokens.with_extension("bak");
+    let legacy_json_bak = state.paths.twitch_tokens.with_extension("json.bak");
+    assert!(state.paths.twitch_tokens.is_file());
+    assert!(!bak.is_file());
+    assert!(!legacy_json_bak.is_file());
+}
+
+#[tokio::test]
+async fn personal_kick_save_does_not_leave_bak() {
+    let (_router, state, _services) = build_app(0).await;
+    let personal_a = stream_sync_core::KickTokenFile {
+        access_token: Some("ssk_test_placeholder_kick_access_a".into()),
+        refresh_token: Some("ssk_test_placeholder_kick_refresh_a".into()),
+        expires_at: Some("2099-01-01T00:00:00Z".into()),
+        kick_id: Some("0".into()),
+        login: Some("ssk_test_placeholder_kick_login".into()),
+        display_name: Some("ssk_test_placeholder_kick_display".into()),
+        scopes: None,
+        feed_ticket: None,
+    };
+    let personal_b = stream_sync_core::KickTokenFile {
+        access_token: Some("ssk_test_placeholder_kick_access_b".into()),
+        refresh_token: Some("ssk_test_placeholder_kick_refresh_b".into()),
+        expires_at: Some("2099-01-01T00:00:00Z".into()),
+        kick_id: Some("0".into()),
+        login: Some("ssk_test_placeholder_kick_login".into()),
+        display_name: Some("ssk_test_placeholder_kick_display".into()),
+        scopes: None,
+        feed_ticket: None,
+    };
+    *state.personal_kick.write().await = personal_a;
+    state.save_kick_tokens().await.unwrap();
+    *state.personal_kick.write().await = personal_b;
+    state.save_kick_tokens().await.unwrap();
+
+    let bak = state.paths.kick_tokens.with_extension("bak");
+    let legacy_json_bak = state.paths.kick_tokens.with_extension("json.bak");
+    assert!(state.paths.kick_tokens.is_file());
+    assert!(!bak.is_file());
+    assert!(!legacy_json_bak.is_file());
+}
+
+#[test]
+fn streamelements_session_save_and_clear_do_not_leave_bak() {
+    let userdata = test_userdata_dir();
+    let paths = paths_for_root(&userdata, false).expect("paths");
+    let session_a = stream_sync_core::SeSession {
+        jwt: "jwt-test-placeholder-a".into(),
+        account_id: "0".into(),
+        username: None,
+        captured_at: Some("2026-01-01T00:00:00Z".into()),
+    };
+    let session_b = stream_sync_core::SeSession {
+        jwt: "jwt-test-placeholder-b".into(),
+        account_id: "0".into(),
+        username: None,
+        captured_at: Some("2026-01-02T00:00:00Z".into()),
+    };
+
+    stream_sync_core::se_save_session(&paths, &session_a).expect("save a");
+    stream_sync_core::se_save_session(&paths, &session_b).expect("save b");
+    stream_sync_core::se_clear_session(&paths).expect("clear");
+
+    let primary = userdata.join("streamelements-session.json");
+    let bak = userdata.join("streamelements-session.bak");
+    let legacy_json_bak = userdata.join("streamelements-session.json.bak");
+    assert!(!primary.is_file());
+    assert!(!bak.is_file());
+    assert!(!legacy_json_bak.is_file());
+}
+
 #[test]
 fn acceptance_boundaries_document_manual_syndicate_integration() {
     // B6/B11: local two-instance tests are process-local service isolation, not multi-consumer

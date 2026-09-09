@@ -185,14 +185,15 @@ pub fn load_session(paths: &StoragePaths) -> Result<Option<SeSession>> {
 }
 
 pub fn save_session(paths: &StoragePaths, session: &SeSession) -> Result<()> {
-    storage::write_json(&session_path(paths), session)
+    let bytes = serde_json::to_vec_pretty(session)?;
+    storage::write_secret_file(&session_path(paths), &bytes)
 }
 
 pub fn clear_session(paths: &StoragePaths) -> Result<()> {
     let p = session_path(paths);
-    if p.is_file() {
-        let _ = std::fs::remove_file(p);
-    }
+    storage::remove_file_durable(&p)?;
+    storage::remove_file_durable(&p.with_extension("bak"))?;
+    storage::remove_file_durable(&p.with_extension("json.bak"))?;
     Ok(())
 }
 
