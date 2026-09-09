@@ -685,6 +685,10 @@ fn sweep_orphan_delegated_artifacts(delegated_path: &Path) -> Result<()> {
     if bak.is_file() {
         remove_file_durable(&bak)?;
     }
+    let legacy_json_bak = delegated_path.with_extension("json.bak");
+    if legacy_json_bak.is_file() {
+        remove_file_durable(&legacy_json_bak)?;
+    }
 
     let committing = delegated_committing_path(delegated_path);
     if committing.is_file() {
@@ -893,6 +897,7 @@ pub fn delegated_secret_variants(delegated_path: &Path) -> Result<Vec<PathBuf>> 
     let mut out = vec![
         delegated_path.to_path_buf(),
         delegated_path.with_extension("bak"),
+        delegated_path.with_extension("json.bak"),
         delegated_committing_path(delegated_path),
         delegated_replace_pending_path(delegated_path),
     ];

@@ -856,6 +856,8 @@ impl AppState {
             .fail(&self.durable_fail.backup_remove, "backup_remove")?;
         let bak = self.paths.twitch_delegated.with_extension("bak");
         storage::remove_file_durable(&bak)?;
+        let legacy_json_bak = self.paths.twitch_delegated.with_extension("json.bak");
+        storage::remove_file_durable(&legacy_json_bak)?;
         Ok(())
     }
 
@@ -900,6 +902,7 @@ impl AppState {
         for leftover in self.delegated_secret_variants()? {
             if leftover == self.paths.twitch_delegated
                 || leftover == self.paths.twitch_delegated.with_extension("bak")
+                || leftover == self.paths.twitch_delegated.with_extension("json.bak")
             {
                 continue;
             }
