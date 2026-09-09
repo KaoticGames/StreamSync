@@ -61,38 +61,38 @@
   <div class="card" style="margin-top: 16px;">
     <div class="card-header">
       <div>
-        <div class="card-title">Export backup</div>
+        <div class="card-title">Backup &amp; restore</div>
         <div class="card-subtitle">
-          Save your Stream Sync settings, overlays, fonts, event media, and imports as a single .zip file.
+          Move overlays, settings, fonts, event media, and imports between machines with a .zip file.
         </div>
       </div>
     </div>
 
     <div class="config-section">
       <p>
-        Use this before reinstalling Windows, moving to a new PC, or sharing a setup with another machine.
-        You choose where the backup is saved.
+        Export saves a backup you pick a location for. Restore opens a .zip and writes those files
+        into this Stream Sync install. Use this before reinstalling Windows or moving to a new PC.
       </p>
 
       <ul class="bullet-list">
         <li>Chat &amp; events overlay profiles</li>
         <li>Uploaded fonts and localized event media</li>
         <li>StreamElements import data</li>
-        <li>Optional recent logs</li>
+        <li>Optional recent logs (export only)</li>
       </ul>
 
       <div class="help-actions">
         <button type="button" class="btn btn-primary" id="btn-export-backup">
           Export backup (.zip)
         </button>
-        <button type="button" class="btn btn-secondary" id="btn-restore-backup">
+        <button type="button" class="btn btn-primary" id="btn-restore-backup">
           Restore backup (.zip)
         </button>
       </div>
 
       <p class="field-help">
-        Backups include overlays, settings, media, and imports only. Account credentials are not
-        exported, so reconnect your accounts after moving to a new machine.
+        Restore does not bring account logins with it. Reconnect Twitch, Kick, and StreamElements
+        after restoring. Takeover keys are never in the zip.
       </p>
     </div>
   </div>
