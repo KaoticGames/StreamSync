@@ -4042,6 +4042,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
@@ -4051,6 +4052,7 @@ dependencies = [
  "twitch-irc",
  "urlencoding",
  "uuid",
+ "windows-sys 0.59.0",
  "zip",
 ]
 

@@ -5,7 +5,14 @@ use crate::config_types::{
     DelegatedSessionFile, DockConfigFile, EventsDockConfig, EventsOverlayConfigFile, KickTokenFile,
     OverlayConfigFile, TwitchActiveMode, TwitchActiveModeFile, TwitchTokenFile,
 };
+use crate::secret_store::{
+    SecretStore, KICK_PERSONAL_ACCESS_KEY, KICK_PERSONAL_FEED_TICKET_KEY,
+    KICK_PERSONAL_REFRESH_KEY, TWITCH_DELEGATED_ACCESS_TOKEN_KEY, TWITCH_DELEGATED_CONNECTION_KEY,
+    TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY, TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY,
+    TWITCH_PERSONAL_ACCESS_KEY, TWITCH_PERSONAL_REFRESH_KEY,
+};
 use crate::storage::{self, StoragePaths};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +21,311 @@ use tokio::sync::RwLock;
 
 type DockControlSockets =
     HashMap<String, HashMap<uuid::Uuid, tokio::sync::mpsc::UnboundedSender<()>>>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TwitchTokenMetadataFile {
+    #[serde(rename = "expiresIn", default, skip_serializing_if = "Option::is_none")]
+    expires_in: Option<i64>,
+    #[serde(
+        rename = "obtainmentTimestamp",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    obtainment_timestamp: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    login: Option<String>,
+    #[serde(rename = "userId", default, skip_serializing_if = "Option::is_none")]
+    user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scopes: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct KickTokenMetadataFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kick_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    login: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scopes: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DelegatedSessionMetadataFile {
+    #[serde(default)]
+    generation: u64,
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    channel_login: String,
+    #[serde(default)]
+    channel_twitch_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    scopes: Vec<String>,
+    #[serde(default)]
+    twitch_expires_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    connection_expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kick_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kick_login: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kick_expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    kick_scopes: Vec<String>,
+}
+
+impl From<&TwitchTokenFile> for TwitchTokenMetadataFile {
+    fn from(tokens: &TwitchTokenFile) -> Self {
+        Self {
+            expires_in: tokens.expires_in,
+            obtainment_timestamp: tokens.obtainment_timestamp,
+            login: tokens.login.clone(),
+            user_id: tokens.user_id.clone(),
+            scopes: tokens.scopes.clone(),
+        }
+    }
+}
+
+impl From<&KickTokenFile> for KickTokenMetadataFile {
+    fn from(tokens: &KickTokenFile) -> Self {
+        Self {
+            expires_at: tokens.expires_at.clone(),
+            kick_id: tokens.kick_id.clone(),
+            login: tokens.login.clone(),
+            display_name: tokens.display_name.clone(),
+            scopes: tokens.scopes.clone(),
+        }
+    }
+}
+
+impl From<&DelegatedSessionFile> for DelegatedSessionMetadataFile {
+    fn from(session: &DelegatedSessionFile) -> Self {
+        Self {
+            generation: session.generation,
+            client_id: session.client_id.clone(),
+            channel_login: session.channel_login.clone(),
+            channel_twitch_id: session.channel_twitch_id.clone(),
+            display_name: session.display_name.clone(),
+            label: session.label.clone(),
+            scopes: session.scopes.clone(),
+            twitch_expires_at: session.twitch_expires_at.clone(),
+            connection_expires_at: session.connection_expires_at.clone(),
+            kick_id: session.kick_id.clone(),
+            kick_login: session.kick_login.clone(),
+            kick_expires_at: session.kick_expires_at.clone(),
+            kick_scopes: session.kick_scopes.clone(),
+        }
+    }
+}
+
+fn nonempty_owned(value: Option<String>) -> Option<String> {
+    value.and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn nonempty_ref(value: Option<&str>) -> Option<&str> {
+    value.and_then(|v| if v.trim().is_empty() { None } else { Some(v) })
+}
+
+fn write_secret_value(
+    store: &dyn SecretStore,
+    key: &str,
+    value: Option<&str>,
+) -> anyhow::Result<()> {
+    match nonempty_ref(value) {
+        Some(secret) => store.set(key, secret.as_bytes()),
+        None => store.delete(key),
+    }
+}
+
+fn read_secret_value(store: &dyn SecretStore, key: &str) -> anyhow::Result<Option<String>> {
+    let Some(bytes) = store.get(key)? else {
+        return Ok(None);
+    };
+    let decoded = String::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("secret store value for '{key}' is not valid UTF-8"))?;
+    Ok(nonempty_owned(Some(decoded)))
+}
+
+fn write_personal_twitch_metadata(
+    path: &std::path::Path,
+    tokens: &TwitchTokenFile,
+) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(&TwitchTokenMetadataFile::from(tokens))?;
+    storage::write_secret_file(path, &bytes)
+}
+
+fn write_personal_kick_metadata(
+    path: &std::path::Path,
+    tokens: &KickTokenFile,
+) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(&KickTokenMetadataFile::from(tokens))?;
+    storage::write_secret_file(path, &bytes)
+}
+
+fn write_delegated_metadata(
+    path: &std::path::Path,
+    session: &DelegatedSessionFile,
+) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(&DelegatedSessionMetadataFile::from(session))?;
+    storage::write_authority_bearing_secret(path, &bytes)
+}
+
+fn maybe_migrate_personal_twitch_secrets(
+    path: &std::path::Path,
+    readonly: bool,
+    store: &dyn SecretStore,
+    mut tokens: TwitchTokenFile,
+) -> anyhow::Result<TwitchTokenFile> {
+    let legacy_access = nonempty_owned(tokens.access_token.clone());
+    let legacy_refresh = nonempty_owned(tokens.refresh_token.clone());
+    let should_read_secret_store = legacy_access.is_some()
+        || legacy_refresh.is_some()
+        || tokens.login.as_ref().is_some_and(|v| !v.trim().is_empty())
+        || tokens
+            .user_id
+            .as_ref()
+            .is_some_and(|v| !v.trim().is_empty())
+        || tokens.expires_in.is_some()
+        || tokens.obtainment_timestamp.is_some()
+        || tokens.scopes.as_ref().is_some_and(|v| !v.is_empty());
+    let mut migrated = false;
+    if let Some(secret) = legacy_access.as_deref() {
+        write_secret_value(store, TWITCH_PERSONAL_ACCESS_KEY, Some(secret))?;
+        migrated = true;
+    }
+    if let Some(secret) = legacy_refresh.as_deref() {
+        write_secret_value(store, TWITCH_PERSONAL_REFRESH_KEY, Some(secret))?;
+        migrated = true;
+    }
+    if should_read_secret_store {
+        tokens.access_token = read_secret_value(store, TWITCH_PERSONAL_ACCESS_KEY)?;
+        tokens.refresh_token = read_secret_value(store, TWITCH_PERSONAL_REFRESH_KEY)?;
+    } else {
+        tokens.access_token = None;
+        tokens.refresh_token = None;
+    }
+    if migrated && !readonly {
+        write_personal_twitch_metadata(path, &tokens)?;
+    }
+    Ok(tokens)
+}
+
+fn maybe_migrate_personal_kick_secrets(
+    path: &std::path::Path,
+    readonly: bool,
+    store: &dyn SecretStore,
+    mut tokens: KickTokenFile,
+) -> anyhow::Result<KickTokenFile> {
+    let legacy_access = nonempty_owned(tokens.access_token.clone());
+    let legacy_refresh = nonempty_owned(tokens.refresh_token.clone());
+    let legacy_feed_ticket = nonempty_owned(tokens.feed_ticket.clone());
+    let should_read_secret_store = legacy_access.is_some()
+        || legacy_refresh.is_some()
+        || legacy_feed_ticket.is_some()
+        || tokens
+            .kick_id
+            .as_ref()
+            .is_some_and(|v| !v.trim().is_empty())
+        || tokens.login.as_ref().is_some_and(|v| !v.trim().is_empty())
+        || tokens
+            .expires_at
+            .as_ref()
+            .is_some_and(|v| !v.trim().is_empty())
+        || tokens.scopes.as_ref().is_some_and(|v| !v.is_empty());
+    let mut migrated = false;
+    if let Some(secret) = legacy_access.as_deref() {
+        write_secret_value(store, KICK_PERSONAL_ACCESS_KEY, Some(secret))?;
+        migrated = true;
+    }
+    if let Some(secret) = legacy_refresh.as_deref() {
+        write_secret_value(store, KICK_PERSONAL_REFRESH_KEY, Some(secret))?;
+        migrated = true;
+    }
+    if let Some(secret) = legacy_feed_ticket.as_deref() {
+        write_secret_value(store, KICK_PERSONAL_FEED_TICKET_KEY, Some(secret))?;
+        migrated = true;
+    }
+    if should_read_secret_store {
+        tokens.access_token = read_secret_value(store, KICK_PERSONAL_ACCESS_KEY)?;
+        tokens.refresh_token = read_secret_value(store, KICK_PERSONAL_REFRESH_KEY)?;
+        tokens.feed_ticket = read_secret_value(store, KICK_PERSONAL_FEED_TICKET_KEY)?;
+    } else {
+        tokens.access_token = None;
+        tokens.refresh_token = None;
+        tokens.feed_ticket = None;
+    }
+    if migrated && !readonly {
+        write_personal_kick_metadata(path, &tokens)?;
+    }
+    Ok(tokens)
+}
+
+fn maybe_migrate_delegated_secrets(
+    path: &std::path::Path,
+    readonly: bool,
+    store: &dyn SecretStore,
+    mut session: DelegatedSessionFile,
+) -> anyhow::Result<Option<DelegatedSessionFile>> {
+    let legacy_connection_key = nonempty_owned(Some(session.connection_key.clone()));
+    let legacy_access_token = nonempty_owned(Some(session.access_token.clone()));
+    let legacy_kick_access_token = nonempty_owned(session.kick_access_token.clone());
+    let legacy_kick_refresh_token = nonempty_owned(session.kick_refresh_token.clone());
+    let should_read_secret_store = session.generation > 0
+        || !session.channel_login.trim().is_empty()
+        || !session.channel_twitch_id.trim().is_empty()
+        || legacy_connection_key.is_some()
+        || legacy_access_token.is_some();
+    let mut migrated = false;
+    if let Some(secret) = legacy_connection_key.as_deref() {
+        write_secret_value(store, TWITCH_DELEGATED_CONNECTION_KEY, Some(secret))?;
+        migrated = true;
+    }
+    if let Some(secret) = legacy_access_token.as_deref() {
+        write_secret_value(store, TWITCH_DELEGATED_ACCESS_TOKEN_KEY, Some(secret))?;
+        migrated = true;
+    }
+    if let Some(secret) = legacy_kick_access_token.as_deref() {
+        write_secret_value(store, TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY, Some(secret))?;
+        migrated = true;
+    }
+    if let Some(secret) = legacy_kick_refresh_token.as_deref() {
+        write_secret_value(store, TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY, Some(secret))?;
+        migrated = true;
+    }
+    if !should_read_secret_store {
+        return Ok(None);
+    }
+    session.connection_key =
+        read_secret_value(store, TWITCH_DELEGATED_CONNECTION_KEY)?.unwrap_or_default();
+    session.access_token =
+        read_secret_value(store, TWITCH_DELEGATED_ACCESS_TOKEN_KEY)?.unwrap_or_default();
+    session.kick_access_token = read_secret_value(store, TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY)?;
+    session.kick_refresh_token = read_secret_value(store, TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY)?;
+    if session.connection_key.is_empty() || session.access_token.is_empty() {
+        return Ok(None);
+    }
+    if migrated && !readonly {
+        write_delegated_metadata(path, &session)?;
+    }
+    Ok(Some(session))
+}
 
 #[derive(Clone, Default)]
 pub struct DockControlRegistry {
@@ -127,6 +439,7 @@ pub struct AppState {
     pub overlay_server_dir: PathBuf,
     pub port: u16,
     pub readonly: bool,
+    secret_store: Arc<dyn SecretStore>,
     /// Bundled / env Twitch Client-ID (local OAuth).
     pub client_id: String,
     pub redirect_uri: String,
@@ -167,6 +480,7 @@ impl AppState {
         repo_root: PathBuf,
         port: u16,
         readonly: bool,
+        secret_store: Arc<dyn SecretStore>,
     ) -> anyhow::Result<Arc<Self>> {
         let rust_root = storage::rust_workspace_root();
         storage::load_streamsync_dotenv(&paths.root, &rust_root);
@@ -226,8 +540,12 @@ impl AppState {
             readonly,
         )?;
 
-        let personal =
-            read_json_for_mode(&paths.twitch_tokens, &TwitchTokenFile::default(), readonly)?;
+        let personal = maybe_migrate_personal_twitch_secrets(
+            &paths.twitch_tokens,
+            readonly,
+            secret_store.as_ref(),
+            read_json_for_mode(&paths.twitch_tokens, &TwitchTokenFile::default(), readonly)?,
+        )?;
         let identity_rollback_pending = paths.twitch_tokens_rollback_pending.is_file();
         let revoked_tombstone = paths.twitch_delegated_revoked.is_file();
         let revoke_pending = paths.twitch_delegated_revoke_pending.is_file();
@@ -266,9 +584,16 @@ impl AppState {
                 None
             }
         } else if paths.twitch_delegated.is_file() {
-            storage::committed_delegated_session_parse(&paths.twitch_delegated)
-                .ok()
-                .flatten()
+            let session = storage::committed_delegated_session_parse(&paths.twitch_delegated)?;
+            match session {
+                Some(session) => maybe_migrate_delegated_secrets(
+                    &paths.twitch_delegated,
+                    readonly,
+                    secret_store.as_ref(),
+                    session,
+                )?,
+                None => None,
+            }
         } else {
             None
         };
@@ -325,8 +650,12 @@ impl AppState {
             }
         };
 
-        let personal_kick =
-            read_json_for_mode(&paths.kick_tokens, &KickTokenFile::default(), readonly)?;
+        let personal_kick = maybe_migrate_personal_kick_secrets(
+            &paths.kick_tokens,
+            readonly,
+            secret_store.as_ref(),
+            read_json_for_mode(&paths.kick_tokens, &KickTokenFile::default(), readonly)?,
+        )?;
         let live_kick = if identity_rollback_pending {
             KickTokenFile::default()
         } else {
@@ -349,6 +678,7 @@ impl AppState {
             overlay_server_dir,
             port,
             readonly,
+            secret_store,
             client_id,
             redirect_uri,
             dock_config: RwLock::new(dock),
@@ -391,6 +721,10 @@ impl AppState {
         &self.control_token
     }
 
+    pub fn secret_store(&self) -> Arc<dyn SecretStore> {
+        self.secret_store.clone()
+    }
+
     pub async fn save_dock(&self) -> anyhow::Result<()> {
         if self.readonly {
             return Ok(());
@@ -425,8 +759,18 @@ impl AppState {
             "save_personal_tokens",
         )?;
         // Always persist personal OAuth separately — never write takeover tokens here.
-        let personal = self.personal_tokens.read().await;
-        storage::write_json(&self.paths.twitch_tokens, &*personal)?;
+        let personal = self.personal_tokens.read().await.clone();
+        write_secret_value(
+            self.secret_store.as_ref(),
+            TWITCH_PERSONAL_ACCESS_KEY,
+            personal.access_token.as_deref(),
+        )?;
+        write_secret_value(
+            self.secret_store.as_ref(),
+            TWITCH_PERSONAL_REFRESH_KEY,
+            personal.refresh_token.as_deref(),
+        )?;
+        write_personal_twitch_metadata(&self.paths.twitch_tokens, &personal)?;
         if self.identity_rollback_pending() {
             self.clear_identity_rollback_pending()?;
         }
@@ -439,8 +783,23 @@ impl AppState {
         }
         self.durable_fail
             .fail(&self.durable_fail.save_kick_tokens, "save_kick_tokens")?;
-        let personal = self.personal_kick.read().await;
-        storage::write_json(&self.paths.kick_tokens, &*personal)
+        let personal = self.personal_kick.read().await.clone();
+        write_secret_value(
+            self.secret_store.as_ref(),
+            KICK_PERSONAL_ACCESS_KEY,
+            personal.access_token.as_deref(),
+        )?;
+        write_secret_value(
+            self.secret_store.as_ref(),
+            KICK_PERSONAL_REFRESH_KEY,
+            personal.refresh_token.as_deref(),
+        )?;
+        write_secret_value(
+            self.secret_store.as_ref(),
+            KICK_PERSONAL_FEED_TICKET_KEY,
+            personal.feed_ticket.as_deref(),
+        )?;
+        write_personal_kick_metadata(&self.paths.kick_tokens, &personal)
     }
 
     pub async fn save_delegated(&self) -> anyhow::Result<()> {
@@ -461,7 +820,27 @@ impl AppState {
         }
         self.durable_fail
             .fail(&self.durable_fail.save_session, "save_session")?;
-        let bytes = serde_json::to_vec_pretty(sess)?;
+        write_secret_value(
+            self.secret_store.as_ref(),
+            TWITCH_DELEGATED_CONNECTION_KEY,
+            Some(&sess.connection_key),
+        )?;
+        write_secret_value(
+            self.secret_store.as_ref(),
+            TWITCH_DELEGATED_ACCESS_TOKEN_KEY,
+            Some(&sess.access_token),
+        )?;
+        write_secret_value(
+            self.secret_store.as_ref(),
+            TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY,
+            sess.kick_access_token.as_deref(),
+        )?;
+        write_secret_value(
+            self.secret_store.as_ref(),
+            TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY,
+            sess.kick_refresh_token.as_deref(),
+        )?;
+        let bytes = serde_json::to_vec_pretty(&DelegatedSessionMetadataFile::from(sess))?;
         // Legacy `.bak` removal and atomic commit are one transaction (B5/B10).
         self.remove_delegated_backup()?;
         storage::write_authority_bearing_secret(&self.paths.twitch_delegated, &bytes)?;
@@ -477,6 +856,8 @@ impl AppState {
             .fail(&self.durable_fail.backup_remove, "backup_remove")?;
         let bak = self.paths.twitch_delegated.with_extension("bak");
         storage::remove_file_durable(&bak)?;
+        let legacy_json_bak = self.paths.twitch_delegated.with_extension("json.bak");
+        storage::remove_file_durable(&legacy_json_bak)?;
         Ok(())
     }
 
@@ -521,6 +902,7 @@ impl AppState {
         for leftover in self.delegated_secret_variants()? {
             if leftover == self.paths.twitch_delegated
                 || leftover == self.paths.twitch_delegated.with_extension("bak")
+                || leftover == self.paths.twitch_delegated.with_extension("json.bak")
             {
                 continue;
             }
@@ -528,6 +910,13 @@ impl AppState {
                 storage::remove_file_durable(&leftover)?;
             }
         }
+        self.secret_store.delete(TWITCH_DELEGATED_CONNECTION_KEY)?;
+        self.secret_store
+            .delete(TWITCH_DELEGATED_ACCESS_TOKEN_KEY)?;
+        self.secret_store
+            .delete(TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY)?;
+        self.secret_store
+            .delete(TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY)?;
         self.durable_fail
             .fail(&self.durable_fail.parent_sync, "parent_sync")?;
         storage::sync_parent_dir(&self.paths.twitch_delegated)?;
@@ -833,7 +1222,14 @@ mod tests {
         let before = list_tree(&dir);
         let repo = storage::resolve_ui_assets_root();
         let paths = storage::paths_for_root(&dir, true).unwrap();
-        let _state = AppState::new(paths, repo, 14201, true).expect("readonly app state");
+        let _state = AppState::new(
+            paths,
+            repo,
+            14201,
+            true,
+            crate::secret_store::memory_secret_store(),
+        )
+        .expect("readonly app state");
         let after = list_tree(&dir);
         assert_eq!(
             before, after,
@@ -853,7 +1249,13 @@ mod tests {
         assert!(!dir.exists());
         let repo = storage::resolve_ui_assets_root();
         let paths = storage::paths_for_root(&dir, true).unwrap();
-        let built = AppState::new(paths, repo, 14202, true);
+        let built = AppState::new(
+            paths,
+            repo,
+            14202,
+            true,
+            crate::secret_store::memory_secret_store(),
+        );
         assert!(
             !dir.exists(),
             "readonly must not create absent userdata root"
@@ -890,7 +1292,14 @@ mod tests {
 
         let repo = storage::resolve_ui_assets_root();
         let paths = storage::paths_for_root(&dir, true).unwrap();
-        let state = AppState::new(paths, repo, 14203, true).expect("readonly with tombstone");
+        let state = AppState::new(
+            paths,
+            repo,
+            14203,
+            true,
+            crate::secret_store::memory_secret_store(),
+        )
+        .expect("readonly with tombstone");
 
         let after_names = list_tree(&dir);
         assert_eq!(before_names, after_names);

@@ -11,16 +11,19 @@
 //! multi-consumer Syndicate revoke, real network partition, or restart-after-remote-revoke without
 //! mocks). That remains manual/CI Syndicate integration evidence.
 
+use axum::body::Body;
+use axum::http::{header, Method, Request, StatusCode};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use stream_sync_core::{
-    connection_key_events_url, disconnect_twitch, paths_for_root, remove_file_durable,
-    sync_live_identity, write_delegated_revoke_pending, write_delegated_revoked_tombstone,
-    write_json, AppState, DelegatedSessionFile, OverlayConfig, OverlayServer, TeardownPhase,
-    TwitchActiveMode, TwitchActiveModeFile, TwitchServices, MAX_DELEGATED_REVOCATION_DELAY,
-    SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,
+    connection_key_events_url, disconnect_twitch, fs_secret_store, paths_for_root,
+    remove_file_durable, sync_live_identity, write_delegated_revoke_pending,
+    write_delegated_revoked_tombstone, write_json, AppState, DelegatedSessionFile, OverlayConfig,
+    OverlayServer, TeardownPhase, TwitchActiveMode, TwitchActiveModeFile, TwitchServices,
+    MAX_DELEGATED_REVOCATION_DELAY, SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,
 };
+use tower::ServiceExt;
 
 static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -49,6 +52,7 @@ async fn build_app_at(
         repo_root: repo_root(),
         readonly: false,
         userdata_root: Some(userdata),
+        secret_store: None,
     };
     OverlayServer::new(config)
         .build_app()
@@ -62,7 +66,8 @@ async fn build_app(port: u16) -> (axum::Router, Arc<AppState>, Arc<TwitchService
 
 fn restart_app_at(userdata: &std::path::Path, readonly: bool) -> Arc<AppState> {
     let paths = paths_for_root(userdata, readonly).expect("paths_for_root");
-    AppState::new(paths, repo_root(), 0, readonly).expect("AppState::new")
+    AppState::new(paths, repo_root(), 0, readonly, fs_secret_store(userdata))
+        .expect("AppState::new")
 }
 
 fn sample_delegated_json() -> serde_json::Value {
@@ -715,6 +720,91 @@ async fn durable_revoke_removes_delegated_bak_backup() {
 }
 
 #[tokio::test]
+async fn delegated_remove_connection_cleans_primary_and_legacy_bak() {
+    let (router, state, _services) = build_app(0).await;
+    let session = sample_session(1, "ssk_test_placeholder_remove_connection");
+    state.persist_delegated_session(&session).unwrap();
+
+    let bak = state.paths.twitch_delegated.with_extension("bak");
+    let legacy_json_bak = state.paths.twitch_delegated.with_extension("json.bak");
+    std::fs::write(
+        &bak,
+        b"{\"connection_key\":\"ssk_test_placeholder_remove_connection_bak\"}",
+    )
+    .unwrap();
+    std::fs::write(
+        &legacy_json_bak,
+        b"{\"connection_key\":\"ssk_test_placeholder_remove_connection_json_bak\"}",
+    )
+    .unwrap();
+
+    let origin = format!("http://127.0.0.1:{}", state.port);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/twitch/remove-connection")
+        .header(header::ORIGIN, origin)
+        .header(
+            stream_sync_core::CONTROL_TOKEN_HEADER,
+            state.control_token(),
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"mode":"delegated"}"#))
+        .unwrap();
+    let response = router.clone().oneshot(req).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert!(!state.paths.twitch_delegated.is_file());
+    assert!(!bak.is_file());
+    assert!(!legacy_json_bak.is_file());
+    assert!(state.paths.twitch_delegated_revoked.is_file());
+    assert!(!state.delegated_secret_files_remain().unwrap());
+}
+
+#[tokio::test]
+async fn delegated_revoke_cleans_inventoried_secret_variants_end_to_end() {
+    let (_router, state, _services) = build_app(0).await;
+    let session = sample_session(1, "ssk_test_placeholder_inventory_cleanup");
+    state.persist_delegated_session(&session).unwrap();
+
+    let committing = stream_sync_core::delegated_committing_path(&state.paths.twitch_delegated);
+    let replace_pending =
+        stream_sync_core::delegated_replace_pending_path(&state.paths.twitch_delegated);
+    let legacy_json_bak = state.paths.twitch_delegated.with_extension("json.bak");
+    let tmp = state
+        .paths
+        .twitch_delegated
+        .with_file_name(format!("twitch-delegated.tmp-{}-pass1", std::process::id()));
+    std::fs::write(
+        &committing,
+        b"{\"connection_key\":\"ssk_test_placeholder_inventory_committing\"}",
+    )
+    .unwrap();
+    std::fs::write(
+        &replace_pending,
+        br#"{"reason":"ssk_test_placeholder_inventory_replace_pending"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &tmp,
+        b"{\"connection_key\":\"ssk_test_placeholder_inventory_tmp\"}",
+    )
+    .unwrap();
+    std::fs::write(
+        &legacy_json_bak,
+        b"{\"connection_key\":\"ssk_test_placeholder_inventory_json_bak\"}",
+    )
+    .unwrap();
+
+    state.durable_revoke_delegated().await.unwrap();
+
+    assert!(!committing.is_file());
+    assert!(!replace_pending.is_file());
+    assert!(!tmp.is_file());
+    assert!(!legacy_json_bak.is_file());
+    assert!(!state.delegated_secret_files_remain().unwrap());
+}
+
+#[tokio::test]
 async fn startup_resumes_pending_revoke_cleanup_at_generation_zero() {
     let userdata = test_userdata_dir();
     write_json(
@@ -917,6 +1007,104 @@ async fn mode_save_failure_rolls_back_personal_token_file() {
         serde_json::from_str(&std::fs::read_to_string(&restarted.paths.twitch_tokens).unwrap())
             .unwrap();
     assert_eq!(reloaded.login.as_deref(), Some("user_a"));
+}
+
+#[tokio::test]
+async fn personal_twitch_save_does_not_leave_bak() {
+    let (_router, state, _services) = build_app(0).await;
+    let personal_a = stream_sync_core::TwitchTokenFile {
+        access_token: Some("ssk_test_placeholder_twitch_access_a".into()),
+        refresh_token: Some("ssk_test_placeholder_twitch_refresh_a".into()),
+        expires_in: Some(3600),
+        obtainment_timestamp: Some(chrono::Utc::now().timestamp_millis()),
+        login: Some("ssk_test_placeholder_twitch_login".into()),
+        user_id: Some("0".into()),
+        scopes: None,
+    };
+    let personal_b = stream_sync_core::TwitchTokenFile {
+        access_token: Some("ssk_test_placeholder_twitch_access_b".into()),
+        refresh_token: Some("ssk_test_placeholder_twitch_refresh_b".into()),
+        expires_in: Some(3600),
+        obtainment_timestamp: Some(chrono::Utc::now().timestamp_millis()),
+        login: Some("ssk_test_placeholder_twitch_login".into()),
+        user_id: Some("0".into()),
+        scopes: None,
+    };
+    *state.personal_tokens.write().await = personal_a;
+    state.save_twitch_tokens().await.unwrap();
+    *state.personal_tokens.write().await = personal_b;
+    state.save_twitch_tokens().await.unwrap();
+
+    let bak = state.paths.twitch_tokens.with_extension("bak");
+    let legacy_json_bak = state.paths.twitch_tokens.with_extension("json.bak");
+    assert!(state.paths.twitch_tokens.is_file());
+    assert!(!bak.is_file());
+    assert!(!legacy_json_bak.is_file());
+}
+
+#[tokio::test]
+async fn personal_kick_save_does_not_leave_bak() {
+    let (_router, state, _services) = build_app(0).await;
+    let personal_a = stream_sync_core::KickTokenFile {
+        access_token: Some("ssk_test_placeholder_kick_access_a".into()),
+        refresh_token: Some("ssk_test_placeholder_kick_refresh_a".into()),
+        expires_at: Some("2099-01-01T00:00:00Z".into()),
+        kick_id: Some("0".into()),
+        login: Some("ssk_test_placeholder_kick_login".into()),
+        display_name: Some("ssk_test_placeholder_kick_display".into()),
+        scopes: None,
+        feed_ticket: None,
+    };
+    let personal_b = stream_sync_core::KickTokenFile {
+        access_token: Some("ssk_test_placeholder_kick_access_b".into()),
+        refresh_token: Some("ssk_test_placeholder_kick_refresh_b".into()),
+        expires_at: Some("2099-01-01T00:00:00Z".into()),
+        kick_id: Some("0".into()),
+        login: Some("ssk_test_placeholder_kick_login".into()),
+        display_name: Some("ssk_test_placeholder_kick_display".into()),
+        scopes: None,
+        feed_ticket: None,
+    };
+    *state.personal_kick.write().await = personal_a;
+    state.save_kick_tokens().await.unwrap();
+    *state.personal_kick.write().await = personal_b;
+    state.save_kick_tokens().await.unwrap();
+
+    let bak = state.paths.kick_tokens.with_extension("bak");
+    let legacy_json_bak = state.paths.kick_tokens.with_extension("json.bak");
+    assert!(state.paths.kick_tokens.is_file());
+    assert!(!bak.is_file());
+    assert!(!legacy_json_bak.is_file());
+}
+
+#[test]
+fn streamelements_session_save_and_clear_do_not_leave_bak() {
+    let userdata = test_userdata_dir();
+    let paths = paths_for_root(&userdata, false).expect("paths");
+    let session_a = stream_sync_core::SeSession {
+        jwt: "jwt-test-placeholder-a".into(),
+        account_id: "0".into(),
+        username: None,
+        captured_at: Some("2026-01-01T00:00:00Z".into()),
+    };
+    let session_b = stream_sync_core::SeSession {
+        jwt: "jwt-test-placeholder-b".into(),
+        account_id: "0".into(),
+        username: None,
+        captured_at: Some("2026-01-02T00:00:00Z".into()),
+    };
+
+    let store = fs_secret_store(&userdata);
+    stream_sync_core::se_save_session(&paths, store.as_ref(), &session_a).expect("save a");
+    stream_sync_core::se_save_session(&paths, store.as_ref(), &session_b).expect("save b");
+    stream_sync_core::se_clear_session(&paths, store.as_ref()).expect("clear");
+
+    let primary = userdata.join("streamelements-session.json");
+    let bak = userdata.join("streamelements-session.bak");
+    let legacy_json_bak = userdata.join("streamelements-session.json.bak");
+    assert!(!primary.is_file());
+    assert!(!bak.is_file());
+    assert!(!legacy_json_bak.is_file());
 }
 
 #[test]

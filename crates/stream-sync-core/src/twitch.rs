@@ -710,9 +710,10 @@ async fn select_helix_credentials(state: &AppState) -> Result<PlatformCredential
 }
 
 pub async fn validate_token(access_token: &str) -> Result<Value> {
+    let oauth_base = twitch_oauth_base_url();
     let client = reqwest::Client::new();
     let res = client
-        .get("https://id.twitch.tv/oauth2/validate")
+        .get(format!("{oauth_base}/oauth2/validate"))
         .header("Authorization", format!("OAuth {access_token}"))
         .send()
         .await?;
@@ -722,6 +723,230 @@ pub async fn validate_token(access_token: &str) -> Result<Value> {
         return Err(anyhow!("Twitch validate failed: {} {}", status, text));
     }
     Ok(res.json().await?)
+}
+
+fn required_trimmed_validate_field<'a>(validated: &'a Value, key: &str) -> Result<&'a str> {
+    validated
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow!("Twitch validate payload missing {key}"))
+}
+
+fn constant_time_eq_str(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let max_len = a_bytes.len().max(b_bytes.len());
+    let mut diff = a_bytes.len() ^ b_bytes.len();
+    for idx in 0..max_len {
+        let av = *a_bytes.get(idx).unwrap_or(&0);
+        let bv = *b_bytes.get(idx).unwrap_or(&0);
+        diff |= usize::from(av ^ bv);
+    }
+    diff == 0
+}
+
+fn scopes_from_validate_payload(validated: &Value) -> Option<Vec<String>> {
+    let from_scopes = validated
+        .get("scopes")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::trim))
+                .filter(|scope| !scope.is_empty())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        });
+    let from_scope = validated
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .map(|value| {
+            value
+                .split_whitespace()
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        });
+    from_scopes
+        .or(from_scope)
+        .filter(|scopes| !scopes.is_empty())
+}
+
+fn personal_tokens_from_validate(
+    configured_client_id: &str,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    validated: &Value,
+) -> Result<TwitchTokenFile> {
+    let expected_client_id = configured_client_id.trim();
+    let validated_client_id = required_trimmed_validate_field(validated, "client_id")?;
+    if !constant_time_eq_str(expected_client_id, validated_client_id) {
+        return Err(anyhow!(
+            "Twitch validate client_id mismatch (configured={}, validate={})",
+            expected_client_id,
+            validated_client_id
+        ));
+    }
+    let login = required_trimmed_validate_field(validated, "login")?.to_string();
+    let user_id = required_trimmed_validate_field(validated, "user_id")?.to_string();
+    Ok(TwitchTokenFile {
+        access_token: Some(access_token.to_string()),
+        refresh_token: refresh_token
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(String::from),
+        expires_in: validated.get("expires_in").and_then(|v| v.as_i64()),
+        obtainment_timestamp: Some(chrono::Utc::now().timestamp_millis()),
+        login: Some(login),
+        user_id: Some(user_id),
+        scopes: scopes_from_validate_payload(validated),
+    })
+}
+
+fn twitch_oauth_base_url() -> String {
+    std::env::var("STREAMSYNC_TWITCH_OAUTH_BASE")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://id.twitch.tv".to_string())
+}
+
+#[derive(Debug, Clone)]
+pub struct TwitchCodeExchange {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_in: Option<i64>,
+    pub scopes: Option<Vec<String>>,
+    pub token_type: Option<String>,
+}
+
+pub async fn exchange_authorization_code(
+    state: &AppState,
+    code: &str,
+    code_verifier: &str,
+) -> Result<TwitchCodeExchange> {
+    if state.client_id.trim().is_empty() {
+        return Err(anyhow!("TWITCH_CLIENT_ID missing"));
+    }
+    let code = code.trim();
+    if code.is_empty() {
+        return Err(anyhow!("missing authorization code"));
+    }
+    let code_verifier = code_verifier.trim();
+    if code_verifier.is_empty() {
+        return Err(anyhow!("missing code verifier"));
+    }
+
+    let mut form = vec![
+        ("client_id", state.client_id.clone()),
+        ("grant_type", "authorization_code".to_string()),
+        ("code", code.to_string()),
+        ("redirect_uri", state.redirect_uri.clone()),
+        ("code_verifier", code_verifier.to_string()),
+    ];
+    if let Ok(secret) = std::env::var("TWITCH_CLIENT_SECRET") {
+        let secret = secret.trim();
+        if !secret.is_empty() {
+            form.push(("client_secret", secret.to_string()));
+        }
+    }
+
+    let oauth_base = twitch_oauth_base_url();
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("{oauth_base}/oauth2/token"))
+        .form(&form)
+        .send()
+        .await?;
+    let status = res.status();
+    let payload: Value = res.json().await?;
+    if !status.is_success() {
+        return Err(anyhow!(
+            "Twitch code exchange failed: {} {}",
+            status,
+            payload
+        ));
+    }
+    let access_token = payload
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow!("missing access_token in Twitch code exchange"))?
+        .to_string();
+    let refresh_token = payload
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(String::from);
+    let expires_in = payload.get("expires_in").and_then(|v| v.as_i64());
+    let scopes = payload
+        .get("scope")
+        .and_then(|v| v.as_array().cloned())
+        .map(|items| {
+            items
+                .into_iter()
+                .filter_map(|item| item.as_str().map(str::trim).map(String::from))
+                .filter(|scope| !scope.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|scopes| !scopes.is_empty())
+        .or_else(|| {
+            payload
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .map(|value| {
+                    value
+                        .split_whitespace()
+                        .map(str::trim)
+                        .filter(|scope| !scope.is_empty())
+                        .map(String::from)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|scopes| !scopes.is_empty())
+        });
+    let token_type = payload
+        .get("token_type")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(String::from);
+    Ok(TwitchCodeExchange {
+        access_token,
+        refresh_token,
+        expires_in,
+        scopes,
+        token_type,
+    })
+}
+
+pub async fn redeem_oauth_code(
+    state: Arc<AppState>,
+    services: Arc<TwitchServices>,
+    code: &str,
+    code_verifier: &str,
+) -> Result<()> {
+    let exchange = exchange_authorization_code(&state, code, code_verifier).await?;
+    let mut body = json!({
+        "accessToken": exchange.access_token,
+    });
+    if let Some(refresh) = exchange.refresh_token {
+        body["refreshToken"] = json!(refresh);
+    }
+    if let Some(expires_in) = exchange.expires_in {
+        body["expiresIn"] = json!(expires_in);
+    }
+    if let Some(scopes) = exchange.scopes {
+        body["scope"] = json!(scopes);
+    }
+    if let Some(token_type) = exchange.token_type {
+        body["tokenType"] = json!(token_type);
+    }
+    apply_set_token(state, services, body).await
 }
 
 pub async fn helix_get(state: &AppState, path: &str) -> Result<Value> {
@@ -1161,28 +1386,15 @@ pub async fn apply_set_token(
         .ok_or_else(|| anyhow!("missing accessToken"))?;
     let validated = validate_token(access_token).await?;
     services.ensure_apply_intent_current(intent)?;
-    let login = validated
-        .get("login")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let user_id = validated
-        .get("user_id")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let expires_in = validated.get("expires_in").and_then(|v| v.as_i64());
-    let tokens = TwitchTokenFile {
-        access_token: Some(access_token.to_string()),
-        refresh_token: None,
-        expires_in,
-        obtainment_timestamp: Some(chrono::Utc::now().timestamp_millis()),
-        login: login.clone(),
-        user_id: user_id.clone(),
-        scopes: body.get("scope").and_then(|v| v.as_array()).map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect()
-        }),
-    };
+    let mut tokens = personal_tokens_from_validate(
+        &state.client_id,
+        access_token,
+        body.get("refreshToken").and_then(|v| v.as_str()),
+        &validated,
+    )?;
+    if tokens.expires_in.is_none() {
+        tokens.expires_in = body.get("expiresIn").and_then(|v| v.as_i64());
+    }
     // Durable commit before live publish; restore personal token file if mode commit fails (B2).
     let (previous_mode, previous_delegated_generation, local_gen) = {
         let _lifecycle = services.lifecycle_lock.lock().await;
@@ -4493,6 +4705,178 @@ mod tests {
     use super::*;
     use twitch_irc::message::{Badge, Emote};
 
+    struct TwitchValidateEnvGuard {
+        twitch_client_id: Option<String>,
+        twitch_oauth_base: Option<String>,
+    }
+
+    impl TwitchValidateEnvGuard {
+        fn install(client_id: &str, oauth_base: &str) -> Self {
+            let twitch_client_id = std::env::var("TWITCH_CLIENT_ID").ok();
+            let twitch_oauth_base = std::env::var("STREAMSYNC_TWITCH_OAUTH_BASE").ok();
+            std::env::set_var("TWITCH_CLIENT_ID", client_id);
+            std::env::set_var("STREAMSYNC_TWITCH_OAUTH_BASE", oauth_base);
+            Self {
+                twitch_client_id,
+                twitch_oauth_base,
+            }
+        }
+    }
+
+    impl Drop for TwitchValidateEnvGuard {
+        fn drop(&mut self) {
+            match self.twitch_client_id.take() {
+                Some(v) => std::env::set_var("TWITCH_CLIENT_ID", v),
+                None => std::env::remove_var("TWITCH_CLIENT_ID"),
+            }
+            match self.twitch_oauth_base.take() {
+                Some(v) => std::env::set_var("STREAMSYNC_TWITCH_OAUTH_BASE", v),
+                None => std::env::remove_var("STREAMSYNC_TWITCH_OAUTH_BASE"),
+            }
+        }
+    }
+
+    async fn spawn_mock_twitch_validate_server(
+        validated: Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let payload = validated.to_string();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    let n = socket.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), server)
+    }
+
+    #[tokio::test]
+    async fn twitch_scope_and_identity_validation_uses_validate_scopes_not_callback() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let validated = json!({
+            "client_id": "app-a",
+            "login": "validate_login",
+            "user_id": "1234",
+            "scopes": ["chat:read"],
+            "expires_in": 3600
+        });
+        let (oauth_base, server) = spawn_mock_twitch_validate_server(validated).await;
+        let _env = TwitchValidateEnvGuard::install("app-a", &oauth_base);
+        let (state, services) = phase2_app().await;
+
+        apply_set_token(
+            state.clone(),
+            services,
+            json!({
+                "accessToken": "personal-access",
+                "refreshToken": "personal-refresh",
+                "scope": ["bits:read"],
+                "login": "callback_login_should_be_ignored",
+                "userId": "callback_user_id_should_be_ignored"
+            }),
+        )
+        .await
+        .expect("apply_set_token");
+        let _ = task_join_with_timeout(server, "mock twitch validate").await;
+
+        let personal = state.personal_tokens.read().await.clone();
+        assert_eq!(personal.scopes, Some(vec!["chat:read".into()]));
+        assert_eq!(personal.login.as_deref(), Some("validate_login"));
+        assert_eq!(personal.user_id.as_deref(), Some("1234"));
+    }
+
+    #[tokio::test]
+    async fn twitch_scope_and_identity_validation_rejects_client_id_mismatch() {
+        let _guard = PHASE2_TEST_LOCK.lock().await;
+        let validated = json!({
+            "client_id": "app-b",
+            "login": "validate_login",
+            "user_id": "1234",
+            "scopes": ["chat:read"]
+        });
+        let helper_err = personal_tokens_from_validate(
+            "app-a",
+            "personal-access",
+            Some("personal-refresh"),
+            &validated,
+        )
+        .expect_err("helper must reject client_id mismatch");
+        assert!(
+            helper_err.to_string().contains("client_id mismatch"),
+            "unexpected error: {helper_err:#}"
+        );
+
+        let (oauth_base, server) = spawn_mock_twitch_validate_server(validated).await;
+        let _env = TwitchValidateEnvGuard::install("app-a", &oauth_base);
+        let (state, services) = phase2_app().await;
+
+        let err = apply_set_token(
+            state.clone(),
+            services,
+            json!({
+                "accessToken": "personal-access",
+                "refreshToken": "personal-refresh",
+            }),
+        )
+        .await
+        .expect_err("apply_set_token must fail closed");
+        assert!(
+            err.to_string().contains("client_id mismatch"),
+            "unexpected apply error: {err:#}"
+        );
+        let _ = task_join_with_timeout(server, "mock twitch validate").await;
+
+        let personal = state.personal_tokens.read().await.clone();
+        assert!(personal.access_token.is_none());
+        let on_disk: TwitchTokenFile = crate::storage::read_json_if_exists(
+            &state.paths.twitch_tokens,
+            &TwitchTokenFile::default(),
+        )
+        .expect("read twitch token file");
+        assert!(on_disk.access_token.is_none());
+    }
+
+    #[test]
+    fn twitch_scope_and_identity_validation_requires_login_and_user_id() {
+        let missing_login = json!({
+            "client_id": "app-a",
+            "user_id": "1234",
+            "scopes": ["chat:read"]
+        });
+        let missing_user_id = json!({
+            "client_id": "app-a",
+            "login": "validate_login",
+            "scopes": ["chat:read"]
+        });
+
+        assert!(
+            personal_tokens_from_validate("app-a", "personal-access", None, &missing_login)
+                .is_err()
+        );
+        assert!(
+            personal_tokens_from_validate("app-a", "personal-access", None, &missing_user_id)
+                .is_err()
+        );
+    }
+
     #[test]
     fn connection_key_error_parts_maps_codes() {
         let err: anyhow::Error = SyndicateApiError {
@@ -4814,6 +5198,7 @@ mod tests {
             repo_root,
             readonly: false,
             userdata_root: Some(userdata),
+            secret_store: None,
         };
         let (_router, state, services) = crate::OverlayServer::new(config)
             .build_app()
@@ -6188,7 +6573,14 @@ mod tests {
     fn restart_state_at(state: &AppState) -> Arc<AppState> {
         let paths =
             crate::storage::paths_for_root(&state.paths.root, false).expect("paths_for_root");
-        AppState::new(paths, state.repo_root.clone(), 0, false).expect("AppState::new")
+        AppState::new(
+            paths,
+            state.repo_root.clone(),
+            0,
+            false,
+            crate::fs_secret_store(&state.paths.root),
+        )
+        .expect("AppState::new")
     }
 
     async fn activate_delegated_gen1(state: &AppState, services: &TwitchServices) {

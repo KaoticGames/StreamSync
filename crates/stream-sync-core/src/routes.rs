@@ -71,6 +71,7 @@ pub const BUILD_ROUTER_ROUTE_IDS: &[(&str, &str)] = &[
     ("POST", "/api/chat/overlay-config"),
     ("DELETE", "/api/chat/overlay-config"),
     ("GET", "/api/twitch/auth-url"),
+    ("POST", "/api/twitch/redeem"),
     ("POST", "/api/twitch/set-token"),
     ("POST", "/api/twitch/connection-key"),
     ("POST", "/api/twitch/use-connection"),
@@ -143,6 +144,7 @@ pub fn build_router(ctx: ServerContext) -> Router {
                 .delete(delete_overlay_config),
         )
         .route("/api/twitch/auth-url", get(get_auth_url))
+        .route("/api/twitch/redeem", post(post_twitch_redeem))
         .route("/api/twitch/set-token", post(post_set_token))
         .route("/api/twitch/connection-key", post(post_connection_key))
         .route("/api/twitch/use-connection", post(post_use_connection))
@@ -435,17 +437,19 @@ async fn api_status(State(ctx): State<ServerContext>) -> Json<Value> {
         active == crate::config_types::TwitchActiveMode::Delegated && delegated.is_some();
     let personal_saved = personal.access_token.is_some() && personal.login.is_some();
     let delegated_saved = delegated.is_some();
-    let se_connected = streamelements::load_session(&ctx.state.paths)
-        .ok()
-        .flatten()
-        .map(|s| {
-            json!({
-                "connected": true,
-                "accountId": s.account_id,
-                "username": s.username,
+    let se_store = ctx.state.secret_store();
+    let se_connected =
+        streamelements::load_session(&ctx.state.paths, se_store.as_ref(), ctx.state.readonly)
+            .ok()
+            .flatten()
+            .map(|s| {
+                json!({
+                    "connected": true,
+                    "accountId": s.account_id,
+                    "username": s.username,
+                })
             })
-        })
-        .unwrap_or_else(|| json!({ "connected": false }));
+            .unwrap_or_else(|| json!({ "connected": false }));
     let kick_tokens = ctx.state.kick.read().await.tokens.clone();
     let personal_kick = ctx.state.personal_kick.read().await.clone();
     let kick_via_takeover = takeover
@@ -594,32 +598,26 @@ const AUTH_CALLBACK_HTML: &str = r##"<!doctype html>
     p.textContent=text;
     el.appendChild(p);
   }
-  function parseHash(hash){
-    const out={};
-    const h=(hash||"").replace(/^#/,"");
-    if(!h) return out;
-    for(const part of h.split("&")){
-      const [k,v]=part.split("=");
-      if(k) out[decodeURIComponent(k)]=decodeURIComponent(v||"");
-    }
-    return out;
-  }
   async function run(){
-    const h=parseHash(window.location.hash);
-    const accessToken=h.access_token||"";
-    const flow=h.state||"";
+    const q=new URLSearchParams(window.location.search);
+    const flow=(q.get("state")||"").trim();
+    const oauthErr=(q.get("error")||"").trim();
+    if(oauthErr){
+      const detail=(q.get("error_description")||oauthErr).trim();
+      setMsg("Twitch authorization failed: "+detail, true);
+      return;
+    }
+    if(window.location.hash && window.location.hash.indexOf("access_token=")>=0){
+      setMsg("This Twitch response used the legacy implicit flow. Restart Connect in Stream Sync.", true);
+      return;
+    }
+    const code=(q.get("code")||"").trim();
     if(!flow){ setMsg("Missing login flow state. Start Twitch connect from Stream Sync.", true); return; }
-    if(!accessToken){ setMsg("Missing access_token.", true); return; }
-    const resp=await fetch("/api/twitch/set-token",{
+    if(!code){ setMsg("Missing Twitch authorization code.", true); return; }
+    const resp=await fetch("/api/twitch/redeem",{
       method:"POST",
       headers:{"Content-Type":"application/json","x-streamsync-login-nonce":flow},
-      body:JSON.stringify({
-        accessToken,
-        expiresIn:h.expires_in?Number(h.expires_in):null,
-        scope:h.scope?h.scope.split(" "):null,
-        tokenType:h.token_type||"",
-        flowNonce:flow
-      })
+      body:JSON.stringify({code, flowNonce:flow, state:flow})
     });
     const data=await resp.json().catch(()=>({}));
     if(!resp.ok||!data.ok) throw new Error(data.error||("HTTP "+resp.status));
@@ -1299,6 +1297,13 @@ async fn get_auth_url(State(ctx): State<ServerContext>) -> Response {
         .state
         .pending_logins
         .create(crate::oauth_pending::OAuthProvider::Twitch);
+    let Some(code_challenge) = ctx.state.pending_logins.pkce_challenge_for(&flow_nonce) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": "pkce_challenge_unavailable" })),
+        )
+            .into_response();
+    };
     let scopes = [
         "chat:read",
         "chat:edit",
@@ -1312,11 +1317,12 @@ async fn get_auth_url(State(ctx): State<ServerContext>) -> Response {
         "moderator:manage:banned_users",
     ];
     let url = format!(
-        "https://id.twitch.tv/oauth2/authorize?client_id={}&redirect_uri={}&response_type=token&scope={}&state={}",
+        "https://id.twitch.tv/oauth2/authorize?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
         urlencoding::encode(&ctx.state.client_id),
         urlencoding::encode(&ctx.state.redirect_uri),
         urlencoding::encode(&scopes.join(" ")),
         urlencoding::encode(&flow_nonce),
+        urlencoding::encode(&code_challenge),
     );
     Json(json!({ "ok": true, "url": url, "flowNonce": flow_nonce })).into_response()
 }
@@ -1329,6 +1335,10 @@ struct OAuthCompletionReservation<'a> {
 }
 
 impl OAuthCompletionReservation<'_> {
+    fn nonce(&self) -> &str {
+        &self.nonce
+    }
+
     fn commit(mut self) -> Result<(), (StatusCode, Json<Value>)> {
         self.store.commit(self.provider, &self.nonce).map_err(|e| {
             (
@@ -1381,21 +1391,90 @@ fn oauth_completion_allowed<'a>(
     }))
 }
 
-async fn post_set_token(
+#[derive(Debug, Deserialize)]
+struct TwitchRedeemBody {
+    code: String,
+    #[serde(default, rename = "flowNonce")]
+    flow_nonce: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+async fn post_twitch_redeem(
     State(ctx): State<ServerContext>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(body): Json<TwitchRedeemBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if ctx.state.readonly {
         return Err(readonly_json());
     }
-    let body_nonce = body.get("flowNonce").and_then(|v| v.as_str());
+    let body_nonce = body.flow_nonce.as_deref().or(body.state.as_deref());
+    if let (Some(header_nonce), Some(body_nonce)) = (
+        control_plane::login_nonce_from_headers(&headers),
+        body_nonce,
+    ) {
+        if !crate::oauth_pending::login_nonce_eq(header_nonce, body_nonce) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "ok": false, "error": "invalid_login_nonce" })),
+            ));
+        }
+    }
     let reservation = oauth_completion_allowed(
         &ctx.state,
         &headers,
         crate::oauth_pending::OAuthProvider::Twitch,
         body_nonce,
-    )?;
+    )?
+    .ok_or((
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "ok": false, "error": "missing_login_nonce" })),
+    ))?;
+
+    let code = body.code.trim();
+    if code.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "missing_code" })),
+        ));
+    }
+    let code_verifier = ctx
+        .state
+        .pending_logins
+        .code_verifier_for(
+            crate::oauth_pending::OAuthProvider::Twitch,
+            reservation.nonce(),
+        )
+        .map_err(|e| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "ok": false, "error": e.as_str() })),
+            )
+        })?
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "ok": false, "error": "invalid_login_nonce" })),
+        ))?;
+
+    twitch::redeem_oauth_code(ctx.state.clone(), ctx.twitch.clone(), code, &code_verifier)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "ok": false, "error": e.to_string() })),
+            )
+        })?;
+    reservation.commit()?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn post_set_token(
+    State(ctx): State<ServerContext>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if ctx.state.readonly {
+        return Err(readonly_json());
+    }
     twitch::apply_set_token(ctx.state.clone(), ctx.twitch.clone(), body)
         .await
         .map_err(|e| {
@@ -1404,9 +1483,6 @@ async fn post_set_token(
                 Json(json!({ "ok": false, "error": e.to_string() })),
             )
         })?;
-    if let Some(reservation) = reservation {
-        reservation.commit()?;
-    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1763,7 +1839,8 @@ struct SeImportBody {
 }
 
 async fn get_se_session(State(ctx): State<ServerContext>) -> Json<Value> {
-    match streamelements::load_session(&ctx.state.paths) {
+    let se_store = ctx.state.secret_store();
+    match streamelements::load_session(&ctx.state.paths, se_store.as_ref(), ctx.state.readonly) {
         Ok(Some(mut s)) => {
             let mut username = s.username.clone();
             let missing_name = username
@@ -1775,7 +1852,8 @@ async fn get_se_session(State(ctx): State<ServerContext>) -> Json<Value> {
                     username = streamelements::display_name_from_channel(&profile);
                     if username.is_some() {
                         s.username = username.clone();
-                        let _ = streamelements::save_session(&ctx.state.paths, &s);
+                        let _ =
+                            streamelements::save_session(&ctx.state.paths, se_store.as_ref(), &s);
                     }
                 }
             }
@@ -1838,7 +1916,8 @@ async fn post_se_session(
     if let Ok(profile) = streamelements::fetch_channel_profile(&session).await {
         session.username = streamelements::display_name_from_channel(&profile);
     }
-    streamelements::save_session(&ctx.state.paths, &session).map_err(|_| {
+    let se_store = ctx.state.secret_store();
+    streamelements::save_session(&ctx.state.paths, se_store.as_ref(), &session).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "ok": false, "error": "save_failed" })),
@@ -1859,28 +1938,32 @@ async fn delete_se_session(State(ctx): State<ServerContext>) -> Json<Value> {
     if ctx.state.readonly {
         return Json(json!({ "ok": false, "error": "readonly" }));
     }
-    let _ = streamelements::clear_session(&ctx.state.paths);
+    let se_store = ctx.state.secret_store();
+    let _ = streamelements::clear_session(&ctx.state.paths, se_store.as_ref());
     Json(json!({ "ok": true, "connected": false }))
 }
 
 async fn get_se_overlays(State(ctx): State<ServerContext>) -> Json<Value> {
-    let session = match streamelements::load_session(&ctx.state.paths) {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            return Json(json!({
-                "ok": false,
-                "error": "not_connected",
-                "overlays": [],
-            }));
-        }
-        Err(e) => {
-            return Json(json!({
-                "ok": false,
-                "error": e.to_string(),
-                "overlays": [],
-            }));
-        }
-    };
+    let se_store = ctx.state.secret_store();
+    let session =
+        match streamelements::load_session(&ctx.state.paths, se_store.as_ref(), ctx.state.readonly)
+        {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return Json(json!({
+                    "ok": false,
+                    "error": "not_connected",
+                    "overlays": [],
+                }));
+            }
+            Err(e) => {
+                return Json(json!({
+                    "ok": false,
+                    "error": e.to_string(),
+                    "overlays": [],
+                }));
+            }
+        };
     let client = match SeClient::from_session(&session).await {
         Ok(c) => c,
         Err(e) => {
@@ -1911,9 +1994,11 @@ async fn post_se_import(
     if body.overlay_ids.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let session = streamelements::load_session(&ctx.state.paths)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let se_store = ctx.state.secret_store();
+    let session =
+        streamelements::load_session(&ctx.state.paths, se_store.as_ref(), ctx.state.readonly)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::UNAUTHORIZED)?;
     let client = SeClient::from_session(&session)
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;

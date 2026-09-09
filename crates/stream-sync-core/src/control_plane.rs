@@ -411,10 +411,14 @@ mod tests {
     }
 
     #[test]
-    fn set_token_is_oauth_completion_not_master_only() {
+    fn twitch_redeem_is_oauth_completion_and_set_token_is_privileged() {
+        assert_eq!(
+            route_policy(&Method::POST, "/api/twitch/redeem"),
+            RoutePolicy::OAuthCompletion
+        );
         assert_eq!(
             route_policy(&Method::POST, "/api/twitch/set-token"),
-            RoutePolicy::OAuthCompletion
+            RoutePolicy::Privileged
         );
     }
 

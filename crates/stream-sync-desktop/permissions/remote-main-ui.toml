@@ -9,6 +9,7 @@ commands.allow = [
   "open_discord",
   "open_se_account_page",
   "export_backup",
+  "restore_backup",
   "check_for_updates",
   "purge_logs",
 ]

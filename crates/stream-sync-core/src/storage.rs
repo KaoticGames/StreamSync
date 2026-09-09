@@ -642,10 +642,12 @@ pub fn committed_delegated_session_parse(
         .with_context(|| format!("read delegated session {}", delegated_path.display()))?;
     let session: crate::config_types::DelegatedSessionFile = serde_json::from_str(&raw)
         .with_context(|| format!("parse delegated session {}", delegated_path.display()))?;
-    if session.connection_key.is_empty() || session.access_token.is_empty() {
-        return Ok(None);
+    let has_inline_secrets = !session.connection_key.is_empty() && !session.access_token.is_empty();
+    let has_metadata = !session.channel_login.is_empty() && !session.channel_twitch_id.is_empty();
+    if has_inline_secrets || has_metadata {
+        return Ok(Some(session));
     }
-    Ok(Some(session))
+    Ok(None)
 }
 
 fn quarantine_delegated_primary_file(delegated_path: &Path) -> Result<()> {
@@ -682,6 +684,10 @@ fn sweep_orphan_delegated_artifacts(delegated_path: &Path) -> Result<()> {
     let bak = delegated_path.with_extension("bak");
     if bak.is_file() {
         remove_file_durable(&bak)?;
+    }
+    let legacy_json_bak = delegated_path.with_extension("json.bak");
+    if legacy_json_bak.is_file() {
+        remove_file_durable(&legacy_json_bak)?;
     }
 
     let committing = delegated_committing_path(delegated_path);
@@ -891,6 +897,7 @@ pub fn delegated_secret_variants(delegated_path: &Path) -> Result<Vec<PathBuf>> 
     let mut out = vec![
         delegated_path.to_path_buf(),
         delegated_path.with_extension("bak"),
+        delegated_path.with_extension("json.bak"),
         delegated_committing_path(delegated_path),
         delegated_replace_pending_path(delegated_path),
     ];

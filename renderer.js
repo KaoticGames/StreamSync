@@ -923,6 +923,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const btnUpdates = viewEl.querySelector("#btn-check-updates");
     const btnExport = viewEl.querySelector("#btn-export-backup");
+    const btnRestore = viewEl.querySelector("#btn-restore-backup");
 
     if (btnDiscord) {
       btnDiscord.addEventListener("click", () => {
@@ -995,6 +996,44 @@ document.addEventListener("DOMContentLoaded", () => {
         } finally {
           btnExport.disabled = false;
           btnExport.textContent = prevLabel;
+        }
+      });
+    }
+
+    if (btnRestore) {
+      btnRestore.addEventListener("click", async () => {
+        const ok = confirm(
+          "Restore a backup ZIP into this Stream Sync install?\n\nThis restores configs, media, and imports only. Account credentials are not restored, so reconnect accounts afterward."
+        );
+        if (!ok) return;
+
+        const prevLabel = btnRestore.textContent;
+        btnRestore.disabled = true;
+        btnRestore.textContent = "Restoring…";
+        try {
+          if (!window.electronAPI?.restoreBackup) {
+            alert(
+              "Restore is only available in the Stream Sync desktop app (restoreBackup API missing)."
+            );
+            return;
+          }
+          const res = await window.electronAPI.restoreBackup();
+          if (res?.cancelled) return;
+          if (!res?.ok) {
+            alert("Restore failed:\n" + (res?.error || "Unknown error"));
+            return;
+          }
+          const files = Number.isFinite(res.files_written)
+            ? String(res.files_written)
+            : "?";
+          alert(
+            `Backup restored.\n\nSource: ${res.path || "selected file"}\nFiles restored: ${files}\n\nReconnect your accounts if needed.`
+          );
+        } catch (err) {
+          alert("Restore failed:\n" + (err?.message || String(err)));
+        } finally {
+          btnRestore.disabled = false;
+          btnRestore.textContent = prevLabel;
         }
       });
     }

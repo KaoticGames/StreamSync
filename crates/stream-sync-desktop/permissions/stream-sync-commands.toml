@@ -15,4 +15,5 @@ commands.allow = [
   "check_for_updates",
   "open_se_account_page",
   "export_backup",
+  "restore_backup",
 ]

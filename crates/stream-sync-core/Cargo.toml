@@ -31,6 +31,10 @@ dotenvy.workspace = true
 urlencoding.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate"] }
 fs2 = "0.4"
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 
 [dev-dependencies]
 tokio-tungstenite.workspace = true
