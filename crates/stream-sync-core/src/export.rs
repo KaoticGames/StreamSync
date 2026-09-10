@@ -114,14 +114,15 @@ pub fn restore_backup_zip(paths: &StoragePaths, zip_bytes: &[u8]) -> Result<Rest
         );
     }
 
-    // Validate all entry paths first so zip-slip fails before any writes happen.
+    // Reject zip-slip before any writes. Absolute/drive-letter leftovers from
+    // older exporters are skipped later, not treated as an attack.
     for i in 0..archive.len() {
         let entry = archive.by_index(i).context("read zip entry metadata")?;
         let name = entry.name();
         if name == "manifest.json" {
             continue;
         }
-        sanitize_restore_relative_path(name)?;
+        classify_restore_path(name)?;
     }
 
     let mut archive =
@@ -133,7 +134,9 @@ pub fn restore_backup_zip(paths: &StoragePaths, zip_bytes: &[u8]) -> Result<Rest
         if name == "manifest.json" {
             continue;
         }
-        let rel = sanitize_restore_relative_path(&name)?;
+        let Some(rel) = classify_restore_path(&name)? else {
+            continue;
+        };
         if should_skip_restore_path(&rel) || !is_restore_target_allowed(&rel) {
             continue;
         }
@@ -213,11 +216,9 @@ fn walk_dir<W: Write + std::io::Seek>(
         if path.is_dir() {
             walk_dir(zip, root, &path, options)?;
         } else if path.is_file() {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let Some(rel) = archive_relative_path(root, &path) else {
+                continue;
+            };
             let data = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
             write_zip_bytes(zip, &rel, &data, options)?;
         }
@@ -264,20 +265,64 @@ fn should_skip_restore_path(path: &Path) -> bool {
     false
 }
 
-fn sanitize_restore_relative_path(raw: &str) -> Result<PathBuf> {
+fn strip_windows_extended_prefix(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn archive_relative_path(root: &Path, path: &Path) -> Option<String> {
+    let rel = path
+        .strip_prefix(root)
+        .ok()
+        .map(|p| p.to_path_buf())
+        .or_else(|| {
+            let root = fs::canonicalize(root)
+                .ok()
+                .map(|p| strip_windows_extended_prefix(&p))
+                .unwrap_or_else(|| strip_windows_extended_prefix(root));
+            let path = fs::canonicalize(path)
+                .ok()
+                .map(|p| strip_windows_extended_prefix(&p))
+                .unwrap_or_else(|| strip_windows_extended_prefix(path));
+            path.strip_prefix(&root).ok().map(|p| p.to_path_buf())
+        })?;
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    if rel.is_empty() {
+        return None;
+    }
+    if Path::new(&rel).is_absolute() {
+        return None;
+    }
+    if let Some(first) = rel.split('/').next() {
+        if first.len() >= 2 {
+            let bytes = first.as_bytes();
+            if bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+                return None;
+            }
+        }
+    }
+    Some(rel)
+}
+
+/// `Ok(None)` = skip (absolute / drive-letter leftovers). `Err` = zip-slip.
+fn classify_restore_path(raw: &str) -> Result<Option<PathBuf>> {
     let normalized = raw.replace('\\', "/");
     let path = normalized.trim();
     if path.is_empty() {
-        anyhow::bail!("zip entry has empty path");
+        return Ok(None);
     }
     if path.starts_with('/') || path.starts_with("//") {
-        anyhow::bail!("zip entry path must be relative: {raw}");
+        return Ok(None);
     }
     if let Some(first) = path.split('/').next() {
         if first.len() >= 2 {
             let bytes = first.as_bytes();
             if bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
-                anyhow::bail!("zip entry path must not use windows drive prefix: {raw}");
+                return Ok(None);
             }
         }
     }
@@ -291,15 +336,15 @@ fn sanitize_restore_relative_path(raw: &str) -> Result<PathBuf> {
             anyhow::bail!("zip-slip path rejected: {raw}");
         }
         if part.contains(':') {
-            anyhow::bail!("zip entry path must not contain windows prefixes: {raw}");
+            return Ok(None);
         }
         rel.push(part);
     }
 
     if rel.as_os_str().is_empty() {
-        anyhow::bail!("zip entry has empty normalized path: {raw}");
+        return Ok(None);
     }
-    Ok(rel)
+    Ok(Some(rel))
 }
 
 fn is_restore_target_allowed(path: &Path) -> bool {
@@ -614,6 +659,55 @@ mod tests {
                 "restore should skip {forbidden}"
             );
         }
+
+        let _ = fs::remove_dir_all(restore_root);
+    }
+
+    #[test]
+    fn restore_backup_skips_windows_absolute_log_and_restores_config() {
+        let n = EXPORT_TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let restore_root = std::env::temp_dir().join(format!(
+            "stream-sync-restore-abs-log-test-{}-{n}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&restore_root);
+        fs::create_dir_all(&restore_root).unwrap();
+        let restore_paths = paths_for_root(&restore_root, false).expect("restore paths");
+
+        let mut buf = Vec::new();
+        {
+            let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            let manifest_json = serde_json::json!({
+                "format": BACKUP_FORMAT,
+                "version": BACKUP_VERSION,
+                "exported_at": "2026-01-01T00:00:00Z",
+                "app_version": "test",
+            })
+            .to_string();
+            write_zip_bytes(&mut zip, "manifest.json", manifest_json.as_bytes(), options).unwrap();
+            write_zip_bytes(&mut zip, "overlay-config.json", br#"{"ok":true}"#, options).unwrap();
+            write_zip_bytes(
+                &mut zip,
+                "C:/Users/Fuki/AppData/Roaming/Stream Sync/logs/stream-sync-2026-05-25.log",
+                b"old log",
+                options,
+            )
+            .unwrap();
+            zip.finish().unwrap();
+        }
+
+        let report = restore_backup_zip(&restore_paths, &buf).expect("restore");
+        assert_eq!(report.files_written, 1);
+        assert_eq!(
+            fs::read(&restore_paths.overlay_config).unwrap(),
+            br#"{"ok":true}"#
+        );
+        assert!(
+            !restore_root.join("C:").exists(),
+            "absolute log path must not be materialized"
+        );
 
         let _ = fs::remove_dir_all(restore_root);
     }
