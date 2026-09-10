@@ -2,7 +2,6 @@
 
 use clap::Parser;
 use stream_sync_core::{OverlayConfig, OverlayServer};
-use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(name = "stream-sync-server")]
@@ -23,11 +22,12 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env().add_directive("stream_sync_core=info".parse()?),
-        )
-        .init();
+    let logs_dir = std::env::var("STREAMSYNC_USERDATA")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("logs");
+    let _ = stream_sync_core::init_tracing(&logs_dir);
 
     let args = Args::parse();
     let mut config = OverlayConfig {

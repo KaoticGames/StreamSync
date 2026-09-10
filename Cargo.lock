@@ -4049,6 +4049,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "twitch-irc",
  "urlencoding",
  "uuid",
@@ -4092,8 +4093,6 @@ dependencies = [
  "clap",
  "stream-sync-core",
  "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

@@ -633,6 +633,9 @@ fn map_widget(
                 "Skipped deprecated Twitch host alert (host is no longer supported by Twitch)."
                     .into(),
             );
+            tracing::warn!(
+                "Skipped deprecated Twitch host alert (host is no longer supported by Twitch)."
+            );
         }
     }
 
@@ -642,6 +645,7 @@ fn map_widget(
             continue;
         };
         if se_event_cfg_enabled(event_cfg) {
+            tracing::warn!("{warning}");
             warnings.push((*warning).into());
         }
     }

@@ -9,6 +9,7 @@ mod config_types;
 mod control_plane;
 mod delegated_lifecycle;
 mod delegated_refresh_observability;
+mod diagnostics;
 mod discord_voice;
 mod dock_capability;
 mod export;
@@ -42,6 +43,10 @@ pub use control_plane::{
     authorize_privileged, control_plane_middleware, cors_layer, load_or_create_control_token,
     route_inventory, route_policy, RoutePolicy, CONTROL_TOKEN_HEADER, MEDIA_UPLOAD_BODY_LIMIT,
     PRIVILEGED_JSON_BODY_LIMIT, WS_CONTROL_AUTH_TIMEOUT_MS,
+};
+pub use diagnostics::{
+    init_tracing, log_file_name_for, prune_logs_older_than, purge_log_files, redact_secrets,
+    PurgeLogsReport, LOG_RETENTION_DAYS,
 };
 pub use dock_capability::{DockCredential, DockCredentialStore};
 pub use export::{build_backup_zip, restore_backup_zip, BackupManifest, RestoreReport};

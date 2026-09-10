@@ -17,12 +17,16 @@ use tracing_subscriber::EnvFilter;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("stream_sync_desktop_lib=info".parse().unwrap()),
-        )
-        .init();
+    let logs_dir = legacy_user_data_dir().join("logs");
+    if let Err(e) = stream_sync_core::init_tracing(&logs_dir) {
+        eprintln!("failed to init file tracing: {e:#}");
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::from_default_env()
+                    .add_directive("stream_sync_desktop_lib=info".parse().unwrap()),
+            )
+            .init();
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())

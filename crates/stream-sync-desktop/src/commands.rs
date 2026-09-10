@@ -21,6 +21,7 @@ pub struct AppState {
 pub struct PurgeLogsResult {
     pub ok: bool,
     pub deleted: usize,
+    pub kept: usize,
 }
 
 #[derive(Serialize)]
@@ -198,20 +199,13 @@ pub fn purge_logs(
     state: State<'_, AppState>,
 ) -> Result<PurgeLogsResult, String> {
     require_main_window(&window, state.overlay_port)?;
-    let logs_dir = &state.logs_dir;
-    std::fs::create_dir_all(logs_dir).map_err(|e| e.to_string())?;
-    let mut deleted = 0usize;
-    let entries = std::fs::read_dir(logs_dir).map_err(|e| e.to_string())?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("log") {
-            continue;
-        }
-        if std::fs::remove_file(&path).is_ok() {
-            deleted += 1;
-        }
-    }
-    Ok(PurgeLogsResult { ok: true, deleted })
+    let report = stream_sync_core::purge_log_files(&state.logs_dir, chrono::Utc::now())
+        .map_err(|e| e.to_string())?;
+    Ok(PurgeLogsResult {
+        ok: true,
+        deleted: report.deleted,
+        kept: report.kept,
+    })
 }
 
 /// Opens StreamElements Account → Channels so the user can copy Account ID + JWT.
