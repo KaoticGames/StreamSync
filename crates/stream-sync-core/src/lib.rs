@@ -73,6 +73,7 @@ pub use storage::{
     write_delegated_revoke_pending, write_delegated_revoked_tombstone,
     write_identity_rollback_pending, write_json, INJECT_COMMITTING_REMOVE_FAILURE,
 };
+pub use store_lock::{try_acquire_instance_lock, InstanceLockError};
 
 /// Back-compat alias.
 pub use storage::bootstrap_twitch_env_from_rust as bootstrap_twitch_env_from_repo;
@@ -193,11 +194,6 @@ impl OverlayServer {
     /// Start listening until the process is interrupted.
     pub async fn run(self) -> anyhow::Result<()> {
         let port = self.config.port;
-        let (router, state, twitch) = self.build_app().await?;
-        twitch::maybe_autostart(state.clone(), twitch.clone()).await;
-        kick::maybe_autostart(state.clone()).await;
-        discord_voice::maybe_autostart(state.clone(), twitch).await;
-
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::AddrInUse {
@@ -210,6 +206,10 @@ impl OverlayServer {
                 anyhow::Error::from(e)
             }
         })?;
+        let (router, state, twitch) = self.build_app().await?;
+        twitch::maybe_autostart(state.clone(), twitch.clone()).await;
+        kick::maybe_autostart(state.clone()).await;
+        discord_voice::maybe_autostart(state.clone(), twitch).await;
         let studio = state.overlay_server_dir.join("events-studio.html");
         info!(
             "stream-sync-core listening on http://localhost:{port} (readonly={}, twitch_redirect={}, repo_root={}, overlay_server={}, events_studio_exists={})",

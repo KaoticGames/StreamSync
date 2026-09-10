@@ -16,6 +16,9 @@ use tauri::{
 };
 use tracing_subscriber::EnvFilter;
 
+#[allow(dead_code)]
+struct InstanceLock(std::fs::File);
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let logs_dir = legacy_user_data_dir().join("logs");
@@ -49,6 +52,24 @@ pub fn run() {
             let port = overlay::configure_environment(&handle, &rust_root, &ui_root);
 
             let user_data = legacy_user_data_dir();
+            match stream_sync_core::try_acquire_instance_lock(&user_data) {
+                Ok(lock_file) => {
+                    app.manage(InstanceLock(lock_file));
+                }
+                Err(stream_sync_core::InstanceLockError::AlreadyHeld) => {
+                    startup_error_dialog(
+                        "Stream Sync is already running. Use the tray icon to show the window.",
+                    );
+                    std::process::exit(0);
+                }
+                Err(stream_sync_core::InstanceLockError::Io(e)) => {
+                    startup_error_dialog(&format!(
+                        "Stream Sync could not start because another copy may already be running.\n\n{e}"
+                    ));
+                    std::process::exit(1);
+                }
+            }
+
             let logs_dir = user_data.join("logs");
             app.manage(AppState {
                 overlay_port: port,
@@ -138,6 +159,7 @@ pub fn run() {
                 };
 
                 if !ready {
+                    handle2.exit(0);
                     return;
                 }
 
