@@ -80,9 +80,6 @@
   }
 
   async function kickConnect() {
-    if (global.electronAPI?.kickConnect) {
-      return global.electronAPI.kickConnect();
-    }
     const url = await kickFetchAuthUrl();
     await openAuthUrl(url);
   }
