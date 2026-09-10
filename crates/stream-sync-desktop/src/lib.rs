@@ -133,6 +133,7 @@ pub fn run() {
             commands::overlay_media_upload,
             commands::open_external,
             commands::open_logs_folder,
+            commands::pick_recording_folder,
             commands::open_discord,
             commands::twitch_connect,
             commands::twitch_reconnect,

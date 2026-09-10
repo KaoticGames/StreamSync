@@ -80,6 +80,7 @@
       isExternalOverlayServer: () => false,
       openExternal: (url) => invoke("open_external", { url }),
       openLogsFolder: () => invoke("open_logs_folder"),
+      pickRecordingFolder: () => invoke("pick_recording_folder"),
       openDiscord: () => invoke("open_discord"),
       getSettings: async () => ({}),
       getTwitchStatus: async () => {

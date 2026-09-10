@@ -6,6 +6,7 @@ commands.allow = [
   "get_overlay_port",
   "open_external",
   "open_logs_folder",
+  "pick_recording_folder",
   "open_discord",
   "twitch_connect",
   "twitch_reconnect",

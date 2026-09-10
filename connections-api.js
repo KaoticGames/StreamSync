@@ -119,6 +119,40 @@
     return data;
   }
 
+  async function discordSaveRecordingFolder(path) {
+    const res = await privilegedFetch("/api/discord/recording-folder", {
+      method: "POST",
+      body: JSON.stringify({ path: String(path || "").trim() }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) {
+      throw new Error(data.message || data.error || `HTTP ${res.status}`);
+    }
+    return data;
+  }
+
+  async function discordRedeemConnectKey(key, deviceId) {
+    const res = await privilegedFetch("/api/discord/connect-key/redeem", {
+      method: "POST",
+      body: JSON.stringify({
+        key: String(key || "").trim(),
+        device_id: String(deviceId || "").trim(),
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) {
+      throw new Error(data.message || data.error || `HTTP ${res.status}`);
+    }
+    return data;
+  }
+
+  async function discordPickRecordingFolder() {
+    if (global.electronAPI?.pickRecordingFolder) {
+      return global.electronAPI.pickRecordingFolder();
+    }
+    return null;
+  }
+
   async function connectWithKey(key) {
     const base = overlayBase();
     console.log("[connections-api] POST connection-key →", base);
@@ -252,6 +286,9 @@
     disconnect,
     useConnection,
     removeConnection,
+    discordSaveRecordingFolder,
+    discordRedeemConnectKey,
+    discordPickRecordingFolder,
     connectWithKey,
     kickConnect,
     kickDisconnect,

@@ -113,6 +113,7 @@ pub struct StoragePaths {
     pub dock_config: PathBuf,
     pub overlay_config: PathBuf,
     pub events_overlay_config: PathBuf,
+    pub discord_voice_config: PathBuf,
     pub profiles: PathBuf,
     pub tokens_dir: PathBuf,
     pub twitch_tokens: PathBuf,
@@ -239,6 +240,7 @@ fn paths_under_root(root: PathBuf, readonly: bool) -> Result<StoragePaths> {
         env_path("STREAMSYNC_OVERLAY_CONFIG").unwrap_or_else(|| root.join("overlay-config.json"));
     let events_overlay_config = env_path("STREAMSYNC_EVENTS_OVERLAY_CONFIG")
         .unwrap_or_else(|| root.join("events-overlay-config.json"));
+    let discord_voice_config = root.join("discord-voice-config.json");
     let twitch_tokens =
         env_path("STREAMSYNC_TOKENS_FILE").unwrap_or_else(|| root.join("twitch-tokens.json"));
     let kick_tokens =
@@ -271,6 +273,7 @@ fn paths_under_root(root: PathBuf, readonly: bool) -> Result<StoragePaths> {
         dock_config,
         overlay_config,
         events_overlay_config,
+        discord_voice_config,
         profiles: root.join("profiles.json"),
         tokens_dir,
         twitch_tokens: twitch_tokens.clone(),

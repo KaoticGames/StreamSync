@@ -124,6 +124,52 @@
       <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 1.25rem 0 1rem;" />
 
       <div class="card-title" style="font-size: 0.95rem; margin-bottom: 0.35rem;">
+        Discord Voice Recordings
+      </div>
+      <div class="field-help small">
+        Pick a recording folder first. Then in Discord run <strong>/connect</strong> (Manage Server).
+        Paste the private key here and press Connect Discord. Takeover keys are not used for this.
+      </div>
+
+      <div class="connection-row" style="margin-top: 0.6rem; align-items: stretch;">
+        <input
+          type="text"
+          id="discord-recording-folder"
+          placeholder="Choose recording folder"
+          readonly
+          spellcheck="false"
+          style="flex: 1; min-width: 0; padding: 0.5rem 0.65rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12); background: rgba(0,0,0,0.35); color: inherit; font-family: ui-monospace, monospace; font-size: 0.85rem;"
+        />
+        <button type="button" class="btn btn-secondary" id="btn-discord-pick-folder" style="margin-left: 0.5rem;">
+          Browse
+        </button>
+        <button type="button" class="btn btn-primary" id="btn-discord-save-folder" style="margin-left: 0.5rem;">
+          Save
+        </button>
+      </div>
+      <div class="field-help small" id="discord-folder-save-status" style="margin-top: 0.35rem;"></div>
+      <div class="field-help small" id="discord-status-folder"></div>
+      <div class="field-help small" id="discord-status-last-write"></div>
+      <div class="field-help small" id="discord-status-last-error" style="color: #f87171;"></div>
+
+      <div class="connection-row" id="discord-connect-row" style="margin-top: 0.75rem; align-items: stretch; display: none;">
+        <input
+          type="text"
+          id="discord-connect-key"
+          placeholder="sdk_…"
+          autocomplete="off"
+          spellcheck="false"
+          style="flex: 1; min-width: 0; padding: 0.5rem 0.65rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12); background: rgba(0,0,0,0.35); color: inherit; font-family: ui-monospace, monospace; font-size: 0.85rem;"
+        />
+        <button type="button" class="btn btn-primary" id="btn-discord-mint-key" style="margin-left: 0.5rem;">
+          Connect Discord
+        </button>
+      </div>
+      <div class="field-help small" id="discord-connect-key-output" style="margin-top: 0.4rem;"></div>
+
+      <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 1.25rem 0 1rem;" />
+
+      <div class="card-title" style="font-size: 0.95rem; margin-bottom: 0.35rem;">
         <span class="platform-pill platform-kick">Kick</span>
         &nbsp;Kick Account
       </div>
