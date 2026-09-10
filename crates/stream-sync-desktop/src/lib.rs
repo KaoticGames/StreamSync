@@ -4,7 +4,7 @@ mod overlay_proxy;
 mod paths;
 
 use commands::AppState;
-use overlay::{spawn_overlay_server, wait_for_health};
+use overlay::{spawn_overlay_server, startup_error_dialog, wait_for_expected_health, OverlayStart};
 use paths::{legacy_user_data_dir, resolve_ui_assets_root};
 use std::time::Duration;
 use stream_sync_core::rust_workspace_root;
@@ -50,7 +50,7 @@ pub fn run() {
                 logs_dir: logs_dir.clone(),
             });
 
-            spawn_overlay_server(ui_root.clone(), port);
+            let (instance_nonce, bind_rx) = spawn_overlay_server(ui_root.clone(), port);
 
             let show = MenuItem::with_id(app, "show", "Show Stream Sync", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -94,11 +94,46 @@ pub fn run() {
 
             let handle2 = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                let ready = wait_for_health(port, Duration::from_secs(30)).await;
+                let ready = tokio::select! {
+                    start = bind_rx => {
+                        match start.unwrap_or(OverlayStart::BindFailed {
+                            detail: "overlay server failed to start".into(),
+                        }) {
+                            OverlayStart::AlreadyRunningSameApp => {
+                                startup_error_dialog(
+                                    "Stream Sync is already running. Use the tray icon to show the window.",
+                                );
+                                false
+                            }
+                            OverlayStart::ForeignOccupant { detail } => {
+                                startup_error_dialog(&format!(
+                                    "Port {port} is already in use by another program. Stream Sync will not attach to it.\n\n{detail}"
+                                ));
+                                false
+                            }
+                            OverlayStart::BindFailed { detail } => {
+                                startup_error_dialog(&format!(
+                                    "Stream Sync could not start its overlay server.\n\n{detail}"
+                                ));
+                                false
+                            }
+                        }
+                    }
+                    ok = wait_for_expected_health(port, Some(&instance_nonce), Duration::from_secs(30)) => {
+                        if !ok {
+                            tracing::error!(
+                                "overlay server did not become healthy on port {port} — open http://127.0.0.1:{port}/health"
+                            );
+                            startup_error_dialog(&format!(
+                                "Stream Sync started but the overlay server on port {port} did not identify itself. Check that nothing else is bound to that port."
+                            ));
+                        }
+                        ok
+                    }
+                };
+
                 if !ready {
-                    tracing::error!(
-                        "overlay server did not become healthy on port {port} — open http://127.0.0.1:{port}/health"
-                    );
+                    return;
                 }
 
                 let url = overlay::shell_url(port);

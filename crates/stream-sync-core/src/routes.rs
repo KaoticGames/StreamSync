@@ -32,6 +32,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 pub struct ServerContext {
     pub state: Arc<AppState>,
     pub twitch: Arc<TwitchServices>,
+    pub instance_nonce: String,
 }
 
 fn readonly_status() -> StatusCode {
@@ -322,8 +323,18 @@ async fn root_redirect() -> Redirect {
     Redirect::to("/shell.html")
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({ "ok": true, "service": "overlay-server", "runtime": "rust" }))
+async fn health(State(ctx): State<ServerContext>) -> Json<Value> {
+    Json(health_payload(&ctx.instance_nonce))
+}
+
+pub fn health_payload(instance_nonce: &str) -> Value {
+    json!({
+        "ok": true,
+        "service": "overlay-server",
+        "runtime": "rust",
+        "version": env!("CARGO_PKG_VERSION"),
+        "instanceNonce": instance_nonce,
+    })
 }
 
 #[derive(Debug, Deserialize)]

@@ -47,7 +47,7 @@ pub use dock_capability::{DockCredential, DockCredentialStore};
 pub use export::{build_backup_zip, restore_backup_zip, BackupManifest, RestoreReport};
 pub use kick::sync_live_identity;
 pub use oauth_pending::{OAuthProvider, PendingLoginStore, LOGIN_NONCE_HEADER};
-pub use routes::BUILD_ROUTER_ROUTE_IDS;
+pub use routes::{health_payload, BUILD_ROUTER_ROUTE_IDS};
 pub use secret_store::{
     fs_secret_store, memory_secret_store, runtime_secret_store, FailClosedSecretStore,
     MemorySecretStore, SecretStore, FAIL_CLOSED_SECRET_STORE_MESSAGE, KICK_PERSONAL_ACCESS_KEY,
@@ -132,11 +132,19 @@ impl std::fmt::Debug for OverlayConfig {
 /// Running overlay HTTP + WebSocket server.
 pub struct OverlayServer {
     config: OverlayConfig,
+    instance_nonce: String,
 }
 
 impl OverlayServer {
     pub fn new(config: OverlayConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            instance_nonce: format!("ssn_{}", uuid::Uuid::new_v4().simple()),
+        }
+    }
+
+    pub fn instance_nonce(&self) -> &str {
+        &self.instance_nonce
     }
 
     /// Build router + state without binding (useful for tests / parent app composition).
@@ -171,6 +179,7 @@ impl OverlayServer {
         let ctx = ServerContext {
             state: state.clone(),
             twitch: twitch.clone(),
+            instance_nonce: self.instance_nonce.clone(),
         };
         let router = build_router(ctx);
         Ok((router, state, twitch))
