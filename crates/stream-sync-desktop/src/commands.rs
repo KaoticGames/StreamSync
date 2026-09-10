@@ -341,55 +341,21 @@ pub fn check_for_updates(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
+    open_download_page(window, state, app)
+}
+
+/// There is no in-app updater. Open the public HTTPS download page.
+#[tauri::command]
+pub fn open_download_page(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<serde_json::Value, String> {
     require_main_window(&window, state.overlay_port)?;
-    let secret = std::env::var("STREAMSYNC_UPDATE_SECRET")
-        .or_else(|_| std::env::var("STREAM_SYNC_UPDATE_SECRET"))
-        .unwrap_or_default();
-    if secret.is_empty() {
-        return Ok(serde_json::json!({ "ok": false, "error": "missing-secret" }));
-    }
-
-    let update_page = std::env::var("STREAMSYNC_UPDATE_PAGE")
-        .unwrap_or_else(|_| "https://syndicateai.net/update".to_string());
-
-    let payload = serde_json::json!({
-        "app": "stream-sync",
-        "v": app.package_info().version.to_string(),
-        "ts": chrono::Utc::now().timestamp_millis(),
-        "nonce": uuid::Uuid::new_v4().to_string(),
-    });
-
-    let p = base64_url_json(&payload);
-    let sig = sign_hmac_sha256(&secret, &p);
-
-    let mut url = reqwest::Url::parse(&update_page).map_err(|e| e.to_string())?;
-    url.query_pairs_mut()
-        .append_pair("p", &p)
-        .append_pair("sig", &sig);
-
+    let env_page = std::env::var("STREAMSYNC_UPDATE_PAGE").ok();
+    let url = crate::updater::resolve_download_page(env_page.as_deref())?;
     app.opener()
-        .open_url(url.as_str(), None::<&str>)
+        .open_url(&url, None::<&str>)
         .map_err(|e| e.to_string())?;
-
-    Ok(serde_json::json!({ "ok": true }))
-}
-
-fn base64_url_json(value: &serde_json::Value) -> String {
-    use base64::Engine;
-    let bytes = serde_json::to_vec(value).unwrap_or_default();
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
-fn sign_hmac_sha256(secret: &str, msg: &str) -> String {
-    hmac_sha256_hex(secret.as_bytes(), msg.as_bytes())
-}
-
-fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(key).expect("hmac key");
-    mac.update(msg);
-    let bytes = mac.finalize().into_bytes();
-    hex::encode(bytes)
+    Ok(serde_json::json!({ "ok": true, "url": url }))
 }

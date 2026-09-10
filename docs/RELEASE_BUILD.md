@@ -21,7 +21,7 @@ npm run build
 
 **Output:** `rust\target\release\bundle\nsis\` — `Stream Sync_2.0.1_x64-setup.exe` (name may vary).
 
-Install that exe on a test machine and verify Twitch connect, overlays, and **Help → Check for updates**.
+Install that exe on a test machine and verify Twitch connect, overlays, and **Help → Open download page**.
 
 ## Code signing (recommended for R2 downloads)
 
@@ -57,7 +57,7 @@ Leave `certificateThumbprint` unset. Fine for your own install testing; SmartScr
 
 | Item | Purpose |
 |------|---------|
-| `config/bundled.env` | Twitch Client ID, redirect, port, `STREAM_SYNC_UPDATE_SECRET` |
+| `config/bundled.env` | Twitch Client ID, redirect, port |
 | UI assets | `shell.html`, `overlay-server/`, `views/`, etc. |
 | Version `2.0.1` | `tauri.conf.json` + Cargo workspace |
 

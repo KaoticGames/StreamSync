@@ -2,6 +2,7 @@ mod commands;
 mod overlay;
 mod overlay_proxy;
 mod paths;
+mod updater;
 
 use commands::AppState;
 use overlay::{spawn_overlay_server, startup_error_dialog, wait_for_expected_health, OverlayStart};
@@ -180,6 +181,7 @@ pub fn run() {
             commands::kick_connect,
             commands::purge_logs,
             commands::check_for_updates,
+            commands::open_download_page,
             commands::open_se_account_page,
             commands::export_backup,
             commands::restore_backup,

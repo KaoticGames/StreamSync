@@ -97,7 +97,8 @@
       twitchDisconnect,
       kickConnect,
       purgeLogs: () => invoke("purge_logs"),
-      checkForUpdates: () => invoke("check_for_updates"),
+      checkForUpdates: () => invoke("open_download_page"),
+      openDownloadPage: () => invoke("open_download_page"),
       openSeAccountPage: (flow) => {
         if (typeof flow !== "string" || !flow.startsWith("ssl_")) {
           return Promise.reject(new Error("missing_login_flow"));
