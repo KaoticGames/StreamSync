@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main, phase-7]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: fmt clippy test npm version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Linux desktop deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libssl-dev
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: npm install
+        run: npm ci
+
+      - name: npm test (js + privileged-fetch)
+        run: npm run test:js
+
+      - name: version consistency
+        run: npm run test:version
+
+      - name: installer smoke checklist present
+        run: test -f docs/INSTALLER_SMOKE.md
+
+  windows-installer:
+    name: Windows NSIS installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: npm install
+        run: npm ci
+
+      - name: version consistency
+        run: node scripts/check-version-consistency.js
+
+      - name: NSIS installer
+        run: npx tauri build --bundles nsis --ci
+        working-directory: crates/stream-sync-desktop
+
+  signed-release:
+    name: Signed artifacts (when signing infra exists)
+    runs-on: windows-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Signing not configured
+        run: |
+          if [ -z "${{ secrets.WINDOWS_CERT_P12 }}" ]; then
+            echo "Signing infrastructure is not ready. Skip provenance until a certificate secret is installed."
+            exit 0
+          fi
+          echo "Certificate secret is present; wire Authenticode in a follow-up. Refusing to sign with an incomplete workflow."
+          exit 1
+        shell: bash
