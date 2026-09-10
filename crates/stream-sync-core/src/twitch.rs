@@ -33,6 +33,7 @@ use twitch_irc::{ClientConfig, SecureTCPTransport, TwitchIRCClient};
 
 type StreamSyncIrcClient = TwitchIRCClient<SecureTCPTransport, StaticLoginCredentials>;
 
+mod eventsub_reconnect;
 mod identity_commit;
 mod platform_workers;
 
@@ -4384,7 +4385,10 @@ async fn eventsub_session(
         }
         crate::delegated_refresh_observability::record_eventsub_connect();
     }
-    let (ws, _) = connect_async("wss://eventsub.wss.twitch.tv/ws").await?;
+    const EVENTSUB_WS: &str = "wss://eventsub.wss.twitch.tv/ws";
+    let mut handshake = eventsub_reconnect::EventSubReconnectState::default();
+    let mut connect_url = EVENTSUB_WS.to_string();
+    let (ws, _) = connect_async(&connect_url).await?;
     let (_write, mut read) = ws.split();
 
     while let Some(msg) = read.next().await {
@@ -4398,16 +4402,100 @@ async fn eventsub_session(
             continue;
         }
         let parsed: EventSubEnvelope = serde_json::from_str(msg.to_text()?)?;
-        let message_type = parsed.metadata.message_type.as_str();
-        match message_type {
+        let message_type = parsed.metadata.message_type.clone();
+        match message_type.as_str() {
             "session_welcome" | "session_reconnect" => {
                 if let Some(gen) = generation {
                     if !state.session_still_current(gen).await {
                         break;
                     }
                 }
-                if let Some(sid) = parsed.payload.session.as_ref().and_then(|s| s.id.clone()) {
-                    subscribe_topics(&state, &sid, generation).await;
+                let session = parsed.payload.session.as_ref();
+                let sid = session.and_then(|s| s.id.as_deref());
+                let reconnect_url = session.and_then(|s| s.reconnect_url.as_deref());
+                let decisions =
+                    handshake.on_control_message(message_type.as_str(), sid, reconnect_url);
+                let mut next_url = None;
+                for decision in decisions {
+                    match decision {
+                        eventsub_reconnect::EventSubDecision::Subscribe { session_id } => {
+                            subscribe_topics(&state, &session_id, generation).await;
+                        }
+                        eventsub_reconnect::EventSubDecision::Connect { url } => {
+                            next_url = Some(url);
+                        }
+                    }
+                }
+                if let Some(url) = next_url {
+                    connect_url = url;
+                    let (ws2, _) = connect_async(&connect_url).await?;
+                    let (_write2, mut read2) = ws2.split();
+                    let mut promoted = false;
+                    while !promoted {
+                        tokio::select! {
+                            new_msg = read2.next() => {
+                                let Some(new_msg) = new_msg else { break; };
+                                let new_msg = new_msg?;
+                                if !new_msg.is_text() {
+                                    continue;
+                                }
+                                let parsed: EventSubEnvelope = serde_json::from_str(new_msg.to_text()?)?;
+                                let ty = parsed.metadata.message_type.as_str();
+                                if ty == "session_welcome" {
+                                    let session = parsed.payload.session.as_ref();
+                                    let sid = session.and_then(|s| s.id.as_deref());
+                                    let ru = session.and_then(|s| s.reconnect_url.as_deref());
+                                    let decisions = handshake.on_control_message(ty, sid, ru);
+                                    for decision in decisions {
+                                        if let eventsub_reconnect::EventSubDecision::Subscribe { session_id } = decision {
+                                            subscribe_topics(&state, &session_id, generation).await;
+                                        }
+                                    }
+                                    promoted = true;
+                                } else if ty == "notification" {
+                                    if let Some(gen) = generation {
+                                        if !state.session_still_current(gen).await {
+                                            return Ok(());
+                                        }
+                                    }
+                                    if let (Some(sub_type), Some(event)) = (
+                                        parsed.metadata.subscription_type.as_deref(),
+                                        parsed.payload.event.as_ref(),
+                                    ) {
+                                        handle_eventsub_notification(&state, &feed, sub_type, event).await;
+                                    }
+                                }
+                            }
+                            old_msg = read.next() => {
+                                let Some(old_msg) = old_msg else { continue; };
+                                if !handshake.accept_old_socket_notification() {
+                                    continue;
+                                }
+                                let old_msg = old_msg?;
+                                if !old_msg.is_text() {
+                                    continue;
+                                }
+                                let parsed: EventSubEnvelope = serde_json::from_str(old_msg.to_text()?)?;
+                                if parsed.metadata.message_type != "notification" {
+                                    continue;
+                                }
+                                if let Some(gen) = generation {
+                                    if !state.session_still_current(gen).await {
+                                        return Ok(());
+                                    }
+                                }
+                                if let (Some(sub_type), Some(event)) = (
+                                    parsed.metadata.subscription_type.as_deref(),
+                                    parsed.payload.event.as_ref(),
+                                ) {
+                                    handle_eventsub_notification(&state, &feed, sub_type, event).await;
+                                }
+                            }
+                        }
+                    }
+                    if promoted {
+                        read = read2;
+                    }
                 }
             }
             "notification" => {
@@ -4522,6 +4610,8 @@ struct EventSubPayload {
 #[derive(Debug, Deserialize)]
 struct EventSubSession {
     id: Option<String>,
+    #[serde(default)]
+    reconnect_url: Option<String>,
 }
 
 /// Install pending lease and start revocation workers without activating platform clients.
