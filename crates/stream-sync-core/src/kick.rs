@@ -827,7 +827,7 @@ async fn feed_loop_inner(state: Arc<AppState>, generation: Option<DelegatedGener
         )
         .await
         {
-            Ok(()) => info!("Kick feed SSE ended"),
+            Ok(events) => log_kick_feed_cycle(events),
             Err(e) => {
                 let msg = sel
                     .redact_key
@@ -837,11 +837,35 @@ async fn feed_loop_inner(state: Arc<AppState>, generation: Option<DelegatedGener
                     })
                     .unwrap_or_else(|| format!("{e:#}"));
                 let msg = msg.replace("Bearer ", "Bearer [redacted]");
-                warn!("Kick feed SSE error: {msg}");
+                if kick_feed_body_is_cycle_end(&msg) {
+                    log_kick_feed_cycle(0);
+                } else {
+                    warn!("Kick feed SSE error: {msg}");
+                }
             }
         }
         state.kick.write().await.connected = false;
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+fn kick_feed_body_is_cycle_end(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("401")
+        || m.contains("403")
+        || m.contains("unauthorized")
+        || m.contains("forbidden")
+    {
+        return false;
+    }
+    m.contains("timed out") || m.contains("timeout") || m.contains("stream ended")
+}
+
+fn log_kick_feed_cycle(events: u64) {
+    if events == 0 {
+        info!("Kick feed cycle ended with no events; reconnecting");
+    } else {
+        info!(events, "Kick feed cycle ended; reconnecting");
     }
 }
 
@@ -851,7 +875,7 @@ async fn consume_sse(
     auth: Option<&str>,
     snap: Option<crate::delegated_lifecycle::AuthorityLeaseSnapshot>,
     generation: Option<DelegatedGeneration>,
-) -> Result<()> {
+) -> Result<u64> {
     if generation.is_some() {
         crate::delegated_refresh_observability::record_kick_sse_connect();
     }
@@ -883,6 +907,7 @@ async fn consume_sse(
     state.kick.write().await.connected = true;
     let mut stream = res.bytes_stream();
     let mut buf = String::new();
+    let mut events = 0u64;
     loop {
         if let Some(snap) = snap {
             let Some(services) = state.twitch_services() else {
@@ -899,15 +924,18 @@ async fn consume_sse(
             let chunk = match tokio::time::timeout(read_budget, stream.next()).await {
                 Ok(c) => c,
                 Err(_) => {
-                    // Deadline or read budget elapsed — revalidate before treating as soft timeout.
                     services.validate_delegated_snapshot(snap).await?;
-                    return Err(anyhow!("Kick feed read timeout"));
+                    return Ok(events);
                 }
             };
             let Some(chunk) = chunk else {
-                return Err(anyhow!("Kick feed stream ended"));
+                return Ok(events);
             };
-            let bytes = chunk?;
+            let bytes = match chunk {
+                Ok(b) => b,
+                Err(e) if kick_feed_body_is_cycle_end(&format!("{e:#}")) => return Ok(events),
+                Err(e) => return Err(e.into()),
+            };
             let frames = crate::delegated_lifecycle::append_sse_chunk(
                 &mut buf,
                 &String::from_utf8_lossy(&bytes),
@@ -917,19 +945,27 @@ async fn consume_sse(
                 services.validate_delegated_snapshot(snap).await?;
                 if let Some(event) = crate::delegated_lifecycle::parse_sse_json_data(&frame) {
                     fanout_kick_event(&state, event, Some(snap)).await?;
+                    events += 1;
                 }
             }
         } else {
-            let chunk = tokio::time::timeout(
+            let chunk = match tokio::time::timeout(
                 crate::delegated_lifecycle::SYNDICATE_SSE_READ_TIMEOUT,
                 stream.next(),
             )
             .await
-            .map_err(|_| anyhow!("Kick feed read timeout"))?;
-            let Some(chunk) = chunk else {
-                return Err(anyhow!("Kick feed stream ended"));
+            {
+                Ok(c) => c,
+                Err(_) => return Ok(events),
             };
-            let bytes = chunk?;
+            let Some(chunk) = chunk else {
+                return Ok(events);
+            };
+            let bytes = match chunk {
+                Ok(b) => b,
+                Err(e) if kick_feed_body_is_cycle_end(&format!("{e:#}")) => return Ok(events),
+                Err(e) => return Err(e.into()),
+            };
             let frames = crate::delegated_lifecycle::append_sse_chunk(
                 &mut buf,
                 &String::from_utf8_lossy(&bytes),
@@ -938,6 +974,7 @@ async fn consume_sse(
             for frame in frames {
                 if let Some(event) = crate::delegated_lifecycle::parse_sse_json_data(&frame) {
                     fanout_kick_event(&state, event, None).await?;
+                    events += 1;
                 }
             }
         }
@@ -1315,6 +1352,20 @@ mod tests {
         assert_ne!(alert["eventType"], json!("bits"));
         assert_eq!(alert["data"]["variables"]["name"], json!("bob"));
         assert_eq!(alert["data"]["variables"]["amount"], json!(100));
+    }
+
+    #[test]
+    fn kick_feed_timeout_is_a_cycle_end_not_an_error() {
+        assert!(kick_feed_body_is_cycle_end(
+            "error decoding response body: request or response body error: operation timed out"
+        ));
+        assert!(kick_feed_body_is_cycle_end("Kick feed read timeout"));
+        assert!(kick_feed_body_is_cycle_end("Kick feed stream ended"));
+        assert!(!kick_feed_body_is_cycle_end(
+            "Kick feed HTTP 401 Unauthorized"
+        ));
+        assert!(!kick_feed_body_is_cycle_end("Kick feed HTTP 403 Forbidden"));
+        assert!(!kick_feed_body_is_cycle_end("Kick feed buffer overflow"));
     }
 
     #[test]
