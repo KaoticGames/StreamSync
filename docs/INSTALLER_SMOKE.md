@@ -5,7 +5,7 @@ Run this on a Windows machine after installing a **rebuild** of the NSIS setup, 
 Manual — not automated in CI. Check each box on the build you are about to ship.
 
 - [ ] Installer launches Stream Sync once; a second launch does not attach to a foreign process on the overlay port
-- [ ] Help → Open download page opens `https://syndicateai.net/update` (or the configured HTTPS page). It does **not** ask for an update secret
+- [ ] Help → Check for updates opens `https://syndicateai.net/update?app=stream-sync&v=<this version>`. No update secret. Page compares to Syndicate's current version.
 - [ ] Twitch Personal connect completes (PKCE). Identity and scopes come from `/oauth2/validate`
 - [ ] Twitch takeover / Delegated connect still works. Personal and Delegated never run as two live identities
 - [ ] Kick connect works for the live identity

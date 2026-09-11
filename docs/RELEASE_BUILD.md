@@ -21,7 +21,7 @@ npm run build
 
 **Output:** `rust\target\release\bundle\nsis\` — `Stream Sync_2.0.1_x64-setup.exe` (name may vary).
 
-Install that exe on a test machine and verify Twitch connect, overlays, and **Help → Open download page**.
+Install that exe on a test machine and verify Twitch connect, overlays, and **Help → Check for updates**.
 
 ## Code signing (recommended for R2 downloads)
 

@@ -341,21 +341,21 @@ pub fn check_for_updates(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    open_download_page(window, state, app)
+    require_main_window(&window, state.overlay_port)?;
+    let env_page = std::env::var("STREAMSYNC_UPDATE_PAGE").ok();
+    let version = app.package_info().version.to_string();
+    let url = crate::updater::check_for_updates_url(env_page.as_deref(), &version)?;
+    app.opener()
+        .open_url(&url, None::<&str>)
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "ok": true, "url": url, "version": version }))
 }
 
-/// There is no in-app updater. Open the public HTTPS download page.
 #[tauri::command]
 pub fn open_download_page(
     window: WebviewWindow,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    require_main_window(&window, state.overlay_port)?;
-    let env_page = std::env::var("STREAMSYNC_UPDATE_PAGE").ok();
-    let url = crate::updater::resolve_download_page(env_page.as_deref())?;
-    app.opener()
-        .open_url(&url, None::<&str>)
-        .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "ok": true, "url": url }))
+    check_for_updates(window, state, app)
 }

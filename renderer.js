@@ -1201,22 +1201,19 @@ document.addEventListener("DOMContentLoaded", () => {
     if (btnUpdates) {
       btnUpdates.addEventListener("click", async () => {
         try {
-          if (!window.electronAPI?.checkForUpdates && !window.electronAPI?.openDownloadPage) {
-            alert("Open download page is not available in this build.");
+          if (!window.electronAPI?.checkForUpdates) {
+            alert("Update check is not available in this build.");
             return;
           }
 
-          const open =
-            window.electronAPI.openDownloadPage || window.electronAPI.checkForUpdates;
-          const res = await open();
+          const res = await window.electronAPI.checkForUpdates();
           if (!res?.ok) {
             alert(
-              "Failed to open download page:\n" + (res?.error || "Unknown error")
+              "Failed to check for updates:\n" + (res?.error || "Unknown error")
             );
           }
-          // Success opens external browser; no UI needed here.
         } catch (err) {
-          alert("Failed to open download page:\n" + (err?.message || String(err)));
+          alert("Failed to check for updates:\n" + (err?.message || String(err)));
         }
       });
     }
