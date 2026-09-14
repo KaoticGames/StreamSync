@@ -859,10 +859,16 @@ pub async fn exchange_authorization_code(
     }
 
     let form = authorization_code_form(&state.client_id, code, &state.redirect_uri, code_verifier);
-    if std::env::var("TWITCH_CLIENT_SECRET")
+    let secret_in_env = std::env::var("TWITCH_CLIENT_SECRET")
         .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    tracing::info!(
+        client_id_len = state.client_id.len(),
+        redirect_uri = %state.redirect_uri,
+        secret_in_env,
+        "Twitch public PKCE code exchange"
+    );
+    if secret_in_env {
         tracing::warn!(
             "TWITCH_CLIENT_SECRET is set; Stream Sync is a public PKCE client and will not send it"
         );

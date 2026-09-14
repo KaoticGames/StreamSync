@@ -506,7 +506,12 @@ impl AppState {
             }
         }
 
-        let client_id = std::env::var("TWITCH_CLIENT_ID").unwrap_or_default();
+        let client_id = std::env::var("TWITCH_CLIENT_ID")
+            .unwrap_or_default()
+            .trim()
+            .trim_matches(['"', '\''])
+            .trim()
+            .to_string();
         if client_id.is_empty() && !readonly {
             tracing::warn!(
                 "TWITCH_CLIENT_ID is not set — add it to {} (see rust/config/env.example) or {}",
