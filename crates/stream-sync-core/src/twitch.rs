@@ -826,6 +826,21 @@ pub struct TwitchCodeExchange {
     pub token_type: Option<String>,
 }
 
+fn authorization_code_form(
+    client_id: &str,
+    code: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("client_id", client_id.to_string()),
+        ("grant_type", "authorization_code".to_string()),
+        ("code", code.to_string()),
+        ("redirect_uri", redirect_uri.to_string()),
+        ("code_verifier", code_verifier.to_string()),
+    ]
+}
+
 pub async fn exchange_authorization_code(
     state: &AppState,
     code: &str,
@@ -843,18 +858,14 @@ pub async fn exchange_authorization_code(
         return Err(anyhow!("missing code verifier"));
     }
 
-    let mut form = vec![
-        ("client_id", state.client_id.clone()),
-        ("grant_type", "authorization_code".to_string()),
-        ("code", code.to_string()),
-        ("redirect_uri", state.redirect_uri.clone()),
-        ("code_verifier", code_verifier.to_string()),
-    ];
-    if let Ok(secret) = std::env::var("TWITCH_CLIENT_SECRET") {
-        let secret = secret.trim();
-        if !secret.is_empty() {
-            form.push(("client_secret", secret.to_string()));
-        }
+    let form = authorization_code_form(&state.client_id, code, &state.redirect_uri, code_verifier);
+    if std::env::var("TWITCH_CLIENT_SECRET")
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+    {
+        tracing::warn!(
+            "TWITCH_CLIENT_SECRET is set; Stream Sync is a public PKCE client and will not send it"
+        );
     }
 
     let oauth_base = twitch_oauth_base_url();
@@ -4805,6 +4816,23 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
 mod tests {
     use super::*;
     use twitch_irc::message::{Badge, Emote};
+
+    #[test]
+    fn public_pkce_code_exchange_form_omits_client_secret() {
+        let form = authorization_code_form(
+            "client",
+            "code",
+            "http://localhost:4040/auth/twitch/callback",
+            "verifier",
+        );
+        assert!(
+            form.iter().all(|(k, _)| *k != "client_secret"),
+            "public PKCE exchange must not send client_secret"
+        );
+        assert!(form
+            .iter()
+            .any(|(k, v)| *k == "code_verifier" && v == "verifier"));
+    }
 
     struct TwitchValidateEnvGuard {
         twitch_client_id: Option<String>,
