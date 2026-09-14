@@ -643,7 +643,10 @@ const AUTH_CALLBACK_HTML: &str = r##"<!doctype html>
       body:JSON.stringify({code, flowNonce:flow, state:flow})
     });
     const data=await resp.json().catch(()=>({}));
-    if(!resp.ok||!data.ok) throw new Error(data.error||("HTTP "+resp.status));
+    if(!resp.ok||!data.ok){
+      setMsg("Failed to finalize connection: "+(data.error||("HTTP "+resp.status)), true);
+      return;
+    }
     document.body.textContent="";
     var h2=document.createElement("h2"); h2.textContent="Stream Sync connected to Twitch";
     document.body.appendChild(h2);
@@ -1437,54 +1440,70 @@ async fn post_twitch_redeem(
         body_nonce,
     ) {
         if !crate::oauth_pending::login_nonce_eq(header_nonce, body_nonce) {
+            tracing::warn!("Twitch OAuth redeem failed: invalid_login_nonce");
             return Err((
                 StatusCode::UNAUTHORIZED,
                 Json(json!({ "ok": false, "error": "invalid_login_nonce" })),
             ));
         }
     }
-    let reservation = oauth_completion_allowed(
+    let reservation = match oauth_completion_allowed(
         &ctx.state,
         &headers,
         crate::oauth_pending::OAuthProvider::Twitch,
         body_nonce,
-    )?
-    .ok_or((
-        StatusCode::UNAUTHORIZED,
-        Json(json!({ "ok": false, "error": "missing_login_nonce" })),
-    ))?;
+    ) {
+        Ok(Some(reservation)) => reservation,
+        Ok(None) => {
+            tracing::warn!("Twitch OAuth redeem failed: missing_login_nonce");
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "ok": false, "error": "missing_login_nonce" })),
+            ));
+        }
+        Err(err) => {
+            tracing::warn!("Twitch OAuth redeem failed: login nonce check rejected");
+            return Err(err);
+        }
+    };
 
     let code = body.code.trim();
     if code.is_empty() {
+        tracing::warn!("Twitch OAuth redeem failed: missing_code");
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({ "ok": false, "error": "missing_code" })),
         ));
     }
-    let code_verifier = ctx
-        .state
-        .pending_logins
-        .code_verifier_for(
-            crate::oauth_pending::OAuthProvider::Twitch,
-            reservation.nonce(),
-        )
-        .map_err(|e| {
-            (
+    let code_verifier = match ctx.state.pending_logins.code_verifier_for(
+        crate::oauth_pending::OAuthProvider::Twitch,
+        reservation.nonce(),
+    ) {
+        Ok(Some(verifier)) => verifier,
+        Ok(None) => {
+            tracing::warn!("Twitch OAuth redeem failed: invalid_login_nonce (no verifier)");
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "ok": false, "error": "invalid_login_nonce" })),
+            ));
+        }
+        Err(e) => {
+            tracing::warn!("Twitch OAuth redeem failed: {}", e.as_str());
+            return Err((
                 StatusCode::UNAUTHORIZED,
                 Json(json!({ "ok": false, "error": e.as_str() })),
-            )
-        })?
-        .ok_or((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "ok": false, "error": "invalid_login_nonce" })),
-        ))?;
+            ));
+        }
+    };
 
     twitch::redeem_oauth_code(ctx.state.clone(), ctx.twitch.clone(), code, &code_verifier)
         .await
         .map_err(|e| {
+            let safe = crate::redact_secrets(&e.to_string());
+            tracing::warn!("Twitch OAuth redeem failed: {safe}");
             (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({ "ok": false, "error": e.to_string() })),
+                Json(json!({ "ok": false, "error": safe })),
             )
         })?;
     reservation.commit()?;
