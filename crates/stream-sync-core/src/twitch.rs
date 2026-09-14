@@ -818,6 +818,7 @@ fn twitch_oauth_base_url() -> String {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TwitchCodeExchange {
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -826,6 +827,7 @@ pub struct TwitchCodeExchange {
     pub token_type: Option<String>,
 }
 
+#[allow(dead_code)]
 fn authorization_code_form(
     client_id: &str,
     code: &str,
@@ -841,6 +843,7 @@ fn authorization_code_form(
     ]
 }
 
+#[allow(dead_code)]
 pub async fn exchange_authorization_code(
     state: &AppState,
     code: &str,
@@ -944,6 +947,7 @@ pub async fn exchange_authorization_code(
     })
 }
 
+#[allow(dead_code)]
 pub async fn redeem_oauth_code(
     state: Arc<AppState>,
     services: Arc<TwitchServices>,

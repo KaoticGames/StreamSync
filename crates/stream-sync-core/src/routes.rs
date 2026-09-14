@@ -622,25 +622,35 @@ const AUTH_CALLBACK_HTML: &str = r##"<!doctype html>
     el.appendChild(p);
   }
   async function run(){
+    function parseHash(hash){
+      const out={};
+      const h=(hash||"").replace(/^#/,"");
+      if(!h) return out;
+      for(const part of h.split("&")){
+        const i=part.indexOf("=");
+        if(i<0) continue;
+        const k=decodeURIComponent(part.slice(0,i).replace(/\+/g," "));
+        const v=decodeURIComponent(part.slice(i+1).replace(/\+/g," "));
+        if(k) out[k]=v;
+      }
+      return out;
+    }
+    const h=parseHash(window.location.hash);
     const q=new URLSearchParams(window.location.search);
-    const flow=(q.get("state")||"").trim();
-    const oauthErr=(q.get("error")||"").trim();
+    const flow=(h.state||q.get("state")||"").trim();
+    const oauthErr=(h.error||q.get("error")||"").trim();
     if(oauthErr){
-      const detail=(q.get("error_description")||oauthErr).trim();
+      const detail=(h.error_description||q.get("error_description")||oauthErr).trim();
       setMsg("Twitch authorization failed: "+detail, true);
       return;
     }
-    if(window.location.hash && window.location.hash.indexOf("access_token=")>=0){
-      setMsg("This Twitch response used the legacy implicit flow. Restart Connect in Stream Sync.", true);
-      return;
-    }
-    const code=(q.get("code")||"").trim();
+    const token=(h.access_token||"").trim();
     if(!flow){ setMsg("Missing login flow state. Start Twitch connect from Stream Sync.", true); return; }
-    if(!code){ setMsg("Missing Twitch authorization code.", true); return; }
+    if(!token){ setMsg("Missing Twitch access token. Start Connect from Stream Sync.", true); return; }
     const resp=await fetch("/api/twitch/redeem",{
       method:"POST",
       headers:{"Content-Type":"application/json","x-streamsync-login-nonce":flow},
-      body:JSON.stringify({code, flowNonce:flow, state:flow})
+      body:JSON.stringify({accessToken:token, flowNonce:flow, state:flow})
     });
     const data=await resp.json().catch(()=>({}));
     if(!resp.ok||!data.ok){
@@ -1323,13 +1333,6 @@ async fn get_auth_url(State(ctx): State<ServerContext>) -> Response {
         .state
         .pending_logins
         .create(crate::oauth_pending::OAuthProvider::Twitch);
-    let Some(code_challenge) = ctx.state.pending_logins.pkce_challenge_for(&flow_nonce) else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "ok": false, "error": "pkce_challenge_unavailable" })),
-        )
-            .into_response();
-    };
     let scopes = [
         "chat:read",
         "chat:edit",
@@ -1343,12 +1346,11 @@ async fn get_auth_url(State(ctx): State<ServerContext>) -> Response {
         "moderator:manage:banned_users",
     ];
     let url = format!(
-        "https://id.twitch.tv/oauth2/authorize?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+        "https://id.twitch.tv/oauth2/authorize?client_id={}&redirect_uri={}&response_type=token&scope={}&state={}",
         urlencoding::encode(&ctx.state.client_id),
         urlencoding::encode(&ctx.state.redirect_uri),
         urlencoding::encode(&scopes.join(" ")),
         urlencoding::encode(&flow_nonce),
-        urlencoding::encode(&code_challenge),
     );
     Json(json!({ "ok": true, "url": url, "flowNonce": flow_nonce })).into_response()
 }
@@ -1361,10 +1363,6 @@ struct OAuthCompletionReservation<'a> {
 }
 
 impl OAuthCompletionReservation<'_> {
-    fn nonce(&self) -> &str {
-        &self.nonce
-    }
-
     fn commit(mut self) -> Result<(), (StatusCode, Json<Value>)> {
         self.store.commit(self.provider, &self.nonce).map_err(|e| {
             (
@@ -1419,7 +1417,8 @@ fn oauth_completion_allowed<'a>(
 
 #[derive(Debug, Deserialize)]
 struct TwitchRedeemBody {
-    code: String,
+    #[serde(default, rename = "accessToken")]
+    access_token: Option<String>,
     #[serde(default, rename = "flowNonce")]
     flow_nonce: Option<String>,
     #[serde(default)]
@@ -1467,36 +1466,18 @@ async fn post_twitch_redeem(
         }
     };
 
-    let code = body.code.trim();
-    if code.is_empty() {
-        tracing::warn!("Twitch OAuth redeem failed: missing_code");
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "ok": false, "error": "missing_code" })),
-        ));
-    }
-    let code_verifier = match ctx.state.pending_logins.code_verifier_for(
-        crate::oauth_pending::OAuthProvider::Twitch,
-        reservation.nonce(),
-    ) {
-        Ok(Some(verifier)) => verifier,
-        Ok(None) => {
-            tracing::warn!("Twitch OAuth redeem failed: invalid_login_nonce (no verifier)");
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "ok": false, "error": "invalid_login_nonce" })),
-            ));
-        }
-        Err(e) => {
-            tracing::warn!("Twitch OAuth redeem failed: {}", e.as_str());
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "ok": false, "error": e.as_str() })),
-            ));
-        }
-    };
-
-    twitch::redeem_oauth_code(ctx.state.clone(), ctx.twitch.clone(), code, &code_verifier)
+    let access_token = body
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(access_token) = access_token {
+        tracing::info!("Twitch implicit grant redeem");
+        twitch::apply_set_token(
+            ctx.state.clone(),
+            ctx.twitch.clone(),
+            json!({ "accessToken": access_token }),
+        )
         .await
         .map_err(|e| {
             let safe = crate::redact_secrets(&e.to_string());
@@ -1506,8 +1487,15 @@ async fn post_twitch_redeem(
                 Json(json!({ "ok": false, "error": safe })),
             )
         })?;
-    reservation.commit()?;
-    Ok(Json(json!({ "ok": true })))
+        reservation.commit()?;
+        return Ok(Json(json!({ "ok": true })));
+    }
+
+    tracing::warn!("Twitch OAuth redeem failed: missing_access_token");
+    Err((
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "ok": false, "error": "missing_access_token" })),
+    ))
 }
 
 async fn post_set_token(

@@ -274,7 +274,7 @@ async fn public_oauth_callbacks_exclude_master_token() {
 }
 
 #[tokio::test]
-async fn twitch_auth_url_uses_code_and_pkce_not_implicit() {
+async fn twitch_auth_url_uses_implicit_grant_for_public_desktop() {
     std::env::set_var("TWITCH_CLIENT_ID", "client_id_test_placeholder");
     let port = 14159;
     let (router, state) = test_app(port).await;
@@ -294,17 +294,13 @@ async fn twitch_auth_url_uses_code_and_pkce_not_implicit() {
         .get("flowNonce")
         .and_then(|v| v.as_str())
         .expect("flow nonce");
-    assert!(url.contains("response_type=code"), "{url}");
-    assert!(url.contains("code_challenge="), "{url}");
-    assert!(url.contains("code_challenge_method=S256"), "{url}");
+    assert!(url.contains("response_type=token"), "{url}");
+    assert!(!url.contains("response_type=code"), "{url}");
+    assert!(!url.contains("code_challenge="), "{url}");
     assert_eq!(
         query_param(url, "state").as_deref(),
         Some(flow_nonce),
         "state must match flow nonce"
-    );
-    assert!(
-        !url.contains("response_type=token"),
-        "implicit flow must be closed"
     );
 }
 
