@@ -1,14 +1,13 @@
-//! HTTP contract tests against a running overlay server (Node :4040 or Rust :4041).
+//! HTTP contract tests against a running overlay server.
 //!
 //! ```text
-//! # Terminal A (reference)
-//! npm start
+//! # Terminal A — desktop (port 4040) or headless A/B:
+//! npm run dev
+//! # or:
+//! OVERLAY_PORT=4041 cargo run -p stream-sync-server
 //!
-//! # Terminal B (Rust under test)
-//! cargo run -p stream-sync-server
-//!
-//! # Terminal C
-//! CONTRACT_BASE_URL=http://127.0.0.1:4041 cargo test -p stream-sync-core --test contract
+//! # Terminal B
+//! CONTRACT_BASE_URL=http://127.0.0.1:4041 cargo test -p stream-sync-core --test contract -- --ignored
 //! ```
 
 use serde_json::{json, Value};

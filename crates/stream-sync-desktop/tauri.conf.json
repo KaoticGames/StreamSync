@@ -34,7 +34,6 @@
       "../../assets": "assets",
       "../../shell.html": "shell.html",
       "../../shell.css": "shell.css",
-      "../../boot.html": "boot.html",
       "../../renderer.js": "renderer.js",
       "../../overlay-client-config.js": "overlay-client-config.js",
       "../../tauri-bridge.js": "tauri-bridge.js",

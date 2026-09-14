@@ -15,17 +15,19 @@ Legacy Node `overlay-server/server.js` is archived under `legacy/node-overlay/` 
 
 ## Commands
 
+Run from this directory. There is no `npm start`.
+
 | Command | Purpose |
 |---------|---------|
-| `npm run dev` | Tauri dev (from `rust/`) |
+| `npm run dev` | Tauri dev |
 | `npm run build` | Windows NSIS installer (see [RELEASE_BUILD.md](RELEASE_BUILD.md)) |
-| `cargo run -p stream-sync-server` | Headless overlay only |
+| `cargo run -p stream-sync-server` | Headless overlay only (default **4040**) |
 
 ## Installer output
 
 After `npm run build`:
 
-`rust/target/release/bundle/nsis/` — see [RELEASE_BUILD.md](RELEASE_BUILD.md) for signing and R2 upload.
+`target/release/bundle/nsis/` — see [RELEASE_BUILD.md](RELEASE_BUILD.md) for signing and R2 upload.
 
 ## Parent broadcasting app
 

@@ -19,6 +19,8 @@ let config = OverlayConfig {
     port: 4040,
     repo_root,
     readonly: false,
+    userdata_root: None,
+    secret_store: None,
 };
 // Match existing Stream Sync userData on Windows when integrating for real users:
 // std::env::set_var("STREAMSYNC_USERDATA", r"C:\Users\...\AppData\Roaming\Stream Sync");
@@ -30,13 +32,14 @@ tokio::spawn(async move {
 
 ## Public API surface
 
-- `OverlayConfig` — port, repo root, readonly flag
+- `OverlayConfig` — port, repo root, readonly flag, optional userdata root and secret store
 - `OverlayServer::build_app()` — returns `(Router, Arc<AppState>, Arc<TwitchServices>)` for embedding in a larger Axum app
-- `OverlayServer::run()` — standalone listener
+- `OverlayServer::run()` — binds the port **before** starting Twitch/Kick/Discord workers
 - `rust_workspace_root()` / `resolve_ui_assets_root()` — locate UI assets in the workspace or bundle
+
+Readonly (`STREAMSYNC_READONLY` / `OverlayConfig.readonly`): load JSON if present; do not create userdata dirs or write tokens/config. See [CONFIG.md](CONFIG.md).
 
 ## Deferred until parent app exists
 
 - Native settings UI (replace `shell.html`)
-- Unified tray / single-instance with broadcaster shell
 - Shared update/signing pipeline

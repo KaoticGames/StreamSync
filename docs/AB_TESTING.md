@@ -1,13 +1,14 @@
 # A/B testing: headless server on alternate port
 
-For parity checks against a second overlay instance, run `stream-sync-server` on port **4041**.
+`stream-sync-server` defaults to port **4040**, same as the desktop app. For parity checks, run it on **4041** so it does not collide with Tauri.
 
 ## Ports
 
 | Stack | Command | URL |
 |-------|---------|-----|
-| **Desktop (Tauri)** | `npm run dev` (from `rust/`) | `http://localhost:4040` |
-| **Headless Rust** | `cargo run -p stream-sync-server` | `http://localhost:4041` (default CLI port) |
+| **Desktop (Tauri)** | `npm run dev` (this directory) | `http://localhost:4040` |
+| **Headless (default)** | `cargo run -p stream-sync-server` | `http://localhost:4040` |
+| **Headless A/B** | `OVERLAY_PORT=4041 cargo run -p stream-sync-server` | `http://localhost:4041` |
 
 ## Safety rule
 
@@ -18,7 +19,6 @@ For Rust validation on a copy of real configs:
 ```powershell
 $env:STREAMSYNC_READONLY = "true"
 $env:OVERLAY_PORT = "4041"
-cd rust
 cargo run -p stream-sync-server
 ```
 
@@ -30,11 +30,11 @@ $env:OVERLAY_PORT = "4041"
 cargo run -p stream-sync-server
 ```
 
-## Browser URLs (headless)
+## Browser URLs (headless A/B)
 
 | URL | Purpose |
 |-----|---------|
-| `http://localhost:4041/health` | Health check |
+| `http://localhost:4041/health` | Health check (`ok`, `overlay-server`, version, `instanceNonce`) |
 | `http://localhost:4041/overlay-server/events-studio.html` | Events alert editor |
 | `http://localhost:4041/dock/chat` | Chat dock |
 
@@ -47,8 +47,9 @@ Duplicate a browser source URL and change the port:
 
 ## Contract tests
 
+Against a **running** overlay (desktop on 4040 or headless A/B on 4041):
+
 ```powershell
-cd rust
 $env:CONTRACT_BASE_URL = "http://127.0.0.1:4041"
 cargo test -p stream-sync-core --test contract -- --ignored
 ```
@@ -67,7 +68,7 @@ If `.env` sets `TWITCH_REDIRECT_URI` to port **4040**, the Rust server rewrites 
 | Variable | Purpose |
 |----------|---------|
 | `STREAMSYNC_USERDATA` | `%APPDATA%\Stream Sync` |
-| `STREAMSYNC_READONLY` | `true` / `1` — load JSON, block writes |
-| `OVERLAY_PORT` | Default `4041` for `stream-sync-server` CLI |
+| `STREAMSYNC_READONLY` | `true` / `1` — load JSON, block writes (see [CONFIG.md](CONFIG.md)) |
+| `OVERLAY_PORT` | Listen port. Default **4040** for both desktop and `stream-sync-server`. Set `4041` only for A/B. |
 | `STREAMSYNC_UI_ROOT` | Workspace root (auto-detected) |
 | `TWITCH_CLIENT_ID` | From `.env` or userData `.env` |

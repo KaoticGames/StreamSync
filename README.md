@@ -2,7 +2,7 @@
 
 **Release installer:** see [docs/RELEASE_BUILD.md](docs/RELEASE_BUILD.md) (`npm run build` → NSIS in `target/release/bundle/nsis/`).
 
-Standalone Rust/Tauri build. All UI assets, config, and crates live in this directory — no dependency on a parent repo folder.
+This directory **is** the workspace (crates, UI, config). Run commands here. Do not `cd rust`.
 
 | Crate | Role |
 |-------|------|
@@ -13,7 +13,6 @@ Standalone Rust/Tauri build. All UI assets, config, and crates live in this dire
 ## First-time setup
 
 ```powershell
-cd rust
 Copy-Item config\env.example .env
 # Edit .env — set TWITCH_CLIENT_ID, etc.
 npm install
@@ -22,14 +21,12 @@ npm install
 ## Run the desktop app
 
 ```powershell
-cd rust
 npm run dev
 ```
 
 Or:
 
 ```powershell
-cd rust
 cargo run -p stream-sync-desktop
 ```
 
@@ -41,16 +38,18 @@ See [docs/CONFIG.md](docs/CONFIG.md) and [docs/TAURI_DESKTOP.md](docs/TAURI_DESK
 
 ## Headless overlay only
 
+Default listen port is **4040** (same as desktop / OBS URLs). Do not run this at the same time as the desktop app against the same user-data folder.
+
 ```powershell
-cd rust
 cargo run -p stream-sync-server
 ```
+
+For a second instance on **4041**, see [docs/AB_TESTING.md](docs/AB_TESTING.md).
 
 ## Build installer
 
 ```powershell
-cd rust
 npm run build
 ```
 
-Installers appear under `target/release/bundle/`.
+Installers appear under `target/release/bundle/nsis/`.

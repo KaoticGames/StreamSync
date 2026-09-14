@@ -1,6 +1,6 @@
 // overlay-client-config.js
-// Single source for overlay-server URL in the Electron UI (and browser dev).
-// Set OVERLAY_PORT + STREAMSYNC_EXTERNAL_OVERLAY before `npm start` for Rust A/B.
+// Overlay-server URL for the desktop UI (and browser). Default port 4040.
+// For a second headless instance, set OVERLAY_PORT (e.g. 4041) — see docs/AB_TESTING.md.
 
 (function (global) {
   function readPort() {
