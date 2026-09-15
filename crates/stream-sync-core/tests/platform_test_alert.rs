@@ -24,7 +24,9 @@ fn test_userdata_dir() -> PathBuf {
     dir
 }
 
-async fn spawn_test_server_mode(readonly: bool) -> (
+async fn spawn_test_server_mode(
+    readonly: bool,
+) -> (
     u16,
     std::sync::Arc<stream_sync_core::AppState>,
     tokio::task::JoinHandle<()>,
@@ -162,7 +164,6 @@ async fn kick_follow_emits_kick_platform() {
         state.control_token(),
         json!({
             "eventType": "follow",
-            "platform": "kick",
             "data": { "name": "KickFan" }
         }),
     )
@@ -235,6 +236,14 @@ async fn events_studio_platform_helper_is_served() {
         html.contains("src=\"/overlay-server/events-studio-platform.js\""),
         "Events Studio must reference the bundled helper at its served path"
     );
+    assert!(
+        html.contains("id=\"testModeLive\" value=\"live\" disabled"),
+        "Live mode must render disabled until connection status is known"
+    );
+    assert!(
+        html.contains("id=\"testBtnLive\" disabled"),
+        "Live button must render disabled until connection status is known"
+    );
 
     let helper = client
         .get(format!(
@@ -249,6 +258,66 @@ async fn events_studio_platform_helper_is_served() {
         .await
         .expect("read platform helper")
         .contains("computeTestPlatformUi"));
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn kick_kicks_and_redeem_match_production_shapes() {
+    let (port, state, handle) = spawn_test_server_mode(false).await;
+    seed_kick_linked(&state).await;
+
+    let mut ws = connect_feed_ws(port, "default").await;
+    drain_feed_bootstrap(&mut ws).await;
+    let (status, _) = post_test_alert_http(
+        port,
+        state.control_token(),
+        json!({
+            "eventType": "kicks",
+            "platform": "kick",
+            "data": { "name": "KickFan", "amount": 50 }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let alert = recv_json_of_type(&mut ws, 1000, "event-alert")
+        .await
+        .expect("Kick Kicks overlay alert");
+    assert_eq!(alert["platform"], "kick");
+    assert_eq!(alert["eventType"], "cheer");
+    assert_eq!(
+        alert["data"]["variables"],
+        json!({ "name": "KickFan", "amount": 50 })
+    );
+    let dock = recv_json_of_type(&mut ws, 1000, "dock-event")
+        .await
+        .expect("Kick Kicks dock event");
+    assert_eq!(dock["platform"], "kick");
+    assert_eq!(dock["eventType"], "kicks");
+    assert_eq!(dock["label"], "Kicks");
+
+    let mut ws_alert = connect_feed_ws(port, "default").await;
+    let mut ws_dock = connect_feed_ws(port, "default").await;
+    drain_feed_bootstrap(&mut ws_alert).await;
+    drain_feed_bootstrap(&mut ws_dock).await;
+    let (status, _) = post_test_alert_http(
+        port,
+        state.control_token(),
+        json!({
+            "eventType": "redeem",
+            "platform": "kick",
+            "data": { "name": "KickFan", "reward": "Test Reward", "input": "hello" }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(recv_json_of_type(&mut ws_alert, 300, "event-alert")
+        .await
+        .is_none());
+    let dock = recv_json_of_type(&mut ws_dock, 1000, "dock-event")
+        .await
+        .expect("Kick redeem dock event");
+    assert_eq!(dock["eventType"], "redeem");
 
     handle.abort();
 }
@@ -294,6 +363,22 @@ async fn fail_closed() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "unknown_platform");
+    assert!(recv_json_of_type(&mut ws, 200, "dock-event")
+        .await
+        .is_none());
+
+    seed_twitch_connected(&state).await;
+    let (status, body) = post_test_alert_http(
+        port,
+        state.control_token(),
+        json!({ "eventType": "follow" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "platform_required");
+    assert!(recv_json_of_type(&mut ws, 200, "event-alert")
+        .await
+        .is_none());
     assert!(recv_json_of_type(&mut ws, 200, "dock-event")
         .await
         .is_none());

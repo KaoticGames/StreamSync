@@ -78,4 +78,30 @@ describe("StreamSyncEventsStudioPlatform selection", () => {
     assert.equal(platform.usesTierForPlatform("kick", "sub"), false);
     assert.equal(platform.usesTierForPlatform("kick", "gift"), false);
   });
+
+  it("fails closed to local mode until a platform is known connected", () => {
+    assert.equal(platform.safeTestMode("live", { twitch: false, kick: false }), "local");
+    assert.equal(platform.safeTestMode("live", { twitch: true, kick: false }), "live");
+    assert.equal(platform.safeTestMode("live", { twitch: false, kick: true }), "live");
+    assert.equal(platform.safeTestMode("local", { twitch: true, kick: true }), "local");
+  });
+
+  it("does not let an older status success override a newer failure", async () => {
+    const pending = [];
+    const applied = [];
+    const run = platform.createLatestStatusRunner({
+      load: () => new Promise((resolve, reject) => pending.push({ resolve, reject })),
+      applyStatus: (status) => applied.push(status),
+      applyUnavailable: () => applied.push("unavailable"),
+    });
+
+    const older = run();
+    const newer = run();
+    pending[1].reject(new Error("newer status failed"));
+    await newer;
+    pending[0].resolve({ twitch: true, kick: false });
+    await older;
+
+    assert.deepEqual(applied, ["unavailable"]);
+  });
 });

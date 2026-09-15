@@ -143,7 +143,13 @@ pub fn build_test_dock_event(platform: TestPlatform, event_type: &str, variables
             } else {
                 et.as_str()
             };
-            make_platform_dock_event("twitch", dock_type, &detail, Some(event_type), None)
+            make_platform_dock_event(
+                "twitch",
+                dock_type,
+                &detail,
+                Some(twitch_dock_label(&et)),
+                None,
+            )
         }
         TestPlatform::Kick => {
             if et == "kicks" {
@@ -232,39 +238,49 @@ fn twitch_dock_detail(et: &str, name: &str, variables: &Value) -> String {
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
         ),
-        "cheer" | "bits" => format!(
-            "{name} cheered {}{}",
-            variables
+        "cheer" | "bits" => {
+            let amount = variables
                 .get("amount")
-                .or(variables.get("bits"))
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            variables
-                .get("input")
-                .map(|i| format!(": {i}"))
-                .unwrap_or_default()
-        ),
-        "raid" => format!(
-            "{name} raided{}",
-            variables
+                .or_else(|| variables.get("bits"))
+                .unwrap_or(&Value::Null);
+            format!("{name} cheered {amount}")
+        }
+        "raid" => {
+            let viewers = variables
                 .get("amount")
-                .or(variables.get("raiders"))
-                .map(|v| format!(" with {v}"))
-                .unwrap_or_default()
-        ),
-        "redeem" => format!(
-            "{} — {}{}",
-            variables
+                .or_else(|| variables.get("raiders"))
+                .unwrap_or(&Value::Null);
+            if viewers.is_null() {
+                format!("{name} raided")
+            } else {
+                format!("{name} raided with {viewers}")
+            }
+        }
+        "redeem" => {
+            let title = variables
                 .get("reward")
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "Redeem".into()),
-            name,
-            variables
-                .get("input")
-                .map(|i| format!(": {i}"))
-                .unwrap_or_default()
-        ),
+                .and_then(Value::as_str)
+                .unwrap_or("Redeem");
+            let mut detail = format!("{title} — {name}");
+            if let Some(cost) = variables.get("cost").and_then(Value::as_u64) {
+                detail.push_str(&format!(" ({cost} pts)"));
+            }
+            detail
+        }
         _ => format!("{name} triggered {et}"),
+    }
+}
+
+fn twitch_dock_label(event_type: &str) -> &'static str {
+    match event_type {
+        "follow" => "Follow",
+        "sub" => "Sub",
+        "resub" => "Resub",
+        "gift" => "Gift",
+        "cheer" | "bits" => "Bits",
+        "raid" => "Raid",
+        "redeem" => "Channel Points",
+        _ => "Event",
     }
 }
 
@@ -433,14 +449,29 @@ mod tests {
         );
         assert_eq!(kick_dock["platform"], "kick");
         assert_eq!(kick_dock["eventType"], "kicks");
+        assert_eq!(kick_dock["label"], "Kicks");
         assert_eq!(kick_dock["detail"], "carol gifted 50 Kicks");
 
         let twitch_dock = build_test_dock_event(
             TestPlatform::Twitch,
             "cheer",
-            &json!({ "name": "bob", "amount": 100 }),
+            &json!({ "name": "bob", "amount": 100, "input": "not part of a cheer" }),
         );
         assert_eq!(twitch_dock["platform"], "twitch");
         assert_eq!(twitch_dock["eventType"], "bits");
+        assert_eq!(twitch_dock["label"], "Bits");
+        assert_eq!(twitch_dock["detail"], "bob cheered 100");
+
+        let twitch_follow =
+            build_test_dock_event(TestPlatform::Twitch, "follow", &json!({ "name": "bob" }));
+        assert_eq!(twitch_follow["label"], "Follow");
+
+        let twitch_raid = build_test_dock_event(
+            TestPlatform::Twitch,
+            "raid",
+            &json!({ "name": "bob", "amount": null }),
+        );
+        assert_eq!(twitch_raid["label"], "Raid");
+        assert_eq!(twitch_raid["detail"], "bob raided");
     }
 }

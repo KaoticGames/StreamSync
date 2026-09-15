@@ -81,12 +81,37 @@
     );
   }
 
+  function safeTestMode(requestedMode, connections) {
+    const wantsLive = requestedMode === "live";
+    const connected = !!(connections?.twitch || connections?.kick);
+    return wantsLive && connected ? "live" : "local";
+  }
+
+  function createLatestStatusRunner({ load, applyStatus, applyUnavailable }) {
+    let latestRequest = 0;
+    return async function run(context) {
+      const request = ++latestRequest;
+      try {
+        const status = await load();
+        if (request !== latestRequest) return false;
+        applyStatus(status, context);
+        return true;
+      } catch (error) {
+        if (request !== latestRequest) return false;
+        applyUnavailable(error, context);
+        return false;
+      }
+    };
+  }
+
   root.StreamSyncEventsStudioPlatform = {
     computeTestPlatformUi,
     simEventsForPlatform,
     variationEventKeyForPlatform,
     simHintForPlatform,
     usesTierForPlatform,
+    safeTestMode,
+    createLatestStatusRunner,
   };
 })(
   typeof globalThis !== "undefined"

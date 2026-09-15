@@ -1266,8 +1266,8 @@
             <input type="radio" name="testMode" id="testModeLocal" value="local" checked />
             <button type="button" class="seg-btn active" id="testBtnLocal">Local</button>
 
-            <input type="radio" name="testMode" id="testModeLive" value="live" />
-            <button type="button" class="seg-btn" id="testBtnLive">Live</button>
+            <input type="radio" name="testMode" id="testModeLive" value="live" disabled />
+            <button type="button" class="seg-btn disabled" id="testBtnLive" disabled>Live</button>
           </div>
 
           <button class="btn-pill btn-pill-small" id="btnTestAlert">Test Alert</button>
@@ -1734,6 +1734,7 @@
       platformConnections: { twitch: false, kick: false },
       selectedTestPlatform: null,
       platformStatusTimer: null,
+      platformStatusRunner: null,
     };
 
     const NUDGE_TAP_PX = 1;
@@ -5270,9 +5271,28 @@ async function ensureProfilesPersistedToServer(profileIds) {
       } catch (_) {}
     }
 
+    function applyUnavailableTestPlatformUi() {
+      state.platformConnections = { twitch: false, kick: false };
+      state.selectedTestPlatform = null;
+      if (testPlatformWrap) testPlatformWrap.style.display = "none";
+      if (testModeLive) testModeLive.disabled = true;
+      if (testBtnLive) {
+        testBtnLive.disabled = true;
+        testBtnLive.classList.add("disabled");
+      }
+      if (state.testMode === "live") {
+        setTestMode("local", { silent: true });
+      } else if (btnTestAlert) {
+        btnTestAlert.disabled = false;
+      }
+    }
+
     function applyTestPlatformUi(connections, opts = {}) {
       const helper = window.StreamSyncEventsStudioPlatform;
-      if (!helper) return;
+      if (!helper) {
+        applyUnavailableTestPlatformUi();
+        return;
+      }
       const ui = helper.computeTestPlatformUi({
         twitch: !!connections?.twitch,
         kick: !!connections?.kick,
@@ -5307,25 +5327,47 @@ async function ensureProfilesPersistedToServer(profileIds) {
     }
 
     async function refreshPlatformConnections(opts = {}) {
-      try {
-        const res = await privilegedFetch("/api/status", { cache: "no-cache" });
-        if (!res.ok) return;
-        const data = await res.json();
-        applyTestPlatformUi(
-          {
-            twitch: !!data?.twitch?.connected,
-            kick: !!data?.kick?.connected,
-          },
-          opts
-        );
-      } catch (err) {
-        console.warn("[Events Studio] Platform status refresh failed:", err);
+      const helper = window.StreamSyncEventsStudioPlatform;
+      if (!helper?.createLatestStatusRunner) {
+        applyUnavailableTestPlatformUi();
+        return;
       }
+      if (!state.platformStatusRunner) {
+        state.platformStatusRunner = helper.createLatestStatusRunner({
+          load: async () => {
+            const res = await privilegedFetch("/api/status", { cache: "no-cache" });
+            if (!res.ok) throw new Error(`Platform status failed: HTTP ${res.status}`);
+            return res.json();
+          },
+          applyStatus: (data, runOpts) => {
+            applyTestPlatformUi(
+              {
+                twitch: !!data?.twitch?.connected,
+                kick: !!data?.kick?.connected,
+              },
+              runOpts || {}
+            );
+          },
+          applyUnavailable: (err) => {
+            console.warn("[Events Studio] Platform status refresh failed:", err);
+            applyUnavailableTestPlatformUi();
+          },
+        });
+      }
+      await state.platformStatusRunner(opts);
     }
 
     function setTestMode(mode, opts){
       const silent = !!(opts && opts.silent);
-      state.testMode = (mode === "live") ? "live" : "local";
+      const helper = window.StreamSyncEventsStudioPlatform;
+      if (helper?.safeTestMode) {
+        state.testMode = helper.safeTestMode(mode, state.platformConnections);
+      } else {
+        const connected = !!(
+          state.platformConnections?.twitch || state.platformConnections?.kick
+        );
+        state.testMode = mode === "live" && connected ? "live" : "local";
+      }
 
       if (testModeLocal) testModeLocal.checked = (state.testMode === "local");
       if (testModeLive) testModeLive.checked = (state.testMode === "live");
