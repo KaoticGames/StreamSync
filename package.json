@@ -8,9 +8,10 @@
     "dev:watch": "node scripts/dev.js --watch",
     "prepare-release": "node scripts/prepare-release.js",
     "build": "npm run prepare-release && node scripts/build.js",
-    "test:js": "node scripts/check-privileged-fetch.js && node --test tests/events-variation-picker.test.js tests/events-alert-delivery.test.js tests/kick-connect-recursion.test.js",
+    "test:js": "node scripts/check-privileged-fetch.js && node --test tests/events-variation-picker.test.js tests/events-alert-delivery.test.js tests/kick-connect-recursion.test.js tests/events-studio-platform.test.js",
     "test:version": "node scripts/check-version-consistency.js",
-    "test": "npm run test:version && npm run test:js && cargo test --workspace"
+    "test:icons": "node scripts/check-desktop-icons.js",
+    "test": "npm run test:version && npm run test:icons && npm run test:js && cargo test --workspace"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

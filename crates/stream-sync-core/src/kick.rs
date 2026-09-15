@@ -1149,15 +1149,15 @@ async fn fanout_kick_event(
 /// Map Kick `kicks` into overlay + dock shapes.
 /// Overlay uses `cheer` (shared Twitch cheer profiles); dock stays Kick-labeled `kicks`.
 /// Variables keep `name` + `amount` so cheer amount-threshold picker rules still apply.
-struct KickKicksMapped {
-    overlay_event_type: &'static str,
-    variables: Value,
-    dock_event_type: &'static str,
-    dock_label: &'static str,
-    dock_detail: String,
+pub(crate) struct KickKicksMapped {
+    pub(crate) overlay_event_type: &'static str,
+    pub(crate) variables: Value,
+    pub(crate) dock_event_type: &'static str,
+    pub(crate) dock_label: &'static str,
+    pub(crate) dock_detail: String,
 }
 
-fn map_kick_kicks(user: &str, amount: &Value) -> KickKicksMapped {
+pub(crate) fn map_kick_kicks(user: &str, amount: &Value) -> KickKicksMapped {
     KickKicksMapped {
         overlay_event_type: "cheer",
         variables: json!({ "name": user, "amount": amount }),

@@ -1,7 +1,7 @@
 //! HTTP routes (port of overlay-server/server.js Express routes).
 
 use crate::app_state::{normalize_chat_profile_id, AppState};
-use crate::broadcast::{make_dock_event, FeedAudience};
+use crate::broadcast::FeedAudience;
 use crate::config_types::{
     normalize_display_mode, normalize_popup_duration, resolve_events_overlay_profile,
     validate_events_overlay_profile_write, ChatOverlayProfile,
@@ -10,6 +10,10 @@ use crate::control_plane::{self, cors_layer, MEDIA_UPLOAD_BODY_LIMIT, PRIVILEGED
 use crate::kick;
 use crate::storage;
 use crate::streamelements::{self, map_overlay_to_profile, save_raw_overlay, SeClient, SeSession};
+use crate::test_alert::{
+    self, build_test_alert_payload, build_test_dock_event, dock_only, resolve_platform,
+    TestAlertError,
+};
 use crate::twitch::{self, TwitchServices};
 use axum::{
     body::Body,
@@ -2193,9 +2197,9 @@ async fn post_test_alert(
     State(ctx): State<ServerContext>,
     Query(q): Query<ProfileQuery>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if ctx.state.readonly {
-        return Json(json!({ "ok": false, "error": "readonly" }));
+        return Ok(Json(json!({ "ok": false, "error": "readonly" })));
     }
     let profile_id = q
         .profile
@@ -2216,106 +2220,44 @@ async fn post_test_alert(
         .unwrap_or_else(|| body.get("data").cloned().unwrap_or(json!({})));
     let variables = twitch::normalize_event_variables(&raw_vars);
 
-    let mut alert = json!({
-        "type": "event-alert",
-        "eventType": event_type,
-        "data": { "variables": variables },
-    });
-    if let Some(vid) = body
+    let twitch_connected = ctx.state.twitch.read().await.connected;
+    let kick_connected = ctx.state.kick.read().await.tokens.is_linked();
+    let platform_raw = match body.get("platform") {
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => return Err(test_alert_error_response(TestAlertError::UnknownPlatform)),
+        None => None,
+    };
+    let platform = resolve_platform(platform_raw, twitch_connected, kick_connected)
+        .map_err(test_alert_error_response)?;
+    test_alert::assert_event_supported(platform, event_type).map_err(test_alert_error_response)?;
+
+    let variation_id = body
         .get("variationId")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        alert["variationId"] = json!(vid);
+        .filter(|s| !s.is_empty());
+    let sound_volume = body.get("soundVolume");
+    let alert =
+        build_test_alert_payload(platform, event_type, &variables, variation_id, sound_volume);
+    if !dock_only(platform, event_type) {
+        ctx.state.feed.broadcast_profile(profile_id, &alert).await;
     }
-    if let Some(sv) = body.get("soundVolume") {
-        if !sv.is_null() {
-            alert["soundVolume"] = sv.clone();
-        }
-    }
-    ctx.state.feed.broadcast_profile(profile_id, &alert).await;
 
-    let et = event_type.to_ascii_lowercase();
-    let name = variables
-        .get("name")
-        .or_else(|| variables.get("user"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("Someone");
-    let detail = test_alert_dock_detail(&et, name, &variables);
-    let dock_type = if et == "cheer" { "bits" } else { et.as_str() };
-    ctx.state
-        .feed
-        .broadcast_all(&make_dock_event(dock_type, &detail, Some(event_type), None))
-        .await;
+    let dock = build_test_dock_event(platform, event_type, &variables);
+    ctx.state.feed.broadcast_all(&dock).await;
 
-    Json(json!({ "ok": true, "profileId": profile_id, "eventType": event_type }))
+    Ok(Json(json!({
+        "ok": true,
+        "profileId": profile_id,
+        "eventType": event_type,
+        "platform": platform.as_str(),
+    })))
 }
 
-fn test_alert_dock_detail(et: &str, name: &str, variables: &Value) -> String {
-    match et {
-        "follow" => format!("{name} followed"),
-        "sub" => twitch::format_sub_dock_detail(
-            name,
-            variables
-                .get("tier")
-                .or(variables.get("amount"))
-                .unwrap_or(&Value::Null),
-        ),
-        "resub" => twitch::format_resub_dock_detail(
-            name,
-            variables.get("months").unwrap_or(&Value::Null),
-            variables
-                .get("tier")
-                .or(variables.get("amount"))
-                .unwrap_or(&Value::Null),
-            variables
-                .get("input")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-        ),
-        "gift" => twitch::format_gift_dock_detail(
-            name,
-            variables.get("amount").unwrap_or(&Value::Null),
-            variables.get("tier").unwrap_or(&Value::Null),
-            variables
-                .get("recipient")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-        ),
-        "cheer" | "bits" => format!(
-            "{name} cheered {}{}",
-            variables
-                .get("amount")
-                .or(variables.get("bits"))
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            variables
-                .get("input")
-                .map(|i| format!(": {i}"))
-                .unwrap_or_default()
-        ),
-        "raid" => format!(
-            "{name} raided{}",
-            variables
-                .get("amount")
-                .or(variables.get("raiders"))
-                .map(|v| format!(" with {v}"))
-                .unwrap_or_default()
-        ),
-        "redeem" => format!(
-            "{} — {}{}",
-            variables
-                .get("reward")
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "Redeem".into()),
-            name,
-            variables
-                .get("input")
-                .map(|i| format!(": {i}"))
-                .unwrap_or_default()
-        ),
-        _ => format!("{name} triggered {et}"),
-    }
+fn test_alert_error_response(err: TestAlertError) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "ok": false, "error": err.code() })),
+    )
 }
 
 async fn ws_feed(

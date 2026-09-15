@@ -249,6 +249,12 @@
     .btn-pill:active{transform:translateY(1px);filter:brightness(0.98);}
 
     .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
+
+    .seg-btn:disabled,
+    .seg-toggle input:disabled + .seg-btn{
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
     .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;}
 
     /* Custom select shell */
@@ -1241,12 +1247,13 @@
         <div class="toolbar">
           <button class="btn btn-ghost" id="btnToggleGrid">Toggle Grid</button>
 
+
           <div class="seg-toggle" role="tablist" aria-label="Test mode">
             <input type="radio" name="testMode" id="testModeLocal" value="local" checked />
             <button type="button" class="seg-btn active" id="testBtnLocal">Local</button>
 
-            <input type="radio" name="testMode" id="testModeLive" value="live" />
-            <button type="button" class="seg-btn" id="testBtnLive">Live</button>
+            <input type="radio" name="testMode" id="testModeLive" value="live" disabled />
+            <button type="button" class="seg-btn disabled" id="testBtnLive" disabled>Live</button>
           </div>
 
           <button class="btn-pill btn-pill-small" id="btnTestAlert">Test Alert</button>
@@ -1293,6 +1300,7 @@
 
   <script src="control-api.js?v=no-anon-fetch-1"></script>
   <script src="/events-variation-picker.js"></script>
+  <script src="/overlay-server/events-studio-platform.js"></script>
   <script>
     if (!window.StreamSyncVariationPicker) {
       console.error(
@@ -1708,7 +1716,11 @@
       nudgeLastTs: 0,
       nudgeAccum: { x: 0, y: 0 },
       audio: null,
-      testMode: "local"
+      testMode: "local",
+      platformConnections: { twitch: false, kick: false },
+      selectedTestPlatform: null,
+      platformStatusTimer: null,
+      platformStatusRunner: null,
     };
 
     const NUDGE_TAP_PX = 1;
@@ -2149,6 +2161,7 @@ async function ensureProfilesPersistedToServer(profileIds) {
     const testModeLive = $("testModeLive");
     const testBtnLocal = $("testBtnLocal");
     const testBtnLive = $("testBtnLive");
+
 
     const btnExport = $("btnExport");
     const toast = $("toast");
@@ -4795,6 +4808,7 @@ async function ensureProfilesPersistedToServer(profileIds) {
     bind(testBtnLive, "click", () => setTestMode("live"));
     bind(testModeLocal, "change", () => setTestMode("local"));
     bind(testModeLive, "change", () => setTestMode("live"));
+
     // Initialize without toast
     setTestMode(state.testMode || "local", { silent: true });
     bindStageDnD();
@@ -5223,9 +5237,111 @@ async function ensureProfilesPersistedToServer(profileIds) {
       return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
     }
 
+    function readStoredTestPlatform() {
+      try {
+        const v = sessionStorage.getItem("eventsStudioTestPlatform");
+        if (v === "twitch" || v === "kick") return v;
+      } catch (_) {}
+      return null;
+    }
+
+    function storeTestPlatform(platform) {
+      try {
+        if (platform === "twitch" || platform === "kick") {
+          sessionStorage.setItem("eventsStudioTestPlatform", platform);
+        }
+      } catch (_) {}
+    }
+
+    function applyUnavailableTestPlatformUi() {
+      state.platformConnections = { twitch: false, kick: false };
+      state.selectedTestPlatform = null;
+      if (testModeLive) testModeLive.disabled = true;
+      if (testBtnLive) {
+        testBtnLive.disabled = true;
+        testBtnLive.classList.add("disabled");
+      }
+      if (state.testMode === "live") {
+        setTestMode("local", { silent: true });
+      } else if (btnTestAlert) {
+        btnTestAlert.disabled = false;
+      }
+    }
+
+    function applyTestPlatformUi(connections, opts = {}) {
+      const helper = window.StreamSyncEventsStudioPlatform;
+      if (!helper) {
+        applyUnavailableTestPlatformUi();
+        return;
+      }
+      const ui = helper.computeTestPlatformUi({
+        twitch: !!connections?.twitch,
+        kick: !!connections?.kick,
+        previousSelection: state.selectedTestPlatform || readStoredTestPlatform(),
+      });
+      state.platformConnections = ui.connections;
+      state.selectedTestPlatform = ui.platform;
+      if (ui.platform) storeTestPlatform(ui.platform);
+
+      const liveDisabled = !ui.liveEnabled;
+      if (testModeLive) testModeLive.disabled = liveDisabled;
+      if (testBtnLive) {
+        testBtnLive.disabled = liveDisabled;
+        testBtnLive.classList.toggle("disabled", liveDisabled);
+      }
+      if (btnTestAlert) {
+        btnTestAlert.disabled = liveDisabled && state.testMode === "live";
+      }
+
+      if (!ui.liveEnabled && state.testMode === "live") {
+        setTestMode("local", { silent: true });
+      } else if (!opts.silent && ui.liveEnabled && state.testMode === "live") {
+        // keep live controls enabled
+      }
+    }
+
+    async function refreshPlatformConnections(opts = {}) {
+      const helper = window.StreamSyncEventsStudioPlatform;
+      if (!helper?.createLatestStatusRunner) {
+        applyUnavailableTestPlatformUi();
+        return;
+      }
+      if (!state.platformStatusRunner) {
+        state.platformStatusRunner = helper.createLatestStatusRunner({
+          load: async () => {
+            const res = await privilegedFetch("/api/status", { cache: "no-cache" });
+            if (!res.ok) throw new Error(`Platform status failed: HTTP ${res.status}`);
+            return res.json();
+          },
+          applyStatus: (data, runOpts) => {
+            applyTestPlatformUi(
+              {
+                twitch: !!data?.twitch?.connected,
+                kick: !!data?.kick?.connected,
+              },
+              runOpts || {}
+            );
+          },
+          applyUnavailable: (err) => {
+            console.warn("[Events Studio] Platform status refresh failed:", err);
+            applyUnavailableTestPlatformUi();
+          },
+        });
+      }
+      await state.platformStatusRunner(opts);
+    }
+
     function setTestMode(mode, opts){
       const silent = !!(opts && opts.silent);
-      state.testMode = (mode === "live") ? "live" : "local";
+      const helper = window.StreamSyncEventsStudioPlatform;
+      if (helper?.safeTestMode) {
+        state.testMode = helper.safeTestMode(mode, state.platformConnections);
+      } else {
+        const connected = !!(
+          state.platformConnections?.twitch || state.platformConnections?.kick
+        );
+        state.testMode = mode === "live" && connected ? "live" : "local";
+      }
 
       if (testModeLocal) testModeLocal.checked = (state.testMode === "local");
       if (testModeLive) testModeLive.checked = (state.testMode === "live");
@@ -5233,7 +5349,22 @@ async function ensureProfilesPersistedToServer(profileIds) {
       if (testBtnLocal) testBtnLocal.classList.toggle("active", state.testMode === "local");
       if (testBtnLive) testBtnLive.classList.toggle("active", state.testMode === "live");
 
+      const liveDisabled = !(state.platformConnections?.twitch || state.platformConnections?.kick);
+      if (btnTestAlert) {
+        btnTestAlert.disabled = state.testMode === "live" && liveDisabled;
+      }
+
       if (!silent) showToast(state.testMode === "live" ? "Live test enabled" : "Local test enabled");
+    }
+
+    function currentSimPlatform() {
+      return state.selectedTestPlatform || "twitch";
+    }
+
+    function simEventsForCurrentPlatform() {
+      const helper = window.StreamSyncEventsStudioPlatform;
+      if (!helper) return SIM_TEST_EVENTS;
+      return helper.simEventsForPlatform(currentSimPlatform());
     }
 
     const SIM_TEST_EVENTS = [
@@ -5246,7 +5377,7 @@ async function ensureProfilesPersistedToServer(profileIds) {
     ];
 
     function defaultSimAmountForEvent(eventKey) {
-      if (eventKey === "cheer") return 100;
+      if (eventKey === "cheer" || eventKey === "kicks") return 100;
       if (eventKey === "raid") return 25;
       if (eventKey === "gift") return 1;
       return 1;
@@ -5272,6 +5403,10 @@ async function ensureProfilesPersistedToServer(profileIds) {
     function buildSimulatedTestVariables(eventKey, form) {
       const name = (form?.name || "TestUser").trim() || "TestUser";
       const tier = [1, 2, 3].includes(Number(form?.tier)) ? Number(form.tier) : 1;
+      const platform = currentSimPlatform();
+      const usesTier =
+        window.StreamSyncEventsStudioPlatform?.usesTierForPlatform(platform, eventKey) ??
+        isTierSubscriberEvent(eventKey);
       const months = Math.max(1, Number(form?.months) || 6);
       const amountRaw = form?.amount;
       const amount = Number(amountRaw);
@@ -5286,7 +5421,7 @@ async function ensureProfilesPersistedToServer(profileIds) {
         recipient: "TestRecipient",
       };
 
-      if (eventKey === "cheer") {
+      if (eventKey === "cheer" || eventKey === "kicks") {
         data.bits = amt;
         data.amount = amt;
       } else if (eventKey === "raid") {
@@ -5295,10 +5430,10 @@ async function ensureProfilesPersistedToServer(profileIds) {
         data.amount = amt;
       } else if (eventKey === "gift") {
         data.amount = Math.max(1, Math.floor(amt));
-        data.tier = tierToTwitchPlan(tier);
+        if (usesTier) data.tier = tierToTwitchPlan(tier);
       } else if (isTierSubscriberEvent(eventKey)) {
         const plan = tierToTwitchPlan(tier);
-        data.tier = plan;
+        if (usesTier) data.tier = plan;
         data.amount = plan;
         if (eventKey === "resub") data.months = months;
       } else if (eventKey === "follow") {
@@ -5411,8 +5546,25 @@ async function ensureProfilesPersistedToServer(profileIds) {
       showToast(`Local test ${label} (${v.durationSec ?? 6}s)`);
     }
 
-    async function runLiveTestBroadcast({ eventKey, variables, variationId, soundVariation }) {
+    async function runLiveTestBroadcast({
+      eventKey,
+      variables,
+      variationId,
+      soundVariation,
+      platform,
+    }) {
       const ek = eventKey || state.eventKey;
+      const requestedPlatform = platform || currentSimPlatform();
+      await refreshPlatformConnections({ silent: true });
+      const helper = window.StreamSyncEventsStudioPlatform;
+      const requestedPlatformConnected = helper?.isSelectedPlatformConnected
+        ? helper.isSelectedPlatformConnected(requestedPlatform, state.platformConnections)
+        : !!state.platformConnections?.[requestedPlatform];
+      if (!requestedPlatformConnected) {
+        const label = requestedPlatform === "kick" ? "Kick" : "Twitch";
+        throw new Error(`Live test unavailable: ${label} is no longer connected`);
+      }
+
       await flushSave(profile, state.cfg);
 
       const vForSound = soundVariation || null;
@@ -5422,6 +5574,7 @@ async function ensureProfilesPersistedToServer(profileIds) {
         profile,
         eventKey: ek,
         eventType: ek,
+        platform: requestedPlatform,
         soundVolume: soundVolumePctLive,
         data: variables,
       };
@@ -5436,6 +5589,14 @@ async function ensureProfilesPersistedToServer(profileIds) {
 
       if (!res.ok) {
         const t = await res.text().catch(() => "");
+        let errCode = "";
+        try {
+          const parsed = JSON.parse(t);
+          errCode = parsed?.error || "";
+        } catch (_) {}
+        if (errCode === "platform_not_connected" || errCode === "no_platform_connected") {
+          await refreshPlatformConnections();
+        }
         throw new Error(`Live test failed: HTTP ${res.status} ${t}`.trim());
       }
 
@@ -5458,10 +5619,14 @@ async function ensureProfilesPersistedToServer(profileIds) {
       });
     }
 
-    async function runSimulatedTest({ eventKey, variables }) {
+    async function runSimulatedTest({ eventKey, variables, platform }) {
       const ek = eventKey || state.eventKey;
-      const eventConfig = eventConfigForSimulatedTest(ek);
-      const picked = pickVariationForSimulatedTest(ek, variables, null);
+      const testPlatform = platform || currentSimPlatform();
+      const helper = window.StreamSyncEventsStudioPlatform;
+      const variationKey =
+        helper?.variationEventKeyForPlatform(ek, testPlatform) || ek;
+      const eventConfig = eventConfigForSimulatedTest(variationKey);
+      const picked = pickVariationForSimulatedTest(variationKey, variables, null);
       if (!picked) {
         const n = Array.isArray(eventConfig?.variations) ? eventConfig.variations.length : 0;
         throw new Error(
@@ -5474,7 +5639,7 @@ async function ensureProfilesPersistedToServer(profileIds) {
       const picker = window.StreamSyncVariationPicker;
       const info = picker?.describePick({
         eventConfig,
-        eventType: ek,
+        eventType: variationKey,
         variables,
         variationId: null,
       });
@@ -5492,6 +5657,7 @@ async function ensureProfilesPersistedToServer(profileIds) {
           variables,
           variationId: null,
           soundVariation: picked,
+          platform: testPlatform,
         });
         const hint =
           info && info.matchingCount > 1
@@ -5505,12 +5671,19 @@ async function ensureProfilesPersistedToServer(profileIds) {
     }
 
     function syncTestAlertFieldVisibility(body, eventKey) {
+      const platform = currentSimPlatform();
       const amountRow = body.querySelector("[data-test-field='amount']");
       const tierRow = body.querySelector("[data-test-field='tier']");
       const monthsRow = body.querySelector("[data-test-field='months']");
       const amountLabel = body.querySelector("#testAlertAmountLabel");
-      const needsAmount = eventKey === "cheer" || eventKey === "raid" || eventKey === "gift";
-      const needsTier = isTierSubscriberEvent(eventKey) || eventKey === "gift";
+      const needsAmount =
+        eventKey === "cheer" ||
+        eventKey === "kicks" ||
+        eventKey === "raid" ||
+        eventKey === "gift";
+      const needsTier =
+        window.StreamSyncEventsStudioPlatform?.usesTierForPlatform(platform, eventKey) ??
+        (isTierSubscriberEvent(eventKey) || eventKey === "gift");
       const needsMonths = eventKey === "resub";
 
       if (amountRow) amountRow.style.display = needsAmount ? "" : "none";
@@ -5520,11 +5693,13 @@ async function ensureProfilesPersistedToServer(profileIds) {
         amountLabel.textContent =
           eventKey === "cheer"
             ? "Bits amount"
-            : eventKey === "raid"
-              ? "Raider count"
-              : eventKey === "gift"
-                ? "Gift count"
-                : "Amount";
+            : eventKey === "kicks"
+              ? "Kicks amount"
+              : eventKey === "raid"
+                ? "Raider count"
+                : eventKey === "gift"
+                  ? "Gift count"
+                  : "Amount";
       }
     }
 
@@ -5545,15 +5720,42 @@ async function ensureProfilesPersistedToServer(profileIds) {
         tEl.textContent = "Simulate alert";
         actions.innerHTML = "";
 
-        const defaultKey = state.eventKey || "follow";
+        const helper = window.StreamSyncEventsStudioPlatform;
+        const platformUi = helper?.computeTestPlatformUi({
+          twitch: !!state.platformConnections?.twitch,
+          kick: !!state.platformConnections?.kick,
+          previousSelection: state.selectedTestPlatform || readStoredTestPlatform(),
+        });
+        if (platformUi?.platform) state.selectedTestPlatform = platformUi.platform;
+
+        const events = simEventsForCurrentPlatform();
+        const preferredKey = state.eventKey || "follow";
+        const defaultKey = events.some((t) => t.key === preferredKey)
+          ? preferredKey
+          : events[0]?.key || "follow";
         const defaultAmt = defaultSimAmountForEvent(defaultKey);
 
-        body.innerHTML = `
-          <p class="mini-hint" style="margin-top:0">
-            Simulates a Twitch event through the same variation rules (value triggers + chance) as live.
-            Use <strong>Live</strong> mode in the toolbar to fire your OBS browser source.
-          </p>
+        const platform = currentSimPlatform();
+        const hint = helper?.simHintForPlatform(platform) ||
+          "Simulates an event through the same variation rules (value triggers + chance) as live.";
+
+        const platformField = platformUi?.showSelector
+          ? `
           <div class="field" style="margin-top:12px">
+            <label>Platform</label>
+            <select id="testAlertPlatform">
+              <option value="twitch"${platform === "twitch" ? " selected" : ""}>Twitch</option>
+              <option value="kick"${platform === "kick" ? " selected" : ""}>Kick</option>
+            </select>
+          </div>`
+          : "";
+
+        body.innerHTML = `
+          <p class="mini-hint" id="testAlertHint" style="margin-top:0">
+            ${hint}
+          </p>
+          ${platformField}
+          <div class="field"${platformUi?.showSelector ? "" : ' style="margin-top:12px"'}>
             <label>Event type</label>
             <select id="testAlertEventType"></select>
           </div>
@@ -5580,13 +5782,8 @@ async function ensureProfilesPersistedToServer(profileIds) {
         `;
 
         const typeSel = body.querySelector("#testAlertEventType");
-        SIM_TEST_EVENTS.forEach((t) => {
-          const opt = document.createElement("option");
-          opt.value = t.key;
-          opt.textContent = t.label;
-          if (t.key === defaultKey) opt.selected = true;
-          typeSel.appendChild(opt);
-        });
+        const platformSel = body.querySelector("#testAlertPlatform");
+        const hintEl = body.querySelector("#testAlertHint");
 
         const onTypeChange = () => {
           const ek = typeSel.value;
@@ -5594,8 +5791,38 @@ async function ensureProfilesPersistedToServer(profileIds) {
           if (amtEl) amtEl.value = String(defaultSimAmountForEvent(ek));
           syncTestAlertFieldVisibility(body, ek);
         };
+
+        const renderEventOptions = (preferredEvent) => {
+          const model = helper?.reconcileSimEventSelection(
+            currentSimPlatform(),
+            preferredEvent
+          ) || {
+            events: simEventsForCurrentPlatform(),
+            selected: preferredEvent || "follow",
+          };
+          typeSel.innerHTML = "";
+          model.events.forEach((event) => {
+            const opt = document.createElement("option");
+            opt.value = event.key;
+            opt.textContent = event.label;
+            typeSel.appendChild(opt);
+          });
+          typeSel.value = model.selected;
+          if (hintEl) {
+            hintEl.innerHTML = helper?.simHintForPlatform(currentSimPlatform()) || hint;
+          }
+          onTypeChange();
+        };
+
         typeSel.addEventListener("change", onTypeChange);
-        onTypeChange();
+        if (platformSel) {
+          platformSel.addEventListener("change", () => {
+            state.selectedTestPlatform = platformSel.value;
+            storeTestPlatform(state.selectedTestPlatform);
+            renderEventOptions(typeSel.value);
+          });
+        }
+        renderEventOptions(defaultKey);
 
         const btnCancel = document.createElement("button");
         btnCancel.type = "button";
@@ -5616,7 +5843,11 @@ async function ensureProfilesPersistedToServer(profileIds) {
             months: body.querySelector("#testAlertMonths")?.value,
             name: body.querySelector("#testAlertName")?.value,
           };
-          closeModal({ eventKey: ek, variables: buildSimulatedTestVariables(ek, form) });
+          closeModal({
+            eventKey: ek,
+            platform: currentSimPlatform(),
+            variables: buildSimulatedTestVariables(ek, form),
+          });
         });
 
         actions.appendChild(btnCancel);
@@ -5630,10 +5861,12 @@ async function ensureProfilesPersistedToServer(profileIds) {
 
     bind(btnTestAlert, "click", async () => {
       try {
+        await refreshPlatformConnections({ silent: true });
         const result = await openTestAlertModal();
         if (!result?.variables) return;
         await runSimulatedTest({
           eventKey: result.eventKey,
+          platform: result.platform,
           variables: result.variables,
         });
       } catch (err) {
@@ -5731,6 +5964,12 @@ async function ensureProfilesPersistedToServer(profileIds) {
       renderAll();
 
       wireVolumeSlider(soundVolume, soundVolumeValue);
+
+      await refreshPlatformConnections({ silent: true });
+      if (state.platformStatusTimer) clearInterval(state.platformStatusTimer);
+      state.platformStatusTimer = setInterval(() => {
+        refreshPlatformConnections({ silent: true });
+      }, 5000);
     }
 
     window.addEventListener("message", (ev) => {

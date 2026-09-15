@@ -47,6 +47,9 @@ jobs:
       - name: version consistency
         run: npm run test:version
 
+      - name: desktop icon validity
+        run: npm run test:icons
+
       - name: installer smoke checklist present
         run: test -f docs/INSTALLER_SMOKE.md
 
@@ -67,6 +70,9 @@ jobs:
 
       - name: version consistency
         run: node scripts/check-version-consistency.js
+
+      - name: desktop icon validity
+        run: node scripts/check-desktop-icons.js
 
       - name: NSIS installer
         run: npx tauri build --bundles nsis --ci
