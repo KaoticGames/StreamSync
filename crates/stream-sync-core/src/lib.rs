@@ -22,6 +22,7 @@ mod storage;
 mod store_lock;
 mod streamelements;
 mod syndicate_connection;
+mod test_alert;
 mod twitch;
 
 pub use delegated_lifecycle::{
