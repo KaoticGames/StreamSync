@@ -71,6 +71,34 @@ describe("StreamSyncEventsStudioPlatform selection", () => {
     assert.equal(platform.variationEventKeyForPlatform("kicks", "kick"), "cheer");
   });
 
+  it("reconciles the modal event selection when its platform changes", () => {
+    assert.deepEqual(platform.reconcileSimEventSelection("kick", "raid"), {
+      events: [
+        { key: "follow", label: "New follower" },
+        { key: "sub", label: "New sub" },
+        { key: "gift", label: "Gift subs" },
+        { key: "kicks", label: "Kicks" },
+      ],
+      selected: "follow",
+    });
+    assert.equal(platform.reconcileSimEventSelection("twitch", "sub").selected, "sub");
+  });
+
+  it("keeps a modal platform pinned across a connection refresh", () => {
+    assert.equal(
+      platform.isSelectedPlatformConnected("kick", { twitch: true, kick: false }),
+      false
+    );
+    assert.equal(
+      platform.isSelectedPlatformConnected("kick", { twitch: true, kick: true }),
+      true
+    );
+    assert.equal(
+      platform.isSelectedPlatformConnected("twitch", { twitch: true, kick: false }),
+      true
+    );
+  });
+
   it("offers tier controls only for Twitch subscriber events", () => {
     assert.equal(platform.usesTierForPlatform("twitch", "sub"), true);
     assert.equal(platform.usesTierForPlatform("twitch", "resub"), true);

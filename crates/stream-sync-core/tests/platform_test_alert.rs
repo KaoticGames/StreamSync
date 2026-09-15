@@ -244,6 +244,14 @@ async fn events_studio_platform_helper_is_served() {
         html.contains("id=\"testBtnLive\" disabled"),
         "Live button must render disabled until connection status is known"
     );
+    assert!(
+        !html.contains("id=\"testPlatformWrap\""),
+        "Platform selection must not live in the editor toolbar"
+    );
+    assert!(
+        html.contains("<label>Platform</label>") && html.contains("id=\"testAlertPlatform\""),
+        "The Simulate alert modal must own the platform field"
+    );
 
     let helper = client
         .get(format!(

@@ -62,6 +62,14 @@
     return TWITCH_SIM_EVENTS.slice();
   }
 
+  function reconcileSimEventSelection(platform, currentSelection) {
+    const events = simEventsForPlatform(platform);
+    const selected = events.some((event) => event.key === currentSelection)
+      ? currentSelection
+      : events[0]?.key || "follow";
+    return { events, selected };
+  }
+
   function variationEventKeyForPlatform(eventKey, platform) {
     if (platform === "kick" && eventKey === "kicks") return "cheer";
     return eventKey;
@@ -87,6 +95,13 @@
     return wantsLive && connected ? "live" : "local";
   }
 
+  function isSelectedPlatformConnected(platform, connections) {
+    return (
+      (platform === "twitch" && !!connections?.twitch) ||
+      (platform === "kick" && !!connections?.kick)
+    );
+  }
+
   function createLatestStatusRunner({ load, applyStatus, applyUnavailable }) {
     let latestRequest = 0;
     return async function run(context) {
@@ -107,10 +122,12 @@
   root.StreamSyncEventsStudioPlatform = {
     computeTestPlatformUi,
     simEventsForPlatform,
+    reconcileSimEventSelection,
     variationEventKeyForPlatform,
     simHintForPlatform,
     usesTierForPlatform,
     safeTestMode,
+    isSelectedPlatformConnected,
     createLatestStatusRunner,
   };
 })(

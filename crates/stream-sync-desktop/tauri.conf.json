@@ -21,7 +21,7 @@
     "targets": ["nsis"],
     "publisher": "Kaotic Games",
     "icon": [
-      "icons/icon.png"
+      "../../assets/icon.ico"
     ],
     "windows": {
       "digestAlgorithm": "sha256",
