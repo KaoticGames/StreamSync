@@ -1629,6 +1629,12 @@ fn normalize_anim(raw: &str) -> String {
 const MAX_MEDIA_BYTES: usize = 25 * 1024 * 1024;
 
 /// Download remote alert media into `{events_media_dir}/{profile_id}/` and rewrite profile URLs.
+const OVERLAY_IMPORT_USER_AGENT: &str = concat!(
+    "StreamSync/",
+    env!("CARGO_PKG_VERSION"),
+    " (overlay import)"
+);
+
 pub async fn localize_profile_media(
     paths: &StoragePaths,
     profile_id: &str,
@@ -1648,7 +1654,7 @@ pub async fn localize_profile_media(
 
     let http = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
-        .user_agent("StreamSync/2.0 (overlay import)")
+        .user_agent(OVERLAY_IMPORT_USER_AGENT)
         .build()
     {
         Ok(c) => c,
@@ -1977,6 +1983,18 @@ fn uniquify_filename(dir: &Path, filename: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn overlay_import_user_agent_tracks_package_version() {
+        assert_eq!(
+            OVERLAY_IMPORT_USER_AGENT,
+            concat!(
+                "StreamSync/",
+                env!("CARGO_PKG_VERSION"),
+                " (overlay import)"
+            )
+        );
+    }
 
     #[test]
     fn should_localize_remote_http_only() {

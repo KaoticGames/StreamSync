@@ -1,6 +1,6 @@
 # Release build — NSIS installer
 
-Local Windows installer for Stream Sync 2.0, same workflow as Electron: build on your machine, upload the NSIS `.exe` to Cloudflare R2.
+Local Windows installer for Stream Sync 2.1, same workflow as Electron: build on your machine, upload the NSIS `.exe` to Cloudflare R2.
 
 ## Prerequisites
 
@@ -12,14 +12,14 @@ Local Windows installer for Stream Sync 2.0, same workflow as Electron: build on
 ## Build (unsigned — smoke test)
 
 ```powershell
-cd G:\StreamSync_2.0.0-Rust\rust
+# Run from the repository root (the directory containing package.json)
 npm install
 npm run build
 ```
 
 `npm run build` runs `prepare-release` first (copies `.env` → `config/bundled.env`), then `tauri build`.
 
-**Output:** `target\release\bundle\nsis\` — `Stream Sync_2.0.1_x64-setup.exe` (name may vary).
+**Output:** `target\release\bundle\nsis\` — `Stream Sync_2.1.0_x64-setup.exe` (name may vary).
 
 Install that exe on a test machine and verify Twitch connect, overlays, and **Help → Check for updates**.
 
@@ -33,7 +33,7 @@ Uses the same Authenticode `.pfx` as electron-builder (`certs/kaotic-games.pfx`)
 
 ```powershell
 $pwd = Read-Host "PFX password" -AsSecureString
-Import-PfxCertificate -FilePath "G:\StreamSync_2.0.0-Rust\certs\kaotic-games.pfx" `
+Import-PfxCertificate -FilePath ".\certs\kaotic-games.pfx" `
   -CertStoreLocation Cert:\CurrentUser\My -Password $pwd
 ```
 
@@ -59,7 +59,7 @@ Leave `certificateThumbprint` unset. Fine for your own install testing; SmartScr
 |------|---------|
 | `config/bundled.env` | Twitch Client ID, redirect, port |
 | UI assets | `shell.html`, `overlay-server/`, `views/`, etc. |
-| Version `2.0.1` | `tauri.conf.json` + Cargo workspace |
+| Version `2.1.0` | `tauri.conf.json` + Cargo workspace |
 
 `%APPDATA%\Stream Sync\.env` still overrides bundled defaults for power users.
 
