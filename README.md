@@ -1,4 +1,4 @@
-# Stream Sync 2.0 — Rust workspace
+# Stream Sync 2.1 — Rust workspace
 
 **Release installer:** see [docs/RELEASE_BUILD.md](docs/RELEASE_BUILD.md) (`npm run build` → NSIS in `target/release/bundle/nsis/`).
 

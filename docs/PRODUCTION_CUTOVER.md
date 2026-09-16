@@ -1,6 +1,6 @@
-# Production — Stream Sync 2.0 (Rust / Tauri)
+# Production — Stream Sync 2.1 (Rust / Tauri)
 
-Stream Sync **2.0** ships from this workspace: Tauri desktop + `stream-sync-core` on port **4040**.
+Stream Sync **2.1** ships from this workspace: Tauri desktop + `stream-sync-core` on port **4040**.
 
 Legacy Node `overlay-server/server.js` is archived under `legacy/node-overlay/` for reference only.
 

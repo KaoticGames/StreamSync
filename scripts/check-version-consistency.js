@@ -52,10 +52,16 @@ for (const rel of crates) {
   }
 }
 
+for (const rel of ["boot.html", "views/about.html"]) {
+  if (!read(rel).includes(`v${cargoVersion}`)) {
+    mismatches.push(`${rel} must display v${cargoVersion}`);
+  }
+}
+
 if (mismatches.length) {
   console.error("Version consistency failed:");
   for (const line of mismatches) console.error(`  - ${line}`);
   process.exit(1);
 }
 
-console.log(`version ${cargoVersion} consistent (Cargo, npm, Tauri)`);
+console.log(`version ${cargoVersion} consistent (Cargo, npm, Tauri, UI)`);
