@@ -39,4 +39,22 @@ describe("generateLatestJson", () => {
       /unexpected asset host/
     );
   });
+
+  it("requires the immutable canonical asset URL for the same version", () => {
+    for (const assetUrl of [
+      "https://github.com/Other/Repo/releases/download/v2.1.1/StreamSync-windows-x86_64-setup.exe",
+      "https://github.com/KaoticGames/StreamSync/releases/download/v2.1.0/StreamSync-windows-x86_64-setup.exe",
+      "https://github.com/KaoticGames/StreamSync/releases/download/v2.1.1/renamed.exe",
+    ]) {
+      assert.throws(
+        () =>
+          generateLatestJson({
+            version: "2.1.1",
+            assetUrl,
+            signature: "sig",
+          }),
+        /unexpected asset path/
+      );
+    }
+  });
 });

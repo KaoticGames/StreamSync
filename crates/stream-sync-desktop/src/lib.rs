@@ -18,7 +18,7 @@ use tauri::{
     Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tracing_subscriber::EnvFilter;
-use update_service::{spawn_launch_check, UpdateService};
+use update_service::UpdateService;
 
 #[allow(dead_code)]
 struct InstanceLock(std::fs::File);
@@ -190,8 +190,6 @@ pub fn run() {
                 .is_err()
                 {
                     tracing::error!("failed to create main window");
-                } else if let Some(service) = handle2.try_state::<Arc<UpdateService>>() {
-                    spawn_launch_check(handle2.clone(), service.inner().clone());
                 }
             });
 
@@ -214,6 +212,7 @@ pub fn run() {
             commands::get_update_status,
             commands::check_for_updates,
             commands::check_for_updates_manual,
+            commands::check_for_updates_background,
             commands::begin_update_install,
             commands::dismiss_update,
             commands::open_update_fallback_page,

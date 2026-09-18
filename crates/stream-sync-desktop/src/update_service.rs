@@ -105,21 +105,15 @@ impl UpdateService {
         Some(generation)
     }
 
-    fn end_check(&self, generation: u64) {
-        if let Ok(mut guard) = self.in_flight.lock() {
-            if *guard == Some(generation) {
-                *guard = None;
-            }
+    fn finish_check(&self, generation: u64) -> bool {
+        let Ok(mut guard) = self.in_flight.lock() else {
+            return false;
+        };
+        if *guard != Some(generation) {
+            return false;
         }
-    }
-
-    fn is_stale(&self, generation: u64) -> bool {
-        self.in_flight
-            .lock()
-            .ok()
-            .map(|guard| *guard)
-            .map(|active| active != Some(generation))
-            .unwrap_or(true)
+        *guard = None;
+        true
     }
 
     fn record_attempt(&self, result: LastResult, success: bool) -> Result<(), String> {
@@ -173,8 +167,7 @@ impl UpdateService {
         };
 
         let outcome = self.perform_check(app, mode).await;
-        self.end_check(generation);
-        if self.is_stale(generation) {
+        if !self.finish_check(generation) {
             if mode == CheckMode::Background {
                 return Ok(BackgroundCheckResult::SkippedCadence);
             }
@@ -337,18 +330,6 @@ fn map_check_error(
     }
 }
 
-pub fn spawn_launch_check(app: AppHandle, service: std::sync::Arc<UpdateService>) {
-    tauri::async_runtime::spawn(async move {
-        match service.check_updates(&app, CheckMode::Background).await {
-            Ok(BackgroundCheckResult::UpdateAvailable(payload)) => {
-                let _ = app.emit("update-available", payload);
-            }
-            Ok(_) => {}
-            Err(_) => {}
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,8 +411,29 @@ mod tests {
         let first = service.begin_check();
         assert!(first.is_some());
         assert!(service.begin_check().is_none());
-        service.end_check(first.unwrap());
+        assert!(service.finish_check(first.unwrap()));
         assert!(service.begin_check().is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn completed_check_clears_only_its_own_generation() {
+        let dir =
+            std::env::temp_dir().join(format!("streamsync-update-finish-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let service = UpdateService::new(dir.clone());
+
+        let generation = service.begin_check().expect("first check starts");
+        assert!(service.finish_check(generation));
+        assert!(
+            service.begin_check().is_some(),
+            "completed check releases gate"
+        );
+        assert!(
+            !service.finish_check(generation),
+            "stale generation cannot finish a newer check"
+        );
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

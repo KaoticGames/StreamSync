@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+*"
+      - "v*"
   workflow_dispatch:
     inputs:
       dry_run_tag:
@@ -69,7 +69,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1635cc071259e90169279235f2 # v4.2.2
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-17
 
       - uses: actions/setup-node@39370e3970a6d50c2d2874e57cc9f70c5a19153b # v4.1.0
         with:
@@ -80,6 +80,18 @@ jobs:
 
       - name: version consistency
         run: node scripts/check-version-consistency.js
+
+      - name: Validate updater signing configuration
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw "TAURI_SIGNING_PRIVATE_KEY is not configured"
+          }
+          $config = Get-Content "crates/stream-sync-desktop/tauri.conf.json" -Raw | ConvertFrom-Json
+          $placeholder = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwCldSVFB1YmxpYyBrZXkgcmVwbGFjZSBhdCBvcGVyYXRvciBHMSE="
+          if ($config.plugins.updater.pubkey -eq $placeholder) {
+            throw "Replace the placeholder updater public key before releasing"
+          }
 
       - name: NSIS installer with updater artifacts
         run: npx tauri build --bundles nsis --ci
@@ -100,19 +112,18 @@ jobs:
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
           Copy-Item $source.FullName "release-assets/StreamSync-windows-x86_64-setup.exe"
           $sig = Get-ChildItem -Path $nsisDir -Filter "*_${version}_x64-setup.exe.sig" | Select-Object -First 1
-          if ($sig) {
-            Copy-Item $sig.FullName "release-assets/StreamSync-windows-x86_64-setup.exe.sig"
+          if (-not $sig) {
+            throw "Updater signature not found under $nsisDir for version $version"
           }
+          Copy-Item $sig.FullName "release-assets/StreamSync-windows-x86_64-setup.exe.sig"
           node scripts/sha256sum-windows-installer.js "release-assets/StreamSync-windows-x86_64-setup.exe" | Out-File -Encoding ascii "release-assets/SHA256SUMS.txt"
-          if (Test-Path "release-assets/StreamSync-windows-x86_64-setup.exe.sig") {
-            node scripts/generate-latest-json.js `
-              --version $version `
-              --tag "${{ needs.validate-tag.outputs.tag }}" `
-              --asset-url "https://github.com/KaoticGames/StreamSync/releases/download/${{ needs.validate-tag.outputs.tag }}/StreamSync-windows-x86_64-setup.exe" `
-              --sig-file "release-assets/StreamSync-windows-x86_64-setup.exe.sig" `
-              --notes-file release-notes.md `
-              | Out-File -Encoding utf8 "release-assets/latest.json"
-          }
+          node scripts/generate-latest-json.js `
+            --version $version `
+            --tag "${{ needs.validate-tag.outputs.tag }}" `
+            --asset-url "https://github.com/KaoticGames/StreamSync/releases/download/${{ needs.validate-tag.outputs.tag }}/StreamSync-windows-x86_64-setup.exe" `
+            --sig-file "release-assets/StreamSync-windows-x86_64-setup.exe.sig" `
+            --notes-file release-notes.md `
+            | Out-File -Encoding utf8 "release-assets/latest.json"
           Copy-Item release-notes.md release-assets/release-notes.md
 
       - uses: actions/upload-artifact@b26b7986833ed16fa0883e91e9fd5c5d4a58d7c6 # v4.3.1
@@ -152,17 +163,9 @@ jobs:
             --notes-file "$NOTES" \
             --draft \
             release-assets/StreamSync-windows-x86_64-setup.exe \
-            release-assets/SHA256SUMS.txt
-          if [ -f release-assets/StreamSync-windows-x86_64-setup.exe.sig ]; then
-            gh release upload "$TAG" \
-              --repo "${{ github.repository }}" \
-              release-assets/StreamSync-windows-x86_64-setup.exe.sig
-          fi
-          if [ -f release-assets/latest.json ]; then
-            gh release upload "$TAG" \
-              --repo "${{ github.repository }}" \
-              release-assets/latest.json
-          fi
+            release-assets/StreamSync-windows-x86_64-setup.exe.sig \
+            release-assets/SHA256SUMS.txt \
+            release-assets/latest.json
 
   publish-release:
     name: Publish GitHub Release
@@ -181,6 +184,7 @@ jobs:
       - name: Verify draft assets before publish
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate-tag.outputs.tag }}
         run: |
           set -euo pipefail
           TAG="${{ needs.validate-tag.outputs.tag }}"
@@ -193,7 +197,7 @@ jobs:
             if (!rel.isDraft) throw new Error('release is not a draft');
             if (rel.tagName !== process.env.TAG) throw new Error('tag mismatch');
             const names = rel.assets.map(a => a.name);
-            for (const required of ['StreamSync-windows-x86_64-setup.exe','SHA256SUMS.txt']) {
+            for (const required of ['StreamSync-windows-x86_64-setup.exe','StreamSync-windows-x86_64-setup.exe.sig','SHA256SUMS.txt','latest.json']) {
               if (!names.includes(required)) throw new Error('missing asset ' + required);
             }
           "
@@ -203,9 +207,6 @@ jobs:
             echo "Installer hash mismatch"
             exit 1
           fi
-        env:
-          TAG: ${{ needs.validate-tag.outputs.tag }}
-
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}

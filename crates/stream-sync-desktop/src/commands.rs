@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use stream_sync_core::{build_backup_zip, get_paths, restore_backup_zip};
-use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt;
 
 static SE_IMPORT_WINDOW: Mutex<()> = Mutex::new(());
@@ -367,6 +367,23 @@ pub async fn check_for_updates_manual(
         }),
         Err(result) => Ok(result),
     }
+}
+
+#[tauri::command]
+pub async fn check_for_updates_background(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    app: AppHandle,
+    updates: State<'_, Arc<UpdateService>>,
+) -> Result<(), String> {
+    require_main_window(&window, state.overlay_port)?;
+    if let Ok(BackgroundCheckResult::UpdateAvailable(payload)) =
+        updates.check_updates(&app, CheckMode::Background).await
+    {
+        app.emit("update-available", payload)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]

@@ -1,5 +1,7 @@
 // Update modal wiring for Stream Sync desktop (Tauri).
 (function (global) {
+  let wiredController = null;
+
   function ensureModal() {
     let backdrop = document.getElementById("update-modal-backdrop");
     if (backdrop) return backdrop;
@@ -50,6 +52,8 @@
 
   function wireUpdateModal(invoke, listen) {
     if (!invoke || !listen) return;
+
+    if (wiredController) return wiredController;
 
     const backdrop = ensureModal();
     let current = null;
@@ -135,32 +139,39 @@
       });
     });
 
-    listen("update-available", (event) => {
-      if (event?.payload) {
-        openModal(event.payload);
-      }
-    }).catch(() => {});
+    const ready = Promise.all([
+      Promise.resolve(
+        listen("update-available", (event) => {
+          if (event?.payload) {
+            openModal(event.payload);
+          }
+        })
+      ),
+      Promise.resolve(
+        listen("update-download-progress", (event) => {
+          const progress = backdrop.querySelector("#update-modal-progress");
+          if (!progress || !event?.payload) return;
+          progress.hidden = false;
+          const downloaded = event.payload.chunkLength || 0;
+          const total = event.payload.contentLength;
+          progress.textContent = total
+            ? `Downloading update… ${downloaded} / ${total} bytes`
+            : "Downloading update…";
+        })
+      ),
+      Promise.resolve(
+        listen("update-download-finished", () => {
+          const progress = backdrop.querySelector("#update-modal-progress");
+          if (progress) {
+            progress.hidden = false;
+            progress.textContent = "Installing update…";
+          }
+        })
+      ),
+    ]).then(() => undefined);
 
-    listen("update-download-progress", (event) => {
-      const progress = backdrop.querySelector("#update-modal-progress");
-      if (!progress || !event?.payload) return;
-      progress.hidden = false;
-      const downloaded = event.payload.chunkLength || 0;
-      const total = event.payload.contentLength;
-      progress.textContent = total
-        ? `Downloading update… ${downloaded} / ${total} bytes`
-        : "Downloading update…";
-    }).catch(() => {});
-
-    listen("update-download-finished", () => {
-      const progress = backdrop.querySelector("#update-modal-progress");
-      if (progress) {
-        progress.hidden = false;
-        progress.textContent = "Installing update…";
-      }
-    }).catch(() => {});
-
-    return { openModal, closeModal, formatManualResult };
+    wiredController = { openModal, closeModal, formatManualResult, ready };
+    return wiredController;
   }
 
   global.StreamSyncUpdateModal = {

@@ -123,7 +123,13 @@
     };
 
     if (window.StreamSyncUpdateModal?.wireUpdateModal) {
-      window.StreamSyncUpdateModal.wireUpdateModal(invoke, tauriListen);
+      const updateController =
+        window.StreamSyncUpdateModal.wireUpdateModal(invoke, tauriListen);
+      Promise.resolve(updateController?.ready)
+        .then(() => invoke("check_for_updates_background"))
+        .catch((err) => {
+          console.warn("[tauri-bridge] launch update check:", err);
+        });
     }
 
     console.log("[tauri-bridge] Stream Sync desktop APIs ready", cachedBase);

@@ -109,4 +109,39 @@ describe("StreamSyncUpdateModal", () => {
     assert.equal(first.id, "update-modal-backdrop");
     assert.equal(body.children.length, 1);
   });
+
+  it("wireUpdateModal is idempotent", () => {
+    const { document } = createMockDocument();
+    const modal = loadUpdateModal(document);
+    const invoke = async () => {};
+    const listen = async () => () => {};
+
+    const first = modal.wireUpdateModal(invoke, listen);
+    const second = modal.wireUpdateModal(invoke, listen);
+
+    assert.equal(second, first);
+  });
+
+  it("exposes readiness only after all update listeners are registered", async () => {
+    const { document } = createMockDocument();
+    const modal = loadUpdateModal(document);
+    const resolvers = [];
+    const listen = () =>
+      new Promise((resolve) => {
+        resolvers.push(() => resolve(() => {}));
+      });
+
+    const controller = modal.wireUpdateModal(async () => {}, listen);
+    let ready = false;
+    Promise.resolve(controller.ready).then(() => {
+      ready = true;
+    });
+    await Promise.resolve();
+    assert.equal(ready, false);
+    assert.equal(resolvers.length, 3);
+
+    resolvers.forEach((resolve) => resolve());
+    await controller.ready;
+    assert.equal(ready, true);
+  });
 });

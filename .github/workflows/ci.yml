@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1635cc071259e90169279235f2 # v4.2.2
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-17
 
       - uses: actions/setup-node@39370e3970a6d50c2d2874e57cc9f70c5a19153b # v4.1.0
         with:

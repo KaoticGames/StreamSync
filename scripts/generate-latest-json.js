@@ -3,7 +3,7 @@
 
 const fs = require("node:fs");
 
-const ALLOWED_HOSTS = new Set(["github.com", "objects.githubusercontent.com"]);
+const ALLOWED_HOSTS = new Set(["github.com"]);
 
 /**
  * @param {object} input
@@ -32,6 +32,12 @@ function generateLatestJson({
   }
   if (!ALLOWED_HOSTS.has(url.hostname)) {
     throw new Error(`unexpected asset host: ${url.hostname}`);
+  }
+  const expectedPath =
+    `/KaoticGames/StreamSync/releases/download/v${v}/` +
+    "StreamSync-windows-x86_64-setup.exe";
+  if (url.pathname !== expectedPath || url.search || url.hash) {
+    throw new Error(`unexpected asset path: ${url.pathname}`);
   }
 
   const sig = String(signature || "").trim();

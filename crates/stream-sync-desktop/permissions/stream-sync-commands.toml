@@ -16,6 +16,7 @@ commands.allow = [
   "get_update_status",
   "check_for_updates",
   "check_for_updates_manual",
+  "check_for_updates_background",
   "begin_update_install",
   "dismiss_update",
   "open_update_fallback_page",
