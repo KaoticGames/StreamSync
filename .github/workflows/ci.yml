@@ -11,57 +11,17 @@ env:
 
 jobs:
   quality:
-    name: fmt clippy test npm version
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Linux desktop deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libssl-dev
-
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: cargo test
-        run: cargo test --workspace
-
-      - name: npm install
-        run: npm ci
-
-      - name: npm test (js + privileged-fetch)
-        run: npm run test:js
-
-      - name: version consistency
-        run: npm run test:version
-
-      - name: desktop icon validity
-        run: npm run test:icons
-
-      - name: installer smoke checklist present
-        run: test -f docs/INSTALLER_SMOKE.md
+    uses: ./.github/workflows/quality.yml
 
   windows-installer:
     name: Windows NSIS installer
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1635cc071259e90169279235f2 # v4.2.2
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@39370e3970a6d50c2d2874e57cc9f70c5a19153b # v4.1.0
         with:
           node-version: "20"
 

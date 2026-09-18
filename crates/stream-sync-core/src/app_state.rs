@@ -141,7 +141,7 @@ fn nonempty_owned(value: Option<String>) -> Option<String> {
 }
 
 fn nonempty_ref(value: Option<&str>) -> Option<&str> {
-    value.and_then(|v| if v.trim().is_empty() { None } else { Some(v) })
+    value.filter(|v| !v.trim().is_empty())
 }
 
 fn write_secret_value(
