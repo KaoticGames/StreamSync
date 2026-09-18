@@ -1,0 +1,215 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+  workflow_dispatch:
+    inputs:
+      dry_run_tag:
+        description: "Validate tag/version only (no build or release mutation)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  validate-tag:
+    name: Validate tag and main ancestry
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+      tag: ${{ steps.validate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1635cc071259e90169279235f2 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@39370e3970a6d50c2d2874e57cc9f70c5a19153b # v4.1.0
+        with:
+          node-version: "20"
+
+      - id: validate
+        shell: bash
+        env:
+          REF_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run_tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG="${REF_NAME}"
+          RESULT="$(node scripts/validate-release-tag.js "$TAG")"
+          echo "$RESULT"
+          VERSION="$(node -e "const {validateReleaseTag}=require('./scripts/validate-release-tag.js'); const r=validateReleaseTag(process.argv[1]); if(!r.ok){process.exit(1)}; console.log(r.tagVersion)" "$TAG")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Dry-run validation only; skipping main ancestry check."
+            exit 0
+          fi
+
+          git fetch origin main --depth=1
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "Tagged commit is not contained in origin/main"
+            exit 1
+          fi
+
+  quality-gates:
+    needs: validate-tag
+    uses: ./.github/workflows/quality.yml
+
+  build-windows:
+    name: Build Windows NSIS installer
+    needs: [validate-tag, quality-gates]
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1635cc071259e90169279235f2 # v4.2.2
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@39370e3970a6d50c2d2874e57cc9f70c5a19153b # v4.1.0
+        with:
+          node-version: "20"
+
+      - name: npm install
+        run: npm ci
+
+      - name: version consistency
+        run: node scripts/check-version-consistency.js
+
+      - name: NSIS installer with updater artifacts
+        run: npx tauri build --bundles nsis --ci
+        working-directory: crates/stream-sync-desktop
+
+      - name: Generate release notes
+        run: node scripts/generate-release-notes.js "${{ needs.validate-tag.outputs.tag }}" > release-notes.md
+
+      - name: Stage canonical release assets
+        shell: pwsh
+        run: |
+          $version = "${{ needs.validate-tag.outputs.version }}"
+          $nsisDir = "target/release/bundle/nsis"
+          $source = Get-ChildItem -Path $nsisDir -Filter "*_${version}_x64-setup.exe" | Select-Object -First 1
+          if (-not $source) {
+            throw "NSIS installer not found under $nsisDir for version $version"
+          }
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Copy-Item $source.FullName "release-assets/StreamSync-windows-x86_64-setup.exe"
+          $sig = Get-ChildItem -Path $nsisDir -Filter "*_${version}_x64-setup.exe.sig" | Select-Object -First 1
+          if ($sig) {
+            Copy-Item $sig.FullName "release-assets/StreamSync-windows-x86_64-setup.exe.sig"
+          }
+          node scripts/sha256sum-windows-installer.js "release-assets/StreamSync-windows-x86_64-setup.exe" | Out-File -Encoding ascii "release-assets/SHA256SUMS.txt"
+          if (Test-Path "release-assets/StreamSync-windows-x86_64-setup.exe.sig") {
+            node scripts/generate-latest-json.js `
+              --version $version `
+              --tag "${{ needs.validate-tag.outputs.tag }}" `
+              --asset-url "https://github.com/KaoticGames/StreamSync/releases/download/${{ needs.validate-tag.outputs.tag }}/StreamSync-windows-x86_64-setup.exe" `
+              --sig-file "release-assets/StreamSync-windows-x86_64-setup.exe.sig" `
+              --notes-file release-notes.md `
+              | Out-File -Encoding utf8 "release-assets/latest.json"
+          }
+          Copy-Item release-notes.md release-assets/release-notes.md
+
+      - uses: actions/upload-artifact@b26b7986833ed16fa0883e91e9fd5c5d4a58d7c6 # v4.3.1
+        with:
+          name: windows-release-assets
+          path: |
+            release-assets/
+            release-notes.md
+
+  draft-release:
+    name: Create draft GitHub Release
+    needs: [validate-tag, build-windows]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1635cc071259e90169279235f2 # v4.2.2
+
+      - uses: actions/download-artifact@fa0a81b686eafc448e2a6752be48d31db5a1b32f # v4.1.8
+        with:
+          name: windows-release-assets
+          path: release-assets
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.validate-tag.outputs.tag }}"
+          VERSION="${{ needs.validate-tag.outputs.version }}"
+          NOTES="release-notes.md"
+          if [ -f release-assets/release-notes.md ]; then
+            NOTES="release-assets/release-notes.md"
+          fi
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "Stream Sync ${VERSION}" \
+            --notes-file "$NOTES" \
+            --draft \
+            release-assets/StreamSync-windows-x86_64-setup.exe \
+            release-assets/SHA256SUMS.txt
+          if [ -f release-assets/StreamSync-windows-x86_64-setup.exe.sig ]; then
+            gh release upload "$TAG" \
+              --repo "${{ github.repository }}" \
+              release-assets/StreamSync-windows-x86_64-setup.exe.sig
+          fi
+          if [ -f release-assets/latest.json ]; then
+            gh release upload "$TAG" \
+              --repo "${{ github.repository }}" \
+              release-assets/latest.json
+          fi
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [validate-tag, draft-release]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: streamsync-release
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1635cc071259e90169279235f2 # v4.2.2
+
+      - uses: actions/download-artifact@fa0a81b686eafc448e2a6752be48d31db5a1b32f # v4.1.8
+        with:
+          name: windows-release-assets
+          path: expected-assets
+
+      - name: Verify draft assets before publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.validate-tag.outputs.tag }}"
+          EXPECTED_SHA="$(cut -d' ' -f1 expected-assets/SHA256SUMS.txt)"
+          gh release view "$TAG" --repo "${{ github.repository }}" --json isDraft,tagName,targetCommitish,assets \
+            > release.json
+          node -e "
+            const fs = require('fs');
+            const rel = JSON.parse(fs.readFileSync('release.json','utf8'));
+            if (!rel.isDraft) throw new Error('release is not a draft');
+            if (rel.tagName !== process.env.TAG) throw new Error('tag mismatch');
+            const names = rel.assets.map(a => a.name);
+            for (const required of ['StreamSync-windows-x86_64-setup.exe','SHA256SUMS.txt']) {
+              if (!names.includes(required)) throw new Error('missing asset ' + required);
+            }
+          "
+          gh release download "$TAG" --repo "${{ github.repository }}" --pattern "StreamSync-windows-x86_64-setup.exe" --dir verify
+          ACTUAL_SHA="$(sha256sum verify/StreamSync-windows-x86_64-setup.exe | cut -d' ' -f1)"
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "Installer hash mismatch"
+            exit 1
+          fi
+        env:
+          TAG: ${{ needs.validate-tag.outputs.tag }}
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${{ needs.validate-tag.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --draft=false
