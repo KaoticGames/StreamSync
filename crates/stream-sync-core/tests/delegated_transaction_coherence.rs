@@ -2,15 +2,21 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use stream_sync_core::{
-    all_delegated_bundle_slot_keys, delegated_bundle_slot_key, fs_secret_store, paths_for_root,
-    read_bound_delegated_bundle, validate_delegated_session_coherence, write_json, AppState,
-    DelegatedSecretBundle, DelegatedSessionFile, OverlayConfig, OverlayServer,
-    TWITCH_DELEGATED_ACCESS_TOKEN_KEY, TWITCH_DELEGATED_CONNECTION_KEY,
+    all_delegated_bundle_slot_keys, delegated_bundle_slot_key, fs_secret_store,
+    legacy_revision_bundle_key, paths_for_root, read_bound_delegated_bundle,
+    read_bound_delegated_bundle_with_provenance, validate_delegated_session_coherence, write_json,
+    AppState, BoundBundleProvenance, DelegatedSecretBundle, DelegatedSessionFile, OverlayConfig,
+    OverlayServer, TWITCH_DELEGATED_ACCESS_TOKEN_KEY, TWITCH_DELEGATED_CONNECTION_KEY,
     TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY, TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY,
 };
 
 static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Authority gates are process-global; serialize gate tests to avoid cross-test races.
+static AUTHORITY_GATE_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
 fn test_userdata_dir() -> std::path::PathBuf {
     let n = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -203,14 +209,15 @@ async fn superseded_apply_rollback_restores_metadata_and_bound_bundle() {
         store.get(&delegated_bundle_slot_key(1)).unwrap(),
     ];
 
-    let snapshot =
+    let mut snapshot =
         stream_sync_core::test_support::DurableApplySnapshot::capture(&state).expect("capture");
     let live = stream_sync_core::test_support::LiveApplySnapshot::capture(&state, &services).await;
 
     let mut stale = gen1.clone();
     stale.access_token = "ssk_test_placeholder_stale_at".into();
     stale.generation = 2;
-    state.persist_delegated_session(&stale).unwrap();
+    let stale_identity = state.persist_delegated_session(&stale).unwrap();
+    snapshot.note_persist_completed(stale_identity);
 
     let err = anyhow::anyhow!("superseded by newer identity action");
     stream_sync_core::test_support::rollback_superseded_apply(
@@ -550,5 +557,399 @@ async fn valid_coherent_twitch_kick_delegated_session_remains_valid() {
         Some("ssk_test_placeholder_kick_at")
     );
     assert_eq!(session.kick_id.as_deref(), Some("kid"));
+    let _ = std::fs::remove_dir_all(&userdata);
+}
+
+fn write_legacy_revision_bundle(
+    store: &dyn stream_sync_core::SecretStore,
+    revision: u64,
+    _generation: u64,
+    connection_key: &str,
+    access_token: &str,
+) {
+    let bundle = serde_json::json!({
+        "revision": revision,
+        "connection_key": connection_key,
+        "access_token": access_token,
+    });
+    store
+        .set(
+            &legacy_revision_bundle_key(revision),
+            serde_json::to_vec(&bundle).unwrap().as_slice(),
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_rollback_refuses_when_newer_persist_wins() {
+    let _gate_lock = AUTHORITY_GATE_TEST_LOCK.lock().unwrap();
+    let userdata = test_userdata_dir();
+    let config = OverlayConfig {
+        port: 0,
+        repo_root: repo_root(),
+        readonly: false,
+        userdata_root: Some(userdata.clone()),
+        secret_store: None,
+    };
+    let (_router, state, _svc) = OverlayServer::new(config).build_app().await.unwrap();
+    state
+        .persist_delegated_session(&sample_session("ssk_test_placeholder_gen1_rb"))
+        .unwrap();
+    let gen1_meta = metadata_bytes(&state.paths.twitch_delegated);
+
+    let snapshot =
+        stream_sync_core::test_support::DurableApplySnapshot::capture(&state).expect("capture");
+
+    let (_gate, arrived_rx, resume_tx) =
+        stream_sync_core::test_support::install_delegated_authority_gate(
+            stream_sync_core::test_support::DelegatedAuthorityBoundary::RollbackBeforeRestore,
+        );
+    let state_rb = state.clone();
+    let snapshot_rb = snapshot.clone();
+    let rollback_task = std::thread::spawn(move || snapshot_rb.rollback(&state_rb));
+
+    arrived_rx.recv().expect("rollback gate arrived");
+    let mut winner = sample_session("ssk_test_placeholder_winner_rb");
+    winner.generation = 2;
+    state
+        .persist_delegated_session(&winner)
+        .expect("winner persist");
+    resume_tx.send(()).expect("release rollback");
+
+    let err = rollback_task.join().expect("rollback join").unwrap_err();
+    assert!(
+        err.to_string().contains("stale rollback refused"),
+        "rollback must refuse when newer persist won: {err:#}"
+    );
+    assert_ne!(
+        std::fs::read(&state.paths.twitch_delegated).unwrap(),
+        gen1_meta,
+        "winner metadata must remain"
+    );
+    let _ = std::fs::remove_dir_all(&userdata);
+}
+
+#[tokio::test]
+async fn concurrent_rollback_refuses_when_revoke_wins() {
+    let _gate_lock = AUTHORITY_GATE_TEST_LOCK.lock().unwrap();
+    let userdata = test_userdata_dir();
+    let config = OverlayConfig {
+        port: 0,
+        repo_root: repo_root(),
+        readonly: false,
+        userdata_root: Some(userdata.clone()),
+        secret_store: None,
+    };
+    let (_router, state, _svc) = OverlayServer::new(config).build_app().await.unwrap();
+    state
+        .persist_delegated_session(&sample_session("ssk_test_placeholder_gen1_revoke_rb"))
+        .unwrap();
+
+    let mut snapshot =
+        stream_sync_core::test_support::DurableApplySnapshot::capture(&state).expect("capture");
+    let mut stale = sample_session("ssk_test_placeholder_stale_revoke_rb");
+    stale.generation = 2;
+    let stale_identity = state.persist_delegated_session(&stale).unwrap();
+    snapshot.note_persist_completed(stale_identity);
+
+    let (_gate, arrived_rx, resume_tx) =
+        stream_sync_core::test_support::install_delegated_authority_gate(
+            stream_sync_core::test_support::DelegatedAuthorityBoundary::RollbackBeforeRestore,
+        );
+    let state_rb = state.clone();
+    let snapshot_rb = snapshot.clone();
+    let rollback_task = std::thread::spawn(move || snapshot_rb.rollback(&state_rb));
+    arrived_rx.recv().expect("rollback gate arrived");
+    state
+        .durable_revoke_delegated()
+        .await
+        .expect("revoke winner");
+    resume_tx.send(()).expect("release rollback");
+
+    let err = rollback_task.join().expect("rollback join").unwrap_err();
+    assert!(
+        err.to_string().contains("stale rollback refused"),
+        "rollback must refuse when revoke won: {err:#}"
+    );
+    assert!(state.paths.twitch_delegated_revoked.is_file());
+    let _ = std::fs::remove_dir_all(&userdata);
+}
+
+#[tokio::test]
+async fn replacement_persist_clears_revoke_markers_atomically() {
+    let userdata = test_userdata_dir();
+    let config = OverlayConfig {
+        port: 0,
+        repo_root: repo_root(),
+        readonly: false,
+        userdata_root: Some(userdata.clone()),
+        secret_store: None,
+    };
+    let (_router, state, _svc) = OverlayServer::new(config).build_app().await.unwrap();
+    state
+        .persist_delegated_session(&sample_session("ssk_test_placeholder_pre_revoke"))
+        .unwrap();
+    state.durable_revoke_delegated().await.unwrap();
+    assert!(state.paths.twitch_delegated_revoked.is_file());
+
+    state
+        .persist_delegated_replacement_session(&sample_session("ssk_test_placeholder_replacement"))
+        .expect("replacement persist");
+    assert!(
+        !state.paths.twitch_delegated_revoked.is_file(),
+        "replacement must clear tombstone in the same authority transaction"
+    );
+    assert!(
+        !state.paths.twitch_delegated_revoke_pending.is_file(),
+        "replacement must clear pending in the same authority transaction"
+    );
+    let restarted = restart_app_at(&userdata, false);
+    assert_metadata_bundle_coherent(&userdata, &restarted).await;
+    let _ = std::fs::remove_dir_all(&userdata);
+}
+
+#[tokio::test]
+async fn concurrent_apply_vs_revoke_marker_race_keeps_revoke_signal() {
+    use std::sync::mpsc;
+
+    let _gate_lock = AUTHORITY_GATE_TEST_LOCK.lock().unwrap();
+    let userdata = test_userdata_dir();
+    let config = OverlayConfig {
+        port: 0,
+        repo_root: repo_root(),
+        readonly: false,
+        userdata_root: Some(userdata.clone()),
+        secret_store: None,
+    };
+    let (_router, state, _svc) = OverlayServer::new(config).build_app().await.unwrap();
+    state
+        .persist_delegated_session(&sample_session("ssk_test_placeholder_pre_revoke_race"))
+        .unwrap();
+    state.durable_revoke_delegated().await.unwrap();
+    assert!(state.paths.twitch_delegated_revoked.is_file());
+
+    let (_gate, arrived_rx, resume_tx) =
+        stream_sync_core::test_support::install_delegated_authority_gate(
+            stream_sync_core::test_support::DelegatedAuthorityBoundary::PersistBeforeMarkerClear,
+        );
+    let state_apply = state.clone();
+    let replacement = sample_session("ssk_test_placeholder_replacement_race");
+    let apply_task =
+        std::thread::spawn(move || state_apply.persist_delegated_replacement_session(&replacement));
+    arrived_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("apply must reach marker-clear gate");
+
+    let (revoke_done_tx, revoke_done_rx) = mpsc::channel();
+    let state_revoke = state.clone();
+    let revoke_thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("revoke runtime");
+        rt.block_on(async {
+            let _ = state_revoke.durable_revoke_delegated().await;
+        });
+        let _ = revoke_done_tx.send(());
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        revoke_done_rx.try_recv().is_err(),
+        "revoke must block on authority lock while apply holds marker-clear transaction"
+    );
+    assert!(
+        state.paths.twitch_delegated_revoked.is_file(),
+        "tombstone must remain until replacement clears markers atomically"
+    );
+
+    resume_tx.send(()).expect("release apply");
+    apply_task
+        .join()
+        .expect("apply join")
+        .expect("replacement apply");
+    assert!(
+        !state.paths.twitch_delegated_revoked.is_file(),
+        "replacement must clear tombstone atomically before releasing authority lock"
+    );
+    let restarted = restart_app_at(&userdata, false);
+    assert_metadata_bundle_coherent(&userdata, &restarted).await;
+
+    let _ = revoke_done_rx.recv_timeout(Duration::from_secs(10));
+    let _ = revoke_thread.join();
+    let _ = std::fs::remove_dir_all(&userdata);
+}
+
+#[tokio::test]
+async fn legacy_revision_bundle_migrates_on_writable_startup() {
+    let userdata = test_userdata_dir();
+    let paths = paths_for_root(&userdata, false).unwrap();
+    write_json(&paths.twitch_delegated, &sample_metadata_only_json(1, 1, 0)).unwrap();
+    let store = fs_secret_store(&userdata);
+    write_legacy_revision_bundle(
+        store.as_ref(),
+        1,
+        1,
+        "ssk_test_placeholder_legacy_conn",
+        "ssk_test_placeholder_legacy_at",
+    );
+
+    let before = store
+        .get(&legacy_revision_bundle_key(1))
+        .unwrap()
+        .expect("legacy key before migrate");
+    assert!(!before.is_empty());
+
+    let state = restart_app_at(&userdata, false);
+    let session = state.delegated.read().await.clone().expect("hydrated");
+    assert_eq!(session.access_token, "ssk_test_placeholder_legacy_at");
+    let (_, provenance) = read_bound_delegated_bundle_with_provenance(store.as_ref(), &session)
+        .unwrap()
+        .expect("bound bundle");
+    assert_eq!(provenance, BoundBundleProvenance::Slot(session.bundle_slot));
+    assert!(
+        store.get(&legacy_revision_bundle_key(1)).unwrap().is_none(),
+        "legacy revision key must be deleted after migration"
+    );
+    let _ = std::fs::remove_dir_all(&userdata);
+}
+
+#[tokio::test]
+async fn legacy_revision_bundle_revoke_deletes_proven_key() {
+    let userdata = test_userdata_dir();
+    let paths = paths_for_root(&userdata, false).unwrap();
+    write_json(&paths.twitch_delegated, &sample_metadata_only_json(1, 1, 0)).unwrap();
+    let store = fs_secret_store(&userdata);
+    write_legacy_revision_bundle(
+        store.as_ref(),
+        1,
+        1,
+        "ssk_test_placeholder_revoke_legacy_conn",
+        "ssk_test_placeholder_revoke_legacy_at",
+    );
+
+    let config = OverlayConfig {
+        port: 0,
+        repo_root: repo_root(),
+        readonly: false,
+        userdata_root: Some(userdata.clone()),
+        secret_store: None,
+    };
+    let (_router, state, _svc) = OverlayServer::new(config).build_app().await.unwrap();
+    state.durable_revoke_delegated().await.unwrap();
+    assert!(
+        store.get(&legacy_revision_bundle_key(1)).unwrap().is_none(),
+        "revoke must delete proven legacy revision bundle"
+    );
+    assert!(!state.delegated_secret_store_authority_remain().unwrap());
+    let _ = std::fs::remove_dir_all(&userdata);
+}
+
+#[tokio::test]
+async fn corrupt_metadata_revoke_retains_pending_with_unknown_legacy_provenance() {
+    let userdata = test_userdata_dir();
+    let config = OverlayConfig {
+        port: 0,
+        repo_root: repo_root(),
+        readonly: false,
+        userdata_root: Some(userdata.clone()),
+        secret_store: None,
+    };
+    let (_router, state, _svc) = OverlayServer::new(config).build_app().await.unwrap();
+    state
+        .persist_delegated_session(&sample_session("ssk_test_placeholder_before_corrupt"))
+        .unwrap();
+    std::fs::write(&state.paths.twitch_delegated, b"{not valid json").unwrap();
+    let store = fs_secret_store(&userdata);
+    write_legacy_revision_bundle(
+        store.as_ref(),
+        1,
+        1,
+        "ssk_test_placeholder_fail_legacy_conn",
+        "ssk_test_placeholder_fail_legacy_at",
+    );
+    let err = state.durable_revoke_delegated().await.unwrap_err();
+    assert!(
+        err.to_string().contains("unparseable"),
+        "must fail closed on corrupt metadata: {err:#}"
+    );
+    assert!(
+        store.get(&legacy_revision_bundle_key(1)).unwrap().is_some(),
+        "legacy bundle must remain when metadata provenance is unknown"
+    );
+    assert!(state.paths.twitch_delegated_revoke_pending.is_file());
+    let _ = std::fs::remove_dir_all(&userdata);
+}
+
+#[test]
+fn same_transaction_id_non_identical_secrets_rejects_without_mutation() {
+    let store = stream_sync_core::memory_secret_store();
+    let bundle_a = DelegatedSecretBundle {
+        transaction_id: 1,
+        generation: 1,
+        slot: 0,
+        connection_key: "ssk_test_placeholder_conn_a".into(),
+        access_token: "ssk_test_placeholder_at_a".into(),
+        kick_access_token: None,
+        kick_refresh_token: None,
+    };
+    stream_sync_core::write_delegated_bundle_create(store.as_ref(), &bundle_a).unwrap();
+    let bundle_b = DelegatedSecretBundle {
+        transaction_id: 1,
+        generation: 1,
+        slot: 0,
+        connection_key: "ssk_test_placeholder_conn_b".into(),
+        access_token: "ssk_test_placeholder_at_b".into(),
+        kick_access_token: None,
+        kick_refresh_token: None,
+    };
+    let err =
+        stream_sync_core::write_delegated_bundle_create(store.as_ref(), &bundle_b).unwrap_err();
+    assert!(
+        err.to_string().contains("collision"),
+        "must reject same-id non-identical write: {err:#}"
+    );
+    let kept: DelegatedSecretBundle = serde_json::from_slice(
+        &store
+            .get(&delegated_bundle_slot_key(0))
+            .unwrap()
+            .expect("slot unchanged"),
+    )
+    .unwrap();
+    assert_eq!(kept.access_token, "ssk_test_placeholder_at_a");
+}
+
+#[tokio::test]
+async fn invalid_committed_slot_rejects_before_mutation() {
+    let userdata = test_userdata_dir();
+    let paths = paths_for_root(&userdata, false).unwrap();
+    write_json(&paths.twitch_delegated, &sample_metadata_only_json(1, 1, 9)).unwrap();
+    write_slot_bundle(
+        fs_secret_store(&userdata).as_ref(),
+        0,
+        1,
+        1,
+        "ssk_test_placeholder_bound_conn",
+        "ssk_test_placeholder_bound_at",
+        None,
+        None,
+    );
+
+    let config = OverlayConfig {
+        port: 0,
+        repo_root: repo_root(),
+        readonly: false,
+        userdata_root: Some(userdata.clone()),
+        secret_store: None,
+    };
+    let (_router, state, _svc) = OverlayServer::new(config).build_app().await.unwrap();
+    let before_meta = std::fs::read(&paths.twitch_delegated).unwrap();
+    let err = state
+        .persist_delegated_session(&sample_session("ssk_test_placeholder_invalid_slot"))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("out of range"),
+        "must reject invalid committed slot before mutation: {err:#}"
+    );
+    assert_eq!(std::fs::read(&paths.twitch_delegated).unwrap(), before_meta);
     let _ = std::fs::remove_dir_all(&userdata);
 }
