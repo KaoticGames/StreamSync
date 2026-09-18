@@ -765,7 +765,9 @@ impl AppState {
         self.secret_store.clone()
     }
 
-    /// Load committed delegated metadata from disk and hydrate externalized secrets.
+    /// Test helper: load committed delegated metadata and hydrate externalized secrets
+    /// through the same path used during production startup.
+    #[cfg(test)]
     pub(crate) fn load_committed_delegated_session(
         &self,
     ) -> anyhow::Result<Option<DelegatedSessionFile>> {
