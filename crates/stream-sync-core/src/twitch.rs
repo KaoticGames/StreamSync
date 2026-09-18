@@ -6694,19 +6694,9 @@ mod tests {
     }
 
     fn read_delegated_disk(state: &AppState) -> Option<DelegatedSessionFile> {
-        if !state.paths.twitch_delegated.is_file() {
-            return None;
-        }
-        let session = crate::storage::read_json_if_exists(
-            &state.paths.twitch_delegated,
-            &DelegatedSessionFile::default(),
-        )
-        .expect("read delegated disk");
-        if session.generation == 0 && session.access_token.is_empty() {
-            None
-        } else {
-            Some(session)
-        }
+        state
+            .load_committed_delegated_session()
+            .expect("read delegated disk")
     }
 
     fn restart_state_at(state: &AppState) -> Arc<AppState> {
@@ -7341,6 +7331,26 @@ mod tests {
             state.twitch.read().await.tokens.access_token.as_deref(),
             Some(token.as_str())
         );
+
+        let restarted = restart_state_at(&state);
+        let restarted_identity = live_identity_snapshot(&restarted, &services).await;
+        assert_eq!(restarted_identity.mode, TwitchActiveMode::Delegated);
+        assert_eq!(
+            restarted_identity.twitch_tokens.access_token.as_deref(),
+            Some("gen2-token")
+        );
+        assert_eq!(
+            restarted_identity.delegated.as_ref().map(|s| s.generation),
+            Some(2)
+        );
+        assert_eq!(
+            restarted_identity
+                .delegated
+                .as_ref()
+                .map(|s| s.access_token.as_str()),
+            Some("gen2-token")
+        );
+        assert_eq!(restarted_identity.lease.generation, 2);
 
         server.abort();
         stop_all_platform_workers(&state, &services).await;

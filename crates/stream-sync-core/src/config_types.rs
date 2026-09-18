@@ -582,8 +582,10 @@ pub struct DelegatedSessionFile {
     /// Monotonic session generation — stale workers must not mutate a newer session.
     #[serde(default)]
     pub generation: u64,
+    #[serde(default)]
     pub connection_key: String,
     pub client_id: String,
+    #[serde(default)]
     pub access_token: String,
     pub channel_login: String,
     pub channel_twitch_id: String,

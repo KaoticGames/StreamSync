@@ -278,6 +278,17 @@ fn maybe_migrate_personal_kick_secrets(
     Ok(tokens)
 }
 
+fn load_committed_delegated_session_at(
+    delegated_path: &std::path::Path,
+    readonly: bool,
+    store: &dyn SecretStore,
+) -> anyhow::Result<Option<DelegatedSessionFile>> {
+    let Some(session) = storage::committed_delegated_session_parse(delegated_path)? else {
+        return Ok(None);
+    };
+    maybe_migrate_delegated_secrets(delegated_path, readonly, store, session)
+}
+
 fn maybe_migrate_delegated_secrets(
     path: &std::path::Path,
     readonly: bool,
@@ -605,16 +616,11 @@ impl AppState {
                 None
             }
         } else if paths.twitch_delegated.is_file() {
-            let session = storage::committed_delegated_session_parse(&paths.twitch_delegated)?;
-            match session {
-                Some(session) => maybe_migrate_delegated_secrets(
-                    &paths.twitch_delegated,
-                    readonly,
-                    secret_store.as_ref(),
-                    session,
-                )?,
-                None => None,
-            }
+            load_committed_delegated_session_at(
+                &paths.twitch_delegated,
+                readonly,
+                secret_store.as_ref(),
+            )?
         } else {
             None
         };
@@ -757,6 +763,17 @@ impl AppState {
 
     pub fn secret_store(&self) -> Arc<dyn SecretStore> {
         self.secret_store.clone()
+    }
+
+    /// Load committed delegated metadata from disk and hydrate externalized secrets.
+    pub(crate) fn load_committed_delegated_session(
+        &self,
+    ) -> anyhow::Result<Option<DelegatedSessionFile>> {
+        load_committed_delegated_session_at(
+            &self.paths.twitch_delegated,
+            self.readonly,
+            self.secret_store.as_ref(),
+        )
     }
 
     pub async fn save_dock(&self) -> anyhow::Result<()> {
