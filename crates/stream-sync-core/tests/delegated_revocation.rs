@@ -17,12 +17,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use stream_sync_core::{
-    connection_key_events_url, delegated_bundle_store_key, disconnect_twitch, fs_secret_store,
+    all_delegated_bundle_slot_keys, connection_key_events_url, disconnect_twitch, fs_secret_store,
     paths_for_root, remove_file_durable, sync_live_identity, write_delegated_revoke_pending,
     write_delegated_revoked_tombstone, write_json, AppState, DelegatedSessionFile, OverlayConfig,
     OverlayServer, TeardownPhase, TwitchActiveMode, TwitchActiveModeFile, TwitchServices,
-    TWITCH_DELEGATED_ACCESS_TOKEN_KEY, TWITCH_DELEGATED_CONNECTION_KEY, TWITCH_PERSONAL_ACCESS_KEY,
     MAX_DELEGATED_REVOCATION_DELAY, SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,
+    TWITCH_DELEGATED_ACCESS_TOKEN_KEY, TWITCH_DELEGATED_CONNECTION_KEY, TWITCH_PERSONAL_ACCESS_KEY,
 };
 use tower::ServiceExt;
 
@@ -501,13 +501,6 @@ async fn restart_after_revoke_keeps_personal_selectable_not_delegated() {
 
     let session = sample_session(1, "ssk_test_placeholder_revoke_restart");
     state.persist_delegated_session(&session).unwrap();
-    let delegated_revision = serde_json::from_str::<serde_json::Value>(
-        &std::fs::read_to_string(&state.paths.twitch_delegated).unwrap(),
-    )
-    .unwrap()
-    .get("secret_revision")
-    .and_then(|r| r.as_u64())
-    .expect("delegated secret_revision on disk");
     *state.delegated.write().await = Some(session);
     state.delegated_generation.store(1, Ordering::SeqCst);
     *state.active_mode.write().await = TwitchActiveMode::Delegated;
@@ -538,15 +531,20 @@ async fn restart_after_revoke_keeps_personal_selectable_not_delegated() {
     assert!(!restarted.delegated_authority_artifacts_remain().unwrap());
 
     let store = fs_secret_store(&userdata);
-    assert!(
-        store
-            .get(&delegated_bundle_store_key(delegated_revision))
-            .unwrap()
-            .is_none(),
-        "revoked delegated bundle must not survive restart"
-    );
-    assert!(store.get(TWITCH_DELEGATED_CONNECTION_KEY).unwrap().is_none());
-    assert!(store.get(TWITCH_DELEGATED_ACCESS_TOKEN_KEY).unwrap().is_none());
+    for key in all_delegated_bundle_slot_keys() {
+        assert!(
+            store.get(&key).unwrap().is_none(),
+            "revoked delegated bundle slot {key} must not survive restart"
+        );
+    }
+    assert!(store
+        .get(TWITCH_DELEGATED_CONNECTION_KEY)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get(TWITCH_DELEGATED_ACCESS_TOKEN_KEY)
+        .unwrap()
+        .is_none());
 
     let hydrated = restarted.personal_tokens.read().await.clone();
     assert_eq!(hydrated.access_token.as_deref(), Some("personal-at"));

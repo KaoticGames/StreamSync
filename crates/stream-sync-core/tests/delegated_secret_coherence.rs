@@ -3,10 +3,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use stream_sync_core::{
-    delegated_bundle_store_key, fs_secret_store, paths_for_root, write_json, AppState,
-    DelegatedSessionFile, OverlayConfig, OverlayServer, TWITCH_DELEGATED_ACCESS_TOKEN_KEY,
-    TWITCH_DELEGATED_CONNECTION_KEY, TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY,
-    TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY,
+    delegated_bundle_slot_key, fs_secret_store, paths_for_root, write_json, AppState,
+    DelegatedSecretBundle, DelegatedSessionFile, OverlayConfig, OverlayServer,
+    TWITCH_DELEGATED_ACCESS_TOKEN_KEY, TWITCH_DELEGATED_CONNECTION_KEY,
+    TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY, TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY,
 };
 
 static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -32,14 +32,18 @@ fn repo_root() -> std::path::PathBuf {
 
 fn restart_app_at(userdata: &std::path::Path) -> Arc<AppState> {
     let paths = paths_for_root(userdata, false).expect("paths_for_root");
-    AppState::new(paths, repo_root(), 0, false, fs_secret_store(userdata))
-        .expect("AppState::new")
+    AppState::new(paths, repo_root(), 0, false, fs_secret_store(userdata)).expect("AppState::new")
 }
 
-fn sample_metadata_only_json(generation: u64, secret_revision: u64) -> serde_json::Value {
+fn sample_metadata_only_json(
+    generation: u64,
+    secret_revision: u64,
+    bundle_slot: u8,
+) -> serde_json::Value {
     serde_json::json!({
         "generation": generation,
         "secret_revision": secret_revision,
+        "bundle_slot": bundle_slot,
         "client_id": "cid",
         "channel_login": "takeover_chan",
         "channel_twitch_id": "999",
@@ -74,30 +78,40 @@ fn sample_session() -> DelegatedSessionFile {
 
 fn write_delegated_bundle(
     store: &dyn stream_sync_core::SecretStore,
-    revision: u64,
+    slot: u8,
+    transaction_id: u64,
+    generation: u64,
     connection_key: &str,
     access_token: &str,
     kick_access: Option<&str>,
     kick_refresh: Option<&str>,
 ) {
-    let bundle = serde_json::json!({
-        "revision": revision,
-        "connection_key": connection_key,
-        "access_token": access_token,
-        "kick_access_token": kick_access,
-        "kick_refresh_token": kick_refresh,
-    });
+    let bundle = DelegatedSecretBundle {
+        transaction_id,
+        generation,
+        slot,
+        connection_key: connection_key.into(),
+        access_token: access_token.into(),
+        kick_access_token: kick_access.map(|s| s.to_string()),
+        kick_refresh_token: kick_refresh.map(|s| s.to_string()),
+    };
     store
         .set(
-            &delegated_bundle_store_key(revision),
+            &delegated_bundle_slot_key(slot),
             serde_json::to_vec(&bundle).unwrap().as_slice(),
         )
         .unwrap();
 }
 
 fn legacy_store_snapshot(store: &dyn stream_sync_core::SecretStore) -> (bool, bool, bool, bool) {
-    let conn = store.get(TWITCH_DELEGATED_CONNECTION_KEY).unwrap().is_some();
-    let at = store.get(TWITCH_DELEGATED_ACCESS_TOKEN_KEY).unwrap().is_some();
+    let conn = store
+        .get(TWITCH_DELEGATED_CONNECTION_KEY)
+        .unwrap()
+        .is_some();
+    let at = store
+        .get(TWITCH_DELEGATED_ACCESS_TOKEN_KEY)
+        .unwrap()
+        .is_some();
     let kick_at = store
         .get(TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY)
         .unwrap()
@@ -121,10 +135,7 @@ async fn valid_both_inline_legacy_migrates_to_bound_bundle() {
     let paths = paths_for_root(&userdata, false).unwrap();
     write_json(
         &paths.twitch_delegated,
-        &sample_inline_legacy_json(
-            "ssk_test_placeholder_conn",
-            "ssk_test_placeholder_at",
-        ),
+        &sample_inline_legacy_json("ssk_test_placeholder_conn", "ssk_test_placeholder_at"),
     )
     .unwrap();
 
@@ -138,10 +149,10 @@ async fn valid_both_inline_legacy_migrates_to_bound_bundle() {
     let store = fs_secret_store(&userdata);
     assert!(
         store
-            .get(&delegated_bundle_store_key(session.secret_revision))
+            .get(&delegated_bundle_slot_key(session.bundle_slot))
             .unwrap()
             .is_some(),
-        "bundle must exist at bound revision"
+        "bundle must exist at bound slot"
     );
     let raw = std::fs::read_to_string(&paths.twitch_delegated).unwrap();
     assert!(!raw.contains("ssk_test_placeholder_conn"));
@@ -221,11 +232,13 @@ async fn partial_inline_access_token_only_rejected_without_store_mutation() {
 async fn metadata_only_with_matching_bound_bundle_loads() {
     let userdata = test_userdata_dir();
     let paths = paths_for_root(&userdata, false).unwrap();
-    write_json(&paths.twitch_delegated, &sample_metadata_only_json(1, 3)).unwrap();
+    write_json(&paths.twitch_delegated, &sample_metadata_only_json(1, 3, 0)).unwrap();
     let store = fs_secret_store(&userdata);
     write_delegated_bundle(
         store.as_ref(),
+        0,
         3,
+        1,
         "ssk_test_placeholder_conn",
         "ssk_test_placeholder_at",
         None,
@@ -245,7 +258,7 @@ async fn metadata_only_with_matching_bound_bundle_loads() {
 async fn missing_bound_bundle_fails_closed() {
     let userdata = test_userdata_dir();
     let paths = paths_for_root(&userdata, false).unwrap();
-    write_json(&paths.twitch_delegated, &sample_metadata_only_json(1, 5)).unwrap();
+    write_json(&paths.twitch_delegated, &sample_metadata_only_json(1, 5, 0)).unwrap();
 
     let state = restart_app_at(&userdata);
     assert!(state.delegated.read().await.is_none());
@@ -256,10 +269,12 @@ async fn missing_bound_bundle_fails_closed() {
 async fn revision_mismatch_fails_closed() {
     let userdata = test_userdata_dir();
     let paths = paths_for_root(&userdata, false).unwrap();
-    write_json(&paths.twitch_delegated, &sample_metadata_only_json(1, 2)).unwrap();
+    write_json(&paths.twitch_delegated, &sample_metadata_only_json(1, 2, 0)).unwrap();
     let store = fs_secret_store(&userdata);
     write_delegated_bundle(
         store.as_ref(),
+        0,
+        1,
         1,
         "ssk_test_placeholder_conn",
         "ssk_test_placeholder_at",
@@ -276,20 +291,24 @@ async fn revision_mismatch_fails_closed() {
 async fn crash_after_bundle_write_before_metadata_commit_fails_closed_or_stays_coherent() {
     let userdata = test_userdata_dir();
     let paths = paths_for_root(&userdata, false).unwrap();
-    write_json(&paths.twitch_delegated, &sample_metadata_only_json(1, 1)).unwrap();
+    write_json(&paths.twitch_delegated, &sample_metadata_only_json(1, 1, 0)).unwrap();
     let store = fs_secret_store(&userdata);
     write_delegated_bundle(
         store.as_ref(),
+        0,
+        1,
         1,
         "ssk_test_placeholder_rev1_conn",
         "ssk_test_placeholder_rev1_at",
         None,
         None,
     );
-    // Simulated crash: new bundle written but metadata still references rev 1 while bundle is rev 2.
+    // Simulated crash: orphan bundle in alternate slot while metadata still references slot 0 / tx 1.
     write_delegated_bundle(
         store.as_ref(),
+        1,
         2,
+        1,
         "ssk_test_placeholder_rev2_conn",
         "ssk_test_placeholder_rev2_at",
         None,
@@ -331,14 +350,16 @@ async fn refresh_same_generation_increments_secret_revision() {
     let rev2 = metadata_secret_revision(&state.paths.twitch_delegated).expect("rev2");
     assert!(rev2 > rev1);
 
-    let store = fs_secret_store(&userdata);
-    assert!(
-        store.get(&delegated_bundle_store_key(rev2)).unwrap().is_some(),
-        "new bundle must exist"
-    );
-
     let restarted = restart_app_at(&userdata);
     let loaded = restarted.delegated.read().await.clone().unwrap();
+    let store = fs_secret_store(&userdata);
+    assert!(
+        store
+            .get(&delegated_bundle_slot_key(loaded.bundle_slot))
+            .unwrap()
+            .is_some(),
+        "new bundle must exist at bound slot"
+    );
     assert_eq!(loaded.generation, 1);
     assert_eq!(loaded.secret_revision, rev2);
     assert_eq!(loaded.access_token, "ssk_test_placeholder_refreshed_at");
@@ -361,7 +382,12 @@ async fn restart_after_committed_winner_hydrates_delegated() {
     *state.delegated.write().await = Some(session);
 
     let restarted = restart_app_at(&userdata);
-    let loaded = restarted.delegated.read().await.clone().expect("winner on disk");
+    let loaded = restarted
+        .delegated
+        .read()
+        .await
+        .clone()
+        .expect("winner on disk");
     assert_eq!(loaded.generation, 1);
     assert_eq!(loaded.connection_key, "ssk_test_placeholder_conn");
     assert_eq!(loaded.access_token, "ssk_test_placeholder_at");
@@ -381,16 +407,38 @@ async fn revocation_removes_bound_bundle_and_legacy_keys() {
     let (_router, state, _svc) = OverlayServer::new(config).build_app().await.unwrap();
     let session = sample_session();
     state.persist_delegated_session(&session).unwrap();
-    let rev = metadata_secret_revision(&state.paths.twitch_delegated).expect("rev");
     let store = fs_secret_store(&userdata);
+    let slot = serde_json::from_str::<serde_json::Value>(
+        &std::fs::read_to_string(&state.paths.twitch_delegated).unwrap(),
+    )
+    .unwrap()
+    .get("bundle_slot")
+    .and_then(|s| s.as_u64())
+    .unwrap_or(0) as u8;
     store
-        .set(TWITCH_DELEGATED_CONNECTION_KEY, b"ssk_test_placeholder_legacy".as_slice())
+        .set(
+            TWITCH_DELEGATED_CONNECTION_KEY,
+            b"ssk_test_placeholder_legacy".as_slice(),
+        )
         .unwrap();
 
     state.durable_revoke_delegated().await.unwrap();
-    assert!(store.get(&delegated_bundle_store_key(rev)).unwrap().is_none());
-    assert!(store.get(TWITCH_DELEGATED_CONNECTION_KEY).unwrap().is_none());
-    assert!(store.get(TWITCH_DELEGATED_ACCESS_TOKEN_KEY).unwrap().is_none());
+    assert!(store
+        .get(&delegated_bundle_slot_key(slot))
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get(&delegated_bundle_slot_key(1 - slot))
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get(TWITCH_DELEGATED_CONNECTION_KEY)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get(TWITCH_DELEGATED_ACCESS_TOKEN_KEY)
+        .unwrap()
+        .is_none());
     let _ = std::fs::remove_dir_all(&userdata);
 }
 
@@ -398,11 +446,7 @@ async fn revocation_removes_bound_bundle_and_legacy_keys() {
 async fn unversioned_legacy_store_pair_migrates_when_metadata_has_no_revision() {
     let userdata = test_userdata_dir();
     let paths = paths_for_root(&userdata, false).unwrap();
-    write_json(
-        &paths.twitch_delegated,
-        &sample_metadata_only_json(1, 0),
-    )
-    .unwrap();
+    write_json(&paths.twitch_delegated, &sample_metadata_only_json(1, 0, 0)).unwrap();
     let store = fs_secret_store(&userdata);
     store
         .set(
@@ -422,8 +466,14 @@ async fn unversioned_legacy_store_pair_migrates_when_metadata_has_no_revision() 
     assert_eq!(session.connection_key, "ssk_test_placeholder_legacy_conn");
     assert_eq!(session.access_token, "ssk_test_placeholder_legacy_at");
     assert!(session.secret_revision >= 1);
-    assert!(store.get(TWITCH_DELEGATED_CONNECTION_KEY).unwrap().is_none());
-    assert!(store.get(TWITCH_DELEGATED_ACCESS_TOKEN_KEY).unwrap().is_none());
+    assert!(store
+        .get(TWITCH_DELEGATED_CONNECTION_KEY)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get(TWITCH_DELEGATED_ACCESS_TOKEN_KEY)
+        .unwrap()
+        .is_none());
     let _ = std::fs::remove_dir_all(&userdata);
 }
 
@@ -431,11 +481,7 @@ async fn unversioned_legacy_store_pair_migrates_when_metadata_has_no_revision() 
 async fn unversioned_legacy_store_partial_pair_fails_closed_without_mutation() {
     let userdata = test_userdata_dir();
     let paths = paths_for_root(&userdata, false).unwrap();
-    write_json(
-        &paths.twitch_delegated,
-        &sample_metadata_only_json(1, 0),
-    )
-    .unwrap();
+    write_json(&paths.twitch_delegated, &sample_metadata_only_json(1, 0, 0)).unwrap();
     let store = fs_secret_store(&userdata);
     store
         .set(
