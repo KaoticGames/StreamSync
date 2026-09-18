@@ -8,8 +8,8 @@ mod broadcast;
 mod config_types;
 mod control_plane;
 mod delegated_lifecycle;
-mod delegated_secrets;
 mod delegated_refresh_observability;
+mod delegated_secrets;
 mod diagnostics;
 mod discord_voice;
 mod dock_capability;
@@ -26,10 +26,14 @@ mod syndicate_connection;
 mod test_alert;
 mod twitch;
 
-pub use delegated_secrets::{delegated_bundle_store_key, DelegatedSecretBundle};
 pub use delegated_lifecycle::{
     redact_connection_key, AuthorityLeaseSnapshot, TeardownPhase, MAX_DELEGATED_REVOCATION_DELAY,
     SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,
+};
+pub use delegated_secrets::{
+    all_delegated_bundle_slot_keys, delegated_bundle_slot_key,
+    delegated_secret_store_authority_remain, read_bound_delegated_bundle,
+    validate_delegated_session_coherence, DelegatedSecretBundle,
 };
 pub use syndicate_connection::connection_key_events_url;
 pub use twitch::{disconnect_twitch, TwitchServices};
@@ -77,6 +81,14 @@ pub use storage::{
     write_identity_rollback_pending, write_json, INJECT_COMMITTING_REMOVE_FAILURE,
 };
 pub use store_lock::{try_acquire_instance_lock, InstanceLockError};
+
+/// Integration-test hooks for durable apply rollback (not a public API surface).
+#[doc(hidden)]
+pub mod test_support {
+    pub use crate::twitch::identity_commit::{
+        rollback_superseded_apply, DurableApplySnapshot, LiveApplySnapshot,
+    };
+}
 
 /// Back-compat alias.
 pub use storage::bootstrap_twitch_env_from_rust as bootstrap_twitch_env_from_repo;

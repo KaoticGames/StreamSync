@@ -34,7 +34,8 @@ use twitch_irc::{ClientConfig, SecureTCPTransport, TwitchIRCClient};
 type StreamSyncIrcClient = TwitchIRCClient<SecureTCPTransport, StaticLoginCredentials>;
 
 mod eventsub_reconnect;
-mod identity_commit;
+#[doc(hidden)]
+pub mod identity_commit;
 mod platform_workers;
 
 pub(crate) use identity_commit::{

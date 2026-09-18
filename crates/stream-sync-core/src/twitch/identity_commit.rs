@@ -34,15 +34,17 @@ pub(crate) enum ApplyDurableBoundary {
 }
 
 /// Disk artifacts this apply may mutate; restored if a newer identity intent wins.
-pub(crate) struct DurableApplySnapshot {
+pub struct DurableApplySnapshot {
     delegated: Option<Vec<u8>>,
     active_mode: Option<Vec<u8>>,
     tombstone: bool,
     pending: bool,
+    /// Bounded journal slots — restored before metadata on rollback.
+    bundle_slots: [Option<Vec<u8>>; 2],
 }
 
 /// In-memory identity published by apply; restored if intent goes stale after awaits.
-pub(crate) struct LiveApplySnapshot {
+pub struct LiveApplySnapshot {
     generation: DelegatedGeneration,
     coordinator_generation: DelegatedGeneration,
     delegated: Option<DelegatedSessionFile>,
@@ -52,7 +54,7 @@ pub(crate) struct LiveApplySnapshot {
 }
 
 impl LiveApplySnapshot {
-    pub(crate) async fn capture(state: &AppState, services: &TwitchServices) -> Self {
+    pub async fn capture(state: &AppState, services: &TwitchServices) -> Self {
         Self {
             generation: state.current_delegated_generation(),
             coordinator_generation: services.teardown_coordinator.active_generation(),
@@ -106,17 +108,31 @@ fn clear_apply_replacement_artifacts(state: &AppState) {
 }
 
 impl DurableApplySnapshot {
-    pub(crate) fn capture(state: &AppState) -> Result<Self> {
+    pub fn capture(state: &AppState) -> Result<Self> {
         Ok(Self {
             delegated: read_path_bytes_if_exists(&state.paths.twitch_delegated)?,
             active_mode: read_path_bytes_if_exists(&state.paths.twitch_active_mode)?,
             tombstone: state.paths.twitch_delegated_revoked.is_file(),
             pending: state.paths.twitch_delegated_revoke_pending.is_file(),
+            bundle_slots: crate::delegated_secrets::capture_delegated_bundle_slots(
+                state.secret_store().as_ref(),
+            )?,
         })
     }
 
     pub(crate) fn rollback(&self, state: &AppState) -> Result<()> {
         let mut errors = Vec::new();
+        if let Err(err) = crate::delegated_secrets::with_delegated_authority_lock(
+            &state.paths.twitch_delegated,
+            || {
+                crate::delegated_secrets::restore_delegated_bundle_slots(
+                    state.secret_store().as_ref(),
+                    &self.bundle_slots,
+                )
+            },
+        ) {
+            errors.push(format!("delegated bundle slot rollback failed: {err:#}"));
+        }
         if let Err(err) = restore_or_remove_path(
             &state.paths.twitch_delegated,
             self.delegated.as_deref(),
@@ -154,7 +170,7 @@ impl DurableApplySnapshot {
     }
 }
 
-pub(crate) async fn rollback_superseded_apply(
+pub async fn rollback_superseded_apply(
     durable_snapshot: &DurableApplySnapshot,
     live_snapshot: LiveApplySnapshot,
     state: &AppState,
