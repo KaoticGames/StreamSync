@@ -582,6 +582,9 @@ pub struct DelegatedSessionFile {
     /// Monotonic session generation — stale workers must not mutate a newer session.
     #[serde(default)]
     pub generation: u64,
+    /// Revision of the bound external secret bundle (independent of generation for refresh).
+    #[serde(default)]
+    pub secret_revision: u64,
     #[serde(default)]
     pub connection_key: String,
     pub client_id: String,

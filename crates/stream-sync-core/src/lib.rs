@@ -8,6 +8,7 @@ mod broadcast;
 mod config_types;
 mod control_plane;
 mod delegated_lifecycle;
+mod delegated_secrets;
 mod delegated_refresh_observability;
 mod diagnostics;
 mod discord_voice;
@@ -25,6 +26,7 @@ mod syndicate_connection;
 mod test_alert;
 mod twitch;
 
+pub use delegated_secrets::{delegated_bundle_store_key, DelegatedSecretBundle};
 pub use delegated_lifecycle::{
     redact_connection_key, AuthorityLeaseSnapshot, TeardownPhase, MAX_DELEGATED_REVOCATION_DELAY,
     SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,

@@ -6,11 +6,15 @@ use crate::config_types::{
     EventsOverlayConfigFile, KickTokenFile, OverlayConfigFile, TwitchActiveMode,
     TwitchActiveModeFile, TwitchTokenFile,
 };
+use crate::delegated_secrets::{
+    apply_bundle_to_session, bundle_from_session, classify_inline_delegated_secrets,
+    delete_delegated_bundle, delete_legacy_delegated_secret_keys, migrate_legacy_inline_to_bundle,
+    migrate_legacy_store_pair_to_bundle, read_delegated_bundle, read_legacy_delegated_secret_pair,
+    write_delegated_bundle, InlineDelegatedSecretState,
+};
 use crate::secret_store::{
     SecretStore, KICK_PERSONAL_ACCESS_KEY, KICK_PERSONAL_FEED_TICKET_KEY,
-    KICK_PERSONAL_REFRESH_KEY, TWITCH_DELEGATED_ACCESS_TOKEN_KEY, TWITCH_DELEGATED_CONNECTION_KEY,
-    TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY, TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY,
-    TWITCH_PERSONAL_ACCESS_KEY, TWITCH_PERSONAL_REFRESH_KEY,
+    KICK_PERSONAL_REFRESH_KEY, TWITCH_PERSONAL_ACCESS_KEY, TWITCH_PERSONAL_REFRESH_KEY,
 };
 use crate::storage::{self, StoragePaths};
 use serde::{Deserialize, Serialize};
@@ -59,6 +63,8 @@ struct KickTokenMetadataFile {
 struct DelegatedSessionMetadataFile {
     #[serde(default)]
     generation: u64,
+    #[serde(default)]
+    secret_revision: u64,
     #[serde(default)]
     client_id: String,
     #[serde(default)]
@@ -113,6 +119,7 @@ impl From<&DelegatedSessionFile> for DelegatedSessionMetadataFile {
     fn from(session: &DelegatedSessionFile) -> Self {
         Self {
             generation: session.generation,
+            secret_revision: session.secret_revision,
             client_id: session.client_id.clone(),
             channel_login: session.channel_login.clone(),
             channel_twitch_id: session.channel_twitch_id.clone(),
@@ -295,44 +302,71 @@ fn maybe_migrate_delegated_secrets(
     store: &dyn SecretStore,
     mut session: DelegatedSessionFile,
 ) -> anyhow::Result<Option<DelegatedSessionFile>> {
-    let legacy_connection_key = nonempty_owned(Some(session.connection_key.clone()));
-    let legacy_access_token = nonempty_owned(Some(session.access_token.clone()));
-    let legacy_kick_access_token = nonempty_owned(session.kick_access_token.clone());
-    let legacy_kick_refresh_token = nonempty_owned(session.kick_refresh_token.clone());
-    let should_read_secret_store = session.generation > 0
+    let has_metadata = session.generation > 0
         || !session.channel_login.trim().is_empty()
-        || !session.channel_twitch_id.trim().is_empty()
-        || legacy_connection_key.is_some()
-        || legacy_access_token.is_some();
+        || !session.channel_twitch_id.trim().is_empty();
+    if !has_metadata {
+        return Ok(None);
+    }
+
+    let inline_state = match classify_inline_delegated_secrets(
+        &session.connection_key,
+        &session.access_token,
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!("delegated session rejected: {error:#}");
+            return Ok(None);
+        }
+    };
     let mut migrated = false;
-    if let Some(secret) = legacy_connection_key.as_deref() {
-        write_secret_value(store, TWITCH_DELEGATED_CONNECTION_KEY, Some(secret))?;
-        migrated = true;
+
+    match inline_state {
+        InlineDelegatedSecretState::BothInline => {
+            let bundle = migrate_legacy_inline_to_bundle(
+                store,
+                &session.connection_key,
+                &session.access_token,
+                session.kick_access_token.as_deref(),
+                session.kick_refresh_token.as_deref(),
+            )?;
+            apply_bundle_to_session(&mut session, &bundle);
+            migrated = true;
+        }
+        InlineDelegatedSecretState::BothAbsent => {
+            if session.secret_revision > 0 {
+                let bundle = match read_delegated_bundle(store, session.secret_revision) {
+                    Ok(bundle) => bundle,
+                    Err(error) => {
+                        tracing::warn!("delegated secret bundle rejected: {error:#}");
+                        return Ok(None);
+                    }
+                };
+                match bundle {
+                    Some(bundle) => apply_bundle_to_session(&mut session, &bundle),
+                    None => return Ok(None),
+                }
+            } else {
+                match read_legacy_delegated_secret_pair(store) {
+                    Ok(Some((conn, at))) => {
+                        let bundle = migrate_legacy_store_pair_to_bundle(store, conn, at)?;
+                        apply_bundle_to_session(&mut session, &bundle);
+                        migrated = true;
+                    }
+                    Ok(None) => return Ok(None),
+                    Err(error) => {
+                        tracing::warn!("delegated legacy secrets rejected: {error:#}");
+                        return Ok(None);
+                    }
+                }
+            }
+        }
     }
-    if let Some(secret) = legacy_access_token.as_deref() {
-        write_secret_value(store, TWITCH_DELEGATED_ACCESS_TOKEN_KEY, Some(secret))?;
-        migrated = true;
-    }
-    if let Some(secret) = legacy_kick_access_token.as_deref() {
-        write_secret_value(store, TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY, Some(secret))?;
-        migrated = true;
-    }
-    if let Some(secret) = legacy_kick_refresh_token.as_deref() {
-        write_secret_value(store, TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY, Some(secret))?;
-        migrated = true;
-    }
-    if !should_read_secret_store {
+
+    if session.connection_key.trim().is_empty() || session.access_token.trim().is_empty() {
         return Ok(None);
     }
-    session.connection_key =
-        read_secret_value(store, TWITCH_DELEGATED_CONNECTION_KEY)?.unwrap_or_default();
-    session.access_token =
-        read_secret_value(store, TWITCH_DELEGATED_ACCESS_TOKEN_KEY)?.unwrap_or_default();
-    session.kick_access_token = read_secret_value(store, TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY)?;
-    session.kick_refresh_token = read_secret_value(store, TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY)?;
-    if session.connection_key.is_empty() || session.access_token.is_empty() {
-        return Ok(None);
-    }
+
     if migrated && !readonly {
         write_delegated_metadata(path, &session)?;
     }
@@ -881,30 +915,39 @@ impl AppState {
         }
         self.durable_fail
             .fail(&self.durable_fail.save_session, "save_session")?;
-        write_secret_value(
-            self.secret_store.as_ref(),
-            TWITCH_DELEGATED_CONNECTION_KEY,
-            Some(&sess.connection_key),
-        )?;
-        write_secret_value(
-            self.secret_store.as_ref(),
-            TWITCH_DELEGATED_ACCESS_TOKEN_KEY,
-            Some(&sess.access_token),
-        )?;
-        write_secret_value(
-            self.secret_store.as_ref(),
-            TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY,
-            sess.kick_access_token.as_deref(),
-        )?;
-        write_secret_value(
-            self.secret_store.as_ref(),
-            TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY,
-            sess.kick_refresh_token.as_deref(),
-        )?;
-        let bytes = serde_json::to_vec_pretty(&DelegatedSessionMetadataFile::from(sess))?;
-        // Legacy `.bak` removal and atomic commit are one transaction (B5/B10).
+        classify_inline_delegated_secrets(&sess.connection_key, &sess.access_token)?;
+
+        let previous_revision = if self.paths.twitch_delegated.is_file() {
+            std::fs::read_to_string(&self.paths.twitch_delegated)
+                .ok()
+                .and_then(|raw| {
+                    serde_json::from_str::<DelegatedSessionMetadataFile>(&raw)
+                        .ok()
+                        .map(|meta| meta.secret_revision)
+                })
+                .unwrap_or(sess.secret_revision)
+        } else {
+            sess.secret_revision
+        };
+        let new_revision = previous_revision + 1;
+        let bundle = bundle_from_session(sess, new_revision);
+        write_delegated_bundle(self.secret_store.as_ref(), &bundle)?;
+
+        let mut metadata_session = sess.clone();
+        metadata_session.secret_revision = new_revision;
+        metadata_session.connection_key.clear();
+        metadata_session.access_token.clear();
+        metadata_session.kick_access_token = None;
+        metadata_session.kick_refresh_token = None;
+        let bytes = serde_json::to_vec_pretty(&DelegatedSessionMetadataFile::from(&metadata_session))?;
+        // Bundle is complete before metadata commit so crash cannot pair new metadata with missing secrets.
         self.remove_delegated_backup()?;
         storage::write_authority_bearing_secret(&self.paths.twitch_delegated, &bytes)?;
+
+        if previous_revision > 0 {
+            delete_delegated_bundle(self.secret_store.as_ref(), previous_revision)?;
+        }
+        delete_legacy_delegated_secret_keys(self.secret_store.as_ref())?;
         Ok(())
     }
 
@@ -955,6 +998,17 @@ impl AppState {
         self.durable_fail
             .fail(&self.durable_fail.tombstone_write, "tombstone_write")?;
         storage::write_delegated_revoked_tombstone(&self.paths.twitch_delegated_revoked)?;
+        let bound_revision = if self.paths.twitch_delegated.is_file() {
+            std::fs::read_to_string(&self.paths.twitch_delegated)
+                .ok()
+                .and_then(|raw| {
+                    serde_json::from_str::<DelegatedSessionMetadataFile>(&raw)
+                        .ok()
+                        .map(|meta| meta.secret_revision)
+                })
+        } else {
+            None
+        };
         self.durable_fail
             .fail(&self.durable_fail.credential_remove, "credential_remove")?;
         storage::remove_file_durable(&self.paths.twitch_delegated)?;
@@ -971,13 +1025,10 @@ impl AppState {
                 storage::remove_file_durable(&leftover)?;
             }
         }
-        self.secret_store.delete(TWITCH_DELEGATED_CONNECTION_KEY)?;
-        self.secret_store
-            .delete(TWITCH_DELEGATED_ACCESS_TOKEN_KEY)?;
-        self.secret_store
-            .delete(TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY)?;
-        self.secret_store
-            .delete(TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY)?;
+        if let Some(revision) = bound_revision {
+            delete_delegated_bundle(self.secret_store.as_ref(), revision)?;
+        }
+        delete_legacy_delegated_secret_keys(self.secret_store.as_ref())?;
         self.durable_fail
             .fail(&self.durable_fail.parent_sync, "parent_sync")?;
         storage::sync_parent_dir(&self.paths.twitch_delegated)?;

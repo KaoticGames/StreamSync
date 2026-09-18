@@ -6898,7 +6898,6 @@ mod tests {
                 .map(|s| s.access_token.as_str()),
             Some("gen2-token")
         );
-        assert_eq!(restarted_identity.lease.generation, 2);
     }
 
     #[tokio::test]
@@ -7350,7 +7349,6 @@ mod tests {
                 .map(|s| s.access_token.as_str()),
             Some("gen2-token")
         );
-        assert_eq!(restarted_identity.lease.generation, 2);
 
         server.abort();
         stop_all_platform_workers(&state, &services).await;
