@@ -10,6 +10,11 @@
 use crate::app_state::{tokens_from_delegated_session, AppState};
 use crate::config_types::{DelegatedSessionFile, TwitchActiveMode, TwitchTokenFile};
 use crate::delegated_lifecycle::{AuthorityLease, DelegatedGeneration};
+use crate::delegated_secrets::{
+    assert_rollback_cas, capture_delegated_authority_epoch,
+    parse_committed_identity_from_metadata_bytes, restore_delegated_authority_epoch,
+    with_delegated_authority_lock, DelegatedAuthorityEpoch, DelegatedCommittedIdentity,
+};
 use anyhow::{anyhow, Result};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -34,13 +39,10 @@ pub(crate) enum ApplyDurableBoundary {
 }
 
 /// Disk artifacts this apply may mutate; restored if a newer identity intent wins.
+#[derive(Clone)]
 pub struct DurableApplySnapshot {
-    delegated: Option<Vec<u8>>,
-    active_mode: Option<Vec<u8>>,
-    tombstone: bool,
-    pending: bool,
-    /// Bounded journal slots — restored before metadata on rollback.
-    bundle_slots: [Option<Vec<u8>>; 2],
+    epoch: DelegatedAuthorityEpoch,
+    expected_post_persist: Option<DelegatedCommittedIdentity>,
 }
 
 /// In-memory identity published by apply; restored if intent goes stale after awaits.
@@ -109,64 +111,60 @@ fn clear_apply_replacement_artifacts(state: &AppState) {
 
 impl DurableApplySnapshot {
     pub fn capture(state: &AppState) -> Result<Self> {
-        Ok(Self {
-            delegated: read_path_bytes_if_exists(&state.paths.twitch_delegated)?,
-            active_mode: read_path_bytes_if_exists(&state.paths.twitch_active_mode)?,
-            tombstone: state.paths.twitch_delegated_revoked.is_file(),
-            pending: state.paths.twitch_delegated_revoke_pending.is_file(),
-            bundle_slots: crate::delegated_secrets::capture_delegated_bundle_slots(
-                state.secret_store().as_ref(),
-            )?,
+        with_delegated_authority_lock(&state.paths.twitch_delegated, || {
+            Ok(Self {
+                epoch: capture_delegated_authority_epoch(
+                    &state.paths.twitch_delegated,
+                    &state.paths.twitch_active_mode,
+                    &state.paths.twitch_delegated_revoked,
+                    &state.paths.twitch_delegated_revoke_pending,
+                    state.secret_store().as_ref(),
+                )?,
+                expected_post_persist: None,
+            })
         })
     }
 
-    pub(crate) fn rollback(&self, state: &AppState) -> Result<()> {
-        let mut errors = Vec::new();
-        if let Err(err) = crate::delegated_secrets::with_delegated_authority_lock(
-            &state.paths.twitch_delegated,
-            || {
-                crate::delegated_secrets::restore_delegated_bundle_slots(
-                    state.secret_store().as_ref(),
-                    &self.bundle_slots,
-                )
-            },
-        ) {
-            errors.push(format!("delegated bundle slot rollback failed: {err:#}"));
-        }
-        if let Err(err) = restore_or_remove_path(
-            &state.paths.twitch_delegated,
-            self.delegated.as_deref(),
-            true,
-        ) {
-            errors.push(format!("delegated credential rollback failed: {err:#}"));
-        }
-        if let Err(err) = restore_or_remove_path(
-            &state.paths.twitch_active_mode,
-            self.active_mode.as_deref(),
-            false,
-        ) {
-            errors.push(format!("active mode rollback failed: {err:#}"));
-        }
-        if let Err(err) = restore_marker_file(
-            &state.paths.twitch_delegated_revoked,
-            self.tombstone,
-            crate::storage::write_delegated_revoked_tombstone,
-        ) {
-            errors.push(format!("revoked tombstone rollback failed: {err:#}"));
-        }
-        if let Err(err) = restore_marker_file(
-            &state.paths.twitch_delegated_revoke_pending,
-            self.pending,
-            crate::storage::write_delegated_revoke_pending,
-        ) {
-            errors.push(format!("revoke pending rollback failed: {err:#}"));
+    pub fn note_persist_completed(&mut self, identity: DelegatedCommittedIdentity) {
+        self.expected_post_persist = Some(identity);
+    }
+
+    pub fn rollback(&self, state: &AppState) -> Result<()> {
+        crate::delegated_secrets::authority_gates::pause_blocking(
+            crate::delegated_secrets::authority_gates::DelegatedAuthorityBoundary::RollbackBeforeRestore,
+        );
+        let rollback_result = with_delegated_authority_lock(&state.paths.twitch_delegated, || {
+            let current = if state.paths.twitch_delegated.is_file() {
+                let raw = std::fs::read(&state.paths.twitch_delegated)?;
+                parse_committed_identity_from_metadata_bytes(&raw)?
+            } else {
+                None
+            };
+            assert_rollback_cas(current, self.expected_post_persist, &self.epoch)?;
+            restore_delegated_authority_epoch(
+                &state.paths.twitch_delegated,
+                &state.paths.twitch_active_mode,
+                &state.paths.twitch_delegated_revoked,
+                &state.paths.twitch_delegated_revoke_pending,
+                state.secret_store().as_ref(),
+                &self.epoch,
+            )
+        });
+        if let Err(err) = rollback_result {
+            if err.to_string().contains("stale rollback refused") {
+                return Err(err);
+            }
+            if let Err(marker_err) = crate::storage::write_identity_rollback_pending(
+                &state.paths.twitch_tokens_rollback_pending,
+            ) {
+                return Err(anyhow!(
+                    "delegated durable rollback failed ({err:#}); recovery marker also failed ({marker_err:#})"
+                ));
+            }
+            return Err(err);
         }
         clear_apply_replacement_artifacts(state);
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(anyhow!(errors.join("; ")))
-        }
+        Ok(())
     }
 }
 
@@ -371,14 +369,15 @@ pub(crate) async fn commit_delegated_activation(
     let _lifecycle = services.lifecycle_lock.lock().await;
     recheck_apply_intent(services, Some(intent))?;
 
-    let durable_snapshot = DurableApplySnapshot::capture(state)?;
+    let mut durable_snapshot = DurableApplySnapshot::capture(state)?;
     let live_snapshot = LiveApplySnapshot::capture(state, services).await;
 
     let commit = async {
         if saved.is_none_or(|s| validated != *s) {
             pause_apply_durable_gate(ApplyDurableBoundary::BeforePersist).await;
             recheck_apply_intent(services, Some(intent))?;
-            state.persist_delegated_session(&validated)?;
+            let identity = state.persist_delegated_session(&validated)?;
+            durable_snapshot.note_persist_completed(identity);
             pause_apply_durable_gate(ApplyDurableBoundary::AfterPersist).await;
             recheck_apply_intent(services, Some(intent))?;
         }
@@ -514,17 +513,5 @@ fn restore_or_remove_path(
             Ok(())
         }
         None => crate::storage::remove_file_durable(path),
-    }
-}
-
-fn restore_marker_file(
-    path: &std::path::Path,
-    should_exist: bool,
-    write: impl FnOnce(&std::path::Path) -> Result<()>,
-) -> Result<()> {
-    if should_exist {
-        write(path)
-    } else {
-        crate::storage::remove_file_durable(path)
     }
 }

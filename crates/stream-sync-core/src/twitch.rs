@@ -2288,10 +2288,11 @@ async fn apply_exchange_session(
         services.ensure_apply_intent_current(intent)?;
     }
 
-    let snapshot = DurableApplySnapshot::capture(&state)?;
+    let mut snapshot = DurableApplySnapshot::capture(&state)?;
     let live_snapshot = LiveApplySnapshot::capture(&state, &services).await;
     let commit = async {
-        state.persist_delegated_session(&session)?;
+        let identity = state.persist_delegated_replacement_session(&session)?;
+        snapshot.note_persist_completed(identity);
         pause_apply_durable_gate(ApplyDurableBoundary::AfterPersist).await;
         recheck_apply_intent(&services, apply_intent)?;
 
@@ -2301,7 +2302,6 @@ async fn apply_exchange_session(
         pause_apply_durable_gate(ApplyDurableBoundary::AfterModeWrite).await;
         recheck_apply_intent(&services, apply_intent)?;
 
-        state.clear_delegated_revoked_tombstone()?;
         pause_apply_durable_gate(ApplyDurableBoundary::AfterTombstoneClear).await;
         recheck_apply_intent(&services, apply_intent)?;
 
@@ -6613,7 +6613,10 @@ mod tests {
         }
     }
 
-    const GATE_WAIT: Duration = Duration::from_secs(5);
+    /// Per-operation gate/join budget: 7 boundaries × worker teardown under PHASE2_TEST_LOCK.
+    const GATE_WAIT: Duration = Duration::from_secs(30);
+    /// Suite ceiling so genuine deadlocks still fail (20 iters × 7 boundaries × ~2s each).
+    const APPLY_BOUNDARY_SUITE_DEADLINE: Duration = Duration::from_secs(600);
 
     fn begin_refresh_side_effect_race() {
         crate::delegated_refresh_observability::reset_side_effect_counters();
@@ -7967,11 +7970,15 @@ mod tests {
     #[tokio::test]
     async fn apply_superseded_by_replacement_at_durable_boundaries() {
         let _guard = PHASE2_TEST_LOCK.lock().await;
-        for boundary in APPLY_DURABLE_BOUNDARIES {
-            for _ in 0..20 {
-                apply_superseded_by_replacement_once(boundary).await;
+        tokio::time::timeout(APPLY_BOUNDARY_SUITE_DEADLINE, async {
+            for boundary in APPLY_DURABLE_BOUNDARIES {
+                for _ in 0..20 {
+                    apply_superseded_by_replacement_once(boundary).await;
+                }
             }
-        }
+        })
+        .await
+        .expect("apply superseded replacement boundary suite deadline");
     }
 
     async fn apply_superseded_by_revocation_once(boundary: ApplyDurableBoundary) {

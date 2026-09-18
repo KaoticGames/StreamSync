@@ -10,11 +10,14 @@ use crate::delegated_secrets::{
     alternate_bundle_slot, apply_bundle_to_session, bundle_from_session,
     classify_inline_delegated_secrets, delegated_secret_store_authority_remain,
     delete_all_delegated_bundle_slots, delete_legacy_delegated_secret_keys,
-    hydrate_inline_secrets_in_memory, hydrate_legacy_store_pair_in_memory,
-    migrate_legacy_inline_to_bundle, migrate_legacy_store_pair_to_bundle,
-    read_bound_delegated_bundle, read_legacy_delegated_secret_pair,
+    delete_legacy_revision_bundle, hydrate_inline_secrets_in_memory,
+    hydrate_legacy_store_pair_in_memory, migrate_legacy_inline_to_bundle,
+    migrate_legacy_revision_bundle_to_slot, migrate_legacy_store_pair_to_bundle,
+    parse_committed_identity_from_metadata_bytes, read_bound_delegated_bundle,
+    read_bound_delegated_bundle_with_provenance, read_legacy_delegated_secret_pair,
     validate_delegated_session_coherence, with_delegated_authority_lock,
-    write_delegated_bundle_create, InlineDelegatedSecretState,
+    write_delegated_bundle_create, BoundBundleProvenance, DelegatedCommittedIdentity,
+    InlineDelegatedSecretState,
 };
 use crate::secret_store::{
     SecretStore, KICK_PERSONAL_ACCESS_KEY, KICK_PERSONAL_FEED_TICKET_KEY,
@@ -345,15 +348,28 @@ fn maybe_migrate_delegated_secrets(
         }
         InlineDelegatedSecretState::BothAbsent => {
             if session.secret_revision > 0 {
-                let bundle = match read_bound_delegated_bundle(store, &session) {
+                let bound = match read_bound_delegated_bundle_with_provenance(store, &session) {
                     Ok(bundle) => bundle,
                     Err(error) => {
                         tracing::warn!("delegated secret bundle rejected: {error:#}");
                         return Ok(None);
                     }
                 };
-                match bundle {
-                    Some(bundle) => apply_bundle_to_session(&mut session, &bundle),
+                match bound {
+                    Some((bundle, BoundBundleProvenance::LegacyRevisionKey(revision))) => {
+                        if readonly {
+                            apply_bundle_to_session(&mut session, &bundle);
+                        } else {
+                            migrate_legacy_revision_bundle_to_slot(
+                                path, store, &session, &bundle, revision,
+                            )?;
+                            apply_bundle_to_session(&mut session, &bundle);
+                            migrated = true;
+                        }
+                    }
+                    Some((bundle, BoundBundleProvenance::Slot(_))) => {
+                        apply_bundle_to_session(&mut session, &bundle);
+                    }
                     None => return Ok(None),
                 }
             } else {
@@ -928,15 +944,49 @@ impl AppState {
         }
         let d = self.delegated.read().await;
         match d.as_ref() {
-            Some(sess) => self.persist_delegated_session(sess),
+            Some(sess) => self.persist_delegated_session(sess).map(|_| ()),
             None => self.durable_revoke_delegated().await,
         }
     }
 
+    fn delegated_metadata_revision(&self) -> Option<u64> {
+        if !self.paths.twitch_delegated.is_file() {
+            return None;
+        }
+        let raw = std::fs::read(&self.paths.twitch_delegated).ok()?;
+        parse_committed_identity_from_metadata_bytes(&raw)
+            .ok()
+            .flatten()
+            .map(|id| id.secret_revision)
+    }
+
     /// Write a delegated session credential file (does not clear tombstone).
-    pub fn persist_delegated_session(&self, sess: &DelegatedSessionFile) -> anyhow::Result<()> {
+    pub fn persist_delegated_session(
+        &self,
+        sess: &DelegatedSessionFile,
+    ) -> anyhow::Result<DelegatedCommittedIdentity> {
+        self.persist_delegated_session_inner(sess, false)
+    }
+
+    /// Replacement persist that atomically clears revoke markers after proving the winner is committed.
+    pub fn persist_delegated_replacement_session(
+        &self,
+        sess: &DelegatedSessionFile,
+    ) -> anyhow::Result<DelegatedCommittedIdentity> {
+        self.persist_delegated_session_inner(sess, true)
+    }
+
+    fn persist_delegated_session_inner(
+        &self,
+        sess: &DelegatedSessionFile,
+        clear_revoke_markers: bool,
+    ) -> anyhow::Result<DelegatedCommittedIdentity> {
         if self.readonly {
-            return Ok(());
+            return Ok(DelegatedCommittedIdentity {
+                secret_revision: sess.secret_revision,
+                generation: sess.generation,
+                bundle_slot: sess.bundle_slot,
+            });
         }
         self.durable_fail
             .fail(&self.durable_fail.save_session, "save_session")?;
@@ -947,6 +997,7 @@ impl AppState {
             let (previous_revision, previous_slot) = if self.paths.twitch_delegated.is_file() {
                 let raw = std::fs::read_to_string(&self.paths.twitch_delegated)?;
                 let meta = serde_json::from_str::<DelegatedSessionMetadataFile>(&raw)?;
+                crate::delegated_secrets::validate_committed_bundle_slot(meta.bundle_slot)?;
                 (meta.secret_revision, meta.bundle_slot)
             } else {
                 (0, 1)
@@ -954,9 +1005,12 @@ impl AppState {
             let new_revision = previous_revision
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("delegated secret revision exhausted"))?;
-            let new_slot = alternate_bundle_slot(previous_slot);
+            let new_slot = alternate_bundle_slot(previous_slot)?;
             let bundle = bundle_from_session(sess, new_revision, new_slot);
             write_delegated_bundle_create(self.secret_store.as_ref(), &bundle)?;
+            crate::delegated_secrets::authority_gates::pause_blocking(
+                crate::delegated_secrets::authority_gates::DelegatedAuthorityBoundary::PersistAfterBundleWrite,
+            );
 
             let mut metadata_session = sess.clone();
             metadata_session.secret_revision = new_revision;
@@ -971,8 +1025,55 @@ impl AppState {
             self.remove_delegated_backup()?;
             storage::write_authority_bearing_secret(&self.paths.twitch_delegated, &bytes)?;
             delete_legacy_delegated_secret_keys(self.secret_store.as_ref())?;
-            Ok(())
+            if previous_revision > 0 {
+                delete_legacy_revision_bundle(self.secret_store.as_ref(), previous_revision)?;
+            }
+
+            let committed = DelegatedCommittedIdentity {
+                secret_revision: new_revision,
+                generation: sess.generation,
+                bundle_slot: new_slot,
+            };
+
+            if clear_revoke_markers {
+                crate::delegated_secrets::authority_gates::pause_blocking(
+                    crate::delegated_secrets::authority_gates::DelegatedAuthorityBoundary::PersistBeforeMarkerClear,
+                );
+                self.clear_revoke_markers_if_replacement_committed(&committed)?;
+            }
+
+            Ok(committed)
         })
+    }
+
+    fn clear_revoke_markers_if_replacement_committed(
+        &self,
+        committed: &DelegatedCommittedIdentity,
+    ) -> anyhow::Result<()> {
+        if !self.paths.twitch_delegated_revoked.is_file()
+            && !self.paths.twitch_delegated_revoke_pending.is_file()
+        {
+            return Ok(());
+        }
+        let raw = std::fs::read(&self.paths.twitch_delegated)?;
+        let current = parse_committed_identity_from_metadata_bytes(&raw)?
+            .ok_or_else(|| anyhow::anyhow!("replacement metadata missing committed identity"))?;
+        if current != *committed {
+            anyhow::bail!("replacement metadata identity mismatch during marker clear");
+        }
+        let session = storage::committed_delegated_session_parse(&self.paths.twitch_delegated)?
+            .ok_or_else(|| anyhow::anyhow!("replacement metadata missing during marker clear"))?;
+        read_bound_delegated_bundle(self.secret_store.as_ref(), &session)?
+            .ok_or_else(|| anyhow::anyhow!("replacement bundle missing during marker clear"))?;
+        self.durable_fail
+            .fail(&self.durable_fail.tombstone_clear, "tombstone_clear")?;
+        if self.paths.twitch_delegated_revoked.is_file() {
+            storage::remove_file_durable(&self.paths.twitch_delegated_revoked)?;
+        }
+        if self.paths.twitch_delegated_revoke_pending.is_file() {
+            storage::remove_file_durable(&self.paths.twitch_delegated_revoke_pending)?;
+        }
+        Ok(())
     }
 
     /// Remove legacy reusable delegated `.bak` (propagates failure).
@@ -1004,7 +1105,10 @@ impl AppState {
 
     /// True when secret-store delegated authority (bounded slots or legacy keys) remains.
     pub fn delegated_secret_store_authority_remain(&self) -> anyhow::Result<bool> {
-        delegated_secret_store_authority_remain(self.secret_store.as_ref())
+        delegated_secret_store_authority_remain(
+            self.secret_store.as_ref(),
+            self.delegated_metadata_revision(),
+        )
     }
 
     /// True when authority-bearing secrets or a crash-persistent revoke marker remain.
@@ -1030,14 +1134,26 @@ impl AppState {
                 .fail(&self.durable_fail.tombstone_write, "tombstone_write")?;
             storage::write_delegated_revoked_tombstone(&self.paths.twitch_delegated_revoked)?;
 
-            let metadata_parse_ok = if self.paths.twitch_delegated.is_file() {
-                match std::fs::read_to_string(&self.paths.twitch_delegated) {
-                    Ok(raw) => serde_json::from_str::<DelegatedSessionMetadataFile>(&raw).is_ok(),
-                    Err(_) => false,
+            let (metadata_parse_ok, metadata_revision) = if self.paths.twitch_delegated.is_file() {
+                match std::fs::read(&self.paths.twitch_delegated) {
+                    Ok(raw) => {
+                        let parse_ok =
+                            serde_json::from_slice::<DelegatedSessionMetadataFile>(&raw).is_ok();
+                        let revision = parse_committed_identity_from_metadata_bytes(&raw)
+                            .ok()
+                            .flatten()
+                            .map(|id| id.secret_revision);
+                        (parse_ok, revision)
+                    }
+                    Err(_) => (false, None),
                 }
             } else {
-                true
+                (true, None)
             };
+
+            if let Some(revision) = metadata_revision {
+                delete_legacy_revision_bundle(self.secret_store.as_ref(), revision)?;
+            }
 
             self.durable_fail
                 .fail(&self.durable_fail.credential_remove, "credential_remove")?;
