@@ -2,11 +2,14 @@ mod commands;
 mod overlay;
 mod overlay_proxy;
 mod paths;
+mod update_service;
+mod update_state;
 mod updater;
 
 use commands::AppState;
 use overlay::{spawn_overlay_server, startup_error_dialog, wait_for_expected_health, OverlayStart};
 use paths::{legacy_user_data_dir, resolve_ui_assets_root};
+use std::sync::Arc;
 use std::time::Duration;
 use stream_sync_core::rust_workspace_root;
 use tauri::{
@@ -15,6 +18,7 @@ use tauri::{
     Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tracing_subscriber::EnvFilter;
+use update_service::{spawn_launch_check, UpdateService};
 
 #[allow(dead_code)]
 struct InstanceLock(std::fs::File);
@@ -35,6 +39,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .on_window_event(|window, event| {
             if window.label() != "main" {
                 return;
@@ -75,6 +80,8 @@ pub fn run() {
                 overlay_port: port,
                 logs_dir: logs_dir.clone(),
             });
+            let update_service = Arc::new(UpdateService::new(user_data.clone()));
+            app.manage(update_service);
 
             let (instance_nonce, bind_rx) = spawn_overlay_server(ui_root.clone(), port);
 
@@ -183,6 +190,8 @@ pub fn run() {
                 .is_err()
                 {
                     tracing::error!("failed to create main window");
+                } else if let Some(service) = handle2.try_state::<Arc<UpdateService>>() {
+                    spawn_launch_check(handle2.clone(), service.inner().clone());
                 }
             });
 
@@ -202,7 +211,12 @@ pub fn run() {
             commands::twitch_disconnect,
             commands::kick_connect,
             commands::purge_logs,
+            commands::get_update_status,
             commands::check_for_updates,
+            commands::check_for_updates_manual,
+            commands::begin_update_install,
+            commands::dismiss_update,
+            commands::open_update_fallback_page,
             commands::open_download_page,
             commands::open_se_account_page,
             commands::export_backup,

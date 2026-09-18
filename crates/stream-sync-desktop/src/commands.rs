@@ -2,9 +2,10 @@
 
 use crate::overlay_proxy;
 use crate::paths::legacy_user_data_dir;
+use crate::update_service::{BackgroundCheckResult, CheckMode, ManualCheckResult, UpdateService};
 use serde::Serialize;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use stream_sync_core::{build_backup_zip, get_paths, restore_backup_zip};
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt;
@@ -336,18 +337,84 @@ pub fn restore_backup(
 }
 
 #[tauri::command]
-pub fn check_for_updates(
+pub fn get_update_status(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    updates: State<'_, Arc<UpdateService>>,
+) -> Result<serde_json::Value, String> {
+    require_main_window(&window, state.overlay_port)?;
+    let current = updates.current_state();
+    Ok(serde_json::json!({
+        "lastAttemptAt": current.last_attempt_at,
+        "lastSuccessfulCheckAt": current.last_successful_check_at,
+        "dismissedVersion": current.dismissed_version,
+        "lastResult": current.last_result,
+    }))
+}
+
+#[tauri::command]
+pub async fn check_for_updates_manual(
     window: WebviewWindow,
     state: State<'_, AppState>,
     app: AppHandle,
+    updates: State<'_, Arc<UpdateService>>,
+) -> Result<ManualCheckResult, String> {
+    require_main_window(&window, state.overlay_port)?;
+    match updates.check_updates(&app, CheckMode::Forced).await {
+        Ok(BackgroundCheckResult::SilentCurrent) => Ok(ManualCheckResult::UpToDate),
+        Ok(_) => Ok(ManualCheckResult::Failed {
+            message: "Unexpected background result during manual check".into(),
+        }),
+        Err(result) => Ok(result),
+    }
+}
+
+#[tauri::command]
+pub async fn check_for_updates(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    app: AppHandle,
+    updates: State<'_, Arc<UpdateService>>,
+) -> Result<ManualCheckResult, String> {
+    check_for_updates_manual(window, state, app, updates).await
+}
+
+#[tauri::command]
+pub async fn begin_update_install(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    app: AppHandle,
+    updates: State<'_, Arc<UpdateService>>,
+    version: String,
+) -> Result<(), String> {
+    require_main_window(&window, state.overlay_port)?;
+    updates.download_and_install(&app, version.trim()).await
+}
+
+#[tauri::command]
+pub fn dismiss_update(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    updates: State<'_, Arc<UpdateService>>,
+    version: String,
+) -> Result<(), String> {
+    require_main_window(&window, state.overlay_port)?;
+    updates.dismiss_version(version.trim())
+}
+
+#[tauri::command]
+pub fn open_update_fallback_page(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    app: AppHandle,
+    updates: State<'_, Arc<UpdateService>>,
 ) -> Result<serde_json::Value, String> {
     require_main_window(&window, state.overlay_port)?;
-    let env_page = std::env::var("STREAMSYNC_UPDATE_PAGE").ok();
-    let version = app.package_info().version.to_string();
-    let url = crate::updater::check_for_updates_url(env_page.as_deref(), &version)?;
+    let url = updates.fallback_page_url(&app)?;
     app.opener()
         .open_url(&url, None::<&str>)
         .map_err(|e| e.to_string())?;
+    let version = app.package_info().version.to_string();
     Ok(serde_json::json!({ "ok": true, "url": url, "version": version }))
 }
 
@@ -356,6 +423,7 @@ pub fn open_download_page(
     window: WebviewWindow,
     state: State<'_, AppState>,
     app: AppHandle,
+    updates: State<'_, Arc<UpdateService>>,
 ) -> Result<serde_json::Value, String> {
-    check_for_updates(window, state, app)
+    open_update_fallback_page(window, state, app, updates)
 }
