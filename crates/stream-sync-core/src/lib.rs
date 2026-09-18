@@ -32,8 +32,10 @@ pub use delegated_lifecycle::{
 };
 pub use delegated_secrets::{
     all_delegated_bundle_slot_keys, delegated_bundle_slot_key,
-    delegated_secret_store_authority_remain, read_bound_delegated_bundle,
-    validate_delegated_session_coherence, DelegatedSecretBundle,
+    delegated_secret_store_authority_remain, legacy_revision_bundle_key,
+    read_bound_delegated_bundle, read_bound_delegated_bundle_with_provenance,
+    validate_delegated_session_coherence, write_delegated_bundle_create, BoundBundleProvenance,
+    DelegatedCommittedIdentity, DelegatedSecretBundle,
 };
 pub use syndicate_connection::connection_key_events_url;
 pub use twitch::{disconnect_twitch, TwitchServices};
@@ -85,6 +87,9 @@ pub use store_lock::{try_acquire_instance_lock, InstanceLockError};
 /// Integration-test hooks for durable apply rollback (not a public API surface).
 #[doc(hidden)]
 pub mod test_support {
+    pub use crate::delegated_secrets::authority_gates::{
+        install as install_delegated_authority_gate, DelegatedAuthorityBoundary,
+    };
     pub use crate::twitch::identity_commit::{
         rollback_superseded_apply, DurableApplySnapshot, LiveApplySnapshot,
     };
