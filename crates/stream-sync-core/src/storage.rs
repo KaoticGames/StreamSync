@@ -1108,6 +1108,23 @@ mod storage_tests {
     use super::*;
 
     #[test]
+    fn metadata_only_delegated_json_deserializes_with_empty_secrets() {
+        let meta = r#"{
+            "generation": 2,
+            "client_id": "cid",
+            "channel_login": "chan",
+            "channel_twitch_id": "123",
+            "twitch_expires_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let session: crate::config_types::DelegatedSessionFile =
+            serde_json::from_str(meta).expect("metadata-only delegated JSON must parse");
+        assert_eq!(session.generation, 2);
+        assert!(session.connection_key.is_empty());
+        assert!(session.access_token.is_empty());
+        assert_eq!(session.channel_login, "chan");
+    }
+
+    #[test]
     fn marker_write_syncs_parent_directory() {
         let dir = std::env::temp_dir().join(format!(
             "streamsync-marker-durable-{}-{}",
