@@ -12,7 +12,7 @@ const TAURI_CONF = path.join(
   "tauri.conf.json"
 );
 
-const SEMVER_TAG = /^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$/;
+const SEMVER_TAG = /^v(\d+\.\d+\.\d+)$/;
 
 function readTauriVersion() {
   const raw = fs.readFileSync(TAURI_CONF, "utf8");

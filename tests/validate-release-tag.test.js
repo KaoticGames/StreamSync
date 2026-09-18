@@ -20,10 +20,12 @@ describe("validateReleaseTag", () => {
     assert.match(result.error, /does not match/);
   });
 
-  it("rejects malformed tags", () => {
+  it("rejects malformed and non-stable tags", () => {
     assert.equal(validateReleaseTag("2.1.0", "2.1.0").ok, false);
     assert.equal(validateReleaseTag("v2.1", "2.1.0").ok, false);
     assert.equal(validateReleaseTag("", "2.1.0").ok, false);
+    assert.equal(validateReleaseTag("v2.1.0-beta.1", "2.1.0-beta.1").ok, false);
+    assert.equal(validateReleaseTag("v2.1.0+build.7", "2.1.0+build.7").ok, false);
   });
 
   it("reads the current tauri.conf.json version", () => {

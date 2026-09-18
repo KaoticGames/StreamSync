@@ -49,4 +49,35 @@ describe("release workflow", () => {
       assert.ok(occurrences >= 3, `${asset} must be staged, uploaded, and verified`);
     }
   });
+
+  it("uploads one flat release-assets directory", () => {
+    assert.doesNotMatch(
+      workflow,
+      /path:\s*\|\s*\n\s+release-assets\/\s*\n\s+release-notes\.md/
+    );
+  });
+
+  it("scopes signing secrets only to the Tauri build step", () => {
+    assert.equal((workflow.match(/TAURI_SIGNING_PRIVATE_KEY:/g) || []).length, 1);
+    assert.equal(
+      (workflow.match(/TAURI_SIGNING_PRIVATE_KEY_PASSWORD:/g) || []).length,
+      1
+    );
+    const buildStep = workflow.match(
+      /- name: NSIS installer with updater artifacts([\s\S]*?)(?=\n\s{6}- name:)/
+    );
+    assert.ok(buildStep);
+    assert.match(buildStep[1], /env:[\s\S]*TAURI_SIGNING_PRIVATE_KEY:/);
+    assert.match(buildStep[1], /TAURI_SIGNING_PRIVATE_KEY_PASSWORD:/);
+  });
+
+  it("grants write permission only to release mutation jobs", () => {
+    assert.match(workflow, /^permissions:\n  contents: read$/m);
+    for (const job of ["draft-release", "publish-release"]) {
+      assert.match(
+        workflow,
+        new RegExp(`^  ${job}:[\\s\\S]*?^    permissions:\\n      contents: write$`, "m")
+      );
+    }
+  });
 });
