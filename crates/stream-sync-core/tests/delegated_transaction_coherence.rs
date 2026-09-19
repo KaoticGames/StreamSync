@@ -919,6 +919,219 @@ fn same_transaction_id_non_identical_secrets_rejects_without_mutation() {
 }
 
 #[tokio::test]
+async fn rollback_refuses_after_failed_revoke_preserves_marker_epoch() {
+    let _gate_lock = AUTHORITY_GATE_TEST_LOCK.lock().unwrap();
+    let userdata = test_userdata_dir();
+    let config = OverlayConfig {
+        port: 0,
+        repo_root: repo_root(),
+        readonly: false,
+        userdata_root: Some(userdata.clone()),
+        secret_store: None,
+    };
+    let (_router, state, _svc) = OverlayServer::new(config).build_app().await.unwrap();
+    let identity = state
+        .persist_delegated_session(&sample_session("ssk_test_placeholder_failed_revoke_rb"))
+        .unwrap();
+    let mut snapshot =
+        stream_sync_core::test_support::DurableApplySnapshot::capture(&state).expect("capture");
+    snapshot.note_persist_completed(identity);
+
+    state
+        .durable_fail
+        .credential_remove
+        .store(true, Ordering::SeqCst);
+    let revoke_err = state.durable_revoke_delegated().await.unwrap_err();
+    assert!(
+        revoke_err.to_string().contains("credential_remove"),
+        "revoke must fail after markers: {revoke_err:#}"
+    );
+    assert!(state.paths.twitch_delegated_revoke_pending.is_file());
+    assert!(state.paths.twitch_delegated_revoked.is_file());
+    assert!(state.paths.twitch_delegated.is_file());
+
+    let rb_err = snapshot.rollback(&state).unwrap_err();
+    assert!(
+        rb_err.to_string().contains("stale rollback refused"),
+        "rollback must refuse when revoke markers advanced: {rb_err:#}"
+    );
+    assert!(state.paths.twitch_delegated_revoke_pending.is_file());
+    assert!(state.paths.twitch_delegated_revoked.is_file());
+
+    let restarted = restart_app_at(&userdata, false);
+    assert!(
+        restarted.paths.twitch_delegated_revoke_pending.is_file()
+            || restarted.paths.twitch_delegated_revoked.is_file(),
+        "restart must quarantine failed revoke"
+    );
+    let _ = std::fs::remove_dir_all(&userdata);
+}
+
+#[tokio::test]
+async fn scheduled_revoke_pending_survives_replacement_marker_clear_race() {
+    use std::sync::mpsc;
+
+    let _gate_lock = AUTHORITY_GATE_TEST_LOCK.lock().unwrap();
+    let userdata = test_userdata_dir();
+    let config = OverlayConfig {
+        port: 0,
+        repo_root: repo_root(),
+        readonly: false,
+        userdata_root: Some(userdata.clone()),
+        secret_store: None,
+    };
+    let (_router, state, services) = OverlayServer::new(config).build_app().await.unwrap();
+    state
+        .persist_delegated_session(&sample_session("ssk_test_placeholder_sched_revoke_race"))
+        .unwrap();
+    state
+        .durable_fail
+        .credential_remove
+        .store(true, Ordering::SeqCst);
+    state.durable_revoke_delegated().await.unwrap_err();
+    state
+        .durable_fail
+        .credential_remove
+        .store(false, Ordering::SeqCst);
+    assert!(state.paths.twitch_delegated_revoke_pending.is_file());
+
+    let (_gate, arrived_rx, resume_tx) =
+        stream_sync_core::test_support::install_delegated_authority_gate(
+            stream_sync_core::test_support::DelegatedAuthorityBoundary::PersistBeforeMarkerClear,
+        );
+    let state_apply = state.clone();
+    let replacement = sample_session("ssk_test_placeholder_sched_revoke_replacement");
+    let apply_task =
+        std::thread::spawn(move || state_apply.persist_delegated_replacement_session(&replacement));
+    arrived_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("replacement must reach marker-clear gate");
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let svc = services.clone();
+    let state_sched = state.clone();
+    let schedule_thread = std::thread::spawn(move || {
+        svc.schedule_durable_revoke_for_test(state_sched, 1, "scheduled_race");
+        let _ = done_tx.send(());
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        done_rx.try_recv().is_err(),
+        "scheduled revoke must block on authority lock while replacement holds marker-clear transaction"
+    );
+
+    resume_tx.send(()).expect("release replacement");
+    let _apply_result = apply_task.join().expect("apply join");
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("scheduled revoke must publish pending after replacement releases lock");
+    let _ = schedule_thread.join();
+    assert!(
+        state.paths.twitch_delegated_revoke_pending.is_file(),
+        "scheduled revoke pending must survive replacement marker-clear race"
+    );
+
+    let restarted = restart_app_at(&userdata, false);
+    assert!(
+        restarted.paths.twitch_delegated_revoke_pending.is_file()
+            || restarted.paths.twitch_delegated_revoked.is_file(),
+        "restart remains fail-closed while revoke signal present"
+    );
+    let _ = std::fs::remove_dir_all(&userdata);
+}
+
+#[tokio::test]
+async fn invalid_slot_metadata_revoke_deletes_legacy_revision_bundle() {
+    let userdata = test_userdata_dir();
+    let paths = paths_for_root(&userdata, false).unwrap();
+    write_json(&paths.twitch_delegated, &sample_metadata_only_json(1, 2, 9)).unwrap();
+    let store = fs_secret_store(&userdata);
+    write_legacy_revision_bundle(
+        store.as_ref(),
+        2,
+        1,
+        "ssk_test_placeholder_invalid_slot_conn",
+        "ssk_test_placeholder_invalid_slot_at",
+    );
+
+    let config = OverlayConfig {
+        port: 0,
+        repo_root: repo_root(),
+        readonly: false,
+        userdata_root: Some(userdata.clone()),
+        secret_store: None,
+    };
+    let (_router, state, _svc) = OverlayServer::new(config).build_app().await.unwrap();
+    state.durable_revoke_delegated().await.unwrap();
+    assert!(
+        store.get(&legacy_revision_bundle_key(2)).unwrap().is_none(),
+        "revoke must delete legacy revision bundle when secret_revision is recoverable"
+    );
+    assert!(!state.delegated_secret_store_authority_remain().unwrap());
+    assert!(!state.paths.twitch_delegated_revoke_pending.is_file());
+    let _ = std::fs::remove_dir_all(&userdata);
+}
+
+#[tokio::test]
+async fn invalid_slot_metadata_revoke_fail_closed_on_legacy_delete() {
+    let userdata = test_userdata_dir();
+    let paths = paths_for_root(&userdata, false).unwrap();
+    write_json(&paths.twitch_delegated, &sample_metadata_only_json(1, 3, 9)).unwrap();
+    let store = fs_secret_store(&userdata);
+    write_legacy_revision_bundle(
+        store.as_ref(),
+        3,
+        1,
+        "ssk_test_placeholder_invalid_slot_del_conn",
+        "ssk_test_placeholder_invalid_slot_del_at",
+    );
+
+    let config = OverlayConfig {
+        port: 0,
+        repo_root: repo_root(),
+        readonly: false,
+        userdata_root: Some(userdata.clone()),
+        secret_store: None,
+    };
+    let (_router, state, _svc) = OverlayServer::new(config).build_app().await.unwrap();
+    state
+        .durable_fail
+        .legacy_revision_remove
+        .store(true, Ordering::SeqCst);
+    let err = state.durable_revoke_delegated().await.unwrap_err();
+    assert!(
+        err.to_string().contains("legacy_revision_remove"),
+        "must fail closed on legacy delete injection: {err:#}"
+    );
+    assert!(
+        store.get(&legacy_revision_bundle_key(3)).unwrap().is_some(),
+        "legacy bundle must remain when delete fails"
+    );
+    assert!(state.paths.twitch_delegated_revoke_pending.is_file());
+    let _ = std::fs::remove_dir_all(&userdata);
+}
+
+#[test]
+fn authority_remain_uses_known_revision_without_metadata_file() {
+    let store = stream_sync_core::memory_secret_store();
+    write_legacy_revision_bundle(
+        store.as_ref(),
+        7,
+        1,
+        "ssk_test_placeholder_known_rev_conn",
+        "ssk_test_placeholder_known_rev_at",
+    );
+    assert!(
+        stream_sync_core::delegated_secret_store_authority_remain(store.as_ref(), Some(7)).unwrap(),
+        "known revision must detect legacy authority without metadata"
+    );
+    assert!(
+        !stream_sync_core::delegated_secret_store_authority_remain(store.as_ref(), None).unwrap(),
+        "revoke must pass proven revision — metadata-only lookup is insufficient after deletion"
+    );
+}
+
+#[tokio::test]
 async fn invalid_committed_slot_rejects_before_mutation() {
     let userdata = test_userdata_dir();
     let paths = paths_for_root(&userdata, false).unwrap();
