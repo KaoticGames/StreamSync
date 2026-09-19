@@ -119,6 +119,7 @@ impl DurableApplySnapshot {
                     &state.paths.twitch_active_mode,
                     &state.paths.twitch_delegated_revoked,
                     &state.paths.twitch_delegated_revoke_pending,
+                    &state.paths.twitch_delegated_revoke_marker_hw,
                     state.secret_store().as_ref(),
                 )?,
                 expected_post_persist: None,
@@ -144,6 +145,7 @@ impl DurableApplySnapshot {
             let current_markers = capture_delegated_revoke_marker_snapshot(
                 &state.paths.twitch_delegated_revoked,
                 &state.paths.twitch_delegated_revoke_pending,
+                &state.paths.twitch_delegated_revoke_marker_hw,
             )?;
             assert_rollback_cas(
                 current,

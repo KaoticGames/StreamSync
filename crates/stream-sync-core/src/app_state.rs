@@ -649,6 +649,14 @@ impl AppState {
             readonly,
         )?;
 
+        if !readonly {
+            storage::ensure_delegated_revoke_marker_high_water_materialized(
+                &paths.twitch_delegated_revoke_marker_hw,
+                &paths.twitch_delegated_revoke_pending,
+            )?;
+        }
+        storage::read_delegated_revoke_marker_high_water(&paths.twitch_delegated_revoke_marker_hw)?;
+
         let personal = maybe_migrate_personal_twitch_secrets(
             &paths.twitch_tokens,
             readonly,
@@ -999,6 +1007,9 @@ impl AppState {
             let revoke_marker_epoch_fence = storage::read_delegated_revoke_marker_epoch(
                 &self.paths.twitch_delegated_revoke_pending,
             )?;
+            let revoke_marker_hw_fence = storage::read_delegated_revoke_marker_high_water(
+                &self.paths.twitch_delegated_revoke_marker_hw,
+            )?;
             let (previous_revision, previous_slot) = if self.paths.twitch_delegated.is_file() {
                 let raw = std::fs::read_to_string(&self.paths.twitch_delegated)?;
                 let meta = serde_json::from_str::<DelegatedSessionMetadataFile>(&raw)?;
@@ -1047,6 +1058,7 @@ impl AppState {
                 self.clear_revoke_markers_if_replacement_committed(
                     &committed,
                     revoke_marker_epoch_fence,
+                    revoke_marker_hw_fence,
                 )?;
             }
 
@@ -1058,6 +1070,7 @@ impl AppState {
         &self,
         committed: &DelegatedCommittedIdentity,
         revoke_marker_epoch_fence: u64,
+        revoke_marker_hw_fence: u64,
     ) -> anyhow::Result<()> {
         if !self.paths.twitch_delegated_revoked.is_file()
             && !self.paths.twitch_delegated_revoke_pending.is_file()
@@ -1069,6 +1082,12 @@ impl AppState {
         )?;
         if marker_epoch > revoke_marker_epoch_fence {
             anyhow::bail!("newer durable revoke marker epoch during replacement");
+        }
+        let marker_hw = storage::read_delegated_revoke_marker_high_water(
+            &self.paths.twitch_delegated_revoke_marker_hw,
+        )?;
+        if marker_hw > revoke_marker_hw_fence {
+            anyhow::bail!("newer durable revoke marker high-water during replacement");
         }
         let raw = std::fs::read(&self.paths.twitch_delegated)?;
         let current = parse_committed_identity_from_metadata_bytes(&raw)?
@@ -1216,7 +1235,10 @@ impl AppState {
             "pending_marker_write",
         )?;
         if !self.paths.twitch_delegated_revoke_pending.is_file() {
-            storage::write_delegated_revoke_pending(&self.paths.twitch_delegated_revoke_pending)?;
+            storage::write_delegated_revoke_pending(
+                &self.paths.twitch_delegated_revoke_marker_hw,
+                &self.paths.twitch_delegated_revoke_pending,
+            )?;
         }
         self.durable_fail
             .fail(&self.durable_fail.tombstone_write, "tombstone_write")?;
@@ -1237,7 +1259,10 @@ impl AppState {
         if self.paths.twitch_delegated_revoke_pending.is_file() {
             return Ok(());
         }
-        storage::write_delegated_revoke_pending(&self.paths.twitch_delegated_revoke_pending)
+        storage::write_delegated_revoke_pending(
+            &self.paths.twitch_delegated_revoke_marker_hw,
+            &self.paths.twitch_delegated_revoke_pending,
+        )
     }
 
     /// Mark that durable revoke must complete across restarts (authority-locked publication).

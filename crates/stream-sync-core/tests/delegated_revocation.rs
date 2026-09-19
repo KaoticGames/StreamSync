@@ -842,7 +842,11 @@ async fn startup_resumes_pending_revoke_cleanup_at_generation_zero() {
         &sample_session(1, "ssk_test_placeholder_resume_pending"),
     )
     .unwrap();
-    write_delegated_revoke_pending(&userdata.join("twitch-delegated.revoke-pending")).unwrap();
+    write_delegated_revoke_pending(
+        &userdata.join("twitch-delegated.revoke-marker-hw"),
+        &userdata.join("twitch-delegated.revoke-pending"),
+    )
+    .unwrap();
 
     let (_router, state, services) = build_app_at(userdata.clone(), 0).await;
     assert!(state.delegated.read().await.is_none());

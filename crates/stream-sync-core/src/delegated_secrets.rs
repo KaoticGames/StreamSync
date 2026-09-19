@@ -44,6 +44,7 @@ pub struct DelegatedAuthorityEpoch {
     pub tombstone: bool,
     pub pending: bool,
     pub marker_epoch: u64,
+    pub revoke_marker_high_water: u64,
     pub bundle_slots: [Option<Vec<u8>>; DELEGATED_BUNDLE_SLOT_COUNT as usize],
     pub legacy_revision_bundle: Option<(String, Vec<u8>)>,
     pub committed: Option<DelegatedCommittedIdentity>,
@@ -55,6 +56,7 @@ pub struct DelegatedRevokeMarkerSnapshot {
     pub pending: bool,
     pub tombstone: bool,
     pub marker_epoch: u64,
+    pub revoke_marker_high_water: u64,
 }
 
 /// Structural metadata provenance for revoke cleanup (independent of committed identity validity).
@@ -566,11 +568,15 @@ pub fn extract_delegated_metadata_provenance(bytes: &[u8]) -> DelegatedMetadataP
 pub fn capture_delegated_revoke_marker_snapshot(
     revoked_tombstone_path: &Path,
     revoke_pending_path: &Path,
+    revoke_marker_hw_path: &Path,
 ) -> Result<DelegatedRevokeMarkerSnapshot> {
     Ok(DelegatedRevokeMarkerSnapshot {
         pending: revoke_pending_path.is_file(),
         tombstone: revoked_tombstone_path.is_file(),
         marker_epoch: crate::storage::read_delegated_revoke_marker_epoch(revoke_pending_path)?,
+        revoke_marker_high_water: crate::storage::read_delegated_revoke_marker_high_water(
+            revoke_marker_hw_path,
+        )?,
     })
 }
 
@@ -604,6 +610,7 @@ pub fn capture_delegated_authority_epoch(
     active_mode_path: &Path,
     revoked_tombstone_path: &Path,
     revoke_pending_path: &Path,
+    revoke_marker_hw_path: &Path,
     store: &dyn SecretStore,
 ) -> Result<DelegatedAuthorityEpoch> {
     let metadata = read_path_bytes_if_exists(delegated_metadata)?;
@@ -620,6 +627,9 @@ pub fn capture_delegated_authority_epoch(
         tombstone: revoked_tombstone_path.is_file(),
         pending: revoke_pending_path.is_file(),
         marker_epoch: crate::storage::read_delegated_revoke_marker_epoch(revoke_pending_path)?,
+        revoke_marker_high_water: crate::storage::read_delegated_revoke_marker_high_water(
+            revoke_marker_hw_path,
+        )?,
         bundle_slots: capture_delegated_bundle_slots(store)?,
         legacy_revision_bundle,
         committed,
@@ -646,11 +656,7 @@ pub fn restore_delegated_authority_epoch(
         crate::storage::write_delegated_revoked_tombstone(path)
     })?;
     restore_marker_file(revoke_pending_path, epoch.pending, |path| {
-        if epoch.marker_epoch == 0 {
-            crate::storage::write_delegated_revoke_pending(path)
-        } else {
-            crate::storage::write_delegated_revoke_pending_with_epoch(path, epoch.marker_epoch)
-        }
+        crate::storage::write_delegated_revoke_pending_with_epoch(path, epoch.marker_epoch)
     })?;
     Ok(())
 }
@@ -681,6 +687,7 @@ pub fn assert_rollback_cas(
     if current_markers.pending != pre_apply.pending
         || current_markers.tombstone != pre_apply.tombstone
         || current_markers.marker_epoch != pre_apply.marker_epoch
+        || current_markers.revoke_marker_high_water != pre_apply.revoke_marker_high_water
     {
         return Err(rollback_refused_durable_advanced());
     }

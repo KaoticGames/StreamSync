@@ -1166,3 +1166,215 @@ async fn invalid_committed_slot_rejects_before_mutation() {
     assert_eq!(std::fs::read(&paths.twitch_delegated).unwrap(), before_meta);
     let _ = std::fs::remove_dir_all(&userdata);
 }
+
+fn read_pending_marker_epoch(pending_path: &std::path::Path) -> u64 {
+    let raw = std::fs::read(pending_path).expect("pending marker bytes");
+    let value: serde_json::Value = serde_json::from_slice(&raw).expect("pending marker json");
+    value
+        .get("marker_epoch")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn rollback_refuses_when_revoke_marker_epoch_reused_after_replacement() {
+    let _gate_lock = AUTHORITY_GATE_TEST_LOCK.lock().unwrap();
+    let userdata = test_userdata_dir();
+    let config = OverlayConfig {
+        port: 0,
+        repo_root: repo_root(),
+        readonly: false,
+        userdata_root: Some(userdata.clone()),
+        secret_store: None,
+    };
+    let (_router, state, _svc) = OverlayServer::new(config).build_app().await.unwrap();
+    let identity = state
+        .persist_delegated_session(&sample_session("ssk_test_placeholder_epoch_reuse_rb"))
+        .unwrap();
+    let mut snapshot =
+        stream_sync_core::test_support::DurableApplySnapshot::capture(&state).expect("capture");
+    snapshot.note_persist_completed(identity);
+
+    state
+        .durable_fail
+        .credential_remove
+        .store(true, Ordering::SeqCst);
+    state.durable_revoke_delegated().await.unwrap_err();
+    assert_eq!(
+        read_pending_marker_epoch(&state.paths.twitch_delegated_revoke_pending),
+        1
+    );
+
+    state
+        .durable_fail
+        .credential_remove
+        .store(false, Ordering::SeqCst);
+    state
+        .persist_delegated_replacement_session(&sample_session(
+            "ssk_test_placeholder_epoch_reuse_replacement",
+        ))
+        .unwrap();
+    assert!(!state.paths.twitch_delegated_revoke_pending.is_file());
+
+    state
+        .durable_fail
+        .credential_remove
+        .store(true, Ordering::SeqCst);
+    state.durable_revoke_delegated().await.unwrap_err();
+    let second_epoch = read_pending_marker_epoch(&state.paths.twitch_delegated_revoke_pending);
+    assert!(
+        second_epoch > 1,
+        "second revoke cycle must allocate a fresh epoch, got {second_epoch}"
+    );
+
+    let rb_err = snapshot.rollback(&state).unwrap_err();
+    assert!(
+        rb_err.to_string().contains("stale rollback refused"),
+        "stale rollback must refuse when revoke epoch advanced: {rb_err:#}"
+    );
+    let _ = std::fs::remove_dir_all(&userdata);
+}
+
+#[tokio::test]
+async fn two_revoke_cycles_separated_by_replacement_use_increasing_epochs() {
+    let _gate_lock = AUTHORITY_GATE_TEST_LOCK.lock().unwrap();
+    let userdata = test_userdata_dir();
+    let config = OverlayConfig {
+        port: 0,
+        repo_root: repo_root(),
+        readonly: false,
+        userdata_root: Some(userdata.clone()),
+        secret_store: None,
+    };
+    let (_router, state, _svc) = OverlayServer::new(config).build_app().await.unwrap();
+    state
+        .persist_delegated_session(&sample_session("ssk_test_placeholder_two_revoke_cycles"))
+        .unwrap();
+
+    state
+        .durable_fail
+        .credential_remove
+        .store(true, Ordering::SeqCst);
+    state.durable_revoke_delegated().await.unwrap_err();
+    let first_epoch = read_pending_marker_epoch(&state.paths.twitch_delegated_revoke_pending);
+    state
+        .durable_fail
+        .credential_remove
+        .store(false, Ordering::SeqCst);
+    state
+        .persist_delegated_replacement_session(&sample_session(
+            "ssk_test_placeholder_two_revoke_cycles_repl",
+        ))
+        .unwrap();
+
+    state
+        .durable_fail
+        .credential_remove
+        .store(true, Ordering::SeqCst);
+    state.durable_revoke_delegated().await.unwrap_err();
+    let second_epoch = read_pending_marker_epoch(&state.paths.twitch_delegated_revoke_pending);
+    assert!(
+        second_epoch > first_epoch,
+        "epochs must strictly increase across cycles ({first_epoch} -> {second_epoch})"
+    );
+    let _ = std::fs::remove_dir_all(&userdata);
+}
+
+#[tokio::test]
+async fn revoke_marker_high_water_survives_restart_and_marker_absence() {
+    let userdata = test_userdata_dir();
+    let config = OverlayConfig {
+        port: 0,
+        repo_root: repo_root(),
+        readonly: false,
+        userdata_root: Some(userdata.clone()),
+        secret_store: None,
+    };
+    let (_router, state, _svc) = OverlayServer::new(config).build_app().await.unwrap();
+    state
+        .persist_delegated_session(&sample_session("ssk_test_placeholder_hw_survives"))
+        .unwrap();
+    state
+        .durable_fail
+        .credential_remove
+        .store(true, Ordering::SeqCst);
+    state.durable_revoke_delegated().await.unwrap_err();
+    state
+        .durable_fail
+        .credential_remove
+        .store(false, Ordering::SeqCst);
+    state
+        .persist_delegated_replacement_session(&sample_session(
+            "ssk_test_placeholder_hw_survives_repl",
+        ))
+        .unwrap();
+    assert!(!state.paths.twitch_delegated_revoke_pending.is_file());
+    let hw_path = state.paths.twitch_delegated_revoke_marker_hw.clone();
+    assert!(
+        hw_path.is_file(),
+        "high-water must remain after marker clear"
+    );
+    let hw_before = stream_sync_core::read_delegated_revoke_marker_high_water(&hw_path).unwrap();
+    assert!(hw_before >= 1);
+
+    let restarted = restart_app_at(&userdata, false);
+    assert!(!restarted.paths.twitch_delegated_revoke_pending.is_file());
+    let hw_after = stream_sync_core::read_delegated_revoke_marker_high_water(
+        &restarted.paths.twitch_delegated_revoke_marker_hw,
+    )
+    .unwrap();
+    assert_eq!(hw_before, hw_after);
+    let _ = std::fs::remove_dir_all(&userdata);
+}
+
+#[tokio::test]
+async fn revoke_marker_high_water_max_rejects_new_intent_without_mutation() {
+    let userdata = test_userdata_dir();
+    let paths = paths_for_root(&userdata, false).unwrap();
+    let config = OverlayConfig {
+        port: 0,
+        repo_root: repo_root(),
+        readonly: false,
+        userdata_root: Some(userdata.clone()),
+        secret_store: None,
+    };
+    let (_router, state, _svc) = OverlayServer::new(config).build_app().await.unwrap();
+    state
+        .persist_delegated_session(&sample_session("ssk_test_placeholder_hw_max"))
+        .unwrap();
+    stream_sync_core::write_delegated_revoke_marker_high_water(
+        &paths.twitch_delegated_revoke_marker_hw,
+        u64::MAX,
+    )
+    .unwrap();
+    let hw_before = std::fs::read(&paths.twitch_delegated_revoke_marker_hw).unwrap();
+    let pending_before = std::fs::read(&paths.twitch_delegated_revoke_pending).ok();
+
+    let err = state.mark_durable_revoke_pending().unwrap_err();
+    assert!(
+        err.to_string().contains("epoch exhausted"),
+        "must reject allocation at u64::MAX: {err:#}"
+    );
+    assert_eq!(
+        std::fs::read(&paths.twitch_delegated_revoke_marker_hw).unwrap(),
+        hw_before
+    );
+    assert_eq!(
+        std::fs::read(&paths.twitch_delegated_revoke_pending).ok(),
+        pending_before
+    );
+    let _ = std::fs::remove_dir_all(&userdata);
+}
+
+#[test]
+fn corrupt_revoke_marker_high_water_fails_closed_on_startup() {
+    let userdata = test_userdata_dir();
+    let paths = paths_for_root(&userdata, false).unwrap();
+    std::fs::write(&paths.twitch_delegated_revoke_marker_hw, b"not-json").unwrap();
+    let startup = AppState::new(paths, repo_root(), 0, false, fs_secret_store(&userdata));
+    assert!(
+        startup.is_err(),
+        "corrupt revoke marker high-water must fail closed"
+    );
+    let _ = std::fs::remove_dir_all(&userdata);
+}

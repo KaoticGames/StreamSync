@@ -125,6 +125,8 @@ pub struct StoragePaths {
     pub twitch_delegated_revoked: PathBuf,
     /// Crash-persistent intent that durable revoke is still pending (independent of tombstone).
     pub twitch_delegated_revoke_pending: PathBuf,
+    /// Monotonic high-water for revoke-marker epochs (survives pending/tombstone removal).
+    pub twitch_delegated_revoke_marker_hw: PathBuf,
     /// Which saved identity is active: local vs delegated.
     pub twitch_active_mode: PathBuf,
     pub fonts_dir: PathBuf,
@@ -248,6 +250,7 @@ fn paths_under_root(root: PathBuf, readonly: bool) -> Result<StoragePaths> {
     let twitch_delegated = root.join("twitch-delegated.json");
     let twitch_delegated_revoked = root.join("twitch-delegated.revoked");
     let twitch_delegated_revoke_pending = root.join("twitch-delegated.revoke-pending");
+    let twitch_delegated_revoke_marker_hw = root.join("twitch-delegated.revoke-marker-hw");
     let twitch_active_mode = root.join("twitch-active-mode.json");
     let fonts_dir = env_path("STREAMSYNC_FONTS_DIR").unwrap_or_else(|| root.join("fonts"));
     let events_media_dir =
@@ -281,6 +284,7 @@ fn paths_under_root(root: PathBuf, readonly: bool) -> Result<StoragePaths> {
         twitch_delegated,
         twitch_delegated_revoked,
         twitch_delegated_revoke_pending,
+        twitch_delegated_revoke_marker_hw,
         twitch_active_mode,
         fonts_dir,
         events_media_dir,
@@ -1063,12 +1067,65 @@ pub fn read_delegated_revoke_marker_epoch(path: &Path) -> Result<u64> {
         .unwrap_or(0))
 }
 
-/// Crash-persistent marker that durable delegated revoke is still incomplete.
-pub fn write_delegated_revoke_pending(path: &Path) -> Result<()> {
-    let epoch = read_delegated_revoke_marker_epoch(path)?
+const DELEGATED_REVOKE_MARKER_HIGH_WATER_FIELD: &str = "revoke_marker_high_water";
+
+/// Durable monotonic high-water for revoke-marker epochs (0 when absent).
+pub fn read_delegated_revoke_marker_high_water(path: &Path) -> Result<u64> {
+    if !path.is_file() {
+        return Ok(0);
+    }
+    let raw = fs::read(path)?;
+    let value: serde_json::Value = serde_json::from_slice(&raw).with_context(|| {
+        format!(
+            "delegated revoke marker high-water corrupt at {}",
+            path.display()
+        )
+    })?;
+    value
+        .get(DELEGATED_REVOKE_MARKER_HIGH_WATER_FIELD)
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "delegated revoke marker high-water corrupt at {}: missing field",
+                path.display()
+            )
+        })
+}
+
+/// Persist revoke-marker high-water (caller must hold delegated authority lock).
+pub fn write_delegated_revoke_marker_high_water(path: &Path, high_water: u64) -> Result<()> {
+    let payload = serde_json::json!({
+        DELEGATED_REVOKE_MARKER_HIGH_WATER_FIELD: high_water,
+    });
+    write_marker_file(path, serde_json::to_string(&payload)?.as_bytes())
+}
+
+/// Materialize high-water from a legacy pending marker epoch when upgrading.
+pub fn ensure_delegated_revoke_marker_high_water_materialized(
+    hw_path: &Path,
+    pending_path: &Path,
+) -> Result<()> {
+    let stored = read_delegated_revoke_marker_high_water(hw_path)?;
+    let pending_epoch = read_delegated_revoke_marker_epoch(pending_path)?;
+    if pending_epoch > stored {
+        write_delegated_revoke_marker_high_water(hw_path, pending_epoch)?;
+    }
+    Ok(())
+}
+
+fn allocate_delegated_revoke_marker_epoch(hw_path: &Path) -> Result<u64> {
+    let current = read_delegated_revoke_marker_high_water(hw_path)?;
+    let next = current
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("delegated revoke marker epoch exhausted"))?;
-    write_delegated_revoke_pending_with_epoch(path, epoch)
+    write_delegated_revoke_marker_high_water(hw_path, next)?;
+    Ok(next)
+}
+
+/// Crash-persistent marker that durable delegated revoke is still incomplete.
+pub fn write_delegated_revoke_pending(hw_path: &Path, pending_path: &Path) -> Result<()> {
+    let epoch = allocate_delegated_revoke_marker_epoch(hw_path)?;
+    write_delegated_revoke_pending_with_epoch(pending_path, epoch)
 }
 
 /// Write pending marker with an explicit epoch (caller must hold authority lock).
@@ -1160,7 +1217,8 @@ mod storage_tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("twitch-delegated.revoke-pending");
-        write_delegated_revoke_pending(&marker).unwrap();
+        let hw = dir.join("twitch-delegated.revoke-marker-hw");
+        write_delegated_revoke_pending(&hw, &marker).unwrap();
         assert!(marker.is_file());
         let _ = std::fs::remove_file(&marker);
         let _ = std::fs::remove_dir_all(&dir);
