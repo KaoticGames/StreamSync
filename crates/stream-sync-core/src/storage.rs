@@ -1050,10 +1050,32 @@ pub fn write_delegated_revoked_tombstone(path: &Path) -> Result<()> {
     write_marker_file(path, serde_json::to_string(&payload)?.as_bytes())
 }
 
+/// Monotonic revoke-marker epoch read from the pending marker (0 when absent).
+pub fn read_delegated_revoke_marker_epoch(path: &Path) -> Result<u64> {
+    if !path.is_file() {
+        return Ok(0);
+    }
+    let raw = fs::read(path)?;
+    let value: serde_json::Value = serde_json::from_slice(&raw)?;
+    Ok(value
+        .get("marker_epoch")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0))
+}
+
 /// Crash-persistent marker that durable delegated revoke is still incomplete.
 pub fn write_delegated_revoke_pending(path: &Path) -> Result<()> {
+    let epoch = read_delegated_revoke_marker_epoch(path)?
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("delegated revoke marker epoch exhausted"))?;
+    write_delegated_revoke_pending_with_epoch(path, epoch)
+}
+
+/// Write pending marker with an explicit epoch (caller must hold authority lock).
+pub fn write_delegated_revoke_pending_with_epoch(path: &Path, marker_epoch: u64) -> Result<()> {
     let payload = serde_json::json!({
         "pending_at": chrono::Utc::now().to_rfc3339(),
+        "marker_epoch": marker_epoch,
     });
     write_marker_file(path, serde_json::to_string(&payload)?.as_bytes())
 }

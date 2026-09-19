@@ -10,14 +10,14 @@ use crate::delegated_secrets::{
     alternate_bundle_slot, apply_bundle_to_session, bundle_from_session,
     classify_inline_delegated_secrets, delegated_secret_store_authority_remain,
     delete_all_delegated_bundle_slots, delete_legacy_delegated_secret_keys,
-    delete_legacy_revision_bundle, hydrate_inline_secrets_in_memory,
-    hydrate_legacy_store_pair_in_memory, migrate_legacy_inline_to_bundle,
-    migrate_legacy_revision_bundle_to_slot, migrate_legacy_store_pair_to_bundle,
-    parse_committed_identity_from_metadata_bytes, read_bound_delegated_bundle,
-    read_bound_delegated_bundle_with_provenance, read_legacy_delegated_secret_pair,
-    validate_delegated_session_coherence, with_delegated_authority_lock,
-    write_delegated_bundle_create, BoundBundleProvenance, DelegatedCommittedIdentity,
-    InlineDelegatedSecretState,
+    delete_legacy_revision_bundle, extract_delegated_metadata_provenance,
+    hydrate_inline_secrets_in_memory, hydrate_legacy_store_pair_in_memory,
+    migrate_legacy_inline_to_bundle, migrate_legacy_revision_bundle_to_slot,
+    migrate_legacy_store_pair_to_bundle, parse_committed_identity_from_metadata_bytes,
+    read_bound_delegated_bundle, read_bound_delegated_bundle_with_provenance,
+    read_legacy_delegated_secret_pair, validate_delegated_session_coherence,
+    with_delegated_authority_lock, write_delegated_bundle_create, BoundBundleProvenance,
+    DelegatedCommittedIdentity, DelegatedMetadataProvenance, InlineDelegatedSecretState,
 };
 use crate::secret_store::{
     SecretStore, KICK_PERSONAL_ACCESS_KEY, KICK_PERSONAL_FEED_TICKET_KEY,
@@ -511,6 +511,8 @@ pub struct DurableFailureInject {
     pub pending_marker_write: std::sync::atomic::AtomicBool,
     /// Legacy reusable `.bak` removal (authority-bearing).
     pub backup_remove: std::sync::atomic::AtomicBool,
+    /// Legacy revision-key bundle removal during revoke.
+    pub legacy_revision_remove: std::sync::atomic::AtomicBool,
     /// Personal Twitch token file write.
     pub save_personal_tokens: std::sync::atomic::AtomicBool,
     /// Personal Kick token file write.
@@ -994,6 +996,9 @@ impl AppState {
         validate_delegated_session_coherence(sess)?;
 
         with_delegated_authority_lock(&self.paths.twitch_delegated, || {
+            let revoke_marker_epoch_fence = storage::read_delegated_revoke_marker_epoch(
+                &self.paths.twitch_delegated_revoke_pending,
+            )?;
             let (previous_revision, previous_slot) = if self.paths.twitch_delegated.is_file() {
                 let raw = std::fs::read_to_string(&self.paths.twitch_delegated)?;
                 let meta = serde_json::from_str::<DelegatedSessionMetadataFile>(&raw)?;
@@ -1039,7 +1044,10 @@ impl AppState {
                 crate::delegated_secrets::authority_gates::pause_blocking(
                     crate::delegated_secrets::authority_gates::DelegatedAuthorityBoundary::PersistBeforeMarkerClear,
                 );
-                self.clear_revoke_markers_if_replacement_committed(&committed)?;
+                self.clear_revoke_markers_if_replacement_committed(
+                    &committed,
+                    revoke_marker_epoch_fence,
+                )?;
             }
 
             Ok(committed)
@@ -1049,11 +1057,18 @@ impl AppState {
     fn clear_revoke_markers_if_replacement_committed(
         &self,
         committed: &DelegatedCommittedIdentity,
+        revoke_marker_epoch_fence: u64,
     ) -> anyhow::Result<()> {
         if !self.paths.twitch_delegated_revoked.is_file()
             && !self.paths.twitch_delegated_revoke_pending.is_file()
         {
             return Ok(());
+        }
+        let marker_epoch = storage::read_delegated_revoke_marker_epoch(
+            &self.paths.twitch_delegated_revoke_pending,
+        )?;
+        if marker_epoch > revoke_marker_epoch_fence {
+            anyhow::bail!("newer durable revoke marker epoch during replacement");
         }
         let raw = std::fs::read(&self.paths.twitch_delegated)?;
         let current = parse_committed_identity_from_metadata_bytes(&raw)?
@@ -1124,36 +1139,28 @@ impl AppState {
             return Ok(());
         }
         with_delegated_authority_lock(&self.paths.twitch_delegated, || {
-            // Crash-safe ordering: pending marker first so restart always fail-closes.
-            self.durable_fail.fail(
-                &self.durable_fail.pending_marker_write,
-                "pending_marker_write",
-            )?;
-            storage::write_delegated_revoke_pending(&self.paths.twitch_delegated_revoke_pending)?;
-            self.durable_fail
-                .fail(&self.durable_fail.tombstone_write, "tombstone_write")?;
-            storage::write_delegated_revoked_tombstone(&self.paths.twitch_delegated_revoked)?;
+            self.publish_durable_revoke_markers_locked()?;
 
-            let (metadata_parse_ok, metadata_revision) = if self.paths.twitch_delegated.is_file() {
-                match std::fs::read(&self.paths.twitch_delegated) {
-                    Ok(raw) => {
-                        let parse_ok =
-                            serde_json::from_slice::<DelegatedSessionMetadataFile>(&raw).is_ok();
-                        let revision = parse_committed_identity_from_metadata_bytes(&raw)
-                            .ok()
-                            .flatten()
-                            .map(|id| id.secret_revision);
-                        (parse_ok, revision)
+            let (metadata_provenance, metadata_bytes_present) =
+                if self.paths.twitch_delegated.is_file() {
+                    match std::fs::read(&self.paths.twitch_delegated) {
+                        Ok(raw) => (extract_delegated_metadata_provenance(&raw), true),
+                        Err(_) => (DelegatedMetadataProvenance::Unrecoverable, false),
                     }
-                    Err(_) => (false, None),
+                } else {
+                    (DelegatedMetadataProvenance::Unrecoverable, false)
+                };
+            let known_revision = match metadata_provenance {
+                DelegatedMetadataProvenance::Committed(identity) => {
+                    self.delete_legacy_revision_bundle_checked(identity.secret_revision)?;
+                    Some(identity.secret_revision)
                 }
-            } else {
-                (true, None)
+                DelegatedMetadataProvenance::RecoverableRevision(revision) => {
+                    self.delete_legacy_revision_bundle_checked(revision)?;
+                    Some(revision)
+                }
+                DelegatedMetadataProvenance::Unrecoverable => None,
             };
-
-            if let Some(revision) = metadata_revision {
-                delete_legacy_revision_bundle(self.secret_store.as_ref(), revision)?;
-            }
 
             self.durable_fail
                 .fail(&self.durable_fail.credential_remove, "credential_remove")?;
@@ -1176,13 +1183,21 @@ impl AppState {
                 .fail(&self.durable_fail.parent_sync, "parent_sync")?;
             storage::sync_parent_dir(&self.paths.twitch_delegated)?;
 
-            if !metadata_parse_ok {
+            if metadata_bytes_present
+                && matches!(
+                    metadata_provenance,
+                    DelegatedMetadataProvenance::Unrecoverable
+                )
+            {
                 anyhow::bail!(
                     "delegated metadata unparseable during revoke — pending marker retained"
                 );
             }
             if self.delegated_secret_files_remain()?
-                || self.delegated_secret_store_authority_remain()?
+                || delegated_secret_store_authority_remain(
+                    self.secret_store.as_ref(),
+                    known_revision,
+                )?
             {
                 anyhow::bail!("delegated authority-bearing artifacts remain after revoke");
             }
@@ -1195,8 +1210,23 @@ impl AppState {
         })
     }
 
-    /// Mark that durable revoke must complete across restarts (best-effort independent path).
-    pub fn mark_durable_revoke_pending(&self) -> anyhow::Result<()> {
+    fn publish_durable_revoke_markers_locked(&self) -> anyhow::Result<()> {
+        self.durable_fail.fail(
+            &self.durable_fail.pending_marker_write,
+            "pending_marker_write",
+        )?;
+        if !self.paths.twitch_delegated_revoke_pending.is_file() {
+            storage::write_delegated_revoke_pending(&self.paths.twitch_delegated_revoke_pending)?;
+        }
+        self.durable_fail
+            .fail(&self.durable_fail.tombstone_write, "tombstone_write")?;
+        if !self.paths.twitch_delegated_revoked.is_file() {
+            storage::write_delegated_revoked_tombstone(&self.paths.twitch_delegated_revoked)?;
+        }
+        Ok(())
+    }
+
+    fn mark_durable_revoke_pending_locked(&self) -> anyhow::Result<()> {
         if self.readonly {
             return Ok(());
         }
@@ -1204,7 +1234,28 @@ impl AppState {
             &self.durable_fail.pending_marker_write,
             "pending_marker_write",
         )?;
+        if self.paths.twitch_delegated_revoke_pending.is_file() {
+            return Ok(());
+        }
         storage::write_delegated_revoke_pending(&self.paths.twitch_delegated_revoke_pending)
+    }
+
+    /// Mark that durable revoke must complete across restarts (authority-locked publication).
+    pub fn mark_durable_revoke_pending(&self) -> anyhow::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
+        with_delegated_authority_lock(&self.paths.twitch_delegated, || {
+            self.mark_durable_revoke_pending_locked()
+        })
+    }
+
+    fn delete_legacy_revision_bundle_checked(&self, revision: u64) -> anyhow::Result<()> {
+        self.durable_fail.fail(
+            &self.durable_fail.legacy_revision_remove,
+            "legacy_revision_remove",
+        )?;
+        delete_legacy_revision_bundle(self.secret_store.as_ref(), revision)
     }
 
     pub fn durable_revoke_pending(&self) -> bool {

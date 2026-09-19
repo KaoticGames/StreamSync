@@ -43,9 +43,26 @@ pub struct DelegatedAuthorityEpoch {
     pub active_mode: Option<Vec<u8>>,
     pub tombstone: bool,
     pub pending: bool,
+    pub marker_epoch: u64,
     pub bundle_slots: [Option<Vec<u8>>; DELEGATED_BUNDLE_SLOT_COUNT as usize],
     pub legacy_revision_bundle: Option<(String, Vec<u8>)>,
     pub committed: Option<DelegatedCommittedIdentity>,
+}
+
+/// Revoke-marker snapshot used for rollback CAS (identity alone is insufficient).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DelegatedRevokeMarkerSnapshot {
+    pub pending: bool,
+    pub tombstone: bool,
+    pub marker_epoch: u64,
+}
+
+/// Structural metadata provenance for revoke cleanup (independent of committed identity validity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegatedMetadataProvenance {
+    Committed(DelegatedCommittedIdentity),
+    RecoverableRevision(u64),
+    Unrecoverable,
 }
 
 pub fn delegated_bundle_slot_key(slot: u8) -> String {
@@ -527,6 +544,36 @@ pub fn restore_delegated_bundle_slots(
     Ok(())
 }
 
+pub fn extract_delegated_metadata_provenance(bytes: &[u8]) -> DelegatedMetadataProvenance {
+    let meta: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(value) => value,
+        Err(_) => return DelegatedMetadataProvenance::Unrecoverable,
+    };
+    let secret_revision = meta
+        .get("secret_revision")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if secret_revision == 0 {
+        return DelegatedMetadataProvenance::Unrecoverable;
+    }
+    match parse_committed_identity_from_metadata_bytes(bytes) {
+        Ok(Some(identity)) => DelegatedMetadataProvenance::Committed(identity),
+        Ok(None) => DelegatedMetadataProvenance::RecoverableRevision(secret_revision),
+        Err(_) => DelegatedMetadataProvenance::RecoverableRevision(secret_revision),
+    }
+}
+
+pub fn capture_delegated_revoke_marker_snapshot(
+    revoked_tombstone_path: &Path,
+    revoke_pending_path: &Path,
+) -> Result<DelegatedRevokeMarkerSnapshot> {
+    Ok(DelegatedRevokeMarkerSnapshot {
+        pending: revoke_pending_path.is_file(),
+        tombstone: revoked_tombstone_path.is_file(),
+        marker_epoch: crate::storage::read_delegated_revoke_marker_epoch(revoke_pending_path)?,
+    })
+}
+
 pub fn parse_committed_identity_from_metadata_bytes(
     bytes: &[u8],
 ) -> Result<Option<DelegatedCommittedIdentity>> {
@@ -572,6 +619,7 @@ pub fn capture_delegated_authority_epoch(
         active_mode: read_path_bytes_if_exists(active_mode_path)?,
         tombstone: revoked_tombstone_path.is_file(),
         pending: revoke_pending_path.is_file(),
+        marker_epoch: crate::storage::read_delegated_revoke_marker_epoch(revoke_pending_path)?,
         bundle_slots: capture_delegated_bundle_slots(store)?,
         legacy_revision_bundle,
         committed,
@@ -598,7 +646,11 @@ pub fn restore_delegated_authority_epoch(
         crate::storage::write_delegated_revoked_tombstone(path)
     })?;
     restore_marker_file(revoke_pending_path, epoch.pending, |path| {
-        crate::storage::write_delegated_revoke_pending(path)
+        if epoch.marker_epoch == 0 {
+            crate::storage::write_delegated_revoke_pending(path)
+        } else {
+            crate::storage::write_delegated_revoke_pending_with_epoch(path, epoch.marker_epoch)
+        }
     })?;
     Ok(())
 }
@@ -612,6 +664,7 @@ pub fn assert_rollback_cas(
     current: Option<DelegatedCommittedIdentity>,
     expected_post_persist: Option<DelegatedCommittedIdentity>,
     pre_apply: &DelegatedAuthorityEpoch,
+    current_markers: DelegatedRevokeMarkerSnapshot,
 ) -> Result<()> {
     match expected_post_persist {
         Some(expected) => {
@@ -624,6 +677,12 @@ pub fn assert_rollback_cas(
                 return Err(rollback_refused_durable_advanced());
             }
         }
+    }
+    if current_markers.pending != pre_apply.pending
+        || current_markers.tombstone != pre_apply.tombstone
+        || current_markers.marker_epoch != pre_apply.marker_epoch
+    {
+        return Err(rollback_refused_durable_advanced());
     }
     Ok(())
 }

@@ -12,8 +12,9 @@ use crate::config_types::{DelegatedSessionFile, TwitchActiveMode, TwitchTokenFil
 use crate::delegated_lifecycle::{AuthorityLease, DelegatedGeneration};
 use crate::delegated_secrets::{
     assert_rollback_cas, capture_delegated_authority_epoch,
-    parse_committed_identity_from_metadata_bytes, restore_delegated_authority_epoch,
-    with_delegated_authority_lock, DelegatedAuthorityEpoch, DelegatedCommittedIdentity,
+    capture_delegated_revoke_marker_snapshot, parse_committed_identity_from_metadata_bytes,
+    restore_delegated_authority_epoch, with_delegated_authority_lock, DelegatedAuthorityEpoch,
+    DelegatedCommittedIdentity,
 };
 use anyhow::{anyhow, Result};
 use std::sync::atomic::Ordering;
@@ -140,7 +141,16 @@ impl DurableApplySnapshot {
             } else {
                 None
             };
-            assert_rollback_cas(current, self.expected_post_persist, &self.epoch)?;
+            let current_markers = capture_delegated_revoke_marker_snapshot(
+                &state.paths.twitch_delegated_revoked,
+                &state.paths.twitch_delegated_revoke_pending,
+            )?;
+            assert_rollback_cas(
+                current,
+                self.expected_post_persist,
+                &self.epoch,
+                current_markers,
+            )?;
             restore_delegated_authority_epoch(
                 &state.paths.twitch_delegated,
                 &state.paths.twitch_active_mode,
