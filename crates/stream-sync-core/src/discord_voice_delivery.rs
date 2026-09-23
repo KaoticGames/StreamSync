@@ -23,8 +23,9 @@ pub const SESSION_4_5H_DATA_BYTES: u64 = 3_110_400_000;
 pub const SESSION_6H_SAMPLE_FRAMES: u64 = 1_036_800_000;
 pub const SESSION_6H_DATA_BYTES: u64 = 4_147_200_000;
 
-/// Classic RIFF/WAV `data` chunk maximum (unsigned 32-bit chunk size field).
-pub const RIFF_MAX_CHUNK_BYTES: u64 = 0xFFFF_FFFF;
+/// Classic RIFF/WAV maximum PCM `data` bytes: both `data` and `riff_size = data + 36` must fit `u32`.
+pub const RIFF_PCM_OVERHEAD_BYTES: u64 = 36;
+pub const RIFF_MAX_CHUNK_BYTES: u64 = (u32::MAX as u64) - RIFF_PCM_OVERHEAD_BYTES;
 
 pub const DEFAULT_STREAM_CHUNK: usize = 256 * 1024;
 
@@ -63,6 +64,8 @@ pub fn validate_plan_session_bounds(sample_frames: u64) -> Result<u64, BoundsErr
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PartialWriteError {
+    #[error("existing partial length {existing} exceeds expected {expected}")]
+    OversizedExisting { existing: u64, expected: u64 },
     #[error("offset {offset} is beyond file capacity {capacity}")]
     OutOfRange { offset: u64, capacity: u64 },
     #[error("range length overflow")]
@@ -96,7 +99,14 @@ impl PartialFileWriter {
             fs::create_dir_all(parent).map_err(PartialWriteError::from)?;
         }
         let contiguous_len = if path.is_file() {
-            path.metadata().map_err(PartialWriteError::from)?.len()
+            let len = path.metadata().map_err(PartialWriteError::from)?.len();
+            if len > expected_len {
+                return Err(PartialWriteError::OversizedExisting {
+                    existing: len,
+                    expected: expected_len,
+                });
+            }
+            len
         } else {
             0
         };
@@ -259,11 +269,15 @@ pub fn streaming_sha256_synthetic(total_len: u64, chunk_size: usize) -> Result<S
 
 /// Minimal WAV header for a fixed data chunk size (classic RIFF, not RF64).
 pub fn minimal_wav_header(data_bytes: u64) -> Result<Vec<u8>> {
-    if data_bytes > u32::MAX as u64 {
-        return Err(anyhow!("WAV data size exceeds u32 RIFF chunk field"));
+    if data_bytes > RIFF_MAX_CHUNK_BYTES {
+        return Err(anyhow!(
+            "WAV data size exceeds classic RIFF limit ({RIFF_MAX_CHUNK_BYTES} bytes)"
+        ));
     }
-    let data_u32 = data_bytes as u32;
-    let riff_size = 36u32 + data_u32;
+    let data_u32 = u32::try_from(data_bytes).map_err(|_| anyhow!("WAV data size exceeds u32"))?;
+    let riff_size = 36u32
+        .checked_add(data_u32)
+        .ok_or_else(|| anyhow!("RIFF size field overflow"))?;
     let mut h = Vec::with_capacity(44);
     h.extend_from_slice(b"RIFF");
     h.extend_from_slice(&riff_size.to_le_bytes());
@@ -347,12 +361,16 @@ pub fn ownership_ledger_path(parent: &Path, delivery_id: &str) -> PathBuf {
         .join("ownership.json")
 }
 
-fn write_ownership_ledger(path: &Path, record: &DeliveryOwnershipRecord) -> Result<()> {
+fn write_ownership_ledger(
+    path: &Path,
+    record: &DeliveryOwnershipRecord,
+    fault: Option<&mut LedgerFaultInjector>,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let data = serde_json::to_vec_pretty(record)?;
-    write_bytes_atomic(path, &data)
+    write_bytes_atomic(path, &data, fault)
 }
 
 fn read_ownership_ledger(path: &Path) -> Result<DeliveryOwnershipRecord> {
@@ -361,7 +379,37 @@ fn read_ownership_ledger(path: &Path) -> Result<DeliveryOwnershipRecord> {
     Ok(record)
 }
 
-fn write_bytes_atomic(target: &Path, data: &[u8]) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerAtomicFault {
+    AfterTempFsync,
+    AfterReplace,
+    AfterParentFsync,
+}
+
+pub struct LedgerFaultInjector {
+    trip: Option<LedgerAtomicFault>,
+}
+
+impl LedgerFaultInjector {
+    pub fn trip_once(point: LedgerAtomicFault) -> Self {
+        Self { trip: Some(point) }
+    }
+
+    pub fn check(&mut self, point: LedgerAtomicFault) -> Result<(), SimulatedCrash> {
+        if self.trip == Some(point) {
+            self.trip = None;
+            Err(SimulatedCrash)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn write_bytes_atomic(
+    target: &Path,
+    data: &[u8],
+    mut fault: Option<&mut LedgerFaultInjector>,
+) -> Result<()> {
     let file_name = target
         .file_name()
         .and_then(|s| s.to_str())
@@ -376,11 +424,62 @@ fn write_bytes_atomic(target: &Path, data: &[u8]) -> Result<()> {
         f.write_all(data)?;
         f.sync_all()?;
     }
-    if target.exists() {
-        fs::remove_file(target)?;
+    if let Some(ref mut f) = fault {
+        f.check(LedgerAtomicFault::AfterTempFsync)
+            .map_err(|e| anyhow::anyhow!(e))?;
     }
-    fs::rename(&tmp, target)?;
+
+    replace_file_same_volume(&tmp, target)?;
+    if let Some(ref mut f) = fault {
+        f.check(LedgerAtomicFault::AfterReplace)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+
     sync_parent_dir(target)?;
+    if let Some(ref mut f) = fault {
+        f.check(LedgerAtomicFault::AfterParentFsync)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+    Ok(())
+}
+
+/// Replace `target` with `tmp` on the same volume without unlinking `target` first.
+fn replace_file_same_volume(tmp: &Path, target: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::rename(tmp, target)?;
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        windows_replace_file_write_through(tmp, target)?;
+        return Ok(());
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (tmp, target);
+        Err(anyhow!("unsupported platform for atomic file replace"))
+    }
+}
+
+#[cfg(windows)]
+fn windows_replace_file_write_through(tmp: &Path, target: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let src_w: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let dst_w: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    let flags = MOVEFILE_WRITE_THROUGH | MOVEFILE_REPLACE_EXISTING;
+    let ok = unsafe { MoveFileExW(src_w.as_ptr(), dst_w.as_ptr(), flags) };
+    if ok == 0 {
+        let err = GetLastError();
+        return Err(anyhow!("MoveFileExW file replace failed: {}", err));
+    }
     Ok(())
 }
 
@@ -491,10 +590,15 @@ pub fn verify_stem_file(path: &Path, expected: &ExpectedStem) -> Result<(), Ledg
             file_name: expected.file_name.clone(),
         });
     }
-    let header_len = 44usize.min(expected.byte_count as usize);
-    let mut header = vec![0u8; header_len];
+    if expected.byte_count < 44 {
+        return Err(LedgerError::StemMismatch {
+            file_name: expected.file_name.clone(),
+        });
+    }
+    let mut header = [0u8; 44];
     let mut f = File::open(path)?;
-    f.read_exact(&mut header)?;
+    f.read_exact(&mut header)
+        .map_err(|e| LedgerError::Io(e.to_string()))?;
     let data_len = parse_wav_data_chunk_len(&header).map_err(|e| LedgerError::Io(e.to_string()))?;
     let expected_data = expected.byte_count.saturating_sub(44);
     if data_len != expected_data {
@@ -530,11 +634,8 @@ fn staging_complete(staging_dir: &Path, stems: &[ExpectedStem]) -> Result<(), Le
 }
 
 /// Same-volume directory publication primitive (Unix: rename; Windows: `MoveFileExW` write-through).
-pub fn publish_directory_same_volume(
-    src: &Path,
-    dst: &Path,
-    replace_owned: bool,
-) -> Result<(), PublishError> {
+/// Never replaces or deletes an existing destination; v2 recovery handles republish via the ledger.
+pub fn publish_directory_same_volume(src: &Path, dst: &Path) -> Result<(), PublishError> {
     let src_parent = src
         .parent()
         .ok_or_else(|| PublishError::Io("src has no parent".into()))?;
@@ -547,16 +648,11 @@ pub fn publish_directory_same_volume(
     }
 
     if dst.exists() {
-        if !replace_owned {
-            return Err(PublishError::Ledger(LedgerError::UnrelatedDestination));
-        }
+        return Err(PublishError::Ledger(LedgerError::UnrelatedDestination));
     }
 
     #[cfg(unix)]
     {
-        if dst.exists() {
-            fs::remove_dir_all(dst)?;
-        }
         fs::rename(src, dst)?;
         sync_parent_dir(dst).map_err(|e| PublishError::Io(e.to_string()))?;
         return Ok(());
@@ -564,13 +660,12 @@ pub fn publish_directory_same_volume(
 
     #[cfg(windows)]
     {
-        windows_publish_directory(src, dst, replace_owned)?;
+        windows_publish_directory(src, dst)?;
         return Ok(());
     }
 
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = replace_owned;
         Err(PublishError::Io(
             "unsupported platform for directory publish".into(),
         ))
@@ -578,25 +673,14 @@ pub fn publish_directory_same_volume(
 }
 
 #[cfg(windows)]
-fn windows_publish_directory(
-    src: &Path,
-    dst: &Path,
-    replace_owned: bool,
-) -> Result<(), PublishError> {
+fn windows_publish_directory(src: &Path, dst: &Path) -> Result<(), PublishError> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::GetLastError;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
 
     let src_w: Vec<u16> = src.as_os_str().encode_wide().chain(Some(0)).collect();
     let dst_w: Vec<u16> = dst.as_os_str().encode_wide().chain(Some(0)).collect();
-    let flags = if replace_owned {
-        MOVEFILE_WRITE_THROUGH | MOVEFILE_REPLACE_EXISTING
-    } else {
-        MOVEFILE_WRITE_THROUGH
-    };
-    let ok = MoveFileExW(src_w.as_ptr(), dst_w.as_ptr(), flags);
+    let ok = unsafe { MoveFileExW(src_w.as_ptr(), dst_w.as_ptr(), MOVEFILE_WRITE_THROUGH) };
     if ok == 0 {
         let err = GetLastError();
         return Err(PublishError::Io(format!("MoveFileExW failed: {}", err)));
@@ -619,17 +703,13 @@ pub fn publish_session_directory(
         state: OwnershipState::Prepared,
         ..record.clone()
     };
-    write_ownership_ledger(ledger_path, &prepared).map_err(|e| PublishError::Io(e.to_string()))?;
+    write_ownership_ledger(ledger_path, &prepared, None)
+        .map_err(|e| PublishError::Io(e.to_string()))?;
     if let Some(ref mut f) = fault {
         f.check(PublicationFault::AfterPreparedPersist)?;
     }
 
-    let replace = false;
-    publish_directory_same_volume(
-        &record.staging_session_dir,
-        &record.final_session_dir,
-        replace,
-    )?;
+    publish_directory_same_volume(&record.staging_session_dir, &record.final_session_dir)?;
 
     if let Some(ref mut f) = fault {
         f.check(PublicationFault::AfterDirectoryRename)?;
@@ -641,7 +721,8 @@ pub fn publish_session_directory(
         state: OwnershipState::Published,
         ..prepared
     };
-    write_ownership_ledger(ledger_path, &published).map_err(|e| PublishError::Io(e.to_string()))?;
+    write_ownership_ledger(ledger_path, &published, None)
+        .map_err(|e| PublishError::Io(e.to_string()))?;
     Ok(published)
 }
 
@@ -665,7 +746,7 @@ pub fn recover_publication(ledger_path: &Path) -> Result<DeliveryOwnershipRecord
                     state: OwnershipState::Published,
                     ..record
                 };
-                write_ownership_ledger(ledger_path, &published)
+                write_ownership_ledger(ledger_path, &published, None)
                     .map_err(|e| PublishError::Io(e.to_string()))?;
                 return Ok(published);
             }
@@ -808,6 +889,31 @@ mod tests {
     }
 
     #[test]
+    fn riff_max_data_bytes_exact_limit_and_reject_one_over() {
+        assert_eq!(
+            RIFF_MAX_CHUNK_BYTES,
+            (u32::MAX as u64) - RIFF_PCM_OVERHEAD_BYTES
+        );
+        assert!(minimal_wav_header(RIFF_MAX_CHUNK_BYTES).is_ok());
+        assert_eq!(
+            minimal_wav_header(RIFF_MAX_CHUNK_BYTES + 1)
+                .unwrap_err()
+                .to_string(),
+            format!("WAV data size exceeds classic RIFF limit ({RIFF_MAX_CHUNK_BYTES} bytes)")
+        );
+        let max_aligned_frames = RIFF_MAX_CHUNK_BYTES / 4;
+        assert_eq!(
+            wav_data_bytes_for_frames(max_aligned_frames, CHANNELS_STEREO, BYTES_PER_SAMPLE)
+                .unwrap(),
+            max_aligned_frames * 4
+        );
+        assert_eq!(
+            wav_data_bytes_for_frames(max_aligned_frames + 1, CHANNELS_STEREO, BYTES_PER_SAMPLE),
+            Err(BoundsError::ExceedsRiffLimit)
+        );
+    }
+
+    #[test]
     fn partial_writer_resumes_contiguous_ranges() {
         let dir = unique_temp_dir("partial");
         fs::create_dir_all(&dir).unwrap();
@@ -821,6 +927,22 @@ mod tests {
         assert_eq!(w2.contiguous_len(), 5);
         w2.write_range(5, &[6]).unwrap();
         assert_eq!(fs::read(&path).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn partial_writer_rejects_oversized_existing_file() {
+        let dir = unique_temp_dir("oversized-partial");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.partial");
+        sparse_extend_file(&path, 500).unwrap();
+        assert!(matches!(
+            PartialFileWriter::open(&path, 100),
+            Err(PartialWriteError::OversizedExisting {
+                existing: 500,
+                expected: 100,
+            })
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -944,15 +1066,99 @@ mod tests {
             stems: vec![stem.clone()],
             state: OwnershipState::Prepared,
         };
-        write_ownership_ledger(&ledger, &record).unwrap();
+        write_ownership_ledger(&ledger, &record, None).unwrap();
 
-        publish_directory_same_volume(&staging, &final_dir, false).unwrap();
+        publish_directory_same_volume(&staging, &final_dir).unwrap();
         assert!(final_dir.is_dir());
         assert!(!staging.exists());
 
         let recovered = recover_publication(&ledger).unwrap();
         assert_eq!(recovered.state, OwnershipState::Published);
         let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn publish_never_replaces_existing_destination_bytes() {
+        let parent = unique_temp_dir("no-replace");
+        fs::create_dir_all(&parent).unwrap();
+        let src = parent.join("staging-session");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("stem.wav"), b"staging-bytes").unwrap();
+        let dst = parent.join("final-session");
+        fs::create_dir_all(&dst).unwrap();
+        let intruder_path = dst.join("intruder.wav");
+        let before = b"keep-this-exactly";
+        fs::write(&intruder_path, before).unwrap();
+
+        let err = publish_directory_same_volume(&src, &dst).unwrap_err();
+        assert_eq!(err, PublishError::Ledger(LedgerError::UnrelatedDestination));
+        assert!(src.is_dir());
+        assert!(dst.is_dir());
+        assert_eq!(fs::read(&intruder_path).unwrap(), before);
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn ledger_atomic_replace_survives_fault_at_each_step() {
+        let dir = unique_temp_dir("ledger-fault");
+        fs::create_dir_all(&dir).unwrap();
+        let ledger = dir.join("ownership.json");
+        let prepared = DeliveryOwnershipRecord {
+            delivery_id: "d".into(),
+            manifest_hash: "mh".into(),
+            staging_session_dir: dir.join("staging"),
+            final_session_dir: dir.join("final"),
+            stems: vec![],
+            state: OwnershipState::Prepared,
+        };
+        let published = DeliveryOwnershipRecord {
+            state: OwnershipState::Published,
+            ..prepared.clone()
+        };
+        write_ownership_ledger(&ledger, &prepared, None).unwrap();
+        let published_bytes = serde_json::to_vec_pretty(&published).unwrap();
+
+        for point in [
+            LedgerAtomicFault::AfterTempFsync,
+            LedgerAtomicFault::AfterReplace,
+            LedgerAtomicFault::AfterParentFsync,
+        ] {
+            write_ownership_ledger(&ledger, &prepared, None).unwrap();
+            let mut inj = LedgerFaultInjector::trip_once(point);
+            let err = write_bytes_atomic(&ledger, &published_bytes, Some(&mut inj)).unwrap_err();
+            assert!(err.to_string().contains("simulated crash"));
+            let record: DeliveryOwnershipRecord =
+                serde_json::from_slice(&fs::read(&ledger).unwrap()).unwrap();
+            match point {
+                LedgerAtomicFault::AfterTempFsync => {
+                    assert_eq!(record.state, OwnershipState::Prepared);
+                }
+                LedgerAtomicFault::AfterReplace | LedgerAtomicFault::AfterParentFsync => {
+                    assert_eq!(record.state, OwnershipState::Published);
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wav_header_read_uses_fixed_44_bytes_without_usize_file_length() {
+        let dir = unique_temp_dir("large-header");
+        fs::create_dir_all(&dir).unwrap();
+        let data_bytes = 1_024u64;
+        let header = minimal_wav_header(data_bytes).unwrap();
+        let path = dir.join("sparse.wav");
+        let total_len = u64::from(u32::MAX) + 4096;
+        sparse_extend_file(&path, total_len).unwrap();
+        let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all(&header).unwrap();
+        f.sync_all().unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), total_len);
+        let mut header_buf = [0u8; 44];
+        let mut rf = File::open(&path).unwrap();
+        rf.read_exact(&mut header_buf).unwrap();
+        assert_eq!(parse_wav_data_chunk_len(&header_buf).unwrap(), data_bytes);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1060,7 +1266,7 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
         fs::write(src.join("x.wav"), b"RIFF").unwrap();
         let dst = parent.join("dst-session");
-        publish_directory_same_volume(&src, &dst, false).unwrap();
+        publish_directory_same_volume(&src, &dst).unwrap();
         assert!(dst.join("x.wav").is_file());
         assert!(!src.exists());
         let _ = fs::remove_dir_all(&parent);
