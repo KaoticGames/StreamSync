@@ -11,6 +11,7 @@ mod delegated_lifecycle;
 mod delegated_refresh_observability;
 mod diagnostics;
 mod discord_voice;
+mod discord_voice_delivery;
 mod dock_capability;
 mod export;
 mod kick;
