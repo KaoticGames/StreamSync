@@ -13,6 +13,15 @@ use windows_sys::Win32::Storage::FileSystem::{
 const DRIVE_FIXED: u32 = 3;
 const DRIVE_REMOTE: u32 = 4;
 
+/// Win32 `ERROR_INSUFFICIENT_BUFFER` / `ERROR_FILENAME_EXCED_RANGE` from `GetVolumePathNameW`.
+const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+const ERROR_FILENAME_EXCED_RANGE: i32 = 206;
+
+/// Hard ceiling for `GetVolumePathNameW` wide-character buffer growth (documented limit for retry).
+#[cfg_attr(not(windows), allow(dead_code))]
+const VOLUME_PATH_BUFFER_CEILING: usize = 32_768;
+const WIN32_MAX_PATH: usize = 260;
+
 #[derive(Debug)]
 pub enum StorageQualifyError {
     UncPath,
@@ -74,6 +83,84 @@ pub fn classify_filesystem_name(name: &str) -> Result<(), StorageQualifyError> {
     }
 }
 
+/// `GetVolumePathNameW` signals an undersized buffer with either Win32 error code.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn get_volume_path_win32_error_is_retryable(raw_os_error: Option<i32>) -> bool {
+    matches!(
+        raw_os_error,
+        Some(ERROR_INSUFFICIENT_BUFFER) | Some(ERROR_FILENAME_EXCED_RANGE)
+    )
+}
+
+/// Initial TCHAR capacity: at least `MAX_PATH` and the input path length, capped at [`VOLUME_PATH_BUFFER_CEILING`].
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn initial_get_volume_path_buffer_capacity(
+    input_wide_len_including_nul: usize,
+    ceiling: usize,
+) -> usize {
+    input_wide_len_including_nul
+        .max(WIN32_MAX_PATH)
+        .min(ceiling)
+}
+
+/// Double capacity until [`ceiling`]; returns `None` when no larger size is available.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn next_get_volume_path_buffer_capacity(
+    current: usize,
+    ceiling: usize,
+) -> Option<usize> {
+    if current >= ceiling {
+        return None;
+    }
+    let doubled = current.saturating_mul(2);
+    let next = if doubled > current {
+        doubled
+    } else {
+        current.saturating_add(1)
+    };
+    Some(next.min(ceiling))
+}
+
+/// `GetDriveTypeW` requires a trailing backslash on the volume root; content is before the final NUL.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn volume_root_has_trailing_backslash_before_nul(prefix: &[u16]) -> bool {
+    if prefix.len() < 2 {
+        return false;
+    }
+    let nul_idx = prefix.len() - 1;
+    if prefix[nul_idx] != 0 {
+        return false;
+    }
+    prefix[nul_idx - 1] == b'\\' as u16
+}
+
+#[derive(Debug, Eq, PartialEq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) enum FinishGetVolumePathBuffer {
+    Ok(Vec<u16>),
+    Retry,
+}
+
+/// After `GetVolumePathNameW` reports success, extract a NUL-terminated root or request a larger buffer.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn finish_get_volume_path_buffer(
+    buf: &[u16],
+    current_cap: usize,
+    ceiling: usize,
+) -> Result<FinishGetVolumePathBuffer, io::Error> {
+    let prefix = nul_terminated_utf16_prefix(buf)?;
+    if volume_root_has_trailing_backslash_before_nul(&prefix) {
+        return Ok(FinishGetVolumePathBuffer::Ok(prefix));
+    }
+    if current_cap >= ceiling {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "GetVolumePathNameW result missing trailing backslash before NUL (buffer truncation at ceiling)",
+        ));
+    }
+    Ok(FinishGetVolumePathBuffer::Retry)
+}
+
 /// Win32 APIs that return `BOOL` leave a NUL-terminated string in a fixed buffer; scan for the first NUL.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn nul_terminated_utf16_prefix(buf: &[u16]) -> Result<Vec<u16>, io::Error> {
@@ -99,19 +186,41 @@ fn win32_last_error() -> io::Error {
 #[cfg(windows)]
 fn get_volume_path_root(path: &Path) -> Result<Vec<u16>, io::Error> {
     let wide = wide_null_terminated(path);
-    let mut cap = 260usize;
+    let ceiling = VOLUME_PATH_BUFFER_CEILING;
+    let mut cap = initial_get_volume_path_buffer_capacity(wide.len(), ceiling);
     loop {
         let mut buf = vec![0u16; cap];
         let ok = unsafe { GetVolumePathNameW(wide.as_ptr(), buf.as_mut_ptr(), cap as u32) };
         if ok == 0 {
             let err = win32_last_error();
-            if err.raw_os_error() == Some(122) && cap < 32_768 {
-                cap = cap.saturating_mul(2);
-                continue;
+            if get_volume_path_win32_error_is_retryable(err.raw_os_error()) {
+                match next_get_volume_path_buffer_capacity(cap, ceiling) {
+                    Some(next) => {
+                        cap = next;
+                        continue;
+                    }
+                    None => return Err(err),
+                }
             }
             return Err(err);
         }
-        return nul_terminated_utf16_prefix(&buf);
+        match finish_get_volume_path_buffer(&buf, cap, ceiling)? {
+            FinishGetVolumePathBuffer::Ok(prefix) => return Ok(prefix),
+            FinishGetVolumePathBuffer::Retry => {
+                match next_get_volume_path_buffer_capacity(cap, ceiling) {
+                    Some(next) => {
+                        cap = next;
+                        continue;
+                    }
+                    None => {
+                        return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "GetVolumePathNameW result missing trailing backslash before NUL (buffer truncation at ceiling)",
+                    ));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -197,6 +306,86 @@ mod tests {
         let buf = vec![b'C' as u16, b':' as u16];
         let err = nul_terminated_utf16_prefix(&buf).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn get_volume_path_win32_retryable_errors() {
+        assert!(get_volume_path_win32_error_is_retryable(Some(122)));
+        assert!(get_volume_path_win32_error_is_retryable(Some(206)));
+        assert!(!get_volume_path_win32_error_is_retryable(Some(5)));
+        assert!(!get_volume_path_win32_error_is_retryable(None));
+    }
+
+    #[test]
+    fn volume_root_trailing_backslash_before_nul() {
+        let valid = vec![b'C' as u16, b':' as u16, b'\\' as u16, 0];
+        assert!(volume_root_has_trailing_backslash_before_nul(&valid));
+        let truncated = vec![b'C' as u16, b':' as u16, 0];
+        assert!(!volume_root_has_trailing_backslash_before_nul(&truncated));
+    }
+
+    #[test]
+    fn finish_get_volume_path_buffer_accepts_well_formed_root() {
+        let buf = vec![b'C' as u16, b':' as u16, b'\\' as u16, 0];
+        let got =
+            finish_get_volume_path_buffer(&buf, 260, VOLUME_PATH_BUFFER_CEILING).expect("finish");
+        assert_eq!(
+            got,
+            FinishGetVolumePathBuffer::Ok(vec![b'C' as u16, b':' as u16, b'\\' as u16, 0])
+        );
+    }
+
+    #[test]
+    fn finish_get_volume_path_buffer_retries_when_backslash_missing() {
+        let buf = vec![b'C' as u16, b':' as u16, 0, b'\\' as u16];
+        let got =
+            finish_get_volume_path_buffer(&buf, 2, VOLUME_PATH_BUFFER_CEILING).expect("finish");
+        assert_eq!(got, FinishGetVolumePathBuffer::Retry);
+    }
+
+    #[test]
+    fn finish_get_volume_path_buffer_invalid_at_ceiling_without_backslash() {
+        let buf = vec![b'C' as u16, b':' as u16, 0];
+        let err = finish_get_volume_path_buffer(
+            &buf,
+            VOLUME_PATH_BUFFER_CEILING,
+            VOLUME_PATH_BUFFER_CEILING,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn next_get_volume_path_buffer_capacity_stops_at_ceiling_without_overflow() {
+        let ceiling = VOLUME_PATH_BUFFER_CEILING;
+        let mut cap = 1usize;
+        let mut steps = 0usize;
+        while let Some(next) = next_get_volume_path_buffer_capacity(cap, ceiling) {
+            assert!(next > cap);
+            assert!(next <= ceiling);
+            cap = next;
+            steps += 1;
+            assert!(steps < 64, "growth should converge quickly");
+        }
+        assert_eq!(cap, ceiling);
+        assert!(next_get_volume_path_buffer_capacity(ceiling, ceiling).is_none());
+        assert!(next_get_volume_path_buffer_capacity(usize::MAX, ceiling).is_none());
+    }
+
+    #[test]
+    fn initial_get_volume_path_buffer_capacity_uses_path_and_max_path() {
+        assert_eq!(
+            initial_get_volume_path_buffer_capacity(10, VOLUME_PATH_BUFFER_CEILING),
+            WIN32_MAX_PATH
+        );
+        assert_eq!(
+            initial_get_volume_path_buffer_capacity(400, VOLUME_PATH_BUFFER_CEILING),
+            400
+        );
+        assert_eq!(
+            initial_get_volume_path_buffer_capacity(100_000, VOLUME_PATH_BUFFER_CEILING),
+            VOLUME_PATH_BUFFER_CEILING
+        );
     }
 
     #[test]
