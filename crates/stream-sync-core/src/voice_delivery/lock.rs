@@ -68,15 +68,26 @@ impl Drop for DeliveryDomainLock {
 #[cfg(test)]
 mod stable_delivery_lock_cross_process {
     use super::*;
-    use crate::voice_delivery::subprocess_env::{LOCK_HOLDER, LOCK_TRY};
+    use crate::voice_delivery::subprocess_env::{LOCK_HOLDER, LOCK_READY, LOCK_TRY};
     use std::fs;
     use std::process::{Command, Stdio};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn test_dest_root() -> (tempfile::TempDir, DestRoot) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = DestRoot::open(tmp.path()).expect("open root");
         (tmp, root)
+    }
+
+    fn wait_for_ready(ready: &std::path::Path, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if ready.is_file() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("holder did not signal readiness within {:?}", timeout);
     }
 
     #[test]
@@ -99,9 +110,11 @@ mod stable_delivery_lock_cross_process {
     fn stable_delivery_lock_cross_process() {
         if std::env::var(LOCK_HOLDER).ok().as_deref() == Some("1") {
             let tmp = std::env::var("STREAMSYNC_VOICE_LOCK_TMP").expect("tmp");
+            let ready = std::env::var(LOCK_READY).expect("ready");
             let root = DestRoot::open(std::path::Path::new(&tmp)).expect("root");
             let id = std::env::var("STREAMSYNC_VOICE_LOCK_ID").expect("id");
             let _lock = acquire_delivery_domain_lock(&root, &id, false).expect("holder lock");
+            fs::write(&ready, b"ready\n").expect("ready signal");
             std::thread::sleep(Duration::from_secs(60));
             return;
         }
@@ -116,12 +129,14 @@ mod stable_delivery_lock_cross_process {
 
         let (tmp, _root) = test_dest_root();
         let id = "delivery:cross-process:test";
+        let ready = tmp.path().join("holder-ready.signal");
         let exe = std::env::current_exe().expect("exe");
         let test_name = "voice_delivery::lock::stable_delivery_lock_cross_process::stable_delivery_lock_cross_process";
 
         let mut holder = Command::new(&exe)
             .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
             .env(LOCK_HOLDER, "1")
+            .env(LOCK_READY, &ready)
             .env("STREAMSYNC_VOICE_LOCK_TMP", tmp.path())
             .env("STREAMSYNC_VOICE_LOCK_ID", id)
             .stdout(Stdio::null())
@@ -129,7 +144,7 @@ mod stable_delivery_lock_cross_process {
             .spawn()
             .expect("spawn holder");
 
-        std::thread::sleep(Duration::from_millis(400));
+        wait_for_ready(&ready, Duration::from_secs(15));
 
         let try_child = Command::new(&exe)
             .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
@@ -143,7 +158,6 @@ mod stable_delivery_lock_cross_process {
         holder.kill().expect("kill holder");
         let _ = holder.wait();
 
-        std::thread::sleep(Duration::from_millis(200));
         let root = DestRoot::open(tmp.path()).expect("reopen");
         let _lock =
             acquire_delivery_domain_lock(&root, id, true).expect("acquire after holder exit");

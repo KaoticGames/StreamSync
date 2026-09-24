@@ -10,6 +10,9 @@ mod unix;
 mod windows;
 
 pub use dir::{DestRoot, DirHandle, ValidatedFinalName};
+#[allow(unused_imports)] // public surface for later slices
+pub use durability::sync_dir_exact;
+pub use durability::NamespaceDurability;
 pub use error::FsError;
 pub use geometry::FinalParentPublication;
 
@@ -64,6 +67,11 @@ mod linux_rename_no_replace_same_parent {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
+    fn stage(hex32: &str) -> String {
+        assert_eq!(hex32.len(), 32);
+        format!(".streamsync-stage-{hex32}")
+    }
+
     fn temp_final_parent() -> (tempfile::TempDir, DirHandle) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let parent_path = tmp.path().join("final-parent");
@@ -78,82 +86,84 @@ mod linux_rename_no_replace_same_parent {
     #[test]
     fn sibling_directory_rename_succeeds() {
         let (_tmp, parent) = temp_final_parent();
-        parent
-            .create_child_dir(".streamsync-stage-abc")
-            .expect("stage");
-        rename_no_replace_same_parent(&parent, ".streamsync-stage-abc", "published-session")
-            .expect("rename");
+        let st = stage("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        parent.create_child_dir(&st).expect("stage");
+        rename_no_replace_same_parent(&parent, &st, "published-session").expect("rename");
         assert!(parent.open_child_dir("published-session").is_ok());
-        assert!(parent.open_child_dir(".streamsync-stage-abc").is_err());
+        assert!(parent.open_child_dir(&st).is_err());
     }
 
     #[test]
     fn pre_existing_file_collision_preserves_both() {
         let (_tmp, parent) = temp_final_parent();
-        parent
-            .create_child_dir(".streamsync-stage-src")
-            .expect("stage");
+        let st = stage("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        parent.create_child_dir(&st).expect("stage");
         let dest_path = _tmp.path().join("final-parent").join("existing-final");
         fs::write(&dest_path, b"DEST_BYTES").expect("dest");
-        let result =
-            rename_no_replace_same_parent(&parent, ".streamsync-stage-src", "existing-final");
+        let result = rename_no_replace_same_parent(&parent, &st, "existing-final");
         assert!(matches!(result, Err(FsError::AlreadyExists)));
         assert_eq!(fs::read(&dest_path).expect("read dest"), b"DEST_BYTES");
-        assert!(parent.open_child_dir(".streamsync-stage-src").is_ok());
+        assert!(parent.open_child_dir(&st).is_ok());
     }
 
     #[test]
     fn pre_existing_nonempty_dir_collision_untouched() {
         let (_tmp, parent) = temp_final_parent();
-        parent
-            .create_child_dir(".streamsync-stage-src")
-            .expect("stage");
+        let st = stage("cccccccccccccccccccccccccccccccc");
+        parent.create_child_dir(&st).expect("stage");
         parent.create_child_dir("existing-final").expect("dest dir");
         let marker = _tmp.path().join("final-parent/existing-final/marker.txt");
         fs::write(&marker, b"INNER").expect("inner");
-        let result =
-            rename_no_replace_same_parent(&parent, ".streamsync-stage-src", "existing-final");
+        let result = rename_no_replace_same_parent(&parent, &st, "existing-final");
         assert!(matches!(result, Err(FsError::AlreadyExists)));
         assert_eq!(fs::read(marker).expect("read"), b"INNER");
-        assert!(parent.open_child_dir(".streamsync-stage-src").is_ok());
+        assert!(parent.open_child_dir(&st).is_ok());
     }
 
     #[test]
     fn concurrent_sibling_renames_exactly_one_wins() {
         let (_tmp, parent) = temp_final_parent();
-        parent.create_child_dir(".streamsync-stage-a").expect("a");
-        parent.create_child_dir(".streamsync-stage-b").expect("b");
+        let sa = stage("dddddddddddddddddddddddddddddddd");
+        let sb = stage("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        parent.create_child_dir(&sa).expect("a");
+        parent.create_child_dir(&sb).expect("b");
         let p1 = parent.clone_handle().expect("clone1");
         let p2 = parent.clone_handle().expect("clone2");
         let barrier = Arc::new(Barrier::new(2));
         let t1 = thread::spawn({
             let b = barrier.clone();
+            let sa = sa.clone();
             move || {
                 b.wait();
-                rename_no_replace_same_parent(&p1, ".streamsync-stage-a", "winner-name")
+                rename_no_replace_same_parent(&p1, &sa, "winner-name")
             }
         });
         let t2 = thread::spawn({
             let b = barrier.clone();
+            let sb = sb.clone();
             move || {
                 b.wait();
-                rename_no_replace_same_parent(&p2, ".streamsync-stage-b", "winner-name")
+                rename_no_replace_same_parent(&p2, &sb, "winner-name")
             }
         });
         let r1 = t1.join().expect("j1");
         let r2 = t2.join().expect("j2");
         let wins = [r1.is_ok(), r2.is_ok()];
         assert_eq!(wins.iter().filter(|w| **w).count(), 1);
-        let exists_a = parent.open_child_dir(".streamsync-stage-a").is_ok();
-        let exists_b = parent.open_child_dir(".streamsync-stage-b").is_ok();
+        let exists_a = parent.open_child_dir(&sa).is_ok();
+        let exists_b = parent.open_child_dir(&sb).is_ok();
         assert!(exists_a ^ exists_b);
         assert!(parent.open_child_dir("winner-name").is_ok());
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn sync_dir_exact_targets_opened_directory_fd() {
         let (_tmp, parent) = temp_final_parent();
-        durability::sync_dir_exact(&parent).expect("sync");
+        assert_eq!(
+            durability::sync_dir_exact(&parent).expect("sync"),
+            NamespaceDurability::Proven
+        );
     }
 
     #[test]
@@ -245,15 +255,21 @@ mod stage_final_sibling_final_parent {
 
     #[test]
     fn reserved_streamsync_prefix_rejected_for_final_name() {
-        let err = ValidatedFinalName::validate(".streamsync-stage-deadbeef");
+        let err =
+            ValidatedFinalName::validate(".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef");
         assert!(matches!(err, Err(FsError::InvalidFinalName(_))));
     }
 
-    /// Nested mount/junction sibling proof requires elevation on Windows and bind mounts on Linux.
     #[test]
-    #[ignore = "manual/CI-qualified: nested mount or junction under final-parent"]
-    fn nested_mount_junction_sibling_geometry() {
-        // Documented limit: run in qualified CI/VM with prepared mount layout.
+    fn invalid_stage_basename_rejected_on_publish() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = DestRoot::open(tmp.path()).expect("root");
+        fs::create_dir(tmp.path().join("guild")).expect("guild");
+        let final_parent = root.open_dir_relative(&["guild"]).expect("parent");
+        let publication = FinalParentPublication::new(final_parent);
+        let final_name = ValidatedFinalName::validate("sess").expect("final");
+        let err = publication.rename_stage_to_final(".streamsync-stage-not32hex", &final_name);
+        assert!(matches!(err, Err(FsError::InvalidStageBasename)));
     }
 }
 
@@ -261,6 +277,11 @@ mod stage_final_sibling_final_parent {
 mod windows_handle_rename_no_replace {
     use super::*;
     use std::fs;
+
+    fn stage(hex32: &str) -> String {
+        assert_eq!(hex32.len(), 32);
+        format!(".streamsync-stage-{hex32}")
+    }
 
     fn temp_final_parent() -> (tempfile::TempDir, DirHandle) {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -276,33 +297,31 @@ mod windows_handle_rename_no_replace {
     #[test]
     fn sibling_directory_rename_succeeds() {
         let (_tmp, parent) = temp_final_parent();
-        parent
-            .create_child_dir(".streamsync-stage-win")
-            .expect("stage");
-        rename_no_replace_same_parent(&parent, ".streamsync-stage-win", "published-win")
-            .expect("rename");
+        let st = stage("ffffffffffffffffffffffffffffffff");
+        parent.create_child_dir(&st).expect("stage");
+        rename_no_replace_same_parent(&parent, &st, "published-win").expect("rename");
         assert!(parent.open_child_dir("published-win").is_ok());
     }
 
     #[test]
     fn pre_existing_final_collision_preserves_both() {
         let (_tmp, parent) = temp_final_parent();
-        parent
-            .create_child_dir(".streamsync-stage-win2")
-            .expect("stage");
+        let st = stage("11111111111111111111111111111111");
+        parent.create_child_dir(&st).expect("stage");
         let dest_path = _tmp.path().join("final-parent").join("taken");
         fs::write(&dest_path, b"KEEP").expect("dest");
-        let result = rename_no_replace_same_parent(&parent, ".streamsync-stage-win2", "taken");
+        let result = rename_no_replace_same_parent(&parent, &st, "taken");
         assert!(matches!(result, Err(FsError::AlreadyExists)));
         assert_eq!(fs::read(&dest_path).expect("read"), b"KEEP");
-        assert!(parent.open_child_dir(".streamsync-stage-win2").is_ok());
+        assert!(parent.open_child_dir(&st).is_ok());
     }
 
     #[test]
     fn invalid_empty_destination_fails_closed() {
         let (_tmp, parent) = temp_final_parent();
-        parent.create_child_dir("stage-z").expect("stage");
-        let err = rename_no_replace_same_parent(&parent, "stage-z", "");
+        let st = stage("22222222222222222222222222222222");
+        parent.create_child_dir(&st).expect("stage");
+        let err = rename_no_replace_same_parent(&parent, &st, "");
         assert!(matches!(err, Err(FsError::InvalidComponent(_))));
     }
 }

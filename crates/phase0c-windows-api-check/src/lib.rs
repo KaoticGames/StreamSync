@@ -16,7 +16,8 @@ mod win {
     pub fn file_rename_info_buffer_size_for_dst(dst: &str) -> usize {
         let wide_len = dst.encode_utf16().count();
         let name_bytes = wide_len * 2;
-        std::mem::size_of::<FILE_RENAME_INFO>() - std::mem::size_of::<u16>() + name_bytes
+        let with_nul = name_bytes + 2;
+        std::mem::size_of::<FILE_RENAME_INFO>() - std::mem::size_of::<u16>() + with_nul
     }
 
     pub fn set_file_rename_info_smoke(
@@ -38,6 +39,7 @@ mod win {
                 (*info).FileName.as_mut_ptr(),
                 dst_wide.len(),
             );
+            (*info).FileName[dst_wide.len()] = 0;
         }
         let ok = unsafe {
             SetFileInformationByHandle(

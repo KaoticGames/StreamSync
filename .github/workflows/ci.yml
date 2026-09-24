@@ -22,7 +22,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-17
 
       - name: voice_delivery Windows runtime tests
-        run: cargo test -p stream-sync-core voice_delivery -- --nocapture
+        run: |
+          cargo test -p stream-sync-core 'voice_delivery::fs::' -- --nocapture
+          cargo test -p stream-sync-core 'voice_delivery::lock::' -- --nocapture --test-threads=1
+          cargo test -p stream-sync-core 'voice_delivery::ids::' -- --nocapture
 
   windows-installer:
     name: Windows NSIS installer

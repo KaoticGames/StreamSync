@@ -167,24 +167,137 @@ pub(crate) fn validate_single_component(name: &str) -> Result<(), FsError> {
     Ok(())
 }
 
-/// Protocol-facing final session directory name (validated, not lossy-mapped).
+/// Portable ASCII final-session component grammar (reject nonportable inputs; never map/sanitize).
+///
+/// Allowed bytes: `A–Z`, `a–z`, `0–9`, `-`, `_`, `.` (no leading/trailing `.` or space).
+/// Max length 128. Rejects control chars, `:`, separators, Unicode, Windows reserved device
+/// basenames (even with extension), and any `.streamsync-` prefix.
 pub struct ValidatedFinalName(String);
+
+const FINAL_NAME_MAX_LEN: usize = 128;
+
+fn is_windows_reserved_device_basename(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    let stem = upper.split('.').next().unwrap_or(&upper);
+    matches!(
+        stem,
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+fn is_portable_final_name_byte(b: u8) -> bool {
+    matches!(
+        b,
+        b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+    )
+}
+
+pub(crate) fn validate_portable_final_name(name: &str) -> Result<(), FsError> {
+    validate_single_component(name)?;
+    if name.starts_with(".streamsync-") {
+        return Err(FsError::InvalidFinalName(
+            "reserved .streamsync- prefix".into(),
+        ));
+    }
+    if name.is_empty() || name.len() > FINAL_NAME_MAX_LEN {
+        return Err(FsError::InvalidFinalName("length out of range".into()));
+    }
+    if name.starts_with('.') || name.ends_with('.') || name.starts_with(' ') || name.ends_with(' ')
+    {
+        return Err(FsError::InvalidFinalName(
+            "leading or trailing dot/space".into(),
+        ));
+    }
+    if name.contains(':') {
+        return Err(FsError::InvalidFinalName("colon not portable".into()));
+    }
+    if !name.bytes().all(is_portable_final_name_byte) {
+        return Err(FsError::InvalidFinalName(
+            "non-portable or non-ASCII character".into(),
+        ));
+    }
+    if is_windows_reserved_device_basename(name) {
+        return Err(FsError::InvalidFinalName(
+            "windows reserved device name".into(),
+        ));
+    }
+    Ok(())
+}
 
 impl ValidatedFinalName {
     pub fn validate(name: &str) -> Result<Self, FsError> {
-        validate_single_component(name)?;
-        if name.starts_with(".streamsync-") {
-            return Err(FsError::InvalidFinalName(
-                "reserved .streamsync- prefix".into(),
-            ));
-        }
-        if name.len() > 200 {
-            return Err(FsError::InvalidFinalName("name too long".into()));
-        }
+        validate_portable_final_name(name)?;
         Ok(Self(name.to_string()))
     }
 
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod validated_final_name_portable {
+    use super::*;
+
+    #[test]
+    fn accepts_safe_ascii_names() {
+        for name in ["my-session", "Guild_42", "a.b-c", "Z9"] {
+            assert!(ValidatedFinalName::validate(name).is_ok());
+        }
+    }
+
+    #[test]
+    fn rejects_nonportable_inputs() {
+        let invalid = [
+            "",
+            ".hidden",
+            "trail.",
+            " lead",
+            "trail ",
+            "bad:name",
+            "unicode-🎙",
+            "CON",
+            "con.txt",
+            "LPT1.log",
+            ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
+            &"x".repeat(129),
+        ];
+        for name in invalid {
+            let err = ValidatedFinalName::validate(name);
+            assert!(
+                matches!(
+                    err,
+                    Err(FsError::InvalidFinalName(_)) | Err(FsError::InvalidComponent(_))
+                ),
+                "expected reject for {:?}",
+                name
+            );
+        }
     }
 }

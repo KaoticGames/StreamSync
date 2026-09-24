@@ -2,7 +2,9 @@
 
 use super::dir::DirHandle;
 use super::error::FsError;
-use rustix::fs::{mkdirat, open, openat, renameat_with, Mode, OFlags, RenameFlags};
+use rustix::fs::{mkdirat, open, openat, Mode, OFlags};
+#[cfg(target_os = "linux")]
+use rustix::fs::{renameat_with, RenameFlags};
 use rustix::io::fcntl_dupfd_cloexec;
 use std::io;
 use std::path::Path;
@@ -53,8 +55,7 @@ pub(crate) fn open_dir_at(parent: &DirHandle, name: &str) -> Result<DirHandle, F
 }
 
 pub(crate) fn mkdir_at(parent: &DirHandle, name: &str) -> Result<(), FsError> {
-    let mode =
-        Mode::RUSR | Mode::WUSR | Mode::XUSR | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
+    let mode = Mode::RUSR | Mode::WUSR | Mode::XUSR;
     match mkdirat(parent.as_fd(), name, mode) {
         Ok(()) => Ok(()),
         Err(rustix::io::Errno::EXIST) => Err(FsError::AlreadyExists),

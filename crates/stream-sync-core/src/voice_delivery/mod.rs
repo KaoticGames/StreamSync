@@ -1,5 +1,8 @@
 //! Phase 0C voice delivery filesystem foundation (slices 0–4).
 //! Public API remains minimal until later phases.
+//!
+//! `dead_code` is allowed here until ledger/ingest slices wire these entry points.
+#![allow(dead_code)]
 
 mod ids;
 mod lock;
@@ -17,4 +20,5 @@ pub(crate) use lock::{acquire_delivery_domain_lock, DeliveryDomainLock, LockErro
 mod subprocess_env {
     pub const LOCK_HOLDER: &str = "STREAMSYNC_VOICE_LOCK_HOLDER";
     pub const LOCK_TRY: &str = "STREAMSYNC_VOICE_LOCK_TRY";
+    pub const LOCK_READY: &str = "STREAMSYNC_VOICE_LOCK_READY";
 }

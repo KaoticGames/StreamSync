@@ -3,7 +3,7 @@
 use super::dir::{DirHandle, ValidatedFinalName};
 use super::error::FsError;
 use super::rename_no_replace_same_parent;
-use crate::voice_delivery::ids::new_opaque_stage_basename;
+use crate::voice_delivery::ids::{new_opaque_stage_basename, validate_stage_basename};
 
 /// Publication operations constrained to a single open final-parent directory.
 pub struct FinalParentPublication {
@@ -32,9 +32,7 @@ impl FinalParentPublication {
         stage_basename: &str,
         final_name: &ValidatedFinalName,
     ) -> Result<(), FsError> {
-        if !stage_basename.starts_with(".streamsync-stage-") {
-            return Err(FsError::InvalidStageBasename);
-        }
+        validate_stage_basename(stage_basename)?;
         rename_no_replace_same_parent(&self.final_parent, stage_basename, final_name.as_str())
     }
 }
