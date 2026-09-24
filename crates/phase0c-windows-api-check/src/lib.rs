@@ -3,64 +3,82 @@
 
 #[cfg(windows)]
 mod win {
+    use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Storage::FileSystem::{
-        GetVolumeInformationW, MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        CreateFileW, FileRenameInfo, SetFileInformationByHandle, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_GENERIC_READ, FILE_RENAME_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
 
-    pub fn volume_serial_for_path(path: &Path) -> Result<u32, u32> {
-        let mut probe = path.to_path_buf();
-        while !probe.exists() {
-            if !probe.pop() {
-                break;
-            }
+    /// Compile-time layout check for `FILE_RENAME_INFO` buffer sizing used by voice delivery slice 1.
+    pub fn file_rename_info_buffer_size_for_dst(dst: &str) -> usize {
+        let wide_len = dst.encode_utf16().count();
+        let name_bytes = wide_len * 2;
+        std::mem::size_of::<FILE_RENAME_INFO>() - std::mem::size_of::<u16>() + name_bytes
+    }
+
+    pub fn set_file_rename_info_smoke(
+        staging_handle: isize,
+        parent_handle: isize,
+        dst: &str,
+    ) -> Result<(), u32> {
+        let dst_wide: Vec<u16> = dst.encode_utf16().collect();
+        let name_bytes = (dst_wide.len() * 2) as u32;
+        let buffer_size = file_rename_info_buffer_size_for_dst(dst);
+        let mut buffer = vec![0u8; buffer_size];
+        let info = buffer.as_mut_ptr() as *mut FILE_RENAME_INFO;
+        unsafe {
+            (*info).Anonymous.ReplaceIfExists = 0;
+            (*info).RootDirectory = parent_handle as _;
+            (*info).FileNameLength = name_bytes;
+            std::ptr::copy_nonoverlapping(
+                dst_wide.as_ptr(),
+                (*info).FileName.as_mut_ptr(),
+                dst_wide.len(),
+            );
         }
-        let wide: Vec<u16> = probe.as_os_str().encode_wide().chain(Some(0)).collect();
-        let mut serial = 0u32;
         let ok = unsafe {
-            GetVolumeInformationW(
-                wide.as_ptr(),
-                std::ptr::null_mut(),
-                0,
-                &mut serial,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                0,
+            SetFileInformationByHandle(
+                staging_handle as _,
+                FileRenameInfo,
+                buffer.as_mut_ptr() as *mut c_void,
+                buffer_size as u32,
             )
         };
         if ok == 0 {
             return Err(unsafe { GetLastError() });
         }
-        Ok(serial)
-    }
-
-    pub fn move_file_no_replace(src: &Path, dst: &Path) -> Result<(), u32> {
-        let src_w: Vec<u16> = src.as_os_str().encode_wide().chain(Some(0)).collect();
-        let dst_w: Vec<u16> = dst.as_os_str().encode_wide().chain(Some(0)).collect();
-        let ok = unsafe { MoveFileExW(src_w.as_ptr(), dst_w.as_ptr(), MOVEFILE_WRITE_THROUGH) };
-        if ok == 0 {
-            return Err(unsafe { GetLastError() });
-        }
         Ok(())
     }
 
-    pub fn move_file_replace(src: &Path, dst: &Path) -> Result<(), u32> {
-        let src_w: Vec<u16> = src.as_os_str().encode_wide().chain(Some(0)).collect();
-        let dst_w: Vec<u16> = dst.as_os_str().encode_wide().chain(Some(0)).collect();
-        let flags = MOVEFILE_WRITE_THROUGH | MOVEFILE_REPLACE_EXISTING;
-        let ok = unsafe { MoveFileExW(src_w.as_ptr(), dst_w.as_ptr(), flags) };
-        if ok == 0 {
+    pub fn open_directory_handle(path: &Path) -> Result<isize, u32> {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                0,
+            )
+        };
+        if handle == 0 {
             return Err(unsafe { GetLastError() });
         }
-        Ok(())
+        Ok(handle as isize)
     }
 }
 
 #[cfg(windows)]
-pub use win::{move_file_no_replace, move_file_replace, volume_serial_for_path};
+pub use win::{
+    file_rename_info_buffer_size_for_dst, open_directory_handle, set_file_rename_info_smoke,
+};
 
 #[cfg(not(windows))]
-pub fn non_windows_build_placeholder() {}
+pub fn non_windows_build_placeholder() {
+    // Full `stream-sync-core` Windows backend is cfg-gated; Linux CI validates this crate only.
+}

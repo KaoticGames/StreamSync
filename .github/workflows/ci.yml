@@ -13,6 +13,17 @@ jobs:
   quality:
     uses: ./.github/workflows/quality.yml
 
+  phase0c-windows:
+    name: Phase 0C voice_delivery (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1635cc071259e90169279235f2 # v4.2.2
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-17
+
+      - name: voice_delivery Windows runtime tests
+        run: cargo test -p stream-sync-core voice_delivery -- --nocapture
+
   windows-installer:
     name: Windows NSIS installer
     runs-on: windows-latest

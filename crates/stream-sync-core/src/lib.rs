@@ -25,6 +25,8 @@ mod streamelements;
 mod syndicate_connection;
 mod test_alert;
 mod twitch;
+#[cfg(test)]
+mod voice_delivery;
 
 pub use delegated_lifecycle::{
     redact_connection_key, AuthorityLeaseSnapshot, TeardownPhase, MAX_DELEGATED_REVOCATION_DELAY,
