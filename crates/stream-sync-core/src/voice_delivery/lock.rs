@@ -204,17 +204,11 @@ mod stable_delivery_lock_cross_process {
         let real_target = tmp.path().join("real-lock-target");
         fs::write(&real_target, b"lock-bytes").expect("target file");
         match try_file_symlink(&lock_path, &real_target) {
-            Ok(()) => {
-                let err = acquire_delivery_domain_lock(&root, id, true);
-                assert!(
-                    matches!(
-                        err,
-                        Err(LockError::Fs(FsError::SymlinkOrReparseComponent(_)))
-                    ),
-                    "expected reparse rejection, got {:?}",
-                    err
-                );
-            }
+            Ok(()) => match acquire_delivery_domain_lock(&root, id, true) {
+                Ok(_) => panic!("expected reparse rejection, got Ok lock"),
+                Err(LockError::Fs(FsError::SymlinkOrReparseComponent(_))) => {}
+                Err(other) => panic!("expected reparse rejection, got {other:?}"),
+            },
             Err(reason) => {
                 eprintln!("SKIP lock_file_reparse_rejected: {reason}");
             }

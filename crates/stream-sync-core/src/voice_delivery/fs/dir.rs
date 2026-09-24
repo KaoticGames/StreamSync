@@ -8,6 +8,7 @@
 //! replacement or races on ancestor directories.
 
 use super::error::FsError;
+#[cfg(unix)]
 use super::unix;
 #[cfg(windows)]
 use super::windows;

@@ -50,7 +50,7 @@ jobs:
         run: node scripts/check-desktop-icons.js
 
       - name: NSIS installer
-        run: npx tauri build --bundles nsis --ci
+        run: npx tauri build --bundles nsis --ci --no-sign --config "{\"bundle\":{\"createUpdaterArtifacts\":false}}"
         working-directory: crates/stream-sync-desktop
 
   signed-release:

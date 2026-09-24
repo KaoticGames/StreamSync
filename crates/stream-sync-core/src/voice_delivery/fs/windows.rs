@@ -44,6 +44,14 @@ pub(crate) struct OwnedDirHandle {
     absolute_path: PathBuf,
 }
 
+// SAFETY: Each `OwnedDirHandle` exclusively owns its Win32 `HANDLE` and calls `CloseHandle` in
+// `Drop` (or transfers sole ownership via `into_std_file`, which forgets this wrapper). Values
+// produced by `duplicate()` are independent kernel handles with the same single-owner invariant.
+// `HANDLE` is not `Send` in the type system because it is a raw pointer; moving this struct
+// between threads does not share mutable access to the handle — callers must still synchronize
+// concurrent directory operations separately.
+unsafe impl Send for OwnedDirHandle {}
+
 impl OwnedDirHandle {
     pub(crate) fn raw(&self) -> HANDLE {
         self.handle
@@ -361,11 +369,11 @@ mod dest_root_storage_qualify {
 
     #[test]
     fn unc_lexical_fixture_rejected_at_open() {
-        let err = DestRoot::open(std::path::Path::new(r"\\server\share\root"));
-        assert!(
-            matches!(err, Err(FsError::UnsupportedStorage(_))),
-            "expected unsupported storage, got {err:?}"
-        );
+        match DestRoot::open(std::path::Path::new(r"\\server\share\root")) {
+            Ok(_) => panic!("expected unsupported storage, got Ok DestRoot"),
+            Err(FsError::UnsupportedStorage(_)) => {}
+            Err(other) => panic!("expected unsupported storage, got {other:?}"),
+        }
         assert!(reject_lexical_unc(std::path::Path::new(r"\\server\share\root")).is_err());
     }
 }
