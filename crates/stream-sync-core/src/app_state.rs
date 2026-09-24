@@ -6,11 +6,22 @@ use crate::config_types::{
     EventsOverlayConfigFile, KickTokenFile, OverlayConfigFile, TwitchActiveMode,
     TwitchActiveModeFile, TwitchTokenFile,
 };
+use crate::delegated_secrets::{
+    alternate_bundle_slot, apply_bundle_to_session, bundle_from_session,
+    classify_inline_delegated_secrets, delegated_secret_store_authority_remain,
+    delete_all_delegated_bundle_slots, delete_legacy_delegated_secret_keys,
+    delete_legacy_revision_bundle, extract_delegated_metadata_provenance,
+    hydrate_inline_secrets_in_memory, hydrate_legacy_store_pair_in_memory,
+    migrate_legacy_inline_to_bundle, migrate_legacy_revision_bundle_to_slot,
+    migrate_legacy_store_pair_to_bundle, parse_committed_identity_from_metadata_bytes,
+    read_bound_delegated_bundle, read_bound_delegated_bundle_with_provenance,
+    read_legacy_delegated_secret_pair, validate_delegated_session_coherence,
+    with_delegated_authority_lock, write_delegated_bundle_create, BoundBundleProvenance,
+    DelegatedCommittedIdentity, DelegatedMetadataProvenance, InlineDelegatedSecretState,
+};
 use crate::secret_store::{
     SecretStore, KICK_PERSONAL_ACCESS_KEY, KICK_PERSONAL_FEED_TICKET_KEY,
-    KICK_PERSONAL_REFRESH_KEY, TWITCH_DELEGATED_ACCESS_TOKEN_KEY, TWITCH_DELEGATED_CONNECTION_KEY,
-    TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY, TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY,
-    TWITCH_PERSONAL_ACCESS_KEY, TWITCH_PERSONAL_REFRESH_KEY,
+    KICK_PERSONAL_REFRESH_KEY, TWITCH_PERSONAL_ACCESS_KEY, TWITCH_PERSONAL_REFRESH_KEY,
 };
 use crate::storage::{self, StoragePaths};
 use serde::{Deserialize, Serialize};
@@ -59,6 +70,10 @@ struct KickTokenMetadataFile {
 struct DelegatedSessionMetadataFile {
     #[serde(default)]
     generation: u64,
+    #[serde(default)]
+    secret_revision: u64,
+    #[serde(default)]
+    bundle_slot: u8,
     #[serde(default)]
     client_id: String,
     #[serde(default)]
@@ -113,6 +128,8 @@ impl From<&DelegatedSessionFile> for DelegatedSessionMetadataFile {
     fn from(session: &DelegatedSessionFile) -> Self {
         Self {
             generation: session.generation,
+            secret_revision: session.secret_revision,
+            bundle_slot: session.bundle_slot,
             client_id: session.client_id.clone(),
             channel_login: session.channel_login.clone(),
             channel_twitch_id: session.channel_twitch_id.clone(),
@@ -278,50 +295,119 @@ fn maybe_migrate_personal_kick_secrets(
     Ok(tokens)
 }
 
+fn load_committed_delegated_session_at(
+    delegated_path: &std::path::Path,
+    readonly: bool,
+    store: &dyn SecretStore,
+) -> anyhow::Result<Option<DelegatedSessionFile>> {
+    let Some(session) = storage::committed_delegated_session_parse(delegated_path)? else {
+        return Ok(None);
+    };
+    maybe_migrate_delegated_secrets(delegated_path, readonly, store, session)
+}
+
 fn maybe_migrate_delegated_secrets(
     path: &std::path::Path,
     readonly: bool,
     store: &dyn SecretStore,
     mut session: DelegatedSessionFile,
 ) -> anyhow::Result<Option<DelegatedSessionFile>> {
-    let legacy_connection_key = nonempty_owned(Some(session.connection_key.clone()));
-    let legacy_access_token = nonempty_owned(Some(session.access_token.clone()));
-    let legacy_kick_access_token = nonempty_owned(session.kick_access_token.clone());
-    let legacy_kick_refresh_token = nonempty_owned(session.kick_refresh_token.clone());
-    let should_read_secret_store = session.generation > 0
+    let has_metadata = session.generation > 0
         || !session.channel_login.trim().is_empty()
-        || !session.channel_twitch_id.trim().is_empty()
-        || legacy_connection_key.is_some()
-        || legacy_access_token.is_some();
+        || !session.channel_twitch_id.trim().is_empty();
+    if !has_metadata {
+        return Ok(None);
+    }
+
+    let inline_state =
+        match classify_inline_delegated_secrets(&session.connection_key, &session.access_token) {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!("delegated session rejected: {error:#}");
+                return Ok(None);
+            }
+        };
     let mut migrated = false;
-    if let Some(secret) = legacy_connection_key.as_deref() {
-        write_secret_value(store, TWITCH_DELEGATED_CONNECTION_KEY, Some(secret))?;
-        migrated = true;
+
+    match inline_state {
+        InlineDelegatedSecretState::BothInline => {
+            if readonly {
+                if let Err(error) = hydrate_inline_secrets_in_memory(&mut session) {
+                    tracing::warn!("delegated session rejected: {error:#}");
+                    return Ok(None);
+                }
+            } else {
+                if let Err(error) = validate_delegated_session_coherence(&session) {
+                    tracing::warn!("delegated session rejected: {error:#}");
+                    return Ok(None);
+                }
+                let bundle = migrate_legacy_inline_to_bundle(store, &session)?;
+                apply_bundle_to_session(&mut session, &bundle);
+                migrated = true;
+            }
+        }
+        InlineDelegatedSecretState::BothAbsent => {
+            if session.secret_revision > 0 {
+                let bound = match read_bound_delegated_bundle_with_provenance(store, &session) {
+                    Ok(bundle) => bundle,
+                    Err(error) => {
+                        tracing::warn!("delegated secret bundle rejected: {error:#}");
+                        return Ok(None);
+                    }
+                };
+                match bound {
+                    Some((bundle, BoundBundleProvenance::LegacyRevisionKey(revision))) => {
+                        if readonly {
+                            apply_bundle_to_session(&mut session, &bundle);
+                        } else {
+                            migrate_legacy_revision_bundle_to_slot(
+                                path, store, &session, &bundle, revision,
+                            )?;
+                            apply_bundle_to_session(&mut session, &bundle);
+                            migrated = true;
+                        }
+                    }
+                    Some((bundle, BoundBundleProvenance::Slot(_))) => {
+                        apply_bundle_to_session(&mut session, &bundle);
+                    }
+                    None => return Ok(None),
+                }
+            } else {
+                match read_legacy_delegated_secret_pair(store) {
+                    Ok(Some((conn, at))) => {
+                        if readonly {
+                            if let Err(error) =
+                                hydrate_legacy_store_pair_in_memory(store, &mut session, conn, at)
+                            {
+                                tracing::warn!("delegated legacy hydrate rejected: {error:#}");
+                                return Ok(None);
+                            }
+                        } else {
+                            let bundle =
+                                migrate_legacy_store_pair_to_bundle(store, &session, conn, at)?;
+                            apply_bundle_to_session(&mut session, &bundle);
+                            migrated = true;
+                        }
+                    }
+                    Ok(None) => return Ok(None),
+                    Err(error) => {
+                        tracing::warn!("delegated legacy secrets rejected: {error:#}");
+                        return Ok(None);
+                    }
+                }
+            }
+        }
     }
-    if let Some(secret) = legacy_access_token.as_deref() {
-        write_secret_value(store, TWITCH_DELEGATED_ACCESS_TOKEN_KEY, Some(secret))?;
-        migrated = true;
-    }
-    if let Some(secret) = legacy_kick_access_token.as_deref() {
-        write_secret_value(store, TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY, Some(secret))?;
-        migrated = true;
-    }
-    if let Some(secret) = legacy_kick_refresh_token.as_deref() {
-        write_secret_value(store, TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY, Some(secret))?;
-        migrated = true;
-    }
-    if !should_read_secret_store {
+
+    if session.connection_key.trim().is_empty() || session.access_token.trim().is_empty() {
         return Ok(None);
     }
-    session.connection_key =
-        read_secret_value(store, TWITCH_DELEGATED_CONNECTION_KEY)?.unwrap_or_default();
-    session.access_token =
-        read_secret_value(store, TWITCH_DELEGATED_ACCESS_TOKEN_KEY)?.unwrap_or_default();
-    session.kick_access_token = read_secret_value(store, TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY)?;
-    session.kick_refresh_token = read_secret_value(store, TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY)?;
-    if session.connection_key.is_empty() || session.access_token.is_empty() {
+
+    if let Err(error) = validate_delegated_session_coherence(&session) {
+        tracing::warn!("delegated session coherence rejected: {error:#}");
         return Ok(None);
     }
+
     if migrated && !readonly {
         write_delegated_metadata(path, &session)?;
     }
@@ -425,6 +511,8 @@ pub struct DurableFailureInject {
     pub pending_marker_write: std::sync::atomic::AtomicBool,
     /// Legacy reusable `.bak` removal (authority-bearing).
     pub backup_remove: std::sync::atomic::AtomicBool,
+    /// Legacy revision-key bundle removal during revoke.
+    pub legacy_revision_remove: std::sync::atomic::AtomicBool,
     /// Personal Twitch token file write.
     pub save_personal_tokens: std::sync::atomic::AtomicBool,
     /// Personal Kick token file write.
@@ -561,6 +649,14 @@ impl AppState {
             readonly,
         )?;
 
+        if !readonly {
+            storage::ensure_delegated_revoke_marker_high_water_materialized(
+                &paths.twitch_delegated_revoke_marker_hw,
+                &paths.twitch_delegated_revoke_pending,
+            )?;
+        }
+        storage::read_delegated_revoke_marker_high_water(&paths.twitch_delegated_revoke_marker_hw)?;
+
         let personal = maybe_migrate_personal_twitch_secrets(
             &paths.twitch_tokens,
             readonly,
@@ -605,16 +701,11 @@ impl AppState {
                 None
             }
         } else if paths.twitch_delegated.is_file() {
-            let session = storage::committed_delegated_session_parse(&paths.twitch_delegated)?;
-            match session {
-                Some(session) => maybe_migrate_delegated_secrets(
-                    &paths.twitch_delegated,
-                    readonly,
-                    secret_store.as_ref(),
-                    session,
-                )?,
-                None => None,
-            }
+            load_committed_delegated_session_at(
+                &paths.twitch_delegated,
+                readonly,
+                secret_store.as_ref(),
+            )?
         } else {
             None
         };
@@ -759,6 +850,19 @@ impl AppState {
         self.secret_store.clone()
     }
 
+    /// Test helper: load committed delegated metadata and hydrate externalized secrets
+    /// through the same path used during production startup.
+    #[cfg(test)]
+    pub(crate) fn load_committed_delegated_session(
+        &self,
+    ) -> anyhow::Result<Option<DelegatedSessionFile>> {
+        load_committed_delegated_session_at(
+            &self.paths.twitch_delegated,
+            self.readonly,
+            self.secret_store.as_ref(),
+        )
+    }
+
     pub async fn save_dock(&self) -> anyhow::Result<()> {
         if self.readonly {
             return Ok(());
@@ -850,42 +954,159 @@ impl AppState {
         }
         let d = self.delegated.read().await;
         match d.as_ref() {
-            Some(sess) => self.persist_delegated_session(sess),
+            Some(sess) => self.persist_delegated_session(sess).map(|_| ()),
             None => self.durable_revoke_delegated().await,
         }
     }
 
+    fn delegated_metadata_revision(&self) -> Option<u64> {
+        if !self.paths.twitch_delegated.is_file() {
+            return None;
+        }
+        let raw = std::fs::read(&self.paths.twitch_delegated).ok()?;
+        parse_committed_identity_from_metadata_bytes(&raw)
+            .ok()
+            .flatten()
+            .map(|id| id.secret_revision)
+    }
+
     /// Write a delegated session credential file (does not clear tombstone).
-    pub fn persist_delegated_session(&self, sess: &DelegatedSessionFile) -> anyhow::Result<()> {
+    pub fn persist_delegated_session(
+        &self,
+        sess: &DelegatedSessionFile,
+    ) -> anyhow::Result<DelegatedCommittedIdentity> {
+        self.persist_delegated_session_inner(sess, false)
+    }
+
+    /// Replacement persist that atomically clears revoke markers after proving the winner is committed.
+    pub fn persist_delegated_replacement_session(
+        &self,
+        sess: &DelegatedSessionFile,
+    ) -> anyhow::Result<DelegatedCommittedIdentity> {
+        self.persist_delegated_session_inner(sess, true)
+    }
+
+    fn persist_delegated_session_inner(
+        &self,
+        sess: &DelegatedSessionFile,
+        clear_revoke_markers: bool,
+    ) -> anyhow::Result<DelegatedCommittedIdentity> {
         if self.readonly {
-            return Ok(());
+            return Ok(DelegatedCommittedIdentity {
+                secret_revision: sess.secret_revision,
+                generation: sess.generation,
+                bundle_slot: sess.bundle_slot,
+            });
         }
         self.durable_fail
             .fail(&self.durable_fail.save_session, "save_session")?;
-        write_secret_value(
-            self.secret_store.as_ref(),
-            TWITCH_DELEGATED_CONNECTION_KEY,
-            Some(&sess.connection_key),
+        classify_inline_delegated_secrets(&sess.connection_key, &sess.access_token)?;
+        validate_delegated_session_coherence(sess)?;
+
+        with_delegated_authority_lock(&self.paths.twitch_delegated, || {
+            let revoke_marker_epoch_fence = storage::read_delegated_revoke_marker_epoch(
+                &self.paths.twitch_delegated_revoke_pending,
+            )?;
+            let revoke_marker_hw_fence = storage::read_delegated_revoke_marker_high_water(
+                &self.paths.twitch_delegated_revoke_marker_hw,
+            )?;
+            let (previous_revision, previous_slot) = if self.paths.twitch_delegated.is_file() {
+                let raw = std::fs::read_to_string(&self.paths.twitch_delegated)?;
+                let meta = serde_json::from_str::<DelegatedSessionMetadataFile>(&raw)?;
+                crate::delegated_secrets::validate_committed_bundle_slot(meta.bundle_slot)?;
+                (meta.secret_revision, meta.bundle_slot)
+            } else {
+                (0, 1)
+            };
+            let new_revision = previous_revision
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("delegated secret revision exhausted"))?;
+            let new_slot = alternate_bundle_slot(previous_slot)?;
+            let bundle = bundle_from_session(sess, new_revision, new_slot);
+            write_delegated_bundle_create(self.secret_store.as_ref(), &bundle)?;
+            crate::delegated_secrets::authority_gates::pause_blocking(
+                crate::delegated_secrets::authority_gates::DelegatedAuthorityBoundary::PersistAfterBundleWrite,
+            );
+
+            let mut metadata_session = sess.clone();
+            metadata_session.secret_revision = new_revision;
+            metadata_session.bundle_slot = new_slot;
+            metadata_session.connection_key.clear();
+            metadata_session.access_token.clear();
+            metadata_session.kick_access_token = None;
+            metadata_session.kick_refresh_token = None;
+            let bytes =
+                serde_json::to_vec_pretty(&DelegatedSessionMetadataFile::from(&metadata_session))?;
+            // Bundle is complete before metadata commit so crash cannot pair new metadata with missing secrets.
+            self.remove_delegated_backup()?;
+            storage::write_authority_bearing_secret(&self.paths.twitch_delegated, &bytes)?;
+            delete_legacy_delegated_secret_keys(self.secret_store.as_ref())?;
+            if previous_revision > 0 {
+                delete_legacy_revision_bundle(self.secret_store.as_ref(), previous_revision)?;
+            }
+
+            let committed = DelegatedCommittedIdentity {
+                secret_revision: new_revision,
+                generation: sess.generation,
+                bundle_slot: new_slot,
+            };
+
+            if clear_revoke_markers {
+                crate::delegated_secrets::authority_gates::pause_blocking(
+                    crate::delegated_secrets::authority_gates::DelegatedAuthorityBoundary::PersistBeforeMarkerClear,
+                );
+                self.clear_revoke_markers_if_replacement_committed(
+                    &committed,
+                    revoke_marker_epoch_fence,
+                    revoke_marker_hw_fence,
+                )?;
+            }
+
+            Ok(committed)
+        })
+    }
+
+    fn clear_revoke_markers_if_replacement_committed(
+        &self,
+        committed: &DelegatedCommittedIdentity,
+        revoke_marker_epoch_fence: u64,
+        revoke_marker_hw_fence: u64,
+    ) -> anyhow::Result<()> {
+        if !self.paths.twitch_delegated_revoked.is_file()
+            && !self.paths.twitch_delegated_revoke_pending.is_file()
+        {
+            return Ok(());
+        }
+        let marker_epoch = storage::read_delegated_revoke_marker_epoch(
+            &self.paths.twitch_delegated_revoke_pending,
         )?;
-        write_secret_value(
-            self.secret_store.as_ref(),
-            TWITCH_DELEGATED_ACCESS_TOKEN_KEY,
-            Some(&sess.access_token),
+        if marker_epoch > revoke_marker_epoch_fence {
+            anyhow::bail!("newer durable revoke marker epoch during replacement");
+        }
+        let marker_hw = storage::read_delegated_revoke_marker_high_water(
+            &self.paths.twitch_delegated_revoke_marker_hw,
         )?;
-        write_secret_value(
-            self.secret_store.as_ref(),
-            TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY,
-            sess.kick_access_token.as_deref(),
-        )?;
-        write_secret_value(
-            self.secret_store.as_ref(),
-            TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY,
-            sess.kick_refresh_token.as_deref(),
-        )?;
-        let bytes = serde_json::to_vec_pretty(&DelegatedSessionMetadataFile::from(sess))?;
-        // Legacy `.bak` removal and atomic commit are one transaction (B5/B10).
-        self.remove_delegated_backup()?;
-        storage::write_authority_bearing_secret(&self.paths.twitch_delegated, &bytes)?;
+        if marker_hw > revoke_marker_hw_fence {
+            anyhow::bail!("newer durable revoke marker high-water during replacement");
+        }
+        let raw = std::fs::read(&self.paths.twitch_delegated)?;
+        let current = parse_committed_identity_from_metadata_bytes(&raw)?
+            .ok_or_else(|| anyhow::anyhow!("replacement metadata missing committed identity"))?;
+        if current != *committed {
+            anyhow::bail!("replacement metadata identity mismatch during marker clear");
+        }
+        let session = storage::committed_delegated_session_parse(&self.paths.twitch_delegated)?
+            .ok_or_else(|| anyhow::anyhow!("replacement metadata missing during marker clear"))?;
+        read_bound_delegated_bundle(self.secret_store.as_ref(), &session)?
+            .ok_or_else(|| anyhow::anyhow!("replacement bundle missing during marker clear"))?;
+        self.durable_fail
+            .fail(&self.durable_fail.tombstone_clear, "tombstone_clear")?;
+        if self.paths.twitch_delegated_revoked.is_file() {
+            storage::remove_file_durable(&self.paths.twitch_delegated_revoked)?;
+        }
+        if self.paths.twitch_delegated_revoke_pending.is_file() {
+            storage::remove_file_durable(&self.paths.twitch_delegated_revoke_pending)?;
+        }
         Ok(())
     }
 
@@ -916,9 +1137,18 @@ impl AppState {
             .any(|p| p.is_file()))
     }
 
+    /// True when secret-store delegated authority (bounded slots or legacy keys) remains.
+    pub fn delegated_secret_store_authority_remain(&self) -> anyhow::Result<bool> {
+        delegated_secret_store_authority_remain(
+            self.secret_store.as_ref(),
+            self.delegated_metadata_revision(),
+        )
+    }
+
     /// True when authority-bearing secrets or a crash-persistent revoke marker remain.
     pub fn delegated_authority_artifacts_remain(&self) -> anyhow::Result<bool> {
         Ok(self.delegated_secret_files_remain()?
+            || self.delegated_secret_store_authority_remain()?
             || self.paths.twitch_delegated_revoke_pending.is_file())
     }
 
@@ -927,55 +1157,98 @@ impl AppState {
         if self.readonly {
             return Ok(());
         }
-        // Crash-safe ordering: pending marker first so restart always fail-closes.
+        with_delegated_authority_lock(&self.paths.twitch_delegated, || {
+            self.publish_durable_revoke_markers_locked()?;
+
+            let (metadata_provenance, metadata_bytes_present) =
+                if self.paths.twitch_delegated.is_file() {
+                    match std::fs::read(&self.paths.twitch_delegated) {
+                        Ok(raw) => (extract_delegated_metadata_provenance(&raw), true),
+                        Err(_) => (DelegatedMetadataProvenance::Unrecoverable, false),
+                    }
+                } else {
+                    (DelegatedMetadataProvenance::Unrecoverable, false)
+                };
+            let known_revision = match metadata_provenance {
+                DelegatedMetadataProvenance::Committed(identity) => {
+                    self.delete_legacy_revision_bundle_checked(identity.secret_revision)?;
+                    Some(identity.secret_revision)
+                }
+                DelegatedMetadataProvenance::RecoverableRevision(revision) => {
+                    self.delete_legacy_revision_bundle_checked(revision)?;
+                    Some(revision)
+                }
+                DelegatedMetadataProvenance::Unrecoverable => None,
+            };
+
+            self.durable_fail
+                .fail(&self.durable_fail.credential_remove, "credential_remove")?;
+            storage::remove_file_durable(&self.paths.twitch_delegated)?;
+            self.remove_delegated_backup()?;
+            for leftover in self.delegated_secret_variants()? {
+                if leftover == self.paths.twitch_delegated
+                    || leftover == self.paths.twitch_delegated.with_extension("bak")
+                    || leftover == self.paths.twitch_delegated.with_extension("json.bak")
+                {
+                    continue;
+                }
+                if leftover.is_file() {
+                    storage::remove_file_durable(&leftover)?;
+                }
+            }
+            delete_all_delegated_bundle_slots(self.secret_store.as_ref())?;
+            delete_legacy_delegated_secret_keys(self.secret_store.as_ref())?;
+            self.durable_fail
+                .fail(&self.durable_fail.parent_sync, "parent_sync")?;
+            storage::sync_parent_dir(&self.paths.twitch_delegated)?;
+
+            if metadata_bytes_present
+                && matches!(
+                    metadata_provenance,
+                    DelegatedMetadataProvenance::Unrecoverable
+                )
+            {
+                anyhow::bail!(
+                    "delegated metadata unparseable during revoke — pending marker retained"
+                );
+            }
+            if self.delegated_secret_files_remain()?
+                || delegated_secret_store_authority_remain(
+                    self.secret_store.as_ref(),
+                    known_revision,
+                )?
+            {
+                anyhow::bail!("delegated authority-bearing artifacts remain after revoke");
+            }
+            self.durable_fail.fail(
+                &self.durable_fail.pending_marker_remove,
+                "pending_marker_remove",
+            )?;
+            storage::remove_file_durable(&self.paths.twitch_delegated_revoke_pending)?;
+            Ok(())
+        })
+    }
+
+    fn publish_durable_revoke_markers_locked(&self) -> anyhow::Result<()> {
         self.durable_fail.fail(
             &self.durable_fail.pending_marker_write,
             "pending_marker_write",
         )?;
-        storage::write_delegated_revoke_pending(&self.paths.twitch_delegated_revoke_pending)?;
+        if !self.paths.twitch_delegated_revoke_pending.is_file() {
+            storage::write_delegated_revoke_pending(
+                &self.paths.twitch_delegated_revoke_marker_hw,
+                &self.paths.twitch_delegated_revoke_pending,
+            )?;
+        }
         self.durable_fail
             .fail(&self.durable_fail.tombstone_write, "tombstone_write")?;
-        storage::write_delegated_revoked_tombstone(&self.paths.twitch_delegated_revoked)?;
-        self.durable_fail
-            .fail(&self.durable_fail.credential_remove, "credential_remove")?;
-        storage::remove_file_durable(&self.paths.twitch_delegated)?;
-        // Backup + temp/revoked/committing leftovers are part of the transaction (B1/B7).
-        self.remove_delegated_backup()?;
-        for leftover in self.delegated_secret_variants()? {
-            if leftover == self.paths.twitch_delegated
-                || leftover == self.paths.twitch_delegated.with_extension("bak")
-                || leftover == self.paths.twitch_delegated.with_extension("json.bak")
-            {
-                continue;
-            }
-            if leftover.is_file() {
-                storage::remove_file_durable(&leftover)?;
-            }
+        if !self.paths.twitch_delegated_revoked.is_file() {
+            storage::write_delegated_revoked_tombstone(&self.paths.twitch_delegated_revoked)?;
         }
-        self.secret_store.delete(TWITCH_DELEGATED_CONNECTION_KEY)?;
-        self.secret_store
-            .delete(TWITCH_DELEGATED_ACCESS_TOKEN_KEY)?;
-        self.secret_store
-            .delete(TWITCH_DELEGATED_KICK_ACCESS_TOKEN_KEY)?;
-        self.secret_store
-            .delete(TWITCH_DELEGATED_KICK_REFRESH_TOKEN_KEY)?;
-        self.durable_fail
-            .fail(&self.durable_fail.parent_sync, "parent_sync")?;
-        storage::sync_parent_dir(&self.paths.twitch_delegated)?;
-        // Pending marker clears only when all inventoried authority-bearing files are gone.
-        if self.delegated_secret_files_remain()? {
-            anyhow::bail!("delegated authority-bearing artifacts remain after revoke");
-        }
-        self.durable_fail.fail(
-            &self.durable_fail.pending_marker_remove,
-            "pending_marker_remove",
-        )?;
-        storage::remove_file_durable(&self.paths.twitch_delegated_revoke_pending)?;
         Ok(())
     }
 
-    /// Mark that durable revoke must complete across restarts (best-effort independent path).
-    pub fn mark_durable_revoke_pending(&self) -> anyhow::Result<()> {
+    fn mark_durable_revoke_pending_locked(&self) -> anyhow::Result<()> {
         if self.readonly {
             return Ok(());
         }
@@ -983,7 +1256,31 @@ impl AppState {
             &self.durable_fail.pending_marker_write,
             "pending_marker_write",
         )?;
-        storage::write_delegated_revoke_pending(&self.paths.twitch_delegated_revoke_pending)
+        if self.paths.twitch_delegated_revoke_pending.is_file() {
+            return Ok(());
+        }
+        storage::write_delegated_revoke_pending(
+            &self.paths.twitch_delegated_revoke_marker_hw,
+            &self.paths.twitch_delegated_revoke_pending,
+        )
+    }
+
+    /// Mark that durable revoke must complete across restarts (authority-locked publication).
+    pub fn mark_durable_revoke_pending(&self) -> anyhow::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
+        with_delegated_authority_lock(&self.paths.twitch_delegated, || {
+            self.mark_durable_revoke_pending_locked()
+        })
+    }
+
+    fn delete_legacy_revision_bundle_checked(&self, revision: u64) -> anyhow::Result<()> {
+        self.durable_fail.fail(
+            &self.durable_fail.legacy_revision_remove,
+            "legacy_revision_remove",
+        )?;
+        delete_legacy_revision_bundle(self.secret_store.as_ref(), revision)
     }
 
     pub fn durable_revoke_pending(&self) -> bool {

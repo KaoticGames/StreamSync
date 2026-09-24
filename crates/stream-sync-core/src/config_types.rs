@@ -582,8 +582,16 @@ pub struct DelegatedSessionFile {
     /// Monotonic session generation — stale workers must not mutate a newer session.
     #[serde(default)]
     pub generation: u64,
+    /// Revision of the bound external secret bundle (independent of generation for refresh).
+    #[serde(default)]
+    pub secret_revision: u64,
+    /// Fixed journal slot (0 or 1) holding the bound secret bundle.
+    #[serde(default)]
+    pub bundle_slot: u8,
+    #[serde(default)]
     pub connection_key: String,
     pub client_id: String,
+    #[serde(default)]
     pub access_token: String,
     pub channel_login: String,
     pub channel_twitch_id: String,
