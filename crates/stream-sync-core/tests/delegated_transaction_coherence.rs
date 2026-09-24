@@ -20,6 +20,12 @@ static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 static AUTHORITY_GATE_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
+fn lock_authority_gate_tests() -> std::sync::MutexGuard<'static, ()> {
+    AUTHORITY_GATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn test_userdata_dir() -> std::path::PathBuf {
     let n = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
@@ -584,7 +590,7 @@ fn write_legacy_revision_bundle(
 
 #[tokio::test]
 async fn concurrent_rollback_refuses_when_newer_persist_wins() {
-    let _gate_lock = AUTHORITY_GATE_TEST_LOCK.lock().unwrap();
+    let _gate_lock = lock_authority_gate_tests();
     let userdata = test_userdata_dir();
     let config = OverlayConfig {
         port: 0,
@@ -633,7 +639,7 @@ async fn concurrent_rollback_refuses_when_newer_persist_wins() {
 
 #[tokio::test]
 async fn concurrent_rollback_refuses_when_revoke_wins() {
-    let _gate_lock = AUTHORITY_GATE_TEST_LOCK.lock().unwrap();
+    let _gate_lock = lock_authority_gate_tests();
     let userdata = test_userdata_dir();
     let config = OverlayConfig {
         port: 0,
@@ -714,7 +720,7 @@ async fn replacement_persist_clears_revoke_markers_atomically() {
 async fn concurrent_apply_vs_revoke_marker_race_keeps_revoke_signal() {
     use std::sync::mpsc;
 
-    let _gate_lock = AUTHORITY_GATE_TEST_LOCK.lock().unwrap();
+    let _gate_lock = lock_authority_gate_tests();
     let userdata = test_userdata_dir();
     let config = OverlayConfig {
         port: 0,
@@ -742,9 +748,11 @@ async fn concurrent_apply_vs_revoke_marker_race_keeps_revoke_signal() {
         .recv_timeout(Duration::from_secs(10))
         .expect("apply must reach marker-clear gate");
 
+    let (revoke_started_tx, revoke_started_rx) = mpsc::channel();
     let (revoke_done_tx, revoke_done_rx) = mpsc::channel();
     let state_revoke = state.clone();
     let revoke_thread = std::thread::spawn(move || {
+        let _ = revoke_started_tx.send(());
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -754,14 +762,12 @@ async fn concurrent_apply_vs_revoke_marker_race_keeps_revoke_signal() {
         });
         let _ = revoke_done_tx.send(());
     });
-    std::thread::sleep(Duration::from_millis(100));
+    revoke_started_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("revoke thread must reach durable revoke entry");
     assert!(
         revoke_done_rx.try_recv().is_err(),
         "revoke must block on authority lock while apply holds marker-clear transaction"
-    );
-    assert!(
-        state.paths.twitch_delegated_revoked.is_file(),
-        "tombstone must remain until replacement clears markers atomically"
     );
 
     resume_tx.send(()).expect("release apply");
@@ -769,15 +775,34 @@ async fn concurrent_apply_vs_revoke_marker_race_keeps_revoke_signal() {
         .join()
         .expect("apply join")
         .expect("replacement apply");
-    assert!(
-        !state.paths.twitch_delegated_revoked.is_file(),
-        "replacement must clear tombstone atomically before releasing authority lock"
-    );
-    let restarted = restart_app_at(&userdata, false);
-    assert_metadata_bundle_coherent(&userdata, &restarted).await;
 
-    let _ = revoke_done_rx.recv_timeout(Duration::from_secs(10));
+    revoke_done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("concurrent revoke must complete after replacement releases authority lock");
     let _ = revoke_thread.join();
+
+    assert!(
+        state.delegated.read().await.is_none(),
+        "terminal state must be revoked with no in-memory delegated session"
+    );
+    assert!(
+        !state.paths.twitch_delegated.is_file(),
+        "successful durable revoke must remove delegated metadata"
+    );
+    assert!(
+        state.paths.twitch_delegated_revoked.is_file(),
+        "revoke signal must survive replacement marker-clear race"
+    );
+    assert!(!state.paths.twitch_delegated_revoke_pending.is_file());
+    assert!(!state.delegated_secret_store_authority_remain().unwrap());
+    assert!(!state.delegated_authority_artifacts_remain().unwrap());
+
+    let restarted = restart_app_at(&userdata, false);
+    assert!(restarted.delegated.read().await.is_none());
+    assert!(!restarted.paths.twitch_delegated.is_file());
+    assert!(restarted.paths.twitch_delegated_revoked.is_file());
+    assert!(!restarted.delegated_secret_store_authority_remain().unwrap());
+
     let _ = std::fs::remove_dir_all(&userdata);
 }
 
@@ -922,7 +947,7 @@ fn same_transaction_id_non_identical_secrets_rejects_without_mutation() {
 
 #[tokio::test]
 async fn rollback_refuses_after_failed_revoke_preserves_marker_epoch() {
-    let _gate_lock = AUTHORITY_GATE_TEST_LOCK.lock().unwrap();
+    let _gate_lock = lock_authority_gate_tests();
     let userdata = test_userdata_dir();
     let config = OverlayConfig {
         port: 0,
@@ -973,7 +998,7 @@ async fn rollback_refuses_after_failed_revoke_preserves_marker_epoch() {
 async fn scheduled_revoke_pending_survives_replacement_marker_clear_race() {
     use std::sync::mpsc;
 
-    let _gate_lock = AUTHORITY_GATE_TEST_LOCK.lock().unwrap();
+    let _gate_lock = lock_authority_gate_tests();
     let userdata = test_userdata_dir();
     let config = OverlayConfig {
         port: 0,
@@ -1180,7 +1205,7 @@ fn read_pending_marker_epoch(pending_path: &std::path::Path) -> u64 {
 
 #[tokio::test]
 async fn rollback_refuses_when_revoke_marker_epoch_reused_after_replacement() {
-    let _gate_lock = AUTHORITY_GATE_TEST_LOCK.lock().unwrap();
+    let _gate_lock = lock_authority_gate_tests();
     let userdata = test_userdata_dir();
     let config = OverlayConfig {
         port: 0,
@@ -1239,7 +1264,7 @@ async fn rollback_refuses_when_revoke_marker_epoch_reused_after_replacement() {
 
 #[tokio::test]
 async fn two_revoke_cycles_separated_by_replacement_use_increasing_epochs() {
-    let _gate_lock = AUTHORITY_GATE_TEST_LOCK.lock().unwrap();
+    let _gate_lock = lock_authority_gate_tests();
     let userdata = test_userdata_dir();
     let config = OverlayConfig {
         port: 0,
