@@ -5,8 +5,34 @@ use sha2::{Digest, Sha256};
 
 const LOCK_DIR: &str = ".streamsync-control";
 const LOCKS_SEGMENT: &str = "locks";
+const LEDGERS_SEGMENT: &str = "ledgers";
+const CHECKPOINTS_SEGMENT: &str = "checkpoints";
 const STAGE_PREFIX: &str = ".streamsync-stage-";
 const STAGE_HEX_LEN: usize = 32;
+
+/// Opaque directory name for ledger/checkpoint generations (hash of canonical delivery id).
+pub fn delivery_opaque_dir_id(canonical_delivery_id: &str) -> String {
+    let digest = Sha256::digest(canonical_delivery_id.as_bytes());
+    format!("{:x}", digest)
+}
+
+/// Relative components from `DEST_ROOT` to ledger generation directory for a delivery.
+pub fn ledger_dir_relative_components(opaque_delivery_id: &str) -> [String; 3] {
+    [
+        LOCK_DIR.to_string(),
+        LEDGERS_SEGMENT.to_string(),
+        opaque_delivery_id.to_string(),
+    ]
+}
+
+/// Relative components from `DEST_ROOT` to checkpoint generation directory for a delivery.
+pub fn checkpoint_dir_relative_components(opaque_delivery_id: &str) -> [String; 3] {
+    [
+        LOCK_DIR.to_string(),
+        CHECKPOINTS_SEGMENT.to_string(),
+        opaque_delivery_id.to_string(),
+    ]
+}
 
 /// SHA-256 hex digest of the full canonical delivery id (lock filename suffix).
 pub fn stable_lock_file_basename(canonical_delivery_id: &str) -> String {
