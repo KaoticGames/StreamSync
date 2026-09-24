@@ -2972,6 +2972,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "phase0c-windows-api-check"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "phf"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4174,6 +4181,7 @@ dependencies = [
  "dotenvy",
  "fs2",
  "futures-util",
+ "libc",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
