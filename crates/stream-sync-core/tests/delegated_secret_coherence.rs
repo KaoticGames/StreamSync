@@ -1,5 +1,7 @@
 //! Delegated secret representation coherence — revision-bound bundles and fail-closed load.
 
+#![allow(clippy::too_many_arguments)]
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use stream_sync_core::{

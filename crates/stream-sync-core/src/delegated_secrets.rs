@@ -524,10 +524,7 @@ pub fn capture_delegated_bundle_slots(
     let mut out = [None, None];
     for slot in 0..DELEGATED_BUNDLE_SLOT_COUNT {
         let key = delegated_bundle_slot_key(slot);
-        out[slot as usize] = match store.get(&key)? {
-            Some(bytes) => Some(bytes),
-            None => None,
-        };
+        out[slot as usize] = store.get(&key)?;
     }
     Ok(out)
 }

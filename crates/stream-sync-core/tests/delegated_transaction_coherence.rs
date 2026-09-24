@@ -1,5 +1,7 @@
 //! Bounded two-slot journal: concurrency, rollback, readonly, revoke, and Kick coherence.
 
+#![allow(clippy::too_many_arguments, clippy::await_holding_lock)]
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
