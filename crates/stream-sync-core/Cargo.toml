@@ -39,7 +39,7 @@ libc = "0.2"
 rustix = { version = "0.38", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
-phase0c-windows-api-check = { path = "../phase0c-windows-api-check" }
+stream-sync-windows-fs = { path = "../stream-sync-windows-fs" }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security_Credentials",

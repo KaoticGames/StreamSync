@@ -1,4 +1,11 @@
-//! Directory handles (capability-style); no ambient paths after acquisition.
+//! Directory handles for voice delivery publication geometry.
+//!
+//! **Unix:** descriptor-relative `openat`/`mkdirat` after `DestRoot` bootstrap — no ambient path strings on handles.
+//!
+//! **Windows:** holds a directory `HANDLE` plus a validated absolute path used for single-component
+//! `CreateFileW` / `CreateDirectoryW` walks with reparse rejection (accidental/stale-state safety).
+//! This is not Linux `openat` capability semantics and does not defend against malicious same-user
+//! replacement or races on ancestor directories.
 
 use super::error::FsError;
 use super::unix;
@@ -9,6 +16,9 @@ use rustix::fd::AsFd;
 use std::path::Path;
 
 /// Owned directory handle — root or descendant of an opened `DestRoot`.
+///
+/// On Unix, operations are relative to the held directory file descriptor. On Windows, child operations
+/// use the stored validated absolute path and directory handle together (see module docs).
 pub struct DirHandle {
     inner: DirHandleInner,
 }
@@ -90,6 +100,22 @@ impl DirHandle {
         }
     }
 
+    /// Idempotent control-directory segment: create if missing, or open and revalidate if a peer won the race.
+    pub(crate) fn create_or_open_child_dir(&self, name: &str) -> Result<DirHandle, FsError> {
+        super::validate_single_component(name)?;
+        match self.open_child_dir(name) {
+            Ok(handle) => Ok(handle),
+            Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                match self.create_child_dir(name) {
+                    Ok(()) => self.open_child_dir(name),
+                    Err(FsError::AlreadyExists) => self.open_child_dir(name),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     pub(crate) fn clone_handle(&self) -> Result<DirHandle, FsError> {
         #[cfg(unix)]
         {
@@ -107,6 +133,8 @@ impl DirHandle {
 }
 
 /// Configured publication root opened without following symlinks/reparse points.
+///
+/// On Windows, `open` rejects UNC paths, mapped/network drives, and non-NTFS volumes (local fixed NTFS only).
 pub struct DestRoot {
     handle: DirHandle,
 }

@@ -110,8 +110,7 @@ pub(crate) fn open_lock_file(
         match dir.open_child_dir(comp) {
             Ok(next) => dir = next,
             Err(FsError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
-                dir.create_child_dir(comp)?;
-                dir = dir.open_child_dir(comp)?;
+                dir = dir.create_or_open_child_dir(comp)?;
             }
             Err(e) => return Err(e),
         }

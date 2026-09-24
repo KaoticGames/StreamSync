@@ -1,15 +1,20 @@
-//! Windows directory capability backend (absolute path walk + `FileRenameInfo`).
+//! Windows directory backend: validated absolute-path walks, reparse rejection, and `FileRenameInfo`.
+//!
+//! Same-parent rename uses cooperative geometry: source path is derived from the stored final-parent
+//! absolute path, source is opened with reparse inspection, and `SetFileInformationByHandle` supplies
+//! the held final-parent handle as `RootDirectory`. This does not bind against hostile ancestor replacement.
 
 use super::dir::DirHandle;
 use super::error::FsError;
-use phase0c_windows_api_check::rename_buffer::{
-    build_no_replace_rename_buffer, built_rename_info_view, RenameBufferError,
-};
 use std::ffi::c_void;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
+use stream_sync_windows_fs::rename_buffer::{
+    build_no_replace_rename_buffer, built_rename_info_view, RenameBufferError,
+};
+use stream_sync_windows_fs::storage_qualify::StorageQualifyError;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, DUPLICATE_SAME_ACCESS, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS,
     HANDLE, INVALID_HANDLE_VALUE,
@@ -27,6 +32,10 @@ fn map_rename_buffer_err(e: RenameBufferError) -> FsError {
             FsError::InvalidComponent("rename name too long".into())
         }
     }
+}
+
+fn map_storage_qualify_err(e: StorageQualifyError) -> FsError {
+    FsError::UnsupportedStorage(e.to_string())
 }
 
 pub(crate) struct OwnedDirHandle {
@@ -197,6 +206,8 @@ fn is_reparse_point(handle: HANDLE) -> Result<bool, FsError> {
 
 pub(crate) fn open_root_dir(path: &Path) -> Result<OwnedDirHandle, FsError> {
     let abs = validated_absolute_path(path)?;
+    stream_sync_windows_fs::storage_qualify::qualify_local_ntfs_dest_root(&abs)
+        .map_err(map_storage_qualify_err)?;
     let opened = open_directory_at_path(&abs)?;
     opened.ensure_not_reparse_root()?;
     Ok(opened.into_dir_handle(abs))
@@ -305,8 +316,7 @@ pub(crate) fn open_lock_file(
         match dir.open_child_dir(comp) {
             Ok(next) => dir = next,
             Err(FsError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
-                dir.create_child_dir(comp)?;
-                dir = dir.open_child_dir(comp)?;
+                dir = dir.create_or_open_child_dir(comp)?;
             }
             Err(e) => return Err(e),
         }
@@ -317,7 +327,7 @@ pub(crate) fn open_lock_file(
 #[cfg(test)]
 mod file_rename_buffer_tests {
     use super::*;
-    use phase0c_windows_api_check::rename_buffer::file_rename_info_buffer_size;
+    use stream_sync_windows_fs::rename_buffer::file_rename_info_buffer_size;
 
     #[test]
     fn multi_char_rename_buffer_matches_shared_helper() {
@@ -328,13 +338,34 @@ mod file_rename_buffer_tests {
         let (_, size_u32, name_bytes) =
             file_rename_info_buffer_size(wide.len()).expect("size helper");
         assert_eq!(built.size_u32, size_u32);
+        assert_eq!(
+            built.as_file_rename_info() as usize % std::mem::align_of::<FILE_RENAME_INFO>(),
+            0
+        );
 
-        let info = built.buffer.as_ptr() as *const FILE_RENAME_INFO;
+        let info = built.as_file_rename_info();
         assert_eq!(unsafe { (*info).FileNameLength }, name_bytes);
         let name_ptr = unsafe { (*info).FileName.as_ptr() };
         let read_back: Vec<u16> =
             unsafe { std::slice::from_raw_parts(name_ptr, wide.len()) }.to_vec();
         assert_eq!(read_back, wide);
         assert_eq!(unsafe { *name_ptr.add(wide.len()) }, 0);
+    }
+}
+
+#[cfg(test)]
+mod dest_root_storage_qualify {
+    use super::*;
+    use crate::voice_delivery::fs::DestRoot;
+    use stream_sync_windows_fs::storage_qualify::reject_lexical_unc;
+
+    #[test]
+    fn unc_lexical_fixture_rejected_at_open() {
+        let err = DestRoot::open(std::path::Path::new(r"\\server\share\root"));
+        assert!(
+            matches!(err, Err(FsError::UnsupportedStorage(_))),
+            "expected unsupported storage, got {err:?}"
+        );
+        assert!(reject_lexical_unc(std::path::Path::new(r"\\server\share\root")).is_err());
     }
 }

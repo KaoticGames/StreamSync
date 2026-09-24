@@ -1,8 +1,10 @@
-//! Isolated stable Windows API signature check for Phase 0C delivery primitives.
-//! Compiles without the full `stream-sync-core` dependency graph (no `ring` / MSVC linker).
+//! Narrow Win32 filesystem helpers shared by `stream-sync-core` voice delivery (Windows cfg only).
 
 #[cfg(windows)]
 pub mod rename_buffer;
+
+#[cfg(windows)]
+pub mod storage_qualify;
 
 #[cfg(windows)]
 mod win {
@@ -75,5 +77,5 @@ pub use win::{
 
 #[cfg(not(windows))]
 pub fn non_windows_build_placeholder() {
-    // Full `stream-sync-core` Windows backend is cfg-gated; Linux CI validates this crate only.
+    // Windows backend is cfg-gated; Linux CI compile-checks this crate for MSVC target.
 }

@@ -21,6 +21,8 @@ pub enum FsError {
     InvalidFinalName(String),
     #[error("invalid stage basename")]
     InvalidStageBasename,
+    #[error("unsupported destination storage: {0}")]
+    UnsupportedStorage(String),
     #[error(transparent)]
     Io(#[from] io::Error),
 }

@@ -23,6 +23,7 @@ jobs:
 
       - name: voice_delivery Windows runtime tests
         run: |
+          cargo test -p stream-sync-windows-fs
           cargo test -p stream-sync-core 'voice_delivery::fs::' -- --nocapture
           cargo test -p stream-sync-core 'voice_delivery::lock::' -- --nocapture --test-threads=1
           cargo test -p stream-sync-core 'voice_delivery::ids::' -- --nocapture

@@ -34,7 +34,7 @@
 | **fmt** | `cargo fmt --all -- --check` | **pass** |
 | **compile (Linux)** | `cargo check -p stream-sync-core` | **pass** |
 | **whitespace** | `git diff --check` | **pass** |
-| **Windows API (isolated)** | `cargo check -p phase0c-windows-api-check --target x86_64-pc-windows-msvc` | **pass** (no `ring` / no full crate link) |
+| **Windows API (isolated)** | `cargo check -p stream-sync-windows-fs --target x86_64-pc-windows-msvc` | **pass** (no `ring` / no full crate link) |
 | **Windows full crate** | `cargo check -p stream-sync-core --target x86_64-pc-windows-msvc` | **blocked on this host** — `ring` build requires MSVC `lib.exe` (not installed) |
 
 ### Focused test inventory (added/changed)

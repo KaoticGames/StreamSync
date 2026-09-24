@@ -239,3 +239,175 @@ mod stable_delivery_lock_cross_process {
         // Two cooperative domains possible after malicious unlink — not defended in Phase 0C.
     }
 }
+
+#[cfg(test)]
+mod first_use_control_dir_cross_process_race {
+    use super::*;
+    use crate::voice_delivery::subprocess_env::{
+        LOCK_RACE_CHILD, LOCK_RACE_GO, LOCK_RACE_OUTCOME_DIR, LOCK_RACE_READY_DIR,
+    };
+    use std::fs;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn wait_for_file(path: &std::path::Path, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if path.is_file() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("timed out waiting for {}", path.display());
+    }
+
+    struct RaceChildEnv<'a> {
+        exe: &'a std::path::Path,
+        test_name: &'a str,
+        tmp: &'a std::path::Path,
+        ready_dir: &'a std::path::Path,
+        go: &'a std::path::Path,
+        outcome_dir: &'a std::path::Path,
+        slot: &'a str,
+        delivery_id: &'a str,
+    }
+
+    fn run_race_child(cfg: RaceChildEnv<'_>) -> std::process::Child {
+        Command::new(cfg.exe)
+            .args([
+                "--exact",
+                cfg.test_name,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(LOCK_RACE_CHILD, "1")
+            .env(LOCK_RACE_READY_DIR, cfg.ready_dir)
+            .env(LOCK_RACE_GO, cfg.go)
+            .env(LOCK_RACE_OUTCOME_DIR, cfg.outcome_dir)
+            .env("STREAMSYNC_VOICE_LOCK_RACE_SLOT", cfg.slot)
+            .env("STREAMSYNC_VOICE_LOCK_TMP", cfg.tmp)
+            .env("STREAMSYNC_VOICE_LOCK_ID", cfg.delivery_id)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn race child")
+    }
+
+    fn read_outcome(outcome_dir: &std::path::Path, slot: &str) -> String {
+        let path = outcome_dir.join(format!("outcome-{slot}"));
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    fn race_child_entrypoint() -> bool {
+        if std::env::var(LOCK_RACE_CHILD).ok().as_deref() != Some("1") {
+            return false;
+        }
+        let slot = std::env::var("STREAMSYNC_VOICE_LOCK_RACE_SLOT").expect("slot");
+        let ready_dir =
+            std::path::PathBuf::from(std::env::var(LOCK_RACE_READY_DIR).expect("ready dir"));
+        let go = std::path::PathBuf::from(std::env::var(LOCK_RACE_GO).expect("go"));
+        let outcome_dir =
+            std::path::PathBuf::from(std::env::var(LOCK_RACE_OUTCOME_DIR).expect("outcome dir"));
+        let tmp = std::env::var("STREAMSYNC_VOICE_LOCK_TMP").expect("tmp");
+        let id = std::env::var("STREAMSYNC_VOICE_LOCK_ID").expect("id");
+        fs::write(ready_dir.join(format!("ready-{slot}")), b"1").expect("ready");
+        wait_for_file(&go, Duration::from_secs(30));
+        let root = DestRoot::open(std::path::Path::new(&tmp)).expect("dest root");
+        let label = match acquire_delivery_domain_lock(&root, &id, true) {
+            Ok(_) => "ok",
+            Err(LockError::Busy) => "busy",
+            Err(LockError::Fs(e)) => panic!("unexpected fs error during race: {e}"),
+            Err(LockError::Io(e)) => panic!("unexpected io error during race: {e}"),
+        };
+        fs::write(outcome_dir.join(format!("outcome-{slot}")), label).expect("outcome");
+        true
+    }
+
+    #[test]
+    fn same_delivery_one_wins_one_busy_no_control_dir_error() {
+        if race_child_entrypoint() {
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ready_dir = tmp.path().join("ready");
+        let outcome_dir = tmp.path().join("outcomes");
+        let go = tmp.path().join("go.signal");
+        fs::create_dir_all(&ready_dir).expect("ready dir");
+        fs::create_dir_all(&outcome_dir).expect("outcome dir");
+        let exe = std::env::current_exe().expect("exe");
+        let test_name = "voice_delivery::lock::first_use_control_dir_cross_process_race::same_delivery_one_wins_one_busy_no_control_dir_error";
+        let id = "delivery:first-use-race:same";
+        let mut a = run_race_child(RaceChildEnv {
+            exe: &exe,
+            test_name,
+            tmp: tmp.path(),
+            ready_dir: &ready_dir,
+            go: &go,
+            outcome_dir: &outcome_dir,
+            slot: "a",
+            delivery_id: id,
+        });
+        let mut b = run_race_child(RaceChildEnv {
+            exe: &exe,
+            test_name,
+            tmp: tmp.path(),
+            ready_dir: &ready_dir,
+            go: &go,
+            outcome_dir: &outcome_dir,
+            slot: "b",
+            delivery_id: id,
+        });
+        wait_for_file(&ready_dir.join("ready-a"), Duration::from_secs(15));
+        wait_for_file(&ready_dir.join("ready-b"), Duration::from_secs(15));
+        fs::write(&go, b"go\n").expect("release barrier");
+        let _ = a.wait().expect("child a");
+        let _ = b.wait().expect("child b");
+        let oa = read_outcome(&outcome_dir, "a");
+        let ob = read_outcome(&outcome_dir, "b");
+        let outcomes = [oa.as_str(), ob.as_str()];
+        assert_eq!(outcomes.iter().filter(|&&s| s == "ok").count(), 1);
+        assert_eq!(outcomes.iter().filter(|&&s| s == "busy").count(), 1);
+    }
+
+    #[test]
+    fn different_deliveries_both_acquire_through_raced_ancestor() {
+        if race_child_entrypoint() {
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ready_dir = tmp.path().join("ready");
+        let outcome_dir = tmp.path().join("outcomes");
+        let go = tmp.path().join("go.signal");
+        fs::create_dir_all(&ready_dir).expect("ready dir");
+        fs::create_dir_all(&outcome_dir).expect("outcome dir");
+        let exe = std::env::current_exe().expect("exe");
+        let test_name = "voice_delivery::lock::first_use_control_dir_cross_process_race::different_deliveries_both_acquire_through_raced_ancestor";
+        let mut a = run_race_child(RaceChildEnv {
+            exe: &exe,
+            test_name,
+            tmp: tmp.path(),
+            ready_dir: &ready_dir,
+            go: &go,
+            outcome_dir: &outcome_dir,
+            slot: "a",
+            delivery_id: "delivery:first-use-race:alpha",
+        });
+        let mut b = run_race_child(RaceChildEnv {
+            exe: &exe,
+            test_name,
+            tmp: tmp.path(),
+            ready_dir: &ready_dir,
+            go: &go,
+            outcome_dir: &outcome_dir,
+            slot: "b",
+            delivery_id: "delivery:first-use-race:beta",
+        });
+        wait_for_file(&ready_dir.join("ready-a"), Duration::from_secs(15));
+        wait_for_file(&ready_dir.join("ready-b"), Duration::from_secs(15));
+        fs::write(&go, b"go\n").expect("release barrier");
+        let _ = a.wait().expect("child a");
+        let _ = b.wait().expect("child b");
+        assert_eq!(read_outcome(&outcome_dir, "a"), "ok");
+        assert_eq!(read_outcome(&outcome_dir, "b"), "ok");
+    }
+}
