@@ -4201,6 +4201,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "libc",
+ "phase0c-windows-api-check",
  "reqwest 0.12.28",
  "rustix 0.38.44",
  "serde",

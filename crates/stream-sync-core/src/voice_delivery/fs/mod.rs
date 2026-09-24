@@ -212,6 +212,73 @@ mod dest_capability_reparse {
         let err = root.open_dir_relative(&[".."]);
         assert!(matches!(err, Err(FsError::InvalidComponent(_))));
     }
+
+    #[cfg(windows)]
+    fn try_directory_junction(
+        link: &std::path::Path,
+        target: &std::path::Path,
+    ) -> Result<(), String> {
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let link_s = link.to_string_lossy();
+        let target_s = target.to_string_lossy();
+        let output = Command::new("cmd")
+            .args(["/C", "mklink", "/J", &link_s, &target_s])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("spawn mklink: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Err(format!(
+                "mklink /J failed (status {:?}): {}{}",
+                output.status.code(),
+                stdout,
+                stderr
+            ))
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn junction_dest_root_rejected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().join("real-root");
+        fs::create_dir(&real).expect("real");
+        let link = tmp.path().join("link-root");
+        match try_directory_junction(&link, &real) {
+            Ok(()) => {
+                let err = DestRoot::open(&link);
+                assert!(matches!(err, Err(FsError::SymlinkOrReparseRoot)));
+            }
+            Err(reason) => {
+                eprintln!("SKIP junction_dest_root_rejected: {reason}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn junction_final_parent_component_rejected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = DestRoot::open(tmp.path()).expect("root");
+        let real = tmp.path().join("real-parent");
+        fs::create_dir(&real).expect("real");
+        let link_name = "link-parent";
+        let link = tmp.path().join(link_name);
+        match try_directory_junction(&link, &real) {
+            Ok(()) => {
+                let err = root.open_dir_relative(&[link_name]);
+                assert!(matches!(err, Err(FsError::SymlinkOrReparseComponent(_))));
+            }
+            Err(reason) => {
+                eprintln!("SKIP junction_final_parent_component_rejected: {reason}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -2,22 +2,32 @@
 
 use super::dir::DirHandle;
 use super::error::FsError;
+use phase0c_windows_api_check::rename_buffer::{
+    build_no_replace_rename_buffer, built_rename_info_view, RenameBufferError,
+};
 use std::ffi::c_void;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{FromRawHandle, IntoRawHandle};
+use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, DUPLICATE_SAME_ACCESS, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS,
     HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, FileRenameInfo, GetFileInformationByHandleEx,
-    SetFileInformationByHandle, DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_RENAME_INFO,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, OPEN_ALWAYS,
-    OPEN_EXISTING,
+    CreateDirectoryW, CreateFileW, GetFileInformationByHandleEx, SetFileInformationByHandle,
+    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, OPEN_ALWAYS, OPEN_EXISTING,
 };
+
+fn map_rename_buffer_err(e: RenameBufferError) -> FsError {
+    match e {
+        RenameBufferError::NameTooLong | RenameBufferError::SizeOverflow => {
+            FsError::InvalidComponent("rename name too long".into())
+        }
+    }
+}
 
 pub(crate) struct OwnedDirHandle {
     handle: HANDLE,
@@ -69,12 +79,70 @@ impl Drop for OwnedDirHandle {
     }
 }
 
+/// Closes the Win32 handle on drop unless consumed via `into_std_file`.
+struct OwnedWinHandle(HANDLE);
+
+impl OwnedWinHandle {
+    fn from_create_result(handle: HANDLE) -> Result<Self, FsError> {
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(FsError::Io(io::Error::from_raw_os_error(
+                unsafe { GetLastError() } as i32,
+            )));
+        }
+        Ok(Self(handle))
+    }
+
+    fn raw(&self) -> HANDLE {
+        self.0
+    }
+
+    fn ensure_not_reparse_root(&self) -> Result<(), FsError> {
+        if is_reparse_point(self.raw())? {
+            return Err(FsError::SymlinkOrReparseRoot);
+        }
+        Ok(())
+    }
+
+    fn ensure_not_reparse_component(&self, name: &str) -> Result<(), FsError> {
+        if is_reparse_point(self.raw())? {
+            return Err(FsError::SymlinkOrReparseComponent(name.to_string()));
+        }
+        Ok(())
+    }
+
+    fn into_std_file(self) -> std::fs::File {
+        let handle = self.0;
+        std::mem::forget(self);
+        unsafe { std::fs::File::from_raw_handle(handle as _) }
+    }
+
+    fn into_dir_handle(self, absolute_path: PathBuf) -> OwnedDirHandle {
+        let handle = self.0;
+        std::mem::forget(self);
+        OwnedDirHandle {
+            handle,
+            absolute_path,
+        }
+    }
+}
+
+impl Drop for OwnedWinHandle {
+    fn drop(&mut self) {
+        if self.0 != INVALID_HANDLE_VALUE && self.0 != 0 as HANDLE {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
 fn wide_path(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
+/// Lexical absolute path without dereferencing filesystem links (unlike `canonicalize`).
 fn validated_absolute_path(path: &Path) -> Result<PathBuf, FsError> {
-    let abs = std::fs::canonicalize(path).map_err(FsError::Io)?;
+    let abs = std::path::absolute(path).map_err(FsError::Io)?;
     if !abs.is_absolute() {
         return Err(FsError::InvalidComponent("path not absolute".into()));
     }
@@ -89,7 +157,7 @@ fn map_exists_win32(err: u32) -> Option<FsError> {
     }
 }
 
-fn open_directory_at_path(path: &Path) -> Result<HANDLE, FsError> {
+fn open_directory_at_path(path: &Path) -> Result<OwnedWinHandle, FsError> {
     let wide = wide_path(path);
     let handle = unsafe {
         CreateFileW(
@@ -102,12 +170,7 @@ fn open_directory_at_path(path: &Path) -> Result<HANDLE, FsError> {
             std::ptr::null_mut(),
         )
     };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(FsError::Io(io::Error::from_raw_os_error(
-            unsafe { GetLastError() } as i32,
-        )));
-    }
-    Ok(handle)
+    OwnedWinHandle::from_create_result(handle)
 }
 
 fn is_reparse_point(handle: HANDLE) -> Result<bool, FsError> {
@@ -132,51 +195,19 @@ fn is_reparse_point(handle: HANDLE) -> Result<bool, FsError> {
     Ok((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
 }
 
-fn file_rename_info_buffer_size(wchar_len: usize) -> Result<(usize, u32), FsError> {
-    let name_bytes = wchar_len
-        .checked_mul(2)
-        .ok_or_else(|| FsError::InvalidComponent("rename name too long".into()))?;
-    let with_nul = name_bytes
-        .checked_add(2)
-        .ok_or_else(|| FsError::InvalidComponent("rename name too long".into()))?;
-    let base = std::mem::size_of::<FILE_RENAME_INFO>() - std::mem::size_of::<u16>();
-    let total = base
-        .checked_add(with_nul)
-        .ok_or_else(|| FsError::InvalidComponent("rename name too long".into()))?;
-    let total_u32 = u32::try_from(total)
-        .map_err(|_| FsError::InvalidComponent("rename buffer size overflow".into()))?;
-    Ok((total, total_u32))
-}
-
 pub(crate) fn open_root_dir(path: &Path) -> Result<OwnedDirHandle, FsError> {
     let abs = validated_absolute_path(path)?;
-    let handle = open_directory_at_path(&abs)?;
-    if is_reparse_point(handle)? {
-        unsafe {
-            CloseHandle(handle);
-        }
-        return Err(FsError::SymlinkOrReparseRoot);
-    }
-    Ok(OwnedDirHandle {
-        handle,
-        absolute_path: abs,
-    })
+    let opened = open_directory_at_path(&abs)?;
+    opened.ensure_not_reparse_root()?;
+    Ok(opened.into_dir_handle(abs))
 }
 
 pub(crate) fn open_dir_at(parent: &DirHandle, name: &str) -> Result<DirHandle, FsError> {
     let parent_path = parent.windows_handle().absolute_path();
     let child_path = parent_path.join(name);
-    let handle = open_directory_at_path(&child_path)?;
-    if is_reparse_point(handle)? {
-        unsafe {
-            CloseHandle(handle);
-        }
-        return Err(FsError::SymlinkOrReparseComponent(name.to_string()));
-    }
-    Ok(DirHandle::from_windows(OwnedDirHandle {
-        handle,
-        absolute_path: child_path,
-    }))
+    let opened = open_directory_at_path(&child_path)?;
+    opened.ensure_not_reparse_component(name)?;
+    Ok(DirHandle::from_windows(opened.into_dir_handle(child_path)))
 }
 
 pub(crate) fn mkdir_at(parent: &DirHandle, name: &str) -> Result<(), FsError> {
@@ -191,16 +222,8 @@ pub(crate) fn mkdir_at(parent: &DirHandle, name: &str) -> Result<(), FsError> {
         }
         return Err(FsError::Io(io::Error::from_raw_os_error(err as i32)));
     }
-    let handle = open_directory_at_path(&child_path)?;
-    if is_reparse_point(handle)? {
-        unsafe {
-            CloseHandle(handle);
-        }
-        return Err(FsError::SymlinkOrReparseComponent(name.to_string()));
-    }
-    unsafe {
-        CloseHandle(handle);
-    }
+    let opened = open_directory_at_path(&child_path)?;
+    opened.ensure_not_reparse_component(name)?;
     Ok(())
 }
 
@@ -225,46 +248,22 @@ pub(crate) fn rename_no_replace_same_parent(
             std::ptr::null_mut(),
         )
     };
-    if src_handle == INVALID_HANDLE_VALUE {
-        return Err(FsError::Io(io::Error::from_raw_os_error(
-            unsafe { GetLastError() } as i32,
-        )));
-    }
-    if is_reparse_point(src_handle)? {
-        unsafe {
-            CloseHandle(src_handle);
-        }
-        return Err(FsError::SymlinkOrReparseComponent(src_name.to_string()));
-    }
+    let src = OwnedWinHandle::from_create_result(src_handle)?;
+    src.ensure_not_reparse_component(src_name)?;
 
     let dst_wide: Vec<u16> = dst_name.encode_utf16().collect();
-    let (buffer_size, buffer_size_u32) = file_rename_info_buffer_size(dst_wide.len())?;
-    let mut buffer = vec![0u8; buffer_size];
-    let info = buffer.as_mut_ptr() as *mut FILE_RENAME_INFO;
-    let name_bytes = (dst_wide.len() * 2) as u32;
-    unsafe {
-        (*info).Anonymous.ReplaceIfExists = 0;
-        (*info).RootDirectory = parent_h;
-        (*info).FileNameLength = name_bytes;
-        std::ptr::copy_nonoverlapping(
-            dst_wide.as_ptr(),
-            (*info).FileName.as_mut_ptr(),
-            dst_wide.len(),
-        );
-        (*info).FileName[dst_wide.len()] = 0;
-    }
+    let built =
+        build_no_replace_rename_buffer(parent_h, &dst_wide).map_err(map_rename_buffer_err)?;
+    let (ptr, size) = built_rename_info_view(&built);
 
     let ok = unsafe {
         SetFileInformationByHandle(
-            src_handle,
-            FileRenameInfo,
-            buffer.as_mut_ptr() as *mut c_void,
-            buffer_size_u32,
+            src.raw(),
+            windows_sys::Win32::Storage::FileSystem::FileRenameInfo,
+            ptr as *mut c_void,
+            size,
         )
     };
-    unsafe {
-        CloseHandle(src_handle);
-    }
     if ok == 0 {
         let err = unsafe { GetLastError() };
         if let Some(mapped) = map_exists_win32(err) {
@@ -295,16 +294,13 @@ pub(crate) fn open_lock_file(
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
                     std::ptr::null(),
                     OPEN_ALWAYS,
-                    windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
+                    FILE_FLAG_OPEN_REPARSE_POINT,
                     std::ptr::null_mut(),
                 )
             };
-            if handle == INVALID_HANDLE_VALUE {
-                return Err(FsError::Io(io::Error::from_raw_os_error(
-                    unsafe { GetLastError() } as i32,
-                )));
-            }
-            return Ok(unsafe { std::fs::File::from_raw_handle(handle as _) });
+            let opened = OwnedWinHandle::from_create_result(handle)?;
+            opened.ensure_not_reparse_component(comp)?;
+            return Ok(opened.into_std_file());
         }
         match dir.open_child_dir(comp) {
             Ok(next) => dir = next,
@@ -316,4 +312,29 @@ pub(crate) fn open_lock_file(
         }
     }
     Err(FsError::InvalidComponent("empty lock path".into()))
+}
+
+#[cfg(test)]
+mod file_rename_buffer_tests {
+    use super::*;
+    use phase0c_windows_api_check::rename_buffer::file_rename_info_buffer_size;
+
+    #[test]
+    fn multi_char_rename_buffer_matches_shared_helper() {
+        let dst = "published-session";
+        let wide: Vec<u16> = dst.encode_utf16().collect();
+        let built =
+            build_no_replace_rename_buffer(0 as HANDLE, &wide).expect("build rename buffer");
+        let (_, size_u32, name_bytes) =
+            file_rename_info_buffer_size(wide.len()).expect("size helper");
+        assert_eq!(built.size_u32, size_u32);
+
+        let info = built.buffer.as_ptr() as *const FILE_RENAME_INFO;
+        assert_eq!(unsafe { (*info).FileNameLength }, name_bytes);
+        let name_ptr = unsafe { (*info).FileName.as_ptr() };
+        let read_back: Vec<u16> =
+            unsafe { std::slice::from_raw_parts(name_ptr, wide.len()) }.to_vec();
+        assert_eq!(read_back, wide);
+        assert_eq!(unsafe { *name_ptr.add(wide.len()) }, 0);
+    }
 }

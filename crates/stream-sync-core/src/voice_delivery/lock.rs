@@ -163,6 +163,64 @@ mod stable_delivery_lock_cross_process {
             acquire_delivery_domain_lock(&root, id, true).expect("acquire after holder exit");
     }
 
+    #[cfg(windows)]
+    fn try_file_symlink(link: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let link_s = link.to_string_lossy();
+        let target_s = target.to_string_lossy();
+        let output = Command::new("cmd")
+            .args(["/C", "mklink", &link_s, &target_s])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("spawn mklink: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Err(format!(
+                "mklink failed (status {:?}): {}{}",
+                output.status.code(),
+                stdout,
+                stderr
+            ))
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn lock_file_reparse_rejected() {
+        let (tmp, root) = test_dest_root();
+        let id = "delivery:reparse-lock";
+        let components = lock_file_relative_components(id);
+        let lock_path = tmp
+            .path()
+            .join(&components[0])
+            .join(&components[1])
+            .join(&components[2]);
+        fs::create_dir_all(lock_path.parent().expect("parent")).expect("mkdirs");
+        let real_target = tmp.path().join("real-lock-target");
+        fs::write(&real_target, b"lock-bytes").expect("target file");
+        match try_file_symlink(&lock_path, &real_target) {
+            Ok(()) => {
+                let err = acquire_delivery_domain_lock(&root, id, true);
+                assert!(
+                    matches!(
+                        err,
+                        Err(LockError::Fs(FsError::SymlinkOrReparseComponent(_)))
+                    ),
+                    "expected reparse rejection, got {:?}",
+                    err
+                );
+            }
+            Err(reason) => {
+                eprintln!("SKIP lock_file_reparse_rejected: {reason}");
+            }
+        }
+    }
+
     /// Documents out-of-scope malicious unlink/recreate; library never unlinks lock files.
     #[test]
     #[cfg(unix)]

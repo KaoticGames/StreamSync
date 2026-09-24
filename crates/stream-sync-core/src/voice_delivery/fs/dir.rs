@@ -218,9 +218,14 @@ fn is_portable_final_name_byte(b: u8) -> bool {
     )
 }
 
+fn has_reserved_streamsync_prefix(name: &str) -> bool {
+    const PREFIX: &str = ".streamsync-";
+    name.len() >= PREFIX.len() && name[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+}
+
 pub(crate) fn validate_portable_final_name(name: &str) -> Result<(), FsError> {
     validate_single_component(name)?;
-    if name.starts_with(".streamsync-") {
+    if has_reserved_streamsync_prefix(name) {
         return Err(FsError::InvalidFinalName(
             "reserved .streamsync- prefix".into(),
         ));
@@ -270,6 +275,12 @@ mod validated_final_name_portable {
         for name in ["my-session", "Guild_42", "a.b-c", "Z9"] {
             assert!(ValidatedFinalName::validate(name).is_ok());
         }
+    }
+
+    #[test]
+    fn rejects_streamsync_prefix_case_insensitive() {
+        let err = ValidatedFinalName::validate(".STREAMSYNC-reserved-name");
+        assert!(matches!(err, Err(FsError::InvalidFinalName(_))));
     }
 
     #[test]
