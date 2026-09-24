@@ -1,10 +1,12 @@
-//! Phase 0C voice delivery: foundation + identity/records (slices A, B, 8).
+//! Phase 0C voice delivery: filesystem foundation (slices 0–4) + media/manifest + slices 6–9.
 #![allow(dead_code)]
 
 mod bounds;
 mod hash;
 mod identity;
+mod ingest;
 mod manifest;
+mod marker;
 mod records;
 mod session;
 mod state;
