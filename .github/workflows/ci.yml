@@ -27,6 +27,9 @@ jobs:
           cargo test -p stream-sync-core 'voice_delivery::fs::' -- --nocapture
           cargo test -p stream-sync-core 'voice_delivery::lock::' -- --nocapture --test-threads=1
           cargo test -p stream-sync-core 'voice_delivery::ids::' -- --nocapture
+          cargo test -p stream-sync-core 'voice_delivery::bounds::|voice_delivery::wav::|voice_delivery::hash::|voice_delivery::manifest::' -- --nocapture
+          cargo test -p stream-sync-core 'voice_delivery::records::|voice_delivery::ingest::|voice_delivery::marker::' -- --nocapture
+          cargo test -p stream-sync-core 'partial_prefix_hasher_checkpoint|partial_sparse_prefix_digest_fail|ledger_generation_wins_valid|publish_intent_before_rename' -- --nocapture
 
   windows-installer:
     name: Windows NSIS installer
