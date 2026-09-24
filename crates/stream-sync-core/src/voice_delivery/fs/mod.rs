@@ -1,8 +1,9 @@
 //! Platform filesystem backend for voice delivery publication geometry.
 
 mod dir;
-mod durability;
+pub(crate) mod durability;
 mod error;
+pub(crate) mod file;
 mod geometry;
 #[cfg(unix)]
 mod unix;
@@ -11,9 +12,9 @@ mod windows;
 
 pub use dir::{DestRoot, DirHandle, ValidatedFinalName};
 #[allow(unused_imports)] // public surface for later slices
-pub use durability::sync_dir_exact;
-pub use durability::NamespaceDurability;
+pub use durability::{sync_dir_exact, sync_file, NamespaceDurability};
 pub use error::FsError;
+pub use file::VoiceFile;
 pub use geometry::FinalParentPublication;
 
 use dir::validate_single_component;

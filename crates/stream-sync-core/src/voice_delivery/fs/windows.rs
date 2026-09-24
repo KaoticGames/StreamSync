@@ -6,6 +6,7 @@
 
 use super::dir::DirHandle;
 use super::error::FsError;
+use super::file::VoiceFile;
 use std::ffi::c_void;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
@@ -295,6 +296,81 @@ pub(crate) fn rename_no_replace_same_parent(
 
 pub(crate) fn clone_dir_handle(dir: &DirHandle) -> Result<DirHandle, FsError> {
     Ok(DirHandle::from_windows(dir.windows_handle().duplicate()?))
+}
+
+fn open_file_at_path(path: &Path, create_new: bool) -> Result<VoiceFile, FsError> {
+    let wide = wide_path(path);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            if create_new {
+                windows_sys::Win32::Storage::FileSystem::CREATE_NEW
+            } else {
+                OPEN_EXISTING
+            },
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    match OwnedWinHandle::from_create_result(handle) {
+        Ok(h) => {
+            h.ensure_not_reparse_component(
+                path.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+            )?;
+            Ok(VoiceFile::from_std_file(h.into_std_file()))
+        }
+        Err(FsError::Io(e)) if e.raw_os_error() == Some(ERROR_FILE_EXISTS as i32) => {
+            Err(FsError::AlreadyExists)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+pub(crate) fn open_file_at(
+    parent: &DirHandle,
+    name: &str,
+    create_new: bool,
+) -> Result<VoiceFile, FsError> {
+    let path = parent.windows_handle().absolute_path().join(name);
+    open_file_at_path(&path, create_new)
+}
+
+pub(crate) fn open_file_create_or_open(
+    parent: &DirHandle,
+    name: &str,
+) -> Result<VoiceFile, FsError> {
+    let path = parent.windows_handle().absolute_path().join(name);
+    let wide = wide_path(&path);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_ALWAYS,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    let opened = OwnedWinHandle::from_create_result(handle)?;
+    opened.ensure_not_reparse_component(name)?;
+    Ok(VoiceFile::from_std_file(opened.into_std_file()))
+}
+
+pub(crate) fn list_child_names(parent: &DirHandle) -> Result<Vec<String>, FsError> {
+    let path = parent.windows_handle().absolute_path();
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(&path).map_err(FsError::from)? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "." || name == ".." {
+            continue;
+        }
+        names.push(name);
+    }
+    Ok(names)
 }
 
 pub(crate) fn open_lock_file(

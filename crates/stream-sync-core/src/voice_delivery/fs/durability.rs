@@ -2,6 +2,7 @@
 
 use super::dir::DirHandle;
 use super::error::FsError;
+use super::file::VoiceFile;
 
 /// Result of attempting POSIX-style directory namespace durability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,6 +11,11 @@ pub enum NamespaceDurability {
     Proven,
     /// Platform does not expose an equivalent guarantee for this handle.
     Unavailable,
+}
+
+/// `fsync` / flush the supplied open file handle only.
+pub fn sync_file(file: &VoiceFile) -> Result<(), FsError> {
+    file.std_file().sync_all().map_err(FsError::from)
 }
 
 /// `fsync` the supplied directory handle on Linux; Windows reports `Unavailable` (no faux dir flush).

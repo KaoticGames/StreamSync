@@ -117,6 +117,37 @@ impl DirHandle {
         }
     }
 
+    pub(crate) fn list_child_names(&self) -> Result<Vec<String>, FsError> {
+        #[cfg(unix)]
+        {
+            unix::list_child_names(self)
+        }
+        #[cfg(windows)]
+        {
+            windows::list_child_names(self)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(FsError::Unsupported)
+        }
+    }
+
+    pub(crate) fn create_new_file(&self, name: &str) -> Result<super::file::VoiceFile, FsError> {
+        super::file::create_new_file_at(self, name)
+    }
+
+    pub(crate) fn read_file_all(&self, name: &str) -> Result<Vec<u8>, FsError> {
+        let file = super::file::open_existing_file_at(self, name)?;
+        let len = file.len()?;
+        let mut buf = vec![
+            0u8;
+            usize::try_from(len)
+                .map_err(|_| FsError::InvalidComponent("file too large".into()))?
+        ];
+        file.read_exact_at(0, &mut buf)?;
+        Ok(buf)
+    }
+
     pub(crate) fn clone_handle(&self) -> Result<DirHandle, FsError> {
         #[cfg(unix)]
         {

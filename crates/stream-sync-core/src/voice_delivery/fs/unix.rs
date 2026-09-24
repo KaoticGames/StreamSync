@@ -2,6 +2,7 @@
 
 use super::dir::DirHandle;
 use super::error::FsError;
+use super::file::VoiceFile;
 use rustix::fs::{mkdirat, open, openat, Mode, OFlags};
 #[cfg(target_os = "linux")]
 use rustix::fs::{renameat_with, RenameFlags};
@@ -28,6 +29,7 @@ fn reject_symlink_at(parent: &DirHandle, name: &str) -> Result<(), FsError> {
             }
             Ok(())
         }
+        Err(rustix::io::Errno::NOENT) => Ok(()),
         Err(e) => Err(FsError::Io(e.into())),
     }
 }
@@ -93,6 +95,62 @@ pub(crate) fn rename_no_replace_same_parent(
 pub(crate) fn clone_dir_handle(dir: &DirHandle) -> Result<DirHandle, FsError> {
     let dup = fcntl_dupfd_cloexec(dir.as_fd(), 0).map_err(|e| FsError::Io(e.into()))?;
     Ok(DirHandle::from_owned_fd(dup))
+}
+
+pub(crate) fn open_file_at(
+    parent: &DirHandle,
+    name: &str,
+    create_new: bool,
+) -> Result<VoiceFile, FsError> {
+    reject_symlink_at(parent, name)?;
+    let flags = if create_new {
+        OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::CREATE | OFlags::EXCL
+    } else {
+        OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW
+    };
+    let mode = Mode::RUSR | Mode::WUSR;
+    match openat(parent.as_fd(), name, flags, mode) {
+        Ok(fd) => Ok(VoiceFile::from_std_file(std::fs::File::from(fd))),
+        Err(rustix::io::Errno::EXIST) => Err(FsError::AlreadyExists),
+        Err(rustix::io::Errno::LOOP) => Err(FsError::SymlinkOrReparseComponent(name.to_string())),
+        Err(e) => Err(FsError::Io(e.into())),
+    }
+}
+
+pub(crate) fn open_file_create_or_open(
+    parent: &DirHandle,
+    name: &str,
+) -> Result<VoiceFile, FsError> {
+    reject_symlink_at(parent, name)?;
+    let flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::CREATE;
+    let mode = Mode::RUSR | Mode::WUSR;
+    match openat(parent.as_fd(), name, flags, mode) {
+        Ok(fd) => Ok(VoiceFile::from_std_file(std::fs::File::from(fd))),
+        Err(rustix::io::Errno::LOOP) => Err(FsError::SymlinkOrReparseComponent(name.to_string())),
+        Err(e) => Err(FsError::Io(e.into())),
+    }
+}
+
+pub(crate) fn list_child_names(parent: &DirHandle) -> Result<Vec<String>, FsError> {
+    use rustix::fs::{Dir, OFlags};
+    let fd = openat(
+        parent.as_fd(),
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| FsError::Io(e.into()))?;
+    let dir = Dir::new(fd).map_err(|e| FsError::Io(e.into()))?;
+    let mut names = Vec::new();
+    for entry in dir {
+        let entry = entry.map_err(|e| FsError::Io(e.into()))?;
+        let name = entry.file_name().to_string_lossy();
+        if name == "." || name == ".." {
+            continue;
+        }
+        names.push(name.into_owned());
+    }
+    Ok(names)
 }
 
 pub(crate) fn open_lock_file(
