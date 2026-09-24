@@ -1,8 +1,10 @@
-//! Phase 0C voice delivery filesystem foundation (slices 0–4).
-//! Public API remains minimal until later phases.
-//!
-//! `dead_code` is allowed here until ledger/ingest slices wire these entry points.
+//! Phase 0C voice delivery: filesystem foundation (slices 0–4) + pure media/manifest (slice A).
 #![allow(dead_code)]
+
+mod bounds;
+mod hash;
+mod manifest;
+mod wav;
 
 mod ids;
 mod lock;
