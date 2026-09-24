@@ -3,7 +3,6 @@
 #[cfg(windows)]
 pub mod rename_buffer;
 
-#[cfg(windows)]
 pub mod storage_qualify;
 
 #[cfg(windows)]

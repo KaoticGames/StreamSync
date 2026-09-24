@@ -1,8 +1,11 @@
 //! Phase 0C destination-root storage qualification (local fixed NTFS only).
 
 use std::io;
-use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     GetDriveTypeW, GetVolumeInformationW, GetVolumePathNameW,
 };
@@ -71,21 +74,36 @@ pub fn classify_filesystem_name(name: &str) -> Result<(), StorageQualifyError> {
     }
 }
 
+/// Win32 APIs that return `BOOL` leave a NUL-terminated string in a fixed buffer; scan for the first NUL.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn nul_terminated_utf16_prefix(buf: &[u16]) -> Result<Vec<u16>, io::Error> {
+    let nul_index = buf.iter().position(|&c| c == 0).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Win32 populated buffer missing NUL terminator",
+        )
+    })?;
+    Ok(buf[..=nul_index].to_vec())
+}
+
+#[cfg(windows)]
 fn wide_null_terminated(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
+#[cfg(windows)]
 fn win32_last_error() -> io::Error {
     io::Error::last_os_error()
 }
 
+#[cfg(windows)]
 fn get_volume_path_root(path: &Path) -> Result<Vec<u16>, io::Error> {
     let wide = wide_null_terminated(path);
     let mut cap = 260usize;
     loop {
         let mut buf = vec![0u16; cap];
-        let copied = unsafe { GetVolumePathNameW(wide.as_ptr(), buf.as_mut_ptr(), cap as u32) };
-        if copied == 0 {
+        let ok = unsafe { GetVolumePathNameW(wide.as_ptr(), buf.as_mut_ptr(), cap as u32) };
+        if ok == 0 {
             let err = win32_last_error();
             if err.raw_os_error() == Some(122) && cap < 32_768 {
                 cap = cap.saturating_mul(2);
@@ -93,16 +111,12 @@ fn get_volume_path_root(path: &Path) -> Result<Vec<u16>, io::Error> {
             }
             return Err(err);
         }
-        let len = copied as usize;
-        buf.truncate(len);
-        if buf.last() == Some(&0) {
-            buf.pop();
-        }
-        return Ok(buf);
+        return nul_terminated_utf16_prefix(&buf);
     }
 }
 
 /// Fail closed unless `path` resolves to a local fixed NTFS volume root.
+#[cfg(windows)]
 pub fn qualify_local_ntfs_dest_root(path: &Path) -> Result<(), StorageQualifyError> {
     reject_lexical_unc(path)?;
     let volume_root = get_volume_path_root(path).map_err(StorageQualifyError::Io)?;
@@ -171,13 +185,26 @@ mod tests {
     }
 
     #[test]
-    fn temp_dir_on_runner_is_local_ntfs_or_skip() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        match qualify_local_ntfs_dest_root(tmp.path()) {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!("SKIP temp_dir_on_runner_is_local_ntfs_or_skip: {e}");
-            }
-        }
+    fn nul_terminated_utf16_prefix_extracts_through_nul() {
+        let buf = vec![b'C' as u16, b':' as u16, b'\\' as u16, 0, b'X' as u16];
+        let got = nul_terminated_utf16_prefix(&buf).expect("prefix");
+        assert_eq!(got, vec![b'C' as u16, b':' as u16, b'\\' as u16, 0]);
+        assert_eq!(got.len(), 4);
+    }
+
+    #[test]
+    fn nul_terminated_utf16_prefix_errors_when_no_nul() {
+        let buf = vec![b'C' as u16, b':' as u16];
+        let err = nul_terminated_utf16_prefix(&buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn env_temp_dir_is_local_ntfs_on_ci_baseline() {
+        let tmp = std::env::temp_dir();
+        qualify_local_ntfs_dest_root(&tmp).unwrap_or_else(|e| {
+            panic!("windows-latest CI baseline expects local fixed NTFS temp_dir {tmp:?}: {e}");
+        });
     }
 }
