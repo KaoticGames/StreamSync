@@ -28,7 +28,8 @@ jobs:
           cargo test -p stream-sync-core 'voice_delivery::fs::' -- --nocapture
           cargo test -p stream-sync-core 'voice_delivery::lock::' -- --nocapture --test-threads=1
           cargo test -p stream-sync-core 'voice_delivery::ids::' -- --nocapture
-          run_suite() { n=$(cargo test -p stream-sync-core "$1" -- --list 2>/dev/null | rg -c '^\s.*: test$' || true); test "$n" -gt 0; cargo test -p stream-sync-core "$1" -- --nocapture; }
+          count_suite_tests() { cargo test -p stream-sync-core "$1" -- --list 2>/dev/null | rg -c ': test$' || true; }
+          run_suite() { n=$(count_suite_tests "$1"); echo "filter '$1' matched $n tests"; test "$n" -gt 0; cargo test -p stream-sync-core "$1" -- --nocapture; }
           run_suite 'voice_delivery::bounds::'
           run_suite 'voice_delivery::wav::'
           run_suite 'voice_delivery::hash::'
@@ -39,7 +40,9 @@ jobs:
           run_suite 'voice_delivery::session::'
           run_suite 'voice_delivery::state::'
           run_suite 'partial_prefix_hasher_checkpoint'
-          run_suite 'partial_sparse_hole_in_committed_prefix_fails'
+          run_suite 'checkpoint_adversarial'
+          run_suite 'session_constructor_substitution'
+          run_suite 'generation_domain_bounds'
           run_suite 'ledger_generation_wins_valid'
           run_suite 'publish_intent_before_rename'
           run_suite 'delivery_bound_lock'

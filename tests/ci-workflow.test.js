@@ -45,6 +45,24 @@ describe("CI workflow", () => {
     assert.equal(ciTauriConfig.bundle.createUpdaterArtifacts, false);
   });
 
+  it("phase0c Windows voice_delivery filters use nonzero : test line counts", () => {
+    const jobStart = ciWorkflow.indexOf("  phase0c-windows:");
+    assert.ok(jobStart >= 0, "phase0c-windows job exists");
+    const nextJob = ciWorkflow.indexOf("\n  windows-installer:", jobStart);
+    const job = ciWorkflow.slice(jobStart, nextJob);
+    assert.match(job, /rg -c ': test\$'/);
+    assert.doesNotMatch(job, /partial_sparse_hole/);
+    const filters = [
+      "voice_delivery::ingest::",
+      "checkpoint_adversarial",
+      "session_constructor_substitution",
+      "generation_domain_bounds",
+    ];
+    for (const f of filters) {
+      assert.match(job, new RegExp(`run_suite '${f.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}'`));
+    }
+  });
+
   it("production tauri.conf.json still enables signed updater artifacts for release", () => {
     assert.equal(prodTauriConfig.bundle.createUpdaterArtifacts, true);
     assert.match(

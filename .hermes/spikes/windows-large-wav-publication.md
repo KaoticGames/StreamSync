@@ -5,7 +5,7 @@
 | **Plan** | `2026-09-23_162634-syndicate-opus-finalization-streamsync-delivery` § Phase 0 / Slice 9 |
 | **Branch** | `feat/finalized-voice-delivery-v2` |
 | **Baseline** | `1fe796e0ec20136cb0b7104a3213e8b4e8a1d059` |
-| **Spike module** | **SUPERSEDED / deleted** — reviewed pure logic ported to `voice_delivery/{bounds,wav,manifest,hash}`; durable state in `records/`, `ingest/partial`, `marker` (slices 6–9 @ `12a7b7a` baseline) |
+| **Spike module** | **SUPERSEDED / deleted** — reviewed pure logic ported to `voice_delivery/{bounds,wav,manifest,hash}`; durable state in `records/`, `ingest/partial`, `marker` (slices 6–9; second review pass from `a67a880`, staging under final-parent via `DeliverySessionGuard::begin`) |
 | **Linux gate** | **PENDING** (slice 6–9 unit tests GREEN on host; not full GO — no slice 10/11, no rename) |
 | **Windows gate** | **PENDING** (isolated API cross-check only; runtime via `phase0c-windows` after push) |
 
