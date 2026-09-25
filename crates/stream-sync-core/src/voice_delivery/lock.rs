@@ -29,6 +29,22 @@ impl DeliveryDomainLock {
     }
 }
 
+/// True when a non-blocking lock attempt failed because another holder has the file locked.
+pub(crate) fn is_lock_contention(err: &io::Error) -> bool {
+    if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::AlreadyExists {
+        return true;
+    }
+    #[cfg(windows)]
+    if let Some(code) = err.raw_os_error() {
+        use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+        let code = code as u32;
+        if code == ERROR_SHARING_VIOLATION || code == ERROR_LOCK_VIOLATION {
+            return true;
+        }
+    }
+    false
+}
+
 /// Acquire the stable lock for `canonical_delivery_id` under `dest_root`.
 pub(crate) fn acquire_delivery_domain_lock(
     dest_root: &DestRoot,
@@ -42,12 +58,7 @@ pub(crate) fn acquire_delivery_domain_lock(
     if try_wait {
         match file.try_lock_exclusive() {
             Ok(()) => {}
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::AlreadyExists =>
-            {
-                return Err(LockError::Busy);
-            }
+            Err(e) if is_lock_contention(&e) => return Err(LockError::Busy),
             Err(e) => return Err(LockError::Io(e)),
         }
     } else {
@@ -122,8 +133,20 @@ mod stable_delivery_lock_cross_process {
             let tmp = std::env::var("STREAMSYNC_VOICE_LOCK_TMP").expect("tmp");
             let root = DestRoot::open(std::path::Path::new(&tmp)).expect("root");
             let id = std::env::var("STREAMSYNC_VOICE_LOCK_ID").expect("id");
-            let err = acquire_delivery_domain_lock(&root, &id, true);
-            assert!(matches!(err, Err(LockError::Busy)));
+            match acquire_delivery_domain_lock(&root, &id, true) {
+                Err(LockError::Busy) => {}
+                Err(e) => {
+                    let diag = std::path::Path::new(&tmp).join("try-lock-unexpected.txt");
+                    let msg = format!("{e:?}");
+                    let _ = fs::write(&diag, &msg);
+                    panic!("LOCK_TRY expected Busy, got {msg}");
+                }
+                Ok(_) => {
+                    let diag = std::path::Path::new(&tmp).join("try-lock-unexpected.txt");
+                    let _ = fs::write(&diag, "Ok");
+                    panic!("LOCK_TRY expected Busy, got Ok");
+                }
+            }
             return;
         }
 
@@ -345,8 +368,14 @@ mod first_use_control_dir_cross_process_race {
             Err(LockError::Busy) => {
                 fs::write(outcome_dir.join(format!("outcome-{slot}")), "busy").expect("outcome");
             }
-            Err(LockError::Fs(e)) => panic!("unexpected fs error during race: {e}"),
-            Err(LockError::Io(e)) => panic!("unexpected io error during race: {e}"),
+            Err(other) => {
+                fs::write(
+                    outcome_dir.join(format!("outcome-{slot}")),
+                    format!("unexpected:{other}"),
+                )
+                .expect("outcome");
+                panic!("unexpected error during race: {other:?}");
+            }
         }
         true
     }
@@ -451,5 +480,49 @@ mod first_use_control_dir_cross_process_race {
         assert_eq!(read_outcome(&outcome_dir, "b"), "ok");
         fs::write(&release, b"release\n").expect("parent release");
         children.wait_all();
+    }
+}
+
+#[cfg(test)]
+mod lock_contention_classifier {
+    use super::is_lock_contention;
+    use std::io;
+
+    #[test]
+    fn portable_would_block_and_already_exists() {
+        assert!(is_lock_contention(&io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "contended"
+        )));
+        assert!(is_lock_contention(&io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "contended"
+        )));
+    }
+
+    #[test]
+    fn permission_denied_without_win32_code_is_not_contention() {
+        assert!(!is_lock_contention(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "access denied"
+        )));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win32_sharing_and_lock_violation_codes() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+        };
+
+        assert!(is_lock_contention(&io::Error::from_raw_os_error(
+            ERROR_SHARING_VIOLATION as i32
+        )));
+        assert!(is_lock_contention(&io::Error::from_raw_os_error(
+            ERROR_LOCK_VIOLATION as i32
+        )));
+        assert!(!is_lock_contention(&io::Error::from_raw_os_error(
+            ERROR_ACCESS_DENIED as i32
+        )));
     }
 }
