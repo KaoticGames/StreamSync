@@ -32,8 +32,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, GetFileInformationByHandleEx, SetFileInformationByHandle,
     DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, OPEN_ALWAYS, OPEN_EXISTING,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_WRITE_ATTRIBUTES, OPEN_ALWAYS, OPEN_EXISTING,
 };
 
 fn map_rename_buffer_err(e: RenameBufferError) -> FsError {
@@ -494,6 +494,7 @@ mod win32_share_mode_constants {
 mod file_rename_buffer_tests {
     use super::*;
     use stream_sync_windows_fs::rename_buffer::file_rename_info_buffer_size;
+    use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
 
     #[test]
     fn multi_char_rename_buffer_matches_shared_helper() {
@@ -559,8 +560,10 @@ mod probe_child_dir_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let parent = probe_parent(&tmp);
         fs::write(tmp.path().join("parent").join("child-file"), b"x").expect("file");
-        let err = parent.probe_child_dir("child-file").unwrap_err();
-        assert!(matches!(err, FsError::NotADirectory(_)));
+        match parent.probe_child_dir("child-file") {
+            Err(e) => assert!(matches!(e, FsError::NotADirectory(_))),
+            Ok(_) => panic!("expected NotADirectory error"),
+        }
     }
 
     /// Real directory that cannot be opened (exclusive handle) must surface the open `Io` error.
@@ -584,8 +587,10 @@ mod probe_child_dir_tests {
         };
         assert_ne!(handle, INVALID_HANDLE_VALUE);
         let held = OwnedWinHandle(handle);
-        let err = parent.probe_child_dir("blocked").unwrap_err();
-        assert!(matches!(err, FsError::Io(_)));
+        match parent.probe_child_dir("blocked") {
+            Err(e) => assert!(matches!(e, FsError::Io(_))),
+            Ok(_) => panic!("expected Io error for blocked directory open"),
+        }
         drop(held);
     }
 
@@ -597,10 +602,10 @@ mod probe_child_dir_tests {
         fs::create_dir(&target).expect("target");
         let link = tmp.path().join("parent").join("junction-child");
         match try_mklink(&["/J", &link.to_string_lossy(), &target.to_string_lossy()]) {
-            Ok(()) => {
-                let err = parent.probe_child_dir("junction-child").unwrap_err();
-                assert!(matches!(err, FsError::SymlinkOrReparseComponent(_)));
-            }
+            Ok(()) => match parent.probe_child_dir("junction-child") {
+                Err(e) => assert!(matches!(e, FsError::SymlinkOrReparseComponent(_))),
+                Ok(_) => panic!("expected SymlinkOrReparseComponent for junction"),
+            },
             Err(reason) => eprintln!("SKIP reparse_directory_junction_rejected: {reason}"),
         }
     }
@@ -613,10 +618,10 @@ mod probe_child_dir_tests {
         fs::write(&target, b"x").expect("target file");
         let link = tmp.path().join("parent").join("symlink-child");
         match try_mklink(&[&link.to_string_lossy(), &target.to_string_lossy()]) {
-            Ok(()) => {
-                let err = parent.probe_child_dir("symlink-child").unwrap_err();
-                assert!(matches!(err, FsError::SymlinkOrReparseComponent(_)));
-            }
+            Ok(()) => match parent.probe_child_dir("symlink-child") {
+                Err(e) => assert!(matches!(e, FsError::SymlinkOrReparseComponent(_))),
+                Ok(_) => panic!("expected SymlinkOrReparseComponent for symlink"),
+            },
             Err(reason) => eprintln!("SKIP reparse_file_symlink_rejected: {reason}"),
         }
     }
