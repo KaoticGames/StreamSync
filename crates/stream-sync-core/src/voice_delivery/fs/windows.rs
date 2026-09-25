@@ -30,8 +30,9 @@ use windows_sys::Win32::Foundation::{
     HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, GetFileInformationByHandleEx, SetFileInformationByHandle,
-    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    CreateDirectoryW, CreateFileW, FileAttributeTagInfo, GetFileInformationByHandleEx,
+    SetFileInformationByHandle, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FILE_WRITE_ATTRIBUTES, OPEN_ALWAYS, OPEN_EXISTING,
 };
@@ -123,13 +124,6 @@ impl OwnedWinHandle {
         self.0
     }
 
-    fn ensure_not_reparse_root(&self) -> Result<(), FsError> {
-        if is_reparse_point(self.raw())? {
-            return Err(FsError::SymlinkOrReparseRoot);
-        }
-        Ok(())
-    }
-
     fn ensure_not_reparse_component(&self, name: &str) -> Result<(), FsError> {
         if is_reparse_point(self.raw())? {
             return Err(FsError::SymlinkOrReparseComponent(name.to_string()));
@@ -191,24 +185,7 @@ pub(crate) const DIRECTORY_CAPABILITY_SHARE: u32 =
 /// Share mode for voice stem/partial/marker files that may need to coexist with same-parent rename.
 pub(crate) const VOICE_FILE_SHARE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
-fn open_directory_at_path(path: &Path) -> Result<OwnedWinHandle, FsError> {
-    let wide = wide_path(path);
-    let handle = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-            DIRECTORY_CAPABILITY_SHARE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            std::ptr::null_mut(),
-        )
-    };
-    OwnedWinHandle::from_create_result(handle)
-}
-
-fn is_reparse_point(handle: HANDLE) -> Result<bool, FsError> {
-    use windows_sys::Win32::Storage::FileSystem::{FileAttributeTagInfo, FILE_ATTRIBUTE_TAG_INFO};
+fn handle_attribute_tag_info(handle: HANDLE) -> Result<FILE_ATTRIBUTE_TAG_INFO, FsError> {
     let mut info = FILE_ATTRIBUTE_TAG_INFO {
         FileAttributes: 0,
         ReparseTag: 0,
@@ -226,6 +203,62 @@ fn is_reparse_point(handle: HANDLE) -> Result<bool, FsError> {
             unsafe { GetLastError() } as i32,
         )));
     }
+    Ok(info)
+}
+
+enum DirectoryOpenContext {
+    Root { not_directory_label: String },
+    ChildComponent(&str),
+}
+
+fn validate_opened_directory_handle(
+    opened: &OwnedWinHandle,
+    ctx: DirectoryOpenContext,
+) -> Result<(), FsError> {
+    let attrs = handle_attribute_tag_info(opened.raw())?.FileAttributes;
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(match ctx {
+            DirectoryOpenContext::Root { .. } => FsError::SymlinkOrReparseRoot,
+            DirectoryOpenContext::ChildComponent(name) => {
+                FsError::SymlinkOrReparseComponent(name.to_string())
+            }
+        });
+    }
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 {
+        let label = match ctx {
+            DirectoryOpenContext::Root {
+                not_directory_label,
+            } => not_directory_label,
+            DirectoryOpenContext::ChildComponent(name) => name.to_string(),
+        };
+        return Err(FsError::NotADirectory(label));
+    }
+    Ok(())
+}
+
+fn open_directory_at_path(
+    path: &Path,
+    ctx: DirectoryOpenContext,
+) -> Result<OwnedWinHandle, FsError> {
+    let wide = wide_path(path);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            DIRECTORY_CAPABILITY_SHARE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    let opened = OwnedWinHandle::from_create_result(handle)?;
+    validate_opened_directory_handle(&opened, ctx)?;
+    Ok(opened)
+}
+
+fn is_reparse_point(handle: HANDLE) -> Result<bool, FsError> {
+    let info = handle_attribute_tag_info(handle)?;
     Ok((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
 }
 
@@ -233,8 +266,17 @@ pub(crate) fn open_root_dir(path: &Path) -> Result<OwnedDirHandle, FsError> {
     let abs = validated_absolute_path(path)?;
     stream_sync_windows_fs::storage_qualify::qualify_local_ntfs_dest_root(&abs)
         .map_err(map_storage_qualify_err)?;
-    let opened = open_directory_at_path(&abs)?;
-    opened.ensure_not_reparse_root()?;
+    let not_directory_label = abs
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    let opened = open_directory_at_path(
+        &abs,
+        DirectoryOpenContext::Root {
+            not_directory_label,
+        },
+    )?;
     Ok(opened.into_dir_handle(abs))
 }
 
@@ -272,15 +314,10 @@ pub(crate) fn probe_child_dir(
 ) -> Result<super::dir::ChildDirProbe, FsError> {
     let parent_path = parent.windows_handle().absolute_path();
     let child_path = parent_path.join(name);
-    match open_directory_at_path(&child_path) {
-        Ok(opened) => {
-            if is_reparse_point(opened.raw())? {
-                return Err(FsError::SymlinkOrReparseComponent(name.to_string()));
-            }
-            Ok(super::dir::ChildDirProbe::Directory(
-                DirHandle::from_windows(opened.into_dir_handle(child_path)),
-            ))
-        }
+    match open_directory_at_path(&child_path, DirectoryOpenContext::ChildComponent(name)) {
+        Ok(opened) => Ok(super::dir::ChildDirProbe::Directory(
+            DirHandle::from_windows(opened.into_dir_handle(child_path)),
+        )),
         Err(FsError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
             Ok(super::dir::ChildDirProbe::Missing)
         }
@@ -292,8 +329,7 @@ pub(crate) fn probe_child_dir(
 pub(crate) fn open_dir_at(parent: &DirHandle, name: &str) -> Result<DirHandle, FsError> {
     let parent_path = parent.windows_handle().absolute_path();
     let child_path = parent_path.join(name);
-    let opened = open_directory_at_path(&child_path)?;
-    opened.ensure_not_reparse_component(name)?;
+    let opened = open_directory_at_path(&child_path, DirectoryOpenContext::ChildComponent(name))?;
     Ok(DirHandle::from_windows(opened.into_dir_handle(child_path)))
 }
 
@@ -309,8 +345,8 @@ pub(crate) fn mkdir_at(parent: &DirHandle, name: &str) -> Result<(), FsError> {
         }
         return Err(FsError::Io(io::Error::from_raw_os_error(err as i32)));
     }
-    let opened = open_directory_at_path(&child_path)?;
-    opened.ensure_not_reparse_component(name)?;
+    let opened = open_directory_at_path(&child_path, DirectoryOpenContext::ChildComponent(name))?;
+    drop(opened);
     Ok(())
 }
 
@@ -556,13 +592,68 @@ mod probe_child_dir_tests {
     }
 
     #[test]
-    fn regular_file_is_not_a_directory() {
+    fn createfilew_backup_semantics_opens_regular_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file_path = tmp.path().join("plain-file.txt");
+        fs::write(&file_path, b"x").expect("file");
+        let wide = wide_path(&file_path);
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                DIRECTORY_CAPABILITY_SHARE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        let held = OwnedWinHandle(handle);
+        let attrs = handle_attribute_tag_info(held.raw()).expect("attrs");
+        assert_eq!(attrs.FileAttributes & FILE_ATTRIBUTE_DIRECTORY, 0);
+        drop(held);
+    }
+
+    #[test]
+    fn open_directory_at_path_regular_file_is_not_a_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file_path = tmp.path().join("not-a-dir.txt");
+        fs::write(&file_path, b"x").expect("file");
+        let name = "not-a-dir.txt";
+        match open_directory_at_path(&file_path, DirectoryOpenContext::ChildComponent(name)) {
+            Err(FsError::NotADirectory(label)) => assert_eq!(label, name),
+            Err(other) => panic!("expected NotADirectory, got {other:?}"),
+            Ok(_) => panic!("expected NotADirectory error"),
+        }
+    }
+
+    #[test]
+    fn root_regular_file_is_not_dest_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file_path = tmp.path().join("dest-root-file.txt");
+        fs::write(&file_path, b"x").expect("file");
+        let label = "dest-root-file.txt";
+        match DestRoot::open(&file_path) {
+            Err(FsError::NotADirectory(name)) => assert_eq!(name, label),
+            Err(other) => panic!("expected NotADirectory, got {other:?}"),
+            Ok(_) => panic!("expected NotADirectory error"),
+        }
+    }
+
+    #[test]
+    fn child_regular_file_is_not_a_directory() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let parent = probe_parent(&tmp);
-        fs::write(tmp.path().join("parent").join("child-file"), b"x").expect("file");
-        match parent.probe_child_dir("child-file") {
-            Err(e) => assert!(matches!(e, FsError::NotADirectory(_))),
-            Ok(_) => panic!("expected NotADirectory error"),
+        let child_name = "child-file";
+        fs::write(tmp.path().join("parent").join(child_name), b"x").expect("file");
+        match parent.probe_child_dir(child_name) {
+            Err(FsError::NotADirectory(name)) => assert_eq!(name, child_name),
+            Err(other) => panic!("expected NotADirectory, got {other:?}"),
+            Ok(super::dir::ChildDirProbe::Directory(_)) => {
+                panic!("expected NotADirectory error")
+            }
+            Ok(super::dir::ChildDirProbe::Missing) => panic!("expected NotADirectory error"),
         }
     }
 
