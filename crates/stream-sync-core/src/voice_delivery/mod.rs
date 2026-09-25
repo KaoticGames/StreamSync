@@ -22,7 +22,7 @@ pub(crate) use fs::{DestRoot, DirHandle, FinalParentPublication, FsError};
 #[allow(unused_imports)]
 pub(crate) use ids::{lock_file_relative_components, stable_lock_file_basename};
 #[allow(unused_imports)]
-pub(crate) use lock::{acquire_delivery_domain_lock, DeliveryDomainLock, LockError};
+pub(crate) use lock::{DeliveryDomainLock, LockError};
 
 #[cfg(test)]
 mod subprocess_env {

@@ -1,9 +1,9 @@
 //! Proof of held delivery-domain lock bound to one destination root and identity.
 
-use crate::voice_delivery::fs::{DestRoot, DirHandle, FsError};
+use crate::voice_delivery::fs::{DestRoot, DirHandle, FsError, PortableParentComponent};
 use crate::voice_delivery::identity::DeliveryImmutableIdentity;
 use crate::voice_delivery::ids::{ledger_dir_relative_components, validate_stage_basename};
-use crate::voice_delivery::lock::DeliveryDomainLock;
+use crate::voice_delivery::lock::{acquire_delivery_domain_lock, DeliveryDomainLock, LockError};
 use crate::voice_delivery::manifest::ValidatedManifest;
 use crate::voice_delivery::records::ledger_generation::LedgerStore;
 use crate::voice_delivery::state::LedgerState;
@@ -15,6 +15,8 @@ pub enum SessionError {
     IdentityMismatch,
     #[error(transparent)]
     Fs(#[from] FsError),
+    #[error(transparent)]
+    Lock(#[from] LockError),
     #[error("invalid session: {0}")]
     Invalid(String),
 }
@@ -25,28 +27,55 @@ pub struct DeliverySessionGuard {
     root: DestRoot,
     identity: DeliveryImmutableIdentity,
     manifest: ValidatedManifest,
+    final_parent: DirHandle,
     staging: DirHandle,
     _lock: DeliveryDomainLock,
 }
 
 impl DeliverySessionGuard {
-    pub fn open(
+    /// Acquire the stable delivery lock and bind root, identity, manifest, final-parent, and staging.
+    pub fn begin(
         root: DestRoot,
-        identity: DeliveryImmutableIdentity,
+        delivery_uuid: impl Into<String>,
         manifest: ValidatedManifest,
-        lock: DeliveryDomainLock,
+        staging_token: impl Into<String>,
+        final_parent_relative: Vec<PortableParentComponent>,
+        final_session_name: &str,
+        try_wait_lock: bool,
     ) -> Result<Self, SessionError> {
+        let identity = DeliveryImmutableIdentity::new(
+            delivery_uuid,
+            &manifest,
+            staging_token,
+            final_parent_relative,
+            final_session_name,
+        )
+        .map_err(|e| SessionError::Invalid(e.to_string()))?;
         if identity.manifest_digest != manifest.digest() {
             return Err(SessionError::Invalid(
                 "manifest digest does not match identity".into(),
             ));
         }
         validate_stage_basename(&identity.staging_token)?;
-        let staging = match root.open_child_dir(&identity.staging_token) {
+        let lock = acquire_delivery_domain_lock(&root, &identity.delivery_uuid, try_wait_lock)?;
+        Self::assemble(root, identity, manifest, lock)
+    }
+
+    fn assemble(
+        root: DestRoot,
+        identity: DeliveryImmutableIdentity,
+        manifest: ValidatedManifest,
+        lock: DeliveryDomainLock,
+    ) -> Result<Self, SessionError> {
+        let mut final_parent = root.handle().clone_handle()?;
+        for comp in identity.final_parent_components() {
+            final_parent = final_parent.create_or_open_child_dir(comp.as_str())?;
+        }
+        let staging = match final_parent.open_child_dir(&identity.staging_token) {
             Ok(dir) => dir,
             Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                root.create_child_dir(&identity.staging_token)?;
-                root.open_child_dir(&identity.staging_token)?
+                final_parent.create_child_dir(&identity.staging_token)?;
+                final_parent.open_child_dir(&identity.staging_token)?
             }
             Err(e) => return Err(e.into()),
         };
@@ -54,6 +83,7 @@ impl DeliverySessionGuard {
             root,
             identity,
             manifest,
+            final_parent,
             staging,
             _lock: lock,
         })
@@ -69,6 +99,10 @@ impl DeliverySessionGuard {
 
     pub fn dest_root(&self) -> &DestRoot {
         &self.root
+    }
+
+    pub fn final_parent_dir(&self) -> &DirHandle {
+        &self.final_parent
     }
 
     pub fn staging_dir(&self) -> &DirHandle {
@@ -99,13 +133,6 @@ impl DeliverySessionGuard {
         Ok(current)
     }
 
-    pub(crate) fn assert_same_delivery_uuid(&self, uuid: &str) -> Result<(), SessionError> {
-        if self.identity.delivery_uuid != uuid {
-            return Err(SessionError::IdentityMismatch);
-        }
-        Ok(())
-    }
-
     pub(crate) fn assert_same_identity(
         &self,
         identity: &DeliveryImmutableIdentity,
@@ -120,7 +147,6 @@ impl DeliverySessionGuard {
 #[cfg(test)]
 mod delivery_bound_lock {
     use super::*;
-    use crate::voice_delivery::lock::acquire_delivery_domain_lock;
     use crate::voice_delivery::manifest::{StemManifestEntry, ValidatedManifest};
 
     fn stem_manifest() -> ValidatedManifest {
@@ -132,39 +158,38 @@ mod delivery_bound_lock {
         .unwrap()
     }
 
+    fn stage_token(suffix: &str) -> String {
+        format!(".streamsync-stage-{suffix}")
+    }
+
     #[test]
     fn lock_for_delivery_a_cannot_commit_delivery_b_ledger() {
         let tmp = tempfile::tempdir().unwrap();
         let root = DestRoot::open(tmp.path()).unwrap();
         let manifest_a = stem_manifest();
-        let id_a = DeliveryImmutableIdentity::new(
+        let guard_a = DeliverySessionGuard::begin(
+            root,
             "delivery-a",
-            &manifest_a,
-            ".streamsync-stage-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            manifest_a,
+            stage_token("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             vec![],
             "final-a",
+            true,
         )
         .unwrap();
-        root.create_child_dir(".streamsync-stage-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-            .unwrap();
-        let lock_a = acquire_delivery_domain_lock(&root, "delivery-a", true).unwrap();
-        let guard_a = DeliverySessionGuard::open(root, id_a.clone(), manifest_a, lock_a).unwrap();
 
         let root_b = DestRoot::open(tmp.path()).unwrap();
         let manifest_b = stem_manifest();
-        let id_b = DeliveryImmutableIdentity::new(
+        let guard_b = DeliverySessionGuard::begin(
+            root_b,
             "delivery-b",
-            &manifest_b,
-            ".streamsync-stage-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            manifest_b,
+            stage_token("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
             vec![],
             "final-b",
+            true,
         )
         .unwrap();
-        root_b
-            .create_child_dir(".streamsync-stage-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-            .unwrap();
-        let lock_b = acquire_delivery_domain_lock(&root_b, "delivery-b", true).unwrap();
-        let guard_b = DeliverySessionGuard::open(root_b, id_b, manifest_b, lock_b).unwrap();
 
         let store_b = LedgerStore::open_for_guard(&guard_b).unwrap();
         let err = store_b.commit(&guard_a, LedgerState::Receiving);
@@ -172,5 +197,88 @@ mod delivery_bound_lock {
             err,
             Err(crate::voice_delivery::records::ledger_generation::LedgerGenerationError::IdentityMismatch)
         ));
+    }
+}
+
+#[cfg(test)]
+mod session_constructor_substitution {
+    use super::*;
+    use crate::voice_delivery::manifest::{StemManifestEntry, ValidatedManifest};
+    fn manifest_a() -> ValidatedManifest {
+        ValidatedManifest::validate(vec![StemManifestEntry {
+            file_name: "a.wav".into(),
+            byte_count: 44,
+            sha256: "a".repeat(64),
+        }])
+        .unwrap()
+    }
+
+    fn manifest_b() -> ValidatedManifest {
+        ValidatedManifest::validate(vec![StemManifestEntry {
+            file_name: "b.wav".into(),
+            byte_count: 44,
+            sha256: "b".repeat(64),
+        }])
+        .unwrap()
+    }
+
+    #[test]
+    fn same_uuid_different_manifest_yields_distinct_identity_and_staging_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uuid = "shared-uuid";
+        let stage_a = ".streamsync-stage-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let stage_b = ".streamsync-stage-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let digest_a = {
+            let guard_a = DeliverySessionGuard::begin(
+                DestRoot::open(tmp.path()).unwrap(),
+                uuid,
+                manifest_a(),
+                stage_a,
+                vec![PortableParentComponent::validate("guild").unwrap()],
+                "sess-a",
+                true,
+            )
+            .unwrap();
+            assert!(tmp.path().join("guild").join(stage_a).is_dir());
+            guard_a.identity().manifest_digest.clone()
+        };
+        let guard_b = DeliverySessionGuard::begin(
+            DestRoot::open(tmp.path()).unwrap(),
+            uuid,
+            manifest_b(),
+            stage_b,
+            vec![PortableParentComponent::validate("guild").unwrap()],
+            "sess-b",
+            true,
+        )
+        .unwrap();
+        assert_ne!(digest_a, guard_b.identity().manifest_digest);
+        assert_ne!(stage_a, guard_b.identity().staging_token);
+        assert!(tmp.path().join("guild").join(stage_b).is_dir());
+        assert!(!tmp.path().join(stage_a).exists());
+    }
+
+    #[test]
+    fn staging_geometry_under_final_parent_not_dest_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = DestRoot::open(tmp.path()).unwrap();
+        let stage = ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef";
+        let guard = DeliverySessionGuard::begin(
+            root,
+            "geo-test",
+            manifest_a(),
+            stage,
+            vec![
+                PortableParentComponent::validate("guild").unwrap(),
+                PortableParentComponent::validate("channel").unwrap(),
+            ],
+            "published",
+            true,
+        )
+        .unwrap();
+        let expected = tmp.path().join("guild").join("channel").join(stage);
+        assert!(expected.is_dir());
+        assert!(!tmp.path().join(stage).exists());
+        let _ = guard.final_parent_dir();
     }
 }

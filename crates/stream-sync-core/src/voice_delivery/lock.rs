@@ -30,7 +30,7 @@ impl DeliveryDomainLock {
 }
 
 /// Acquire the stable lock for `canonical_delivery_id` under `dest_root`.
-pub fn acquire_delivery_domain_lock(
+pub(crate) fn acquire_delivery_domain_lock(
     dest_root: &DestRoot,
     canonical_delivery_id: &str,
     try_wait: bool,

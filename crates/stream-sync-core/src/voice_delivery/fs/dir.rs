@@ -326,6 +326,59 @@ impl ValidatedFinalName {
     }
 }
 
+/// One validated relative directory segment under `DEST_ROOT` (final-parent path).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct PortableParentComponent(String);
+
+impl PortableParentComponent {
+    pub fn validate(name: &str) -> Result<Self, FsError> {
+        validate_portable_final_name(name)?;
+        Ok(Self(name.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+pub(crate) fn portable_parent_components_as_str_slice(
+    components: &[PortableParentComponent],
+) -> Vec<&str> {
+    components.iter().map(|c| c.as_str()).collect()
+}
+
+#[cfg(test)]
+mod portable_parent_component_table {
+    use super::*;
+
+    #[test]
+    fn portable_parent_component_table() {
+        for name in ["guild", "Guild_42", "a.b-c", "Z9"] {
+            assert!(PortableParentComponent::validate(name).is_ok());
+        }
+        let invalid = [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "trail.",
+            "bad:name",
+            "unicode-🎙",
+            "CON",
+            ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
+            &"x".repeat(129),
+        ];
+        for name in invalid {
+            assert!(
+                PortableParentComponent::validate(name).is_err(),
+                "expected reject for {:?}",
+                name
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod validated_final_name_portable {
     use super::*;
