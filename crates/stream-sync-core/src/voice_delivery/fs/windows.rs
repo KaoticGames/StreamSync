@@ -1,8 +1,11 @@
 //! Windows directory backend: validated absolute-path walks, reparse rejection, and `FileRenameInfo`.
 //!
-//! Same-parent rename uses cooperative geometry: source path is derived from the stored final-parent
-//! absolute path, source is opened with reparse inspection, and `SetFileInformationByHandle` supplies
-//! the held final-parent handle as `RootDirectory`. This does not bind against hostile ancestor replacement.
+//! Same-parent rename uses cooperative geometry: source and destination absolute paths are siblings
+//! under the stored validated `final_parent.absolute_path()` plus validated basenames. The source is
+//! opened with reparse inspection and DELETE access; `SetFileInformationByHandle(FileRenameInfo)` uses
+//! `RootDirectory = NULL` and the full absolute destination UTF-16 path (`ReplaceIfExists = FALSE`).
+//! Atomic no-replace on local NTFS holds, but path resolution is cooperative (accidental/stale state),
+//! not a defense against malicious same-user ancestor replacement.
 
 use super::dir::DirHandle;
 use super::error::FsError;
@@ -252,9 +255,9 @@ pub(crate) fn rename_no_replace_same_parent(
     src_name: &str,
     dst_name: &str,
 ) -> Result<(), FsError> {
-    let parent_h = final_parent.raw_handle();
     let parent_path = final_parent.windows_handle().absolute_path();
     let src_path = parent_path.join(src_name);
+    let dst_path = parent_path.join(dst_name);
 
     let src_wide = wide_path(&src_path);
     let src_handle = unsafe {
@@ -271,9 +274,8 @@ pub(crate) fn rename_no_replace_same_parent(
     let src = OwnedWinHandle::from_create_result(src_handle)?;
     src.ensure_not_reparse_component(src_name)?;
 
-    let dst_wide: Vec<u16> = dst_name.encode_utf16().collect();
-    let built =
-        build_no_replace_rename_buffer(parent_h, &dst_wide).map_err(map_rename_buffer_err)?;
+    let dst_wide: Vec<u16> = dst_path.as_os_str().encode_wide().collect();
+    let built = build_no_replace_rename_buffer(&dst_wide).map_err(map_rename_buffer_err)?;
     let (ptr, size) = built_rename_info_view(&built);
 
     let ok = unsafe {
@@ -416,10 +418,9 @@ mod file_rename_buffer_tests {
 
     #[test]
     fn multi_char_rename_buffer_matches_shared_helper() {
-        let dst = "published-session";
+        let dst = r"C:\temp\final-parent\published-session";
         let wide: Vec<u16> = dst.encode_utf16().collect();
-        let built =
-            build_no_replace_rename_buffer(0 as HANDLE, &wide).expect("build rename buffer");
+        let built = build_no_replace_rename_buffer(&wide).expect("build rename buffer");
         let (_, size_u32, name_bytes) =
             file_rename_info_buffer_size(wide.len()).expect("size helper");
         assert_eq!(built.size_u32, size_u32);
@@ -429,6 +430,7 @@ mod file_rename_buffer_tests {
         );
 
         let info = built.as_file_rename_info();
+        assert_eq!(unsafe { (*info).RootDirectory }, 0 as HANDLE);
         assert_eq!(unsafe { (*info).FileNameLength }, name_bytes);
         let name_ptr = unsafe { (*info).FileName.as_ptr() };
         let read_back: Vec<u16> =

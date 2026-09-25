@@ -26,14 +26,9 @@ mod win {
             .0
     }
 
-    pub fn set_file_rename_info_smoke(
-        staging_handle: isize,
-        parent_handle: isize,
-        dst: &str,
-    ) -> Result<(), u32> {
-        let dst_wide: Vec<u16> = dst.encode_utf16().collect();
-        let built =
-            build_no_replace_rename_buffer(parent_handle as _, &dst_wide).map_err(|_| 1u32)?;
+    pub fn set_file_rename_info_smoke(staging_handle: isize, dst_abs: &str) -> Result<(), u32> {
+        let dst_wide: Vec<u16> = dst_abs.encode_utf16().collect();
+        let built = build_no_replace_rename_buffer(&dst_wide).map_err(|_| 1u32)?;
         let (ptr, size) = built_rename_info_view(&built);
         let ok = unsafe {
             SetFileInformationByHandle(

@@ -67,9 +67,11 @@ pub struct BuiltFileRenameInfo {
     pub size_u32: u32,
 }
 
-/// Build a no-replace rename buffer (`ReplaceIfExists = 0`) with UTF-16 `dst` and trailing NUL.
+/// Build a no-replace rename buffer (`ReplaceIfExists = 0`) with UTF-16 absolute `dst` and trailing NUL.
+///
+/// `RootDirectory` is always `NULL`; `dst_utf16` must be the full destination path (NUL written after
+/// the copy; `FileNameLength` is `dst_utf16.len() * 2` bytes, excluding that terminator).
 pub fn build_no_replace_rename_buffer(
-    parent_directory: HANDLE,
     dst_utf16: &[u16],
 ) -> Result<BuiltFileRenameInfo, RenameBufferError> {
     let (buffer_size, buffer_size_u32, name_bytes) = file_rename_info_buffer_size(dst_utf16.len())?;
@@ -78,7 +80,7 @@ pub fn build_no_replace_rename_buffer(
     let name_ptr = unsafe { (*info).FileName.as_mut_ptr() };
     unsafe {
         (*info).Anonymous.ReplaceIfExists = 0;
-        (*info).RootDirectory = parent_directory;
+        (*info).RootDirectory = 0 as HANDLE;
         (*info).FileNameLength = name_bytes;
         std::ptr::copy_nonoverlapping(dst_utf16.as_ptr(), name_ptr, dst_utf16.len());
         *name_ptr.add(dst_utf16.len()) = 0;
@@ -111,9 +113,9 @@ mod tests {
 
     #[test]
     fn multi_char_name_buffer_layout_and_alignment() {
-        let dst = "published-session";
+        let dst = r"C:\voice\final-parent\published-session";
         let wide: Vec<u16> = dst.encode_utf16().collect();
-        let built = build_no_replace_rename_buffer(42 as HANDLE, &wide).expect("build");
+        let built = build_no_replace_rename_buffer(&wide).expect("build");
         let (total, size_u32, name_bytes) = file_rename_info_buffer_size(wide.len()).expect("size");
         assert_eq!(built.size_u32, size_u32);
         assert_eq!(built.size_u32, total as u32);
@@ -124,7 +126,7 @@ mod tests {
 
         let info = built.as_file_rename_info();
         assert_eq!(unsafe { (*info).Anonymous.ReplaceIfExists }, 0);
-        assert_eq!(unsafe { (*info).RootDirectory }, 42 as HANDLE);
+        assert_eq!(unsafe { (*info).RootDirectory }, 0 as HANDLE);
         assert_eq!(unsafe { (*info).FileNameLength }, name_bytes);
         assert_eq!(name_bytes as usize, wide.len() * 2);
 

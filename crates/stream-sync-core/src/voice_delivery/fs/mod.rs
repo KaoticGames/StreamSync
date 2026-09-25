@@ -61,7 +61,7 @@ pub(crate) fn open_lock_file_at_root(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod linux_rename_no_replace_same_parent {
     use super::*;
     use std::fs;
