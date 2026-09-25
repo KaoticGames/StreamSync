@@ -242,11 +242,9 @@ mod publication_durability_order {
 #[cfg(test)]
 mod crash_child_process_publication {
     use super::super::publish::PublicationCrashPoint;
+    use super::super::publish::{prepare_publication, publish_prepared, PublishOptions};
     use super::super::recover::recover_delivery;
     use super::super::test_support::sealed_publish_intent_fixture;
-    use super::super::publish::{
-        prepare_publication, publish_prepared, PublishOptions,
-    };
     use crate::voice_delivery::records::ledger_generation::LedgerStore;
     use crate::voice_delivery::session::DeliverySessionGuard;
     use crate::voice_delivery::state::LedgerState;

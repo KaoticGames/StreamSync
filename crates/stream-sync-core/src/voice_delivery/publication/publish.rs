@@ -140,8 +140,8 @@ pub fn publish_prepared(
         r.record(PublicationOperation::StagingReverified);
     }
 
-    let final_name = ValidatedFinalName::validate(&identity.final_session_name)
-        .map_err(PublicationError::Fs)?;
+    let final_name =
+        ValidatedFinalName::validate(&identity.final_session_name).map_err(PublicationError::Fs)?;
     let publication = FinalParentPublication::new(final_parent.clone_handle()?);
     match publication.rename_stage_to_final(&identity.staging_token, &final_name) {
         Ok(()) => {}
