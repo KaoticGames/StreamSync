@@ -23,13 +23,27 @@ jobs:
 
       - name: voice_delivery Windows runtime tests
         run: |
+          set -e
           cargo test -p stream-sync-windows-fs
           cargo test -p stream-sync-core 'voice_delivery::fs::' -- --nocapture
           cargo test -p stream-sync-core 'voice_delivery::lock::' -- --nocapture --test-threads=1
           cargo test -p stream-sync-core 'voice_delivery::ids::' -- --nocapture
-          cargo test -p stream-sync-core 'voice_delivery::bounds::|voice_delivery::wav::|voice_delivery::hash::|voice_delivery::manifest::' -- --nocapture
-          cargo test -p stream-sync-core 'voice_delivery::records::|voice_delivery::ingest::|voice_delivery::marker::' -- --nocapture
-          cargo test -p stream-sync-core 'partial_prefix_hasher_checkpoint|partial_sparse_prefix_digest_fail|ledger_generation_wins_valid|publish_intent_before_rename' -- --nocapture
+          run_suite() { n=$(cargo test -p stream-sync-core "$1" -- --list 2>/dev/null | rg -c '^\s.*: test$' || true); test "$n" -gt 0; cargo test -p stream-sync-core "$1" -- --nocapture; }
+          run_suite 'voice_delivery::bounds::'
+          run_suite 'voice_delivery::wav::'
+          run_suite 'voice_delivery::hash::'
+          run_suite 'voice_delivery::manifest::'
+          run_suite 'voice_delivery::records::'
+          run_suite 'voice_delivery::ingest::'
+          run_suite 'voice_delivery::marker::'
+          run_suite 'voice_delivery::session::'
+          run_suite 'voice_delivery::state::'
+          run_suite 'partial_prefix_hasher_checkpoint'
+          run_suite 'partial_sparse_hole_in_committed_prefix_fails'
+          run_suite 'ledger_generation_wins_valid'
+          run_suite 'publish_intent_before_rename'
+          run_suite 'delivery_bound_lock'
+        shell: bash
 
   windows-installer:
     name: Windows NSIS installer
