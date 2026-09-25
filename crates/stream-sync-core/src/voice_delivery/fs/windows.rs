@@ -238,6 +238,34 @@ pub(crate) fn open_root_dir(path: &Path) -> Result<OwnedDirHandle, FsError> {
     Ok(opened.into_dir_handle(abs))
 }
 
+fn classify_child_dir_open_failure(
+    child_path: &Path,
+    name: &str,
+    open_err: io::Error,
+) -> Result<super::dir::ChildDirProbe, FsError> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileAttributesW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+    let wide = wide_path(child_path);
+    let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attrs == u32::MAX {
+        let err = unsafe { GetLastError() };
+        if err == windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND
+            || err == windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND
+        {
+            return Ok(super::dir::ChildDirProbe::Missing);
+        }
+        return Err(FsError::Io(io::Error::from_raw_os_error(err as i32)));
+    }
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(FsError::SymlinkOrReparseComponent(name.to_string()));
+    }
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 {
+        return Err(FsError::NotADirectory(name.to_string()));
+    }
+    Err(FsError::Io(open_err))
+}
+
 pub(crate) fn probe_child_dir(
     parent: &DirHandle,
     name: &str,
@@ -256,34 +284,7 @@ pub(crate) fn probe_child_dir(
         Err(FsError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
             Ok(super::dir::ChildDirProbe::Missing)
         }
-        Err(FsError::Io(e))
-            if e.kind() == io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(5) =>
-        {
-            Err(FsError::Io(e))
-        }
-        Err(FsError::Io(e)) => {
-            use windows_sys::Win32::Storage::FileSystem::{
-                GetFileAttributesW, FILE_ATTRIBUTE_DIRECTORY,
-            };
-            let wide = wide_path(&child_path);
-            let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
-            if attrs == u32::MAX {
-                let err = unsafe { GetLastError() };
-                if err == windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND
-                    || err == windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND
-                {
-                    return Ok(super::dir::ChildDirProbe::Missing);
-                }
-                return Err(FsError::Io(io::Error::from_raw_os_error(err as i32)));
-            }
-            if (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 {
-                if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-                    return Err(FsError::SymlinkOrReparseComponent(name.to_string()));
-                }
-                return Err(FsError::NotADirectory(name.to_string()));
-            }
-            Err(FsError::Io(e))
-        }
+        Err(FsError::Io(e)) => classify_child_dir_open_failure(&child_path, name, e),
         Err(other) => Err(other),
     }
 }
@@ -515,6 +516,109 @@ mod file_rename_buffer_tests {
             unsafe { std::slice::from_raw_parts(name_ptr, wide.len()) }.to_vec();
         assert_eq!(read_back, wide);
         assert_eq!(unsafe { *name_ptr.add(wide.len()) }, 0);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod probe_child_dir_tests {
+    use super::*;
+    use crate::voice_delivery::fs::DestRoot;
+    use std::fs;
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    fn probe_parent(tmp: &tempfile::TempDir) -> DirHandle {
+        let root = DestRoot::open(tmp.path()).expect("root");
+        fs::create_dir_all(tmp.path().join("parent")).expect("mkdir parent");
+        root.open_dir_relative(&["parent"]).expect("open parent")
+    }
+
+    fn try_mklink(args: &[&str]) -> Result<(), String> {
+        let output = Command::new("cmd")
+            .args(["/C", "mklink"])
+            .args(args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("spawn mklink: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "mklink failed (status {:?}): {}{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
+    #[test]
+    fn regular_file_is_not_a_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = probe_parent(&tmp);
+        fs::write(tmp.path().join("parent").join("child-file"), b"x").expect("file");
+        let err = parent.probe_child_dir("child-file").unwrap_err();
+        assert!(matches!(err, FsError::NotADirectory(_)));
+    }
+
+    /// Real directory that cannot be opened (exclusive handle) must surface the open `Io` error.
+    #[test]
+    fn real_directory_open_failure_returns_io() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = probe_parent(&tmp);
+        let blocked = tmp.path().join("parent").join("blocked");
+        fs::create_dir(&blocked).expect("mkdir");
+        let wide = wide_path(&blocked);
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_GENERIC_READ,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        let held = OwnedWinHandle(handle);
+        let err = parent.probe_child_dir("blocked").unwrap_err();
+        assert!(matches!(err, FsError::Io(_)));
+        drop(held);
+    }
+
+    #[test]
+    fn reparse_directory_junction_rejected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = probe_parent(&tmp);
+        let target = tmp.path().join("parent").join("junction-target");
+        fs::create_dir(&target).expect("target");
+        let link = tmp.path().join("parent").join("junction-child");
+        match try_mklink(&["/J", &link.to_string_lossy(), &target.to_string_lossy()]) {
+            Ok(()) => {
+                let err = parent.probe_child_dir("junction-child").unwrap_err();
+                assert!(matches!(err, FsError::SymlinkOrReparseComponent(_)));
+            }
+            Err(reason) => eprintln!("SKIP reparse_directory_junction_rejected: {reason}"),
+        }
+    }
+
+    #[test]
+    fn reparse_file_symlink_rejected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = probe_parent(&tmp);
+        let target = tmp.path().join("parent").join("symlink-target.txt");
+        fs::write(&target, b"x").expect("target file");
+        let link = tmp.path().join("parent").join("symlink-child");
+        match try_mklink(&[&link.to_string_lossy(), &target.to_string_lossy()]) {
+            Ok(()) => {
+                let err = parent.probe_child_dir("symlink-child").unwrap_err();
+                assert!(matches!(err, FsError::SymlinkOrReparseComponent(_)));
+            }
+            Err(reason) => eprintln!("SKIP reparse_file_symlink_rejected: {reason}"),
+        }
     }
 }
 
