@@ -92,7 +92,7 @@ fn recover_publish_intent(
     guard: &DeliverySessionGuard,
     store: &LedgerStore,
     presence: super::publish::PublicationPresence,
-    recorder: Option<&mut PublicationOperationRecorder>,
+    mut recorder: Option<&mut PublicationOperationRecorder>,
     options: PublishOptions,
 ) -> Result<RecoveryOutcome, PublicationError> {
     match (presence.stage_present(), presence.final_present()) {
@@ -120,16 +120,21 @@ fn recover_publish_intent(
                 Err(e) => Err(e),
             }
         }
-        (false, true) => match finalize_from_final_only(guard, recorder, options, false) {
-            Ok(published) => Ok(RecoveryOutcome::Published(published)),
-            Err(_) => Ok(RecoveryOutcome::Quarantined(quarantine_idempotent(
-                store,
-                guard,
-                QUARANTINE_PUBLISHED_FINAL_INVALID,
-                false,
-                true,
-            )?)),
-        },
+        (false, true) => {
+            if let Some(r) = recorder.as_mut() {
+                r.record(super::publish::PublicationOperation::PublishIntentObserved);
+            }
+            match finalize_from_final_only(guard, recorder, options) {
+                Ok(published) => Ok(RecoveryOutcome::Published(published)),
+                Err(_) => Ok(RecoveryOutcome::Quarantined(quarantine_idempotent(
+                    store,
+                    guard,
+                    QUARANTINE_PUBLISHED_FINAL_INVALID,
+                    false,
+                    true,
+                )?)),
+            }
+        }
     }
 }
 

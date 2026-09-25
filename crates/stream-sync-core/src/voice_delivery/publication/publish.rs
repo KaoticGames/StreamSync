@@ -100,13 +100,6 @@ pub struct PublicationOperationRecorder {
 
 impl PublicationOperationRecorder {
     pub fn record(&mut self, op: PublicationOperation) {
-        if op == PublicationOperation::PublishIntentObserved
-            && self
-                .ops
-                .contains(&PublicationOperation::PublishIntentObserved)
-        {
-            return;
-        }
         self.ops.push(op);
     }
 }
@@ -189,7 +182,7 @@ pub fn publish_prepared(
     }
     if !presence.stage_present() {
         if presence.final_present() {
-            return finalize_from_final_only(guard, recorder, options, true);
+            return finalize_from_final_only(guard, recorder, options);
         }
         return Err(PublicationError::MissingPublication);
     }
@@ -287,24 +280,20 @@ fn reconcile_after_rename_error(
     match (presence.stage_present(), presence.final_present()) {
         (false, true) => {
             if verify_final_session_directory(final_parent, identity, manifest).is_ok() {
-                return finalize_from_final_only(guard, recorder, options, true);
+                return finalize_from_final_only(guard, recorder, options);
             }
             if matches!(rename_err, FsError::AlreadyExists) {
-                return Err(classify_destination_collision(
-                    final_parent,
-                    identity,
-                    manifest,
+                return Err(classify_existing_final_collision(
+                    &presence, identity, manifest,
                 ));
             }
             Err(PublicationError::RenameIndeterminate { detail })
         }
         (true, false) => {
             if matches!(rename_err, FsError::AlreadyExists) {
-                return Err(classify_destination_collision(
-                    final_parent,
-                    identity,
-                    manifest,
-                ));
+                return Err(PublicationError::RenameFailed {
+                    detail: rename_error_detail(&rename_err),
+                });
             }
             Err(PublicationError::RenameFailed { detail })
         }
@@ -322,17 +311,11 @@ pub(crate) fn finalize_from_final_only(
     guard: &DeliverySessionGuard,
     mut recorder: Option<&mut PublicationOperationRecorder>,
     options: PublishOptions,
-    intent_already_observed: bool,
 ) -> Result<LedgerGeneration, PublicationError> {
     let store = LedgerStore::open_for_guard(guard)?;
     let identity = guard.identity();
     let manifest = guard.manifest();
     let final_parent = guard.final_parent_dir();
-    if !intent_already_observed {
-        if let Some(r) = recorder.as_mut() {
-            r.record(PublicationOperation::PublishIntentObserved);
-        }
-    }
     let namespace_durability = sync_dir_exact(final_parent)?;
     if let Some(r) = recorder.as_mut() {
         r.record(PublicationOperation::ParentNamespaceDurability);
@@ -366,24 +349,22 @@ pub(crate) fn verify_final_session_directory(
     Ok(())
 }
 
-fn classify_destination_collision(
-    final_parent: &DirHandle,
+fn classify_existing_final_collision(
+    presence: &PublicationPresence,
     identity: &DeliveryImmutableIdentity,
     manifest: &ValidatedManifest,
 ) -> PublicationError {
-    match final_parent.probe_child_dir(&identity.final_session_name) {
-        Ok(ChildDirProbe::Directory(dir)) => {
-            if marker_matches_delivery(&dir, identity, manifest) {
+    match &presence.final_session {
+        PresenceSlot::Directory(dir) => {
+            if marker_matches_delivery(dir, identity, manifest) {
                 PublicationError::DestinationExists
             } else {
                 PublicationError::UnrelatedDestination
             }
         }
-        Ok(ChildDirProbe::Missing) => PublicationError::DestinationExists,
-        Err(FsError::SymlinkOrReparseComponent(_)) | Err(FsError::NotADirectory(_)) => {
-            PublicationError::UnrelatedDestination
-        }
-        Err(e) => PublicationError::Fs(e),
+        PresenceSlot::Missing => PublicationError::RenameIndeterminate {
+            detail: "already_exists".into(),
+        },
     }
 }
 

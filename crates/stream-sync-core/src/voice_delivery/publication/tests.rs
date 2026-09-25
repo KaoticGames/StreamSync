@@ -1,7 +1,10 @@
 #[cfg(test)]
 mod recover_rename_outcome_matrix {
     use super::super::error::PublicationError;
-    use super::super::publish::{prepare_publication, publish_prepared, PublishOptions};
+    use super::super::publish::{
+        prepare_publication, publish_prepared, PublicationOperation, PublicationOperationRecorder,
+        PublishOptions,
+    };
     use super::super::recover::{recover_delivery, RecoveryOutcome, QUARANTINE_AMBIGUOUS};
     use super::super::test_support::{
         sealed_publish_intent_fixture, stage_token, write_minimal_stem,
@@ -44,8 +47,18 @@ mod recover_rename_outcome_matrix {
         publication
             .rename_stage_to_final(&fx.stage, &final_name)
             .unwrap();
-        let outcome = recover_delivery(&fx.guard, None).unwrap();
+        let mut recorder = PublicationOperationRecorder::default();
+        let outcome = recover_delivery(&fx.guard, Some(&mut recorder)).unwrap();
         assert!(matches!(outcome, RecoveryOutcome::Published(_)));
+        assert_eq!(
+            recorder.ops,
+            vec![
+                PublicationOperation::PublishIntentObserved,
+                PublicationOperation::ParentNamespaceDurability,
+                PublicationOperation::FinalReopenVerify,
+                PublicationOperation::PublishedCommitted,
+            ]
+        );
         let store = LedgerStore::open_for_guard(&fx.guard).unwrap();
         assert_eq!(
             store.read_highest_valid().unwrap().unwrap().state,
@@ -238,6 +251,20 @@ mod publication_durability_order {
     }
 
     #[test]
+    fn publication_operation_recorder_appends_every_invocation() {
+        let mut recorder = PublicationOperationRecorder::default();
+        recorder.record(PublicationOperation::PublishIntentObserved);
+        recorder.record(PublicationOperation::PublishIntentObserved);
+        assert_eq!(
+            recorder.ops,
+            vec![
+                PublicationOperation::PublishIntentObserved,
+                PublicationOperation::PublishIntentObserved,
+            ]
+        );
+    }
+
+    #[test]
     fn publication_operation_order_final_only() {
         let fx = sealed_publish_intent_fixture("pub-order-final", "final-only-order", &[]);
         let parent = fx.guard.final_parent_dir();
@@ -266,7 +293,10 @@ mod publication_durability_order {
 #[cfg(test)]
 mod injectable_rename_outcome_matrix {
     use super::super::error::PublicationError;
-    use super::super::publish::{prepare_publication, publish_prepared, PublishOptions};
+    use super::super::publish::{
+        prepare_publication, publish_prepared, PublicationOperation, PublicationOperationRecorder,
+        PublishOptions,
+    };
     use super::super::recover::{recover_delivery, RecoveryOutcome};
     use super::super::test_support::sealed_publish_intent_fixture;
     use crate::voice_delivery::fs::{DirHandle, FsError, ValidatedFinalName};
@@ -295,13 +325,49 @@ mod injectable_rename_outcome_matrix {
         wrap
     }
 
+    fn inject_rename_then_already_exists(
+    ) -> crate::voice_delivery::publication::publish::RenameInjectFn {
+        fn wrap(
+            parent: &DirHandle,
+            stage: &str,
+            final_name: &ValidatedFinalName,
+        ) -> Result<(), FsError> {
+            let publication =
+                crate::voice_delivery::fs::FinalParentPublication::new(parent.clone_handle()?);
+            publication.rename_stage_to_final(stage, final_name)?;
+            Err(FsError::AlreadyExists)
+        }
+        wrap
+    }
+
+    fn inject_foreign_final_reconcile(
+    ) -> crate::voice_delivery::publication::publish::RenameInjectFn {
+        fn wrap(
+            _parent: &DirHandle,
+            stage: &str,
+            final_name: &ValidatedFinalName,
+        ) -> Result<(), FsError> {
+            let root = std::env::var("STREAMSYNC_INJECT_RECONCILE_ROOT")
+                .map(std::path::PathBuf::from)
+                .map_err(|_| FsError::Io(std::io::Error::other("missing root")))?;
+            let stage_path = root.join(stage);
+            let _ = std::fs::remove_dir_all(&stage_path);
+            let final_path = root.join(final_name.as_str());
+            std::fs::create_dir(&final_path).map_err(FsError::Io)?;
+            std::fs::write(final_path.join("foreign.txt"), b"x").map_err(FsError::Io)?;
+            Err(FsError::AlreadyExists)
+        }
+        wrap
+    }
+
     #[test]
     fn rename_error_stage_only_leaves_publish_intent() {
         let fx = sealed_publish_intent_fixture("inj-stage", "inj-final", &[]);
         let prepared = prepare_publication(&fx.guard).unwrap();
+        let mut recorder = PublicationOperationRecorder::default();
         let err = publish_prepared(
             prepared,
-            None,
+            Some(&mut recorder),
             PublishOptions {
                 rename_inject: Some(inject_io()),
                 ..Default::default()
@@ -309,12 +375,53 @@ mod injectable_rename_outcome_matrix {
         )
         .unwrap_err();
         assert!(matches!(err, PublicationError::RenameFailed { .. }));
+        assert_eq!(
+            recorder.ops,
+            vec![
+                PublicationOperation::PublishIntentObserved,
+                PublicationOperation::StagingReverified,
+            ]
+        );
         let store = LedgerStore::open_for_guard(&fx.guard).unwrap();
         assert_eq!(
             store.read_highest_valid().unwrap().unwrap().state,
             LedgerState::PublishIntent
         );
         assert!(fx.tmp.path().join(&fx.stage).is_dir());
+    }
+
+    #[test]
+    fn rename_already_exists_stage_only_truthful() {
+        let fx = sealed_publish_intent_fixture("inj-ae-stage", "inj-ae-final", &[]);
+        let prepared = prepare_publication(&fx.guard).unwrap();
+        let mut recorder = PublicationOperationRecorder::default();
+        let err = publish_prepared(
+            prepared,
+            Some(&mut recorder),
+            PublishOptions {
+                rename_inject: Some(inject_already_exists()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            PublicationError::RenameFailed { detail } if detail == "already_exists"
+        ));
+        assert_eq!(
+            recorder.ops,
+            vec![
+                PublicationOperation::PublishIntentObserved,
+                PublicationOperation::StagingReverified,
+            ]
+        );
+        let store = LedgerStore::open_for_guard(&fx.guard).unwrap();
+        assert_eq!(
+            store.read_highest_valid().unwrap().unwrap().state,
+            LedgerState::PublishIntent
+        );
+        assert!(fx.tmp.path().join(&fx.stage).is_dir());
+        assert!(!fx.tmp.path().join("inj-ae-final").exists());
     }
 
     #[test]
@@ -362,7 +469,6 @@ mod injectable_rename_outcome_matrix {
 
     #[test]
     fn rename_unknown_outcome_operation_order_final_only() {
-        use super::super::publish::{PublicationOperation, PublicationOperationRecorder};
         let fx = sealed_publish_intent_fixture("inj-order-final", "inj-order-commit", &[]);
         let parent = fx.guard.final_parent_dir();
         let publication =
@@ -384,16 +490,105 @@ mod injectable_rename_outcome_matrix {
         )
         .unwrap();
         assert_eq!(
-            recorder
-                .ops
-                .iter()
-                .filter(|o| **o == PublicationOperation::PublishIntentObserved)
-                .count(),
-            1
+            recorder.ops,
+            vec![
+                PublicationOperation::PublishIntentObserved,
+                PublicationOperation::ParentNamespaceDurability,
+                PublicationOperation::FinalReopenVerify,
+                PublicationOperation::PublishedCommitted,
+            ]
         );
-        assert!(recorder
-            .ops
-            .contains(&PublicationOperation::PublishedCommitted));
+    }
+
+    #[test]
+    fn rename_error_reconciled_final_only_operation_order() {
+        let fx = sealed_publish_intent_fixture("inj-reconcile-final", "inj-reconcile-name", &[]);
+        let prepared = prepare_publication(&fx.guard).unwrap();
+        let mut recorder = PublicationOperationRecorder::default();
+        publish_prepared(
+            prepared,
+            Some(&mut recorder),
+            PublishOptions {
+                rename_inject: Some(inject_rename_then_already_exists()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            recorder.ops,
+            vec![
+                PublicationOperation::PublishIntentObserved,
+                PublicationOperation::StagingReverified,
+                PublicationOperation::ParentNamespaceDurability,
+                PublicationOperation::FinalReopenVerify,
+                PublicationOperation::PublishedCommitted,
+            ]
+        );
+    }
+
+    #[test]
+    fn rename_already_exists_reconcile_foreign_final_unrelated() {
+        let fx = sealed_publish_intent_fixture("inj-foreign-recon", "inj-foreign-final", &[]);
+        std::env::set_var(
+            "STREAMSYNC_INJECT_RECONCILE_ROOT",
+            fx.tmp.path().to_string_lossy().as_ref(),
+        );
+        let prepared = prepare_publication(&fx.guard).unwrap();
+        let mut recorder = PublicationOperationRecorder::default();
+        let err = publish_prepared(
+            prepared,
+            Some(&mut recorder),
+            PublishOptions {
+                rename_inject: Some(inject_foreign_final_reconcile()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        std::env::remove_var("STREAMSYNC_INJECT_RECONCILE_ROOT");
+        assert!(matches!(err, PublicationError::UnrelatedDestination));
+        assert_eq!(
+            recorder.ops,
+            vec![
+                PublicationOperation::PublishIntentObserved,
+                PublicationOperation::StagingReverified,
+            ]
+        );
+        let store = LedgerStore::open_for_guard(&fx.guard).unwrap();
+        assert_eq!(
+            store.read_highest_valid().unwrap().unwrap().state,
+            LedgerState::PublishIntent
+        );
+        assert!(fx.tmp.path().join("inj-foreign-final").is_dir());
+        assert!(!fx.tmp.path().join(&fx.stage).exists());
+    }
+
+    #[test]
+    fn rename_unknown_neither_operation_order() {
+        let fx = sealed_publish_intent_fixture("inj-neither-order", "inj-neither-final", &[]);
+        std::env::set_var(
+            "STREAMSYNC_INJECT_DROP_STAGE_ROOT",
+            fx.tmp.path().to_string_lossy().as_ref(),
+        );
+        let prepared = prepare_publication(&fx.guard).unwrap();
+        let mut recorder = PublicationOperationRecorder::default();
+        let err = publish_prepared(
+            prepared,
+            Some(&mut recorder),
+            PublishOptions {
+                rename_inject: Some(inject_drop_stage_and_fail()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        std::env::remove_var("STREAMSYNC_INJECT_DROP_STAGE_ROOT");
+        assert!(matches!(err, PublicationError::RenameIndeterminate { .. }));
+        assert_eq!(
+            recorder.ops,
+            vec![
+                PublicationOperation::PublishIntentObserved,
+                PublicationOperation::StagingReverified,
+            ]
+        );
     }
 
     fn inject_drop_stage_and_fail() -> crate::voice_delivery::publication::publish::RenameInjectFn {
