@@ -51,7 +51,7 @@ pub struct PartialStemWriter<'guard> {
     live_contiguous_len: u64,
     hasher: LiveSha256,
     artifact: StemArtifactId,
-    checkpoint_store: CheckpointStore,
+    checkpoint_store: CheckpointStore<'guard>,
     chunk_size: usize,
 }
 
@@ -60,6 +60,15 @@ impl<'guard> PartialStemWriter<'guard> {
         guard: &'guard DeliverySessionGuard,
         stem_portable_name: &str,
         chunk_size: usize,
+    ) -> Result<Self, PartialError> {
+        Self::open_or_resume_inner(guard, stem_portable_name, chunk_size, None)
+    }
+
+    fn open_or_resume_inner(
+        guard: &'guard DeliverySessionGuard,
+        stem_portable_name: &str,
+        chunk_size: usize,
+        prefix_read_counter: Option<&mut u64>,
     ) -> Result<Self, PartialError> {
         if chunk_size == 0 {
             return Err(PartialError::InvalidChunkSize);
@@ -104,7 +113,13 @@ impl<'guard> PartialStemWriter<'guard> {
                 });
             }
             let mut live = LiveSha256::new();
-            hash_prefix_into(&file, cp.durable_contiguous_len, chunk_size, &mut live)?;
+            hash_prefix_into(
+                &file,
+                cp.durable_contiguous_len,
+                chunk_size,
+                &mut live,
+                prefix_read_counter,
+            )?;
             let digest = live.prefix_digest_hex();
             if digest != cp.prefix_digest {
                 return Err(PartialError::PrefixDigestMismatch);
@@ -215,11 +230,13 @@ fn verify_overlap_prefix(
     Ok(())
 }
 
-fn hash_prefix_into(
+/// When `chunk_reads` is set, increments once per physical read issued while rebuilding the prefix hasher.
+pub(crate) fn hash_prefix_into(
     file: &VoiceFile,
     len: u64,
     chunk_size: usize,
     live: &mut LiveSha256,
+    mut chunk_reads: Option<&mut u64>,
 ) -> Result<(), PartialError> {
     let mut offset = 0u64;
     let mut remaining = len;
@@ -228,6 +245,9 @@ fn hash_prefix_into(
         let take = remaining.min(chunk_size as u64);
         let take_usize = usize::try_from(take).map_err(|_| PartialError::LengthOverflow)?;
         file.read_exact_at(offset, &mut buf[..take_usize])?;
+        if let Some(counter) = chunk_reads.as_deref_mut() {
+            *counter += 1;
+        }
         live.update(&buf[..take_usize]);
         offset += take;
         remaining -= take;
@@ -406,6 +426,9 @@ mod partial_resume_adversarial {
         f.sync_all().unwrap();
         let w2 = PartialStemWriter::open_or_resume(&guard, "a.wav", 64).unwrap();
         assert_eq!(w2.resumable_offset(), 20);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(bytes, [1; 20]);
     }
 
     #[test]
@@ -431,7 +454,157 @@ mod partial_resume_adversarial {
         let (_tmp, guard) = guard(100, &"a".repeat(64));
         let mut w = PartialStemWriter::open_or_resume(&guard, "a.wav", 64).unwrap();
         w.write_contiguous(0, &[1, 2, 3, 4]).unwrap();
+        let digest_before = w.prefix_digest_hex();
+        let offset_before = w.resumable_offset();
         let err = w.write_contiguous(2, &[9, 9]);
         assert!(matches!(err, Err(PartialError::OverlapMismatch { .. })));
+        assert_eq!(w.resumable_offset(), offset_before);
+        assert_eq!(w.prefix_digest_hex(), digest_before);
+        let name = StemArtifactId::from_manifest_stem(guard.identity(), guard.manifest(), "a.wav")
+            .unwrap()
+            .partial_basename();
+        let path = _tmp
+            .path()
+            .join(".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef")
+            .join(name);
+        assert_eq!(std::fs::read(&path).unwrap(), [1, 2, 3, 4]);
+    }
+}
+
+#[cfg(test)]
+mod partial_contiguous_overlap_behavior {
+    use super::*;
+    use crate::voice_delivery::fs::DestRoot;
+    use crate::voice_delivery::hash::hex_digest;
+    use crate::voice_delivery::manifest::{StemManifestEntry, ValidatedManifest};
+    use crate::voice_delivery::session::DeliverySessionGuard;
+    use sha2::{Digest, Sha256};
+
+    fn guard(bytes: u64) -> (tempfile::TempDir, DeliverySessionGuard) {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = ValidatedManifest::validate(vec![StemManifestEntry {
+            file_name: "a.wav".into(),
+            byte_count: bytes,
+            sha256: "b".repeat(64),
+        }])
+        .unwrap();
+        let guard = DeliverySessionGuard::begin(
+            DestRoot::open(tmp.path()).unwrap(),
+            "overlap-beh",
+            manifest,
+            ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
+            vec![],
+            "final",
+            true,
+        )
+        .unwrap();
+        (tmp, guard)
+    }
+
+    fn partial_path(tmp: &tempfile::TempDir, guard: &DeliverySessionGuard) -> std::path::PathBuf {
+        let name = StemArtifactId::from_manifest_stem(guard.identity(), guard.manifest(), "a.wav")
+            .unwrap()
+            .partial_basename();
+        tmp.path()
+            .join(".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef")
+            .join(name)
+    }
+
+    #[test]
+    fn full_duplicate_replay_is_idempotent() {
+        let (tmp, guard) = guard(64);
+        let mut w = PartialStemWriter::open_or_resume(&guard, "a.wav", 8).unwrap();
+        let chunk = [10, 11, 12, 13];
+        w.write_contiguous(0, &chunk).unwrap();
+        let digest = w.prefix_digest_hex();
+        let offset = w.resumable_offset();
+        w.write_contiguous(0, &chunk).unwrap();
+        assert_eq!(w.resumable_offset(), offset);
+        assert_eq!(w.prefix_digest_hex(), digest);
+        assert_eq!(std::fs::read(partial_path(&tmp, &guard)).unwrap(), chunk);
+    }
+
+    #[test]
+    fn partial_overlap_appends_tail_and_updates_digest() {
+        let (tmp, guard) = guard(64);
+        let mut w = PartialStemWriter::open_or_resume(&guard, "a.wav", 8).unwrap();
+        w.write_contiguous(0, &[1, 2, 3, 4]).unwrap();
+        w.commit_checkpoint().unwrap();
+        let mut w2 = PartialStemWriter::open_or_resume(&guard, "a.wav", 8).unwrap();
+        w2.write_contiguous(2, &[3, 4, 5, 6, 7]).unwrap();
+        assert_eq!(w2.resumable_offset(), 4);
+        assert!(matches!(
+            w2.write_contiguous(8, &[0]),
+            Err(PartialError::NonContiguous { .. })
+        ));
+        let on_disk = std::fs::read(partial_path(&tmp, &guard)).unwrap();
+        assert_eq!(on_disk, [1, 2, 3, 4, 5, 6, 7]);
+        let mut expected = Sha256::new();
+        expected.update([1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(w2.prefix_digest_hex(), hex_digest(&expected.finalize()));
+    }
+}
+
+#[cfg(test)]
+mod partial_restart_single_prefix_pass {
+    use super::*;
+    use crate::voice_delivery::fs::file::open_or_create_file_at;
+    use crate::voice_delivery::fs::DestRoot;
+    use crate::voice_delivery::manifest::{StemManifestEntry, ValidatedManifest};
+    use crate::voice_delivery::session::DeliverySessionGuard;
+
+    #[test]
+    fn resume_rebuilds_prefix_hasher_in_one_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = ValidatedManifest::validate(vec![StemManifestEntry {
+            file_name: "a.wav".into(),
+            byte_count: 200,
+            sha256: "c".repeat(64),
+        }])
+        .unwrap();
+        let guard = DeliverySessionGuard::begin(
+            DestRoot::open(tmp.path()).unwrap(),
+            "one-pass",
+            manifest,
+            ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
+            vec![],
+            "final",
+            true,
+        )
+        .unwrap();
+        let chunk_size = 32usize;
+        const PREFIX_LEN: u64 = 100;
+        let mut w = PartialStemWriter::open_or_resume(&guard, "a.wav", chunk_size).unwrap();
+        w.write_contiguous(0, &[7; PREFIX_LEN as usize]).unwrap();
+        w.commit_checkpoint().unwrap();
+        let expected_chunks = PREFIX_LEN.div_ceil(chunk_size as u64);
+        let mut resume_reads = 0u64;
+        let w2 = PartialStemWriter::open_or_resume_inner(
+            &guard,
+            "a.wav",
+            chunk_size,
+            Some(&mut resume_reads),
+        )
+        .unwrap();
+        assert_eq!(resume_reads, expected_chunks);
+        assert_eq!(resume_reads, 4);
+        assert_eq!(w2.resumable_offset(), PREFIX_LEN);
+        let mut second_pass_reads = 0u64;
+        let mut live = LiveSha256::new();
+        let artifact =
+            StemArtifactId::from_manifest_stem(guard.identity(), guard.manifest(), "a.wav")
+                .unwrap();
+        let file =
+            open_or_create_file_at(guard.staging_dir(), &artifact.partial_basename()).unwrap();
+        hash_prefix_into(
+            &file,
+            PREFIX_LEN,
+            chunk_size,
+            &mut live,
+            Some(&mut second_pass_reads),
+        )
+        .unwrap();
+        assert_eq!(second_pass_reads, expected_chunks);
+        assert_eq!(w2.prefix_digest_hex(), live.prefix_digest_hex());
     }
 }
