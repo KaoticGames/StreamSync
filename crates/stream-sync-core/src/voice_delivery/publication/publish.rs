@@ -101,7 +101,9 @@ pub struct PublicationOperationRecorder {
 impl PublicationOperationRecorder {
     pub fn record(&mut self, op: PublicationOperation) {
         if op == PublicationOperation::PublishIntentObserved
-            && self.ops.contains(&PublicationOperation::PublishIntentObserved)
+            && self
+                .ops
+                .contains(&PublicationOperation::PublishIntentObserved)
         {
             return;
         }
