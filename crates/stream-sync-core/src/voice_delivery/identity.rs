@@ -1,5 +1,6 @@
 //! Immutable delivery and stem identities bound into records and checkpoints.
 
+use crate::voice_delivery::fs::validate_single_component;
 use crate::voice_delivery::fs::{FsError, ValidatedFinalName};
 use crate::voice_delivery::ids::{delivery_opaque_dir_id, validate_stage_basename};
 use crate::voice_delivery::manifest::ValidatedManifest;
@@ -48,11 +49,7 @@ impl DeliveryImmutableIdentity {
         let staging_token = staging_token.into();
         validate_stage_basename(&staging_token)?;
         for comp in &final_parent_relative {
-            if comp.is_empty() || comp.contains('/') || comp.contains('\\') {
-                return Err(IdentityError::Invalid(
-                    "invalid final parent component".into(),
-                ));
-            }
+            validate_single_component(comp).map_err(|e| IdentityError::Fs(e))?;
         }
         let final_name = ValidatedFinalName::validate(final_session_name)?;
         let manifest_digest = manifest.digest();
@@ -70,36 +67,77 @@ impl DeliveryImmutableIdentity {
         })
     }
 
-    pub fn matches_record_fields(
+    pub fn matches_ledger_record(
+        &self,
+        record: &crate::voice_delivery::records::ledger_generation::LedgerGeneration,
+    ) -> bool {
+        self.delivery_uuid == record.delivery_uuid
+            && self.manifest_digest == record.manifest_digest
+            && self.staging_token == record.staging_token
+            && self.final_parent_relative == record.final_parent_relative
+            && self.final_session_name == record.final_session_name
+    }
+
+    pub fn foreign_identity_in_record(
         &self,
         delivery_uuid: &str,
         manifest_digest: &str,
         staging_token: &str,
+        final_parent_relative: &[String],
+        final_session_name: &str,
     ) -> bool {
-        self.delivery_uuid == delivery_uuid
-            && self.manifest_digest == manifest_digest
-            && self.staging_token == staging_token
+        self.delivery_uuid != delivery_uuid
+            || self.manifest_digest != manifest_digest
+            || self.staging_token != staging_token
+            || self.final_parent_relative.as_slice() != final_parent_relative
+            || self.final_session_name != final_session_name
     }
 }
 
 impl StemArtifactId {
-    pub fn new(
+    pub fn from_manifest_stem(
         identity: &DeliveryImmutableIdentity,
-        stem_portable_name: impl Into<String>,
-    ) -> Self {
-        Self {
+        manifest: &ValidatedManifest,
+        stem_portable_name: &str,
+    ) -> Result<Self, IdentityError> {
+        let entry = manifest
+            .stems
+            .iter()
+            .find(|s| s.file_name == stem_portable_name)
+            .ok_or(IdentityError::Invalid(format!(
+                "stem {stem_portable_name} not in manifest"
+            )))?;
+        Ok(Self {
             delivery_uuid: identity.delivery_uuid.clone(),
             manifest_digest: identity.manifest_digest.clone(),
-            stem_portable_name: stem_portable_name.into(),
-        }
+            stem_portable_name: entry.file_name.clone(),
+        })
+    }
+
+    fn identity_key(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.delivery_uuid, self.manifest_digest, self.stem_portable_name
+        )
+    }
+
+    pub fn checkpoint_dir_key(&self) -> String {
+        let digest = Sha256::digest(self.identity_key().as_bytes());
+        format!("{:x}", digest)
     }
 
     pub fn partial_basename(&self) -> String {
-        let key = format!(
-            "{}:{}:{}",
-            self.delivery_uuid, self.manifest_digest, self.stem_portable_name
-        );
-        let digest = Sha256::digest(key.as_bytes());
-        format!("{:x}.partial", digest)
+        format!("{}.partial", self.checkpoint_dir_key())
+    }
+
+    pub fn manifest_entry<'a>(
+        &'a self,
+        manifest: &'a ValidatedManifest,
+    ) -> Result<&'a crate::voice_delivery::manifest::StemManifestEntry, IdentityError> {
+        manifest
+            .stems
+            .iter()
+            .find(|s| s.file_name == self.stem_portable_name)
+            .ok_or(IdentityError::Mismatch)
     }
 }

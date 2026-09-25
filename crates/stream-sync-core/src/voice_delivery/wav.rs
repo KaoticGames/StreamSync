@@ -152,6 +152,53 @@ pub fn validate_canonical_pcm_wav_header(
 }
 
 #[cfg(test)]
+mod canonical_wav_header_field_mutations {
+    use super::*;
+
+    fn good_header(data_bytes: u64) -> Vec<u8> {
+        minimal_wav_header(data_bytes).unwrap()
+    }
+
+    #[test]
+    fn each_header_field_and_file_len_mutation_rejected() {
+        let data_bytes = 4096u64;
+        let h = good_header(data_bytes);
+        let file_len = 44 + data_bytes;
+        assert!(validate_canonical_pcm_wav_header(&h, Some(file_len)).is_ok());
+
+        let cases: Vec<(&str, Box<dyn FnMut(&mut Vec<u8>)>)> = vec![
+            ("riff magic", Box::new(|b| b[0] = b'X')),
+            ("wave magic", Box::new(|b| b[9] = b'X')),
+            ("fmt magic", Box::new(|b| b[13] = b'X')),
+            ("fmt len", Box::new(|b| b[16] = 15)),
+            ("audio format", Box::new(|b| b[20] = 3)),
+            ("channels", Box::new(|b| b[22] = 1)),
+            ("sample rate", Box::new(|b| b[24] = 1)),
+            ("byte rate", Box::new(|b| b[28] = 1)),
+            ("block align", Box::new(|b| b[32] = 1)),
+            ("bits per sample", Box::new(|b| b[34] = 8)),
+            ("data magic", Box::new(|b| b[36] = b'X')),
+            ("data len", Box::new(|b| b[40] = 1)),
+            ("riff size", Box::new(|b| b[4] = 0)),
+            ("file too short", Box::new(|_| {})),
+        ];
+        for (label, mut mutate) in cases {
+            let mut trial = h.clone();
+            mutate(&mut trial);
+            let len = if label == "file too short" {
+                Some(file_len - 1)
+            } else {
+                Some(file_len)
+            };
+            assert!(
+                validate_canonical_pcm_wav_header(&trial, len).is_err(),
+                "expected reject for {label}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod wav_header_read_uses_fixed_44_bytes_without_usize_file_length {
     use super::*;
     use std::fs::{File, OpenOptions};

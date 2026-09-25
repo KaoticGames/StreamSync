@@ -17,7 +17,7 @@ pub use error::FsError;
 pub use file::VoiceFile;
 pub use geometry::FinalParentPublication;
 
-use dir::validate_single_component;
+pub(crate) use dir::validate_single_component;
 
 /// Same final-parent handle for source and destination directory names.
 pub(crate) fn rename_no_replace_same_parent(

@@ -25,12 +25,16 @@ pub fn ledger_dir_relative_components(opaque_delivery_id: &str) -> [String; 3] {
     ]
 }
 
-/// Relative components from `DEST_ROOT` to checkpoint generation directory for a delivery.
-pub fn checkpoint_dir_relative_components(opaque_delivery_id: &str) -> [String; 3] {
+/// Relative components from `DEST_ROOT` to checkpoint generations for one stem artifact.
+pub fn checkpoint_stem_dir_relative_components(
+    opaque_delivery_id: &str,
+    stem_checkpoint_key: &str,
+) -> [String; 4] {
     [
         LOCK_DIR.to_string(),
         CHECKPOINTS_SEGMENT.to_string(),
         opaque_delivery_id.to_string(),
+        stem_checkpoint_key.to_string(),
     ]
 }
 

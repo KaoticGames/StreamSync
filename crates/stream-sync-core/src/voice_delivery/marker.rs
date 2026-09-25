@@ -2,7 +2,7 @@
 
 use crate::voice_delivery::fs::durability::{sync_dir_exact, sync_file, NamespaceDurability};
 use crate::voice_delivery::fs::file::open_existing_file_at;
-use crate::voice_delivery::fs::{DestRoot, DirHandle, FsError, VoiceFile};
+use crate::voice_delivery::fs::{DirHandle, FsError, VoiceFile};
 use crate::voice_delivery::hash::{sha256_hex_reader, DEFAULT_STREAM_CHUNK};
 use crate::voice_delivery::identity::DeliveryImmutableIdentity;
 use crate::voice_delivery::manifest::{StemManifestEntry, ValidatedManifest};
@@ -51,6 +51,8 @@ pub enum MarkerError {
     StemVerification(String),
     #[error("marker already exists")]
     AlreadyExists,
+    #[error("unexpected pre-existing marker")]
+    PreexistingMarker,
     #[error(transparent)]
     Ledger(#[from] crate::voice_delivery::records::ledger_generation::LedgerGenerationError),
     #[error(transparent)]
@@ -59,21 +61,17 @@ pub enum MarkerError {
     Parse(String),
 }
 
-/// Records publication-side effects for ordering tests (rename must not run before intent).
-pub trait PublicationOps {
-    fn rename_stage_to_final(&mut self) -> Result<(), FsError>;
-}
-
+/// Proves PublishIntent is durable without invoking any publication rename API (slice 10+).
 #[derive(Default)]
-pub struct OperationRecorder {
-    pub rename_calls: u32,
-    pub intent_written: bool,
+pub struct PublishIntentRecorder {
+    pub intent_observed: bool,
 }
 
-impl PublicationOps for OperationRecorder {
-    fn rename_stage_to_final(&mut self) -> Result<(), FsError> {
-        self.rename_calls += 1;
-        Ok(())
+impl PublishIntentRecorder {
+    pub fn observe_intent(&mut self, state: LedgerState) {
+        if state == LedgerState::PublishIntent {
+            self.intent_observed = true;
+        }
     }
 }
 
@@ -111,9 +109,12 @@ impl DeliveryMarker {
         serde_json::to_vec(&tmp).map_err(|e| MarkerError::Parse(e.to_string()))
     }
 
-    pub fn parse(bytes: &[u8]) -> Result<Self, MarkerError> {
+    pub fn parse(bytes: &[u8], identity: &DeliveryImmutableIdentity) -> Result<Self, MarkerError> {
         let marker: Self =
             serde_json::from_slice(bytes).map_err(|_| MarkerError::Parse("json".into()))?;
+        if marker.schema_version != MARKER_SCHEMA_VERSION {
+            return Err(MarkerError::Parse("schema".into()));
+        }
         let mut tmp = marker.clone();
         let expected = tmp.record_digest.clone();
         tmp.record_digest = String::new();
@@ -121,14 +122,100 @@ impl DeliveryMarker {
         if record_digest_hex(&payload) != expected {
             return Err(MarkerError::ChecksumMismatch);
         }
+        if !identity.matches_marker(&marker) {
+            return Err(MarkerError::IdentityMismatch);
+        }
+        validate_marker_stems(&marker)?;
         Ok(marker)
     }
 }
 
-pub fn write_marker_create_new(
+fn validate_marker_stems(marker: &DeliveryMarker) -> Result<(), MarkerError> {
+    for stem in &marker.stems {
+        if stem.sha256.len() != 64
+            || !stem
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(MarkerError::Parse("stem digest".into()));
+        }
+    }
+    Ok(())
+}
+
+impl DeliveryImmutableIdentity {
+    pub fn matches_marker(&self, marker: &DeliveryMarker) -> bool {
+        self.delivery_uuid == marker.delivery_uuid
+            && self.manifest_digest == marker.manifest_digest
+            && self.staging_token == marker.staging_token
+            && self.final_parent_relative == marker.final_parent_relative
+            && self.final_session_name == marker.final_session_name
+    }
+}
+
+impl DeliverySessionGuard {
+    /// Seal staging (marker + membership), durable Sealed ledger, then PublishIntent — **no rename**.
+    pub fn seal_and_write_publish_intent(
+        &self,
+    ) -> Result<(LedgerGeneration, LedgerGeneration, NamespaceDurability), MarkerError> {
+        if self.manifest().digest() != self.identity().manifest_digest {
+            return Err(MarkerError::IdentityMismatch);
+        }
+        let staging_dir = self.staging_dir();
+        ensure_no_preexisting_marker(staging_dir)?;
+        verify_exact_staging_membership(staging_dir, self.manifest())?;
+        let marker = DeliveryMarker::from_manifest(self.identity(), self.manifest());
+        write_marker_create_new(self, staging_dir, &marker)?;
+        prove_post_marker_membership(staging_dir, self.manifest(), self.identity())?;
+        let staging_durability = sync_dir_exact(staging_dir)?;
+        let ledger = LedgerStore::open_for_guard(self)?;
+        let sealed = ledger.commit(self, LedgerState::Sealed)?;
+        let intent = ledger.commit(self, LedgerState::PublishIntent)?;
+        Ok((sealed, intent, staging_durability))
+    }
+}
+
+fn ensure_no_preexisting_marker(staging_dir: &DirHandle) -> Result<(), MarkerError> {
+    for name in staging_dir.list_child_names()? {
+        if name == MARKER_FILENAME {
+            return Err(MarkerError::PreexistingMarker);
+        }
+    }
+    Ok(())
+}
+
+fn prove_post_marker_membership(
+    staging_dir: &DirHandle,
+    manifest: &ValidatedManifest,
+    identity: &DeliveryImmutableIdentity,
+) -> Result<(), MarkerError> {
+    let names: std::collections::HashSet<String> =
+        staging_dir.list_child_names()?.into_iter().collect();
+    let expected_stems: std::collections::HashSet<String> =
+        manifest.stems.iter().map(|s| s.file_name.clone()).collect();
+    if names.len() != expected_stems.len() + 1 {
+        return Err(MarkerError::UnexpectedEntry("membership size".into()));
+    }
+    if !names.contains(MARKER_FILENAME) {
+        return Err(MarkerError::MissingStem(MARKER_FILENAME.into()));
+    }
+    for stem in &expected_stems {
+        if !names.contains(stem) {
+            return Err(MarkerError::MissingStem(stem.clone()));
+        }
+    }
+    let marker_bytes = staging_dir.read_file_all(MARKER_FILENAME)?;
+    DeliveryMarker::parse(&marker_bytes, identity)?;
+    Ok(())
+}
+
+fn write_marker_create_new(
+    guard: &DeliverySessionGuard,
     staging_dir: &DirHandle,
     marker: &DeliveryMarker,
 ) -> Result<(), MarkerError> {
+    let _ = guard;
     let bytes = marker.serialize()?;
     let mut file = staging_dir
         .create_new_file(MARKER_FILENAME)
@@ -138,7 +225,6 @@ pub fn write_marker_create_new(
         })?;
     file.write_all_at(0, &bytes)?;
     sync_file(&file)?;
-    sync_dir_exact(staging_dir)?;
     Ok(())
 }
 
@@ -178,7 +264,7 @@ pub fn verify_exact_staging_membership(
     let mut seen = std::collections::HashSet::new();
     for name in staging_dir.list_child_names()? {
         if name == MARKER_FILENAME {
-            continue;
+            return Err(MarkerError::UnexpectedEntry(MARKER_FILENAME.into()));
         }
         if name.ends_with(".partial") {
             return Err(MarkerError::UnexpectedEntry(name));
@@ -205,41 +291,6 @@ pub fn verify_exact_staging_membership(
             return Err(MarkerError::MissingStem(stem.file_name.clone()));
         }
     }
-    Ok(())
-}
-
-/// Seal staging (marker + membership), durable Sealed ledger, then PublishIntent — **no rename**.
-pub fn seal_and_write_publish_intent(
-    guard: &DeliverySessionGuard,
-    _root: &DestRoot,
-    identity: &DeliveryImmutableIdentity,
-    manifest: &ValidatedManifest,
-    staging_dir: &DirHandle,
-    ledger_store: &LedgerStore,
-    prior_ledger: Option<&LedgerGeneration>,
-) -> Result<(LedgerGeneration, LedgerGeneration, NamespaceDurability), MarkerError> {
-    verify_exact_staging_membership(staging_dir, manifest)?;
-    let marker = DeliveryMarker::from_manifest(identity, manifest);
-    write_marker_create_new(staging_dir, &marker)?;
-    let staging_durability = sync_dir_exact(staging_dir)?;
-    let sealed = ledger_store.commit(guard, identity, LedgerState::Sealed, prior_ledger)?;
-    let intent = ledger_store.commit(guard, identity, LedgerState::PublishIntent, Some(&sealed))?;
-    Ok((sealed, intent, staging_durability))
-}
-
-/// Publication rename is blocked until a durable PublishIntent generation exists (slice 10+ wires real rename).
-pub fn execute_publication_rename(
-    ledger_store: &LedgerStore,
-    identity: &DeliveryImmutableIdentity,
-    ops: &mut dyn PublicationOps,
-) -> Result<(), MarkerError> {
-    let intent = ledger_store
-        .read_highest_valid(identity)?
-        .ok_or_else(|| MarkerError::Parse("no ledger".into()))?;
-    if intent.state != LedgerState::PublishIntent {
-        return Err(MarkerError::Parse("publish intent not durable".into()));
-    }
-    ops.rename_stage_to_final()?;
     Ok(())
 }
 
@@ -274,9 +325,9 @@ mod publish_intent_before_rename {
     }
 
     #[test]
-    fn publish_intent_before_rename() {
+    fn publish_intent_stops_without_rename_api() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = DestRoot::open(tmp.path()).unwrap();
+        let root = crate::voice_delivery::fs::DestRoot::open(tmp.path()).unwrap();
         let stage = ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef";
         root.create_child_dir(stage).unwrap();
         let staging = root.open_child_dir(stage).unwrap();
@@ -293,35 +344,22 @@ mod publish_intent_before_rename {
         )
         .unwrap();
         let lock = acquire_delivery_domain_lock(&root, "delivery-intent", true).unwrap();
-        let guard = DeliverySessionGuard::new(lock);
-        let ledger = LedgerStore::open_at_root(&root, &identity).unwrap();
-        let receiving = ledger
-            .commit(&guard, &identity, LedgerState::Receiving, None)
-            .unwrap();
-        let mut recorder = OperationRecorder::default();
-        assert!(execute_publication_rename(&ledger, &identity, &mut recorder).is_err());
-        assert_eq!(recorder.rename_calls, 0);
-        let (_sealed, intent, _dur) = seal_and_write_publish_intent(
-            &guard,
-            &root,
-            &identity,
-            &manifest,
-            &staging,
-            &ledger,
-            Some(&receiving),
-        )
-        .unwrap();
+        let guard = DeliverySessionGuard::open(root, identity, manifest, lock).unwrap();
+        let ledger = LedgerStore::open_for_guard(&guard).unwrap();
+        ledger.commit(&guard, LedgerState::Receiving).unwrap();
+        let mut recorder = PublishIntentRecorder::default();
+        let (_sealed, intent, _dur) = guard.seal_and_write_publish_intent().unwrap();
+        recorder.observe_intent(intent.state);
+        assert!(recorder.intent_observed);
         assert_eq!(intent.state, LedgerState::PublishIntent);
-        let highest = ledger.read_highest_valid(&identity).unwrap().unwrap();
+        let highest = ledger.read_highest_valid().unwrap().unwrap();
         assert_eq!(highest.state, LedgerState::PublishIntent);
-        execute_publication_rename(&ledger, &identity, &mut recorder).unwrap();
-        assert_eq!(recorder.rename_calls, 1);
     }
 
     #[test]
     fn seal_path_never_renames() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = DestRoot::open(tmp.path()).unwrap();
+        let root = crate::voice_delivery::fs::DestRoot::open(tmp.path()).unwrap();
         let stage = ".streamsync-stage-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         root.create_child_dir(stage).unwrap();
         let staging = root.open_child_dir(stage).unwrap();
@@ -333,21 +371,10 @@ mod publish_intent_before_rename {
             DeliveryImmutableIdentity::new("delivery-no-rename", &manifest, stage, vec![], "final")
                 .unwrap();
         let lock = acquire_delivery_domain_lock(&root, "delivery-no-rename", true).unwrap();
-        let guard = DeliverySessionGuard::new(lock);
-        let ledger = LedgerStore::open_at_root(&root, &identity).unwrap();
-        let receiving = ledger
-            .commit(&guard, &identity, LedgerState::Receiving, None)
-            .unwrap();
-        seal_and_write_publish_intent(
-            &guard,
-            &root,
-            &identity,
-            &manifest,
-            &staging,
-            &ledger,
-            Some(&receiving),
-        )
-        .unwrap();
-        assert!(root.open_child_dir(stage).is_ok());
+        let guard = DeliverySessionGuard::open(root, identity, manifest, lock).unwrap();
+        let ledger = LedgerStore::open_for_guard(&guard).unwrap();
+        ledger.commit(&guard, LedgerState::Receiving).unwrap();
+        guard.seal_and_write_publish_intent().unwrap();
+        assert!(guard.dest_root().open_child_dir(stage).is_ok());
     }
 }
