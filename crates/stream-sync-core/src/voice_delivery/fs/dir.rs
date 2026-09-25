@@ -327,9 +327,19 @@ impl ValidatedFinalName {
 }
 
 /// One validated relative directory segment under `DEST_ROOT` (final-parent path).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(transparent)]
 pub struct PortableParentComponent(String);
+
+impl<'de> serde::Deserialize<'de> for PortableParentComponent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::validate(&raw).map_err(serde::de::Error::custom)
+    }
+}
 
 impl PortableParentComponent {
     pub fn validate(name: &str) -> Result<Self, FsError> {
@@ -346,6 +356,73 @@ pub(crate) fn portable_parent_components_as_str_slice(
     components: &[PortableParentComponent],
 ) -> Vec<&str> {
     components.iter().map(|c| c.as_str()).collect()
+}
+
+#[cfg(test)]
+mod portable_parent_component_deserialize_bypass {
+    use crate::voice_delivery::marker::DeliveryMarker;
+    use crate::voice_delivery::records::ledger_generation::LedgerGeneration;
+    fn ledger_json_with_parent(component: &str) -> String {
+        format!(
+            r#"{{
+              "schema_version": 1,
+              "state": "receiving",
+              "delivery_uuid": "uuid",
+              "manifest_digest": "{}",
+              "staging_token": ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
+              "final_parent_relative": ["{}"],
+              "final_session_name": "final",
+              "generation": 1,
+              "record_digest": "{}"
+            }}"#,
+            "a".repeat(64),
+            component.replace('"', "\\\""),
+            "c".repeat(64)
+        )
+    }
+
+    #[test]
+    fn rejects_nonportable_parent_components_in_ledger_json() {
+        for bad in [
+            ".hidden",
+            "..",
+            "unicode-🎙",
+            "CON",
+            "trail.",
+            "trail ",
+            "bad:name",
+        ] {
+            let json = ledger_json_with_parent(bad);
+            let err = serde_json::from_str::<LedgerGeneration>(&json);
+            assert!(err.is_err(), "expected reject for {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn accepts_valid_parent_component_in_ledger_json() {
+        let json = ledger_json_with_parent("guild");
+        let parsed: LedgerGeneration = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.final_parent_relative[0].as_str(), "guild");
+    }
+
+    #[test]
+    fn rejects_nonportable_parent_in_marker_json() {
+        let json = format!(
+            r#"{{
+              "schema_version": 1,
+              "delivery_uuid": "u",
+              "manifest_digest": "{}",
+              "staging_token": ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
+              "final_parent_relative": [".hidden"],
+              "final_session_name": "final",
+              "stems": [],
+              "record_digest": "{}"
+            }}"#,
+            "a".repeat(64),
+            "b".repeat(64)
+        );
+        assert!(serde_json::from_str::<DeliveryMarker>(&json).is_err());
+    }
 }
 
 #[cfg(test)]

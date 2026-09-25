@@ -5,8 +5,6 @@ use crate::voice_delivery::identity::DeliveryImmutableIdentity;
 use crate::voice_delivery::ids::{ledger_dir_relative_components, validate_stage_basename};
 use crate::voice_delivery::lock::{acquire_delivery_domain_lock, DeliveryDomainLock, LockError};
 use crate::voice_delivery::manifest::ValidatedManifest;
-use crate::voice_delivery::records::ledger_generation::LedgerStore;
-use crate::voice_delivery::state::LedgerState;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -148,6 +146,8 @@ impl DeliverySessionGuard {
 mod delivery_bound_lock {
     use super::*;
     use crate::voice_delivery::manifest::{StemManifestEntry, ValidatedManifest};
+    use crate::voice_delivery::records::ledger_generation::LedgerStore;
+    use crate::voice_delivery::state::LedgerState;
 
     fn stem_manifest() -> ValidatedManifest {
         ValidatedManifest::validate(vec![StemManifestEntry {

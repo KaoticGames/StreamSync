@@ -1,4 +1,5 @@
 //! Phase 0C voice delivery: filesystem foundation (slices 0–4) + media/manifest + slices 6–9.
+//! Not yet wired into the overlay server — `dead_code` allowed until integration lands.
 #![allow(dead_code)]
 
 mod bounds;

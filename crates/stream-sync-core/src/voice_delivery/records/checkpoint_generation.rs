@@ -5,7 +5,7 @@ use super::generation_read::{
     GenerationScanError, ParseFailureKind,
 };
 use super::{record_digest_hex, GenerationIoError};
-use crate::voice_delivery::identity::{DeliveryImmutableIdentity, StemArtifactId};
+use crate::voice_delivery::identity::StemArtifactId;
 use crate::voice_delivery::session::DeliverySessionGuard;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -48,17 +48,20 @@ pub enum CheckpointGenerationError {
     Parse(String),
 }
 
-pub struct CheckpointStore {
+/// Checkpoint mutations are bound to the session guard that opened the store for the entire
+/// lifetime of `CheckpointStore<'guard>` (see `open_for_guard`). `commit` does not accept a
+/// separate guard argument.
+pub struct CheckpointStore<'guard> {
+    guard: &'guard DeliverySessionGuard,
     pub(crate) dir: crate::voice_delivery::fs::DirHandle,
     artifact: StemArtifactId,
-    bound_identity: DeliveryImmutableIdentity,
     expected_total_bytes: u64,
     expected_full_sha256: String,
 }
 
-impl CheckpointStore {
+impl<'guard> CheckpointStore<'guard> {
     pub fn open_for_guard(
-        guard: &DeliverySessionGuard,
+        guard: &'guard DeliverySessionGuard,
         artifact: StemArtifactId,
     ) -> Result<Self, CheckpointGenerationError> {
         if !artifact.matches_identity(guard.identity()) {
@@ -73,9 +76,9 @@ impl CheckpointStore {
             .checkpoint_dir_for(&artifact.checkpoint_dir_key())
             .map_err(|e| CheckpointGenerationError::Parse(e.to_string()))?;
         Ok(Self {
+            guard,
             dir,
             artifact,
-            bound_identity: guard.identity().clone(),
             expected_total_bytes,
             expected_full_sha256,
         })
@@ -126,10 +129,14 @@ impl CheckpointStore {
             &self.expected_full_sha256,
         )?;
         let generation = allocate_next_generation(&self.dir).map_err(map_scan_err)?;
+        let identity = self.guard.identity();
+        if !self.artifact.matches_identity(identity) {
+            return Err(CheckpointGenerationError::IdentityMismatch);
+        }
         let record = CheckpointGeneration {
             schema_version: CHECKPOINT_SCHEMA_VERSION,
-            delivery_uuid: self.bound_identity.delivery_uuid.clone(),
-            manifest_digest: self.bound_identity.manifest_digest.clone(),
+            delivery_uuid: identity.delivery_uuid.clone(),
+            manifest_digest: identity.manifest_digest.clone(),
             stem_portable_name: self.artifact.stem_portable_name().to_string(),
             expected_total_bytes: self.expected_total_bytes,
             expected_full_sha256: self.expected_full_sha256.clone(),
@@ -355,5 +362,63 @@ mod checkpoint_adversarial {
             store.read_highest_valid(),
             Err(CheckpointGenerationError::IdentityMismatch)
         ));
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_store_guard_lifetime {
+    //! `CheckpointStore<'guard>` is opened with `open_for_guard(&'guard DeliverySessionGuard, …)`;
+    //! the store cannot outlive that guard reference (enforced by rustc).
+
+    use super::*;
+    use crate::voice_delivery::fs::DestRoot;
+    use crate::voice_delivery::manifest::{StemManifestEntry, ValidatedManifest};
+    use crate::voice_delivery::session::DeliverySessionGuard;
+
+    fn guard_with_id(tmp: &tempfile::TempDir, delivery_id: &str) -> DeliverySessionGuard {
+        let manifest = ValidatedManifest::validate(vec![StemManifestEntry {
+            file_name: "a.wav".into(),
+            byte_count: 64,
+            sha256: "a".repeat(64),
+        }])
+        .unwrap();
+        DeliverySessionGuard::begin(
+            DestRoot::open(tmp.path()).unwrap(),
+            delivery_id,
+            manifest,
+            ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
+            vec![],
+            "final",
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn open_rejects_artifact_from_different_session_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let guard_a = guard_with_id(&tmp, "session-a");
+        let guard_b = guard_with_id(&tmp, "session-b");
+        let artifact_b =
+            StemArtifactId::from_manifest_stem(guard_b.identity(), guard_b.manifest(), "a.wav")
+                .unwrap();
+        let err = CheckpointStore::open_for_guard(&guard_a, artifact_b);
+        assert!(matches!(
+            err,
+            Err(CheckpointGenerationError::IdentityMismatch)
+        ));
+    }
+
+    #[test]
+    fn commit_uses_guard_opened_with_not_substituted_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let guard = guard_with_id(&tmp, "commit-guard");
+        let artifact =
+            StemArtifactId::from_manifest_stem(guard.identity(), guard.manifest(), "a.wav")
+                .unwrap();
+        let store = CheckpointStore::open_for_guard(&guard, artifact).unwrap();
+        let rec = store.commit(8, &"b".repeat(64)).unwrap();
+        assert_eq!(rec.delivery_uuid, guard.identity().delivery_uuid);
+        assert_eq!(rec.manifest_digest, guard.identity().manifest_digest);
     }
 }
