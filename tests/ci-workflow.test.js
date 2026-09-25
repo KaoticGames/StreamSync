@@ -50,7 +50,9 @@ describe("CI workflow", () => {
     assert.ok(jobStart >= 0, "phase0c-windows job exists");
     const nextJob = ciWorkflow.indexOf("\n  windows-installer:", jobStart);
     const job = ciWorkflow.slice(jobStart, nextJob);
-    assert.match(job, /rg -c ': test\$'/);
+    assert.doesNotMatch(job, /\brg\b/, "Windows Git Bash has no ripgrep; count via grep");
+    assert.match(job, /grep -cE ": test\\r\?\$"/);
+    assert.match(job, /test "\$n" -gt 0/);
     assert.doesNotMatch(job, /partial_sparse_hole/);
     const filters = [
       "voice_delivery::ingest::",

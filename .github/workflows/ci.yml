@@ -28,7 +28,7 @@ jobs:
           cargo test -p stream-sync-core 'voice_delivery::fs::' -- --nocapture
           cargo test -p stream-sync-core 'voice_delivery::lock::' -- --nocapture --test-threads=1
           cargo test -p stream-sync-core 'voice_delivery::ids::' -- --nocapture
-          count_suite_tests() { cargo test -p stream-sync-core "$1" -- --list 2>/dev/null | rg -c ': test$' || true; }
+          count_suite_tests() { cargo test -p stream-sync-core "$1" -- --list 2>/dev/null | grep -cE ": test\r?$" || true; }
           run_suite() { n=$(count_suite_tests "$1"); echo "filter '$1' matched $n tests"; test "$n" -gt 0; cargo test -p stream-sync-core "$1" -- --nocapture; }
           run_suite 'voice_delivery::bounds::'
           run_suite 'voice_delivery::wav::'
