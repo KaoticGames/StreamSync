@@ -192,7 +192,9 @@ impl DeliverySessionGuard {
         if self.manifest().digest() != self.identity().manifest_digest {
             return Err(MarkerError::IdentityMismatch);
         }
-        let staging_dir = self.staging_dir();
+        let staging_dir = self
+            .staging_dir()
+            .map_err(|e| MarkerError::Parse(e.to_string()))?;
         ensure_no_preexisting_marker(staging_dir)?;
         verify_exact_staging_membership(staging_dir, self.manifest())?;
         let marker = DeliveryMarker::from_manifest(self.identity(), self.manifest());
@@ -215,7 +217,7 @@ fn ensure_no_preexisting_marker(staging_dir: &DirHandle) -> Result<(), MarkerErr
     Ok(())
 }
 
-fn prove_post_marker_membership(
+pub(crate) fn prove_post_marker_membership(
     staging_dir: &DirHandle,
     manifest: &ValidatedManifest,
     identity: &DeliveryImmutableIdentity,

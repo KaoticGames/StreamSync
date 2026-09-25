@@ -5,7 +5,8 @@ use super::error::FsError;
 use super::file::VoiceFile;
 
 /// Result of attempting POSIX-style directory namespace durability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NamespaceDurability {
     /// Directory metadata durability was proven (e.g. Linux `fsync` on the dir fd).
     Proven,

@@ -83,7 +83,9 @@ impl<'guard> PartialStemWriter<'guard> {
         let expected_total = stem.byte_count;
         let expected_full_sha256 = stem.sha256.clone();
         let checkpoint_store = CheckpointStore::open_for_guard(guard, artifact.clone())?;
-        let staging_dir = guard.staging_dir();
+        let staging_dir = guard
+            .staging_dir()
+            .map_err(|e| PartialError::Io(e.to_string()))?;
         let partial_name = artifact.partial_basename();
         let checkpoint = checkpoint_store.read_highest_valid()?;
         let file = staging_dir
@@ -595,7 +597,8 @@ mod partial_restart_single_prefix_pass {
             StemArtifactId::from_manifest_stem(guard.identity(), guard.manifest(), "a.wav")
                 .unwrap();
         let file =
-            open_or_create_file_at(guard.staging_dir(), &artifact.partial_basename()).unwrap();
+            open_or_create_file_at(guard.staging_dir().unwrap(), &artifact.partial_basename())
+                .unwrap();
         hash_prefix_into(
             &file,
             PREFIX_LEN,

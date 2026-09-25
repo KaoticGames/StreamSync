@@ -8,6 +8,7 @@ mod identity;
 mod ingest;
 mod manifest;
 mod marker;
+mod publication;
 mod records;
 mod session;
 mod state;
@@ -35,4 +36,10 @@ mod subprocess_env {
     pub const LOCK_RACE_GO: &str = "STREAMSYNC_VOICE_LOCK_RACE_GO";
     pub const LOCK_RACE_OUTCOME_DIR: &str = "STREAMSYNC_VOICE_LOCK_RACE_OUTCOME_DIR";
     pub const LOCK_RACE_RELEASE: &str = "STREAMSYNC_VOICE_LOCK_RACE_RELEASE";
+    pub const PUB_CRASH_CHILD: &str = "STREAMSYNC_VOICE_PUB_CRASH_CHILD";
+    pub const PUB_CRASH_POINT: &str = "STREAMSYNC_VOICE_PUB_CRASH_POINT";
+    pub const PUB_CRASH_READY: &str = "STREAMSYNC_VOICE_PUB_CRASH_READY";
+    pub const PUB_CRASH_GO: &str = "STREAMSYNC_VOICE_PUB_CRASH_GO";
+    pub const PUB_CRASH_TMP: &str = "STREAMSYNC_VOICE_PUB_CRASH_TMP";
+    pub const PUB_CRASH_OUTCOME: &str = "STREAMSYNC_VOICE_PUB_CRASH_OUTCOME";
 }

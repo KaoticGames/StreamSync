@@ -26,7 +26,7 @@ pub struct DeliverySessionGuard {
     identity: DeliveryImmutableIdentity,
     manifest: ValidatedManifest,
     final_parent: DirHandle,
-    staging: DirHandle,
+    staging: Option<DirHandle>,
     _lock: DeliveryDomainLock,
 }
 
@@ -56,7 +56,35 @@ impl DeliverySessionGuard {
         }
         validate_stage_basename(&identity.staging_token)?;
         let lock = acquire_delivery_domain_lock(&root, &identity.delivery_uuid, try_wait_lock)?;
-        Self::assemble(root, identity, manifest, lock)
+        Self::assemble(root, identity, manifest, lock, true)
+    }
+
+    /// Reopen a delivery session for recovery without synthesizing a missing staging directory.
+    pub(crate) fn begin_for_recovery(
+        root: DestRoot,
+        delivery_uuid: impl Into<String>,
+        manifest: ValidatedManifest,
+        staging_token: impl Into<String>,
+        final_parent_relative: Vec<PortableParentComponent>,
+        final_session_name: &str,
+        try_wait_lock: bool,
+    ) -> Result<Self, SessionError> {
+        let identity = DeliveryImmutableIdentity::new(
+            delivery_uuid,
+            &manifest,
+            staging_token,
+            final_parent_relative,
+            final_session_name,
+        )
+        .map_err(|e| SessionError::Invalid(e.to_string()))?;
+        if identity.manifest_digest != manifest.digest() {
+            return Err(SessionError::Invalid(
+                "manifest digest does not match identity".into(),
+            ));
+        }
+        validate_stage_basename(&identity.staging_token)?;
+        let lock = acquire_delivery_domain_lock(&root, &identity.delivery_uuid, try_wait_lock)?;
+        Self::assemble(root, identity, manifest, lock, false)
     }
 
     fn assemble(
@@ -64,16 +92,21 @@ impl DeliverySessionGuard {
         identity: DeliveryImmutableIdentity,
         manifest: ValidatedManifest,
         lock: DeliveryDomainLock,
+        create_staging_if_missing: bool,
     ) -> Result<Self, SessionError> {
         let mut final_parent = root.handle().clone_handle()?;
         for comp in identity.final_parent_components() {
             final_parent = final_parent.create_or_open_child_dir(comp.as_str())?;
         }
         let staging = match final_parent.open_child_dir(&identity.staging_token) {
-            Ok(dir) => dir,
+            Ok(dir) => Some(dir),
             Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                final_parent.create_child_dir(&identity.staging_token)?;
-                final_parent.open_child_dir(&identity.staging_token)?
+                if create_staging_if_missing {
+                    final_parent.create_child_dir(&identity.staging_token)?;
+                    Some(final_parent.open_child_dir(&identity.staging_token)?)
+                } else {
+                    None
+                }
             }
             Err(e) => return Err(e.into()),
         };
@@ -103,8 +136,10 @@ impl DeliverySessionGuard {
         &self.final_parent
     }
 
-    pub fn staging_dir(&self) -> &DirHandle {
-        &self.staging
+    pub fn staging_dir(&self) -> Result<&DirHandle, SessionError> {
+        self.staging
+            .as_ref()
+            .ok_or_else(|| SessionError::Invalid("staging directory absent".into()))
     }
 
     pub(crate) fn ledger_dir(&self) -> Result<DirHandle, FsError> {

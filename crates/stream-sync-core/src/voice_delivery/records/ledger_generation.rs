@@ -5,6 +5,7 @@ use super::generation_read::{
     GenerationScanError, ParseFailureKind,
 };
 use super::{record_digest_hex, GenerationIoError};
+use crate::voice_delivery::fs::durability::NamespaceDurability;
 use crate::voice_delivery::fs::PortableParentComponent;
 use crate::voice_delivery::identity::DeliveryImmutableIdentity;
 use crate::voice_delivery::session::DeliverySessionGuard;
@@ -25,6 +26,16 @@ pub struct LedgerGeneration {
     pub final_session_name: String,
     pub generation: u64,
     pub record_digest: String,
+    /// Set only when `state == Published`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace_durability: Option<NamespaceDurability>,
+    /// Machine-readable quarantine code when `state == Quarantined`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_stage_present: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_final_present: Option<bool>,
 }
 
 impl GenerationRecord for LedgerGeneration {
@@ -101,9 +112,85 @@ impl LedgerStore {
             .map_err(|_| LedgerGenerationError::IdentityMismatch)?;
         let prior = self.read_highest_valid()?;
         let from_state = prior.as_ref().map(|p| p.state);
+        if state == LedgerState::Published || state == LedgerState::Quarantined {
+            return Err(LedgerGenerationError::Invalid);
+        }
         validate_ledger_transition(from_state, state)
             .map_err(|_| LedgerGenerationError::Transition)?;
+        self.write_state_record(guard, state, LedgerExtra::None)
+    }
+
+    pub fn commit_published(
+        &self,
+        guard: &DeliverySessionGuard,
+        namespace_durability: NamespaceDurability,
+    ) -> Result<LedgerGeneration, LedgerGenerationError> {
+        guard
+            .assert_same_identity(&self.identity)
+            .map_err(|_| LedgerGenerationError::IdentityMismatch)?;
+        let prior = self.read_highest_valid()?;
+        let from_state = prior.as_ref().map(|p| p.state);
+        validate_ledger_transition(from_state, LedgerState::Published)
+            .map_err(|_| LedgerGenerationError::Transition)?;
+        self.write_state_record(
+            guard,
+            LedgerState::Published,
+            LedgerExtra::Published(namespace_durability),
+        )
+    }
+
+    pub fn commit_quarantined(
+        &self,
+        guard: &DeliverySessionGuard,
+        reason: &str,
+        observed_stage_present: bool,
+        observed_final_present: bool,
+    ) -> Result<LedgerGeneration, LedgerGenerationError> {
+        guard
+            .assert_same_identity(&self.identity)
+            .map_err(|_| LedgerGenerationError::IdentityMismatch)?;
+        let prior = self.read_highest_valid()?;
+        let from_state = prior.as_ref().map(|p| p.state);
+        validate_ledger_transition(from_state, LedgerState::Quarantined)
+            .map_err(|_| LedgerGenerationError::Transition)?;
+        self.write_state_record(
+            guard,
+            LedgerState::Quarantined,
+            LedgerExtra::Quarantined {
+                reason: reason.to_string(),
+                observed_stage_present,
+                observed_final_present,
+            },
+        )
+    }
+
+    fn write_state_record(
+        &self,
+        guard: &DeliverySessionGuard,
+        state: LedgerState,
+        extra: LedgerExtra,
+    ) -> Result<LedgerGeneration, LedgerGenerationError> {
+        let _ = guard;
         let generation = allocate_next_generation(&self.dir).map_err(map_scan_err)?;
+        let (
+            namespace_durability,
+            quarantine_reason,
+            observed_stage_present,
+            observed_final_present,
+        ) = match extra {
+            LedgerExtra::None => (None, None, None, None),
+            LedgerExtra::Published(d) => (Some(d), None, None, None),
+            LedgerExtra::Quarantined {
+                reason,
+                observed_stage_present,
+                observed_final_present,
+            } => (
+                None,
+                Some(reason),
+                Some(observed_stage_present),
+                Some(observed_final_present),
+            ),
+        };
         let record = LedgerGeneration {
             schema_version: LEDGER_SCHEMA_VERSION,
             state,
@@ -114,11 +201,25 @@ impl LedgerStore {
             final_session_name: self.identity.final_session_name.clone(),
             generation,
             record_digest: String::new(),
+            namespace_durability,
+            quarantine_reason,
+            observed_stage_present,
+            observed_final_present,
         };
         let bytes = serialize_with_digest(&record)?;
         write_generation_create_new(&self.dir, generation, &bytes).map_err(map_scan_err)?;
         parse_ledger_bytes(&bytes)
     }
+}
+
+enum LedgerExtra {
+    None,
+    Published(NamespaceDurability),
+    Quarantined {
+        reason: String,
+        observed_stage_present: bool,
+        observed_final_present: bool,
+    },
 }
 
 fn map_scan_err(err: GenerationScanError) -> LedgerGenerationError {
@@ -180,6 +281,43 @@ pub fn validate_ledger_record(record: &LedgerGeneration) -> Result<(), LedgerGen
     let digest = record_digest_hex(&payload);
     if digest != expected {
         return Err(LedgerGenerationError::ChecksumMismatch);
+    }
+    match record.state {
+        LedgerState::Published => {
+            if record.namespace_durability.is_none() {
+                return Err(LedgerGenerationError::Invalid);
+            }
+            if record.quarantine_reason.is_some()
+                || record.observed_stage_present.is_some()
+                || record.observed_final_present.is_some()
+            {
+                return Err(LedgerGenerationError::Invalid);
+            }
+        }
+        LedgerState::Quarantined => {
+            if record
+                .quarantine_reason
+                .as_deref()
+                .is_none_or(|r| r.is_empty())
+            {
+                return Err(LedgerGenerationError::Invalid);
+            }
+            if record.observed_stage_present.is_none() || record.observed_final_present.is_none() {
+                return Err(LedgerGenerationError::Invalid);
+            }
+            if record.namespace_durability.is_some() {
+                return Err(LedgerGenerationError::Invalid);
+            }
+        }
+        _ => {
+            if record.namespace_durability.is_some()
+                || record.quarantine_reason.is_some()
+                || record.observed_stage_present.is_some()
+                || record.observed_final_present.is_some()
+            {
+                return Err(LedgerGenerationError::Invalid);
+            }
+        }
     }
     Ok(())
 }
@@ -256,6 +394,10 @@ mod ledger_generation_wins_valid {
             final_session_name: _identity.final_session_name.clone(),
             generation: 5,
             record_digest: "f".repeat(64),
+            namespace_durability: None,
+            quarantine_reason: None,
+            observed_stage_present: None,
+            observed_final_present: None,
         };
         let bytes = serde_json::to_vec(&record).unwrap();
         fs::write(gen_dir_path.join("gen-5.json"), bytes).unwrap();
@@ -281,6 +423,10 @@ mod ledger_generation_wins_valid {
             final_session_name: identity.final_session_name.clone(),
             generation: 3,
             record_digest: String::new(),
+            namespace_durability: None,
+            quarantine_reason: None,
+            observed_stage_present: None,
+            observed_final_present: None,
         };
         let bytes = serialize_with_digest(&other).unwrap();
         fs::write(gen_dir_path.join("gen-3.json"), bytes).unwrap();
