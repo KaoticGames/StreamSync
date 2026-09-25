@@ -20,6 +20,12 @@ pub enum PublicationError {
     AmbiguousPublication,
     #[error("missing publication artifacts")]
     MissingPublication,
+    #[error("publication child is not a directory: {role}")]
+    OtherArtifact { role: &'static str },
+    #[error("rename failed with stage intact: {detail}")]
+    RenameFailed { detail: String },
+    #[error("rename outcome indeterminate: {detail}")]
+    RenameIndeterminate { detail: String },
     #[error("published final directory invalid")]
     PublishedFinalInvalid,
     #[error("terminal quarantined state")]

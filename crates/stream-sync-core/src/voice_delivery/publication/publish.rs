@@ -2,34 +2,83 @@
 
 use super::error::PublicationError;
 use crate::voice_delivery::fs::durability::{sync_dir_exact, NamespaceDurability};
+use crate::voice_delivery::fs::ChildDirProbe;
 use crate::voice_delivery::fs::FinalParentPublication;
 use crate::voice_delivery::fs::{DirHandle, FsError, ValidatedFinalName};
 use crate::voice_delivery::identity::DeliveryImmutableIdentity;
 use crate::voice_delivery::manifest::ValidatedManifest;
-use crate::voice_delivery::marker::DeliveryMarker;
-use crate::voice_delivery::marker::{prove_post_marker_membership, MARKER_FILENAME};
+use crate::voice_delivery::marker::verify_marker_directory_membership;
 use crate::voice_delivery::records::ledger_generation::{LedgerGeneration, LedgerStore};
 use crate::voice_delivery::session::DeliverySessionGuard;
 use crate::voice_delivery::state::LedgerState;
 
-/// Observed stage/final directory presence under the final-parent handle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Observed stage/final directory presence under the final-parent handle (fail-closed probe).
 pub(crate) struct PublicationPresence {
-    pub stage_present: bool,
-    pub final_present: bool,
+    pub stage: PresenceSlot,
+    pub final_session: PresenceSlot,
+}
+
+pub(crate) enum PresenceSlot {
+    Missing,
+    Directory(DirHandle),
+}
+
+impl std::fmt::Debug for PublicationPresence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublicationPresence")
+            .field("stage", &self.stage)
+            .field("final_session", &self.final_session)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for PresenceSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PresenceSlot::Missing => write!(f, "Missing"),
+            PresenceSlot::Directory(_) => write!(f, "Directory(..)"),
+        }
+    }
+}
+
+impl PublicationPresence {
+    pub(crate) fn stage_present(&self) -> bool {
+        matches!(self.stage, PresenceSlot::Directory(_))
+    }
+
+    pub(crate) fn final_present(&self) -> bool {
+        matches!(self.final_session, PresenceSlot::Directory(_))
+    }
+}
+
+fn map_child_probe_err(role: &'static str, err: FsError) -> PublicationError {
+    match err {
+        FsError::NotADirectory(_) => PublicationError::OtherArtifact { role },
+        other => PublicationError::Fs(other),
+    }
 }
 
 pub(crate) fn observe_publication_presence(
     final_parent: &DirHandle,
     identity: &DeliveryImmutableIdentity,
-) -> Result<PublicationPresence, FsError> {
-    let stage_present = final_parent.open_child_dir(&identity.staging_token).is_ok();
-    let final_present = final_parent
-        .open_child_dir(&identity.final_session_name)
-        .is_ok();
+) -> Result<PublicationPresence, PublicationError> {
+    let stage = match final_parent.probe_child_dir(&identity.staging_token) {
+        Ok(probe) => match probe {
+            ChildDirProbe::Missing => PresenceSlot::Missing,
+            ChildDirProbe::Directory(h) => PresenceSlot::Directory(h),
+        },
+        Err(e) => return Err(map_child_probe_err("stage", e)),
+    };
+    let final_session = match final_parent.probe_child_dir(&identity.final_session_name) {
+        Ok(probe) => match probe {
+            ChildDirProbe::Missing => PresenceSlot::Missing,
+            ChildDirProbe::Directory(h) => PresenceSlot::Directory(h),
+        },
+        Err(e) => return Err(map_child_probe_err("final", e)),
+    };
     Ok(PublicationPresence {
-        stage_present,
-        final_present,
+        stage,
+        final_session,
     })
 }
 
@@ -51,6 +100,11 @@ pub struct PublicationOperationRecorder {
 
 impl PublicationOperationRecorder {
     pub fn record(&mut self, op: PublicationOperation) {
+        if op == PublicationOperation::PublishIntentObserved
+            && self.ops.contains(&PublicationOperation::PublishIntentObserved)
+        {
+            return;
+        }
         self.ops.push(op);
     }
 }
@@ -94,8 +148,14 @@ pub enum PublicationCrashPoint {
     DuringPublishedLedgerWrite,
 }
 
+#[cfg(test)]
+pub(crate) type RenameInjectFn = fn(&DirHandle, &str, &ValidatedFinalName) -> Result<(), FsError>;
+
+#[derive(Default)]
 pub struct PublishOptions {
     pub crash: Option<PublicationCrashPoint>,
+    #[cfg(test)]
+    pub rename_inject: Option<RenameInjectFn>,
 }
 
 /// Execute publication rename + verification + Published ledger commit.
@@ -122,37 +182,34 @@ pub fn publish_prepared(
     let manifest = guard.manifest();
     let final_parent = guard.final_parent_dir();
     let presence = observe_publication_presence(final_parent, identity)?;
-    if presence.stage_present && presence.final_present {
+    if presence.stage_present() && presence.final_present() {
         return Err(PublicationError::AmbiguousPublication);
     }
-    if !presence.stage_present {
-        if presence.final_present {
-            return finalize_from_final_only(guard, recorder, options);
+    if !presence.stage_present() {
+        if presence.final_present() {
+            return finalize_from_final_only(guard, recorder, options, true);
         }
         return Err(PublicationError::MissingPublication);
     }
 
-    let staging = final_parent
-        .open_child_dir(&identity.staging_token)
-        .map_err(PublicationError::Fs)?;
-    prove_post_marker_membership(&staging, manifest, identity)?;
+    let staging = match &presence.stage {
+        PresenceSlot::Directory(h) => h,
+        PresenceSlot::Missing => return Err(PublicationError::MissingPublication),
+    };
+    verify_marker_directory_membership(staging, manifest, identity)?;
     if let Some(r) = recorder.as_mut() {
         r.record(PublicationOperation::StagingReverified);
     }
 
     let final_name =
         ValidatedFinalName::validate(&identity.final_session_name).map_err(PublicationError::Fs)?;
-    let publication = FinalParentPublication::new(final_parent.clone_handle()?);
-    match publication.rename_stage_to_final(&identity.staging_token, &final_name) {
+    let rename_result =
+        perform_stage_rename(final_parent, &identity.staging_token, &final_name, &options);
+    match rename_result {
         Ok(()) => {}
-        Err(FsError::AlreadyExists) => {
-            return Err(classify_destination_collision(
-                final_parent,
-                identity,
-                manifest,
-            ));
+        Err(e) => {
+            return reconcile_after_rename_error(guard, recorder, options, e, manifest, identity);
         }
-        Err(e) => return Err(PublicationError::Fs(e)),
     }
     if let Some(r) = recorder.as_mut() {
         r.record(PublicationOperation::RenameNoReplace);
@@ -188,17 +245,91 @@ pub fn publish_prepared(
     Ok(published)
 }
 
+fn perform_stage_rename(
+    final_parent: &DirHandle,
+    stage_token: &str,
+    final_name: &ValidatedFinalName,
+    options: &PublishOptions,
+) -> Result<(), FsError> {
+    #[cfg(test)]
+    if let Some(inject) = options.rename_inject {
+        return inject(final_parent, stage_token, final_name);
+    }
+    #[cfg(not(test))]
+    let _options = options;
+    let publication = FinalParentPublication::new(final_parent.clone_handle()?);
+    publication.rename_stage_to_final(stage_token, final_name)
+}
+
+fn rename_error_detail(err: &FsError) -> String {
+    match err {
+        FsError::AlreadyExists => "already_exists".into(),
+        FsError::Io(e) => format!("io:{:?}", e.kind()),
+        FsError::SymlinkOrReparseComponent(c) => format!("reparse:{c}"),
+        FsError::NotADirectory(c) => format!("not_directory:{c}"),
+        other => format!("{other}"),
+    }
+}
+
+fn reconcile_after_rename_error(
+    guard: &DeliverySessionGuard,
+    recorder: Option<&mut PublicationOperationRecorder>,
+    options: PublishOptions,
+    rename_err: FsError,
+    manifest: &ValidatedManifest,
+    identity: &DeliveryImmutableIdentity,
+) -> Result<LedgerGeneration, PublicationError> {
+    let detail = rename_error_detail(&rename_err);
+    let final_parent = guard.final_parent_dir();
+    let presence = observe_publication_presence(final_parent, identity)?;
+    match (presence.stage_present(), presence.final_present()) {
+        (false, true) => {
+            if verify_final_session_directory(final_parent, identity, manifest).is_ok() {
+                return finalize_from_final_only(guard, recorder, options, true);
+            }
+            if matches!(rename_err, FsError::AlreadyExists) {
+                return Err(classify_destination_collision(
+                    final_parent,
+                    identity,
+                    manifest,
+                ));
+            }
+            Err(PublicationError::RenameIndeterminate { detail })
+        }
+        (true, false) => {
+            if matches!(rename_err, FsError::AlreadyExists) {
+                return Err(classify_destination_collision(
+                    final_parent,
+                    identity,
+                    manifest,
+                ));
+            }
+            Err(PublicationError::RenameFailed { detail })
+        }
+        (true, true) => {
+            if matches!(rename_err, FsError::AlreadyExists) {
+                return Err(PublicationError::AmbiguousPublication);
+            }
+            Err(PublicationError::RenameIndeterminate { detail })
+        }
+        (false, false) => Err(PublicationError::RenameIndeterminate { detail }),
+    }
+}
+
 pub(crate) fn finalize_from_final_only(
     guard: &DeliverySessionGuard,
     mut recorder: Option<&mut PublicationOperationRecorder>,
     options: PublishOptions,
+    intent_already_observed: bool,
 ) -> Result<LedgerGeneration, PublicationError> {
     let store = LedgerStore::open_for_guard(guard)?;
     let identity = guard.identity();
     let manifest = guard.manifest();
     let final_parent = guard.final_parent_dir();
-    if let Some(r) = recorder.as_mut() {
-        r.record(PublicationOperation::PublishIntentObserved);
+    if !intent_already_observed {
+        if let Some(r) = recorder.as_mut() {
+            r.record(PublicationOperation::PublishIntentObserved);
+        }
     }
     let namespace_durability = sync_dir_exact(final_parent)?;
     if let Some(r) = recorder.as_mut() {
@@ -224,10 +355,12 @@ pub(crate) fn verify_final_session_directory(
     identity: &DeliveryImmutableIdentity,
     manifest: &ValidatedManifest,
 ) -> Result<(), PublicationError> {
-    let final_dir = final_parent
-        .open_child_dir(&identity.final_session_name)
-        .map_err(PublicationError::Fs)?;
-    prove_post_marker_membership(&final_dir, manifest, identity)?;
+    let presence = observe_publication_presence(final_parent, identity)?;
+    let final_dir = match presence.final_session {
+        PresenceSlot::Directory(h) => h,
+        PresenceSlot::Missing => return Err(PublicationError::MissingPublication),
+    };
+    verify_marker_directory_membership(&final_dir, manifest, identity)?;
     Ok(())
 }
 
@@ -236,22 +369,17 @@ fn classify_destination_collision(
     identity: &DeliveryImmutableIdentity,
     manifest: &ValidatedManifest,
 ) -> PublicationError {
-    match final_parent.open_child_dir(&identity.final_session_name) {
-        Ok(dir) => {
+    match final_parent.probe_child_dir(&identity.final_session_name) {
+        Ok(ChildDirProbe::Directory(dir)) => {
             if marker_matches_delivery(&dir, identity, manifest) {
                 PublicationError::DestinationExists
             } else {
                 PublicationError::UnrelatedDestination
             }
         }
-        Err(FsError::AlreadyExists) | Err(FsError::SymlinkOrReparseComponent(_)) => {
+        Ok(ChildDirProbe::Missing) => PublicationError::DestinationExists,
+        Err(FsError::SymlinkOrReparseComponent(_)) | Err(FsError::NotADirectory(_)) => {
             PublicationError::UnrelatedDestination
-        }
-        Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotADirectory => {
-            PublicationError::UnrelatedDestination
-        }
-        Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            PublicationError::DestinationExists
         }
         Err(e) => PublicationError::Fs(e),
     }
@@ -262,10 +390,7 @@ fn marker_matches_delivery(
     identity: &DeliveryImmutableIdentity,
     manifest: &ValidatedManifest,
 ) -> bool {
-    match dir.read_file_all(MARKER_FILENAME) {
-        Ok(bytes) => DeliveryMarker::parse(&bytes, identity, manifest).is_ok(),
-        Err(_) => false,
-    }
+    verify_marker_directory_membership(dir, manifest, identity).is_ok()
 }
 
 fn commit_published_with_optional_crash(
@@ -293,5 +418,12 @@ fn write_malformed_higher_generation_and_abort(store: &LedgerStore) -> ! {
 }
 
 pub(crate) fn hard_abort() -> ! {
+    #[cfg(test)]
+    {
+        use crate::voice_delivery::subprocess_env::PUB_CRASH_ABORT_MARKER;
+        if let Ok(path) = std::env::var(PUB_CRASH_ABORT_MARKER) {
+            let _ = std::fs::write(path, b"pre_abort\n");
+        }
+    }
     std::process::abort();
 }

@@ -15,6 +15,8 @@ pub enum FsError {
     SymlinkOrReparseComponent(String),
     #[error("destination already exists")]
     AlreadyExists,
+    #[error("child is not a directory: {0}")]
+    NotADirectory(String),
     #[error("cross-parent rename is not representable")]
     CrossParentRename,
     #[error("invalid final session name: {0}")]

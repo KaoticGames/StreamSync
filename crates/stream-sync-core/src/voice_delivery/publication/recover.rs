@@ -3,10 +3,10 @@
 use super::error::PublicationError;
 use super::publish::{
     finalize_from_final_only, observe_publication_presence, publish_prepared,
-    verify_final_session_directory, PreparedPublication, PublicationOperationRecorder,
-    PublishOptions,
+    verify_final_session_directory, PreparedPublication, PresenceSlot,
+    PublicationOperationRecorder, PublishOptions,
 };
-use crate::voice_delivery::marker::prove_post_marker_membership;
+use crate::voice_delivery::marker::verify_marker_directory_membership;
 use crate::voice_delivery::records::ledger_generation::{LedgerGeneration, LedgerStore};
 use crate::voice_delivery::session::DeliverySessionGuard;
 use crate::voice_delivery::state::LedgerState;
@@ -15,6 +15,8 @@ pub const QUARANTINE_AMBIGUOUS: &str = "ambiguous_publication";
 pub const QUARANTINE_MISSING: &str = "missing_publication";
 pub const QUARANTINE_PUBLISHED_AMBIGUOUS: &str = "published_with_staging_present";
 pub const QUARANTINE_PUBLISHED_FINAL_INVALID: &str = "published_final_invalid";
+pub const QUARANTINE_PROBE_ARTIFACT: &str = "publication_child_artifact";
+pub const QUARANTINE_SEALED_INVALID: &str = "sealed_staging_invalid";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryOutcome {
@@ -34,31 +36,50 @@ pub fn recover_delivery(
     let identity = guard.identity();
     let manifest = guard.manifest();
     let final_parent = guard.final_parent_dir();
-    let presence = observe_publication_presence(final_parent, identity)?;
+    let presence = match observe_publication_presence(final_parent, identity) {
+        Ok(p) => p,
+        Err(PublicationError::OtherArtifact { .. }) => {
+            return Ok(RecoveryOutcome::Quarantined(quarantine_idempotent(
+                &store,
+                guard,
+                QUARANTINE_PROBE_ARTIFACT,
+                false,
+                false,
+            )?));
+        }
+        Err(e) => return Err(e),
+    };
 
     match highest.as_ref().map(|h| h.state) {
-        None | Some(LedgerState::Receiving) => {
-            if highest.is_some() {
-                return Ok(RecoveryOutcome::ResumeIngest);
-            }
-            Ok(RecoveryOutcome::ResumeIngest)
-        }
+        None | Some(LedgerState::Receiving) => Ok(RecoveryOutcome::ResumeIngest),
         Some(LedgerState::Sealed) => {
-            let staging = guard
-                .final_parent_dir()
-                .open_child_dir(&identity.staging_token)
-                .map_err(PublicationError::Fs)?;
-            prove_post_marker_membership(&staging, manifest, identity)?;
+            let staging = match &presence.stage {
+                PresenceSlot::Directory(h) => h,
+                PresenceSlot::Missing => {
+                    return Ok(RecoveryOutcome::Quarantined(quarantine_idempotent(
+                        &store,
+                        guard,
+                        QUARANTINE_MISSING,
+                        false,
+                        presence.final_present(),
+                    )?));
+                }
+            };
+            if verify_marker_directory_membership(staging, manifest, identity).is_err() {
+                return Ok(RecoveryOutcome::Quarantined(quarantine_idempotent(
+                    &store,
+                    guard,
+                    QUARANTINE_SEALED_INVALID,
+                    true,
+                    presence.final_present(),
+                )?));
+            }
             let intent = store.commit(guard, LedgerState::PublishIntent)?;
             Ok(RecoveryOutcome::AdvancedToPublishIntent(intent))
         }
-        Some(LedgerState::PublishIntent) => recover_publish_intent(
-            guard,
-            &store,
-            presence,
-            recorder,
-            PublishOptions { crash: None },
-        ),
+        Some(LedgerState::PublishIntent) => {
+            recover_publish_intent(guard, &store, presence, recorder, PublishOptions::default())
+        }
         Some(LedgerState::Published) => recover_published(guard, &store, presence),
         Some(LedgerState::Quarantined) => {
             let q = highest.expect("quarantined");
@@ -74,30 +95,41 @@ fn recover_publish_intent(
     recorder: Option<&mut PublicationOperationRecorder>,
     options: PublishOptions,
 ) -> Result<RecoveryOutcome, PublicationError> {
-    match (presence.stage_present, presence.final_present) {
+    match (presence.stage_present(), presence.final_present()) {
         (true, true) => Ok(RecoveryOutcome::Quarantined(quarantine_idempotent(
             store,
             guard,
             QUARANTINE_AMBIGUOUS,
-            presence.stage_present,
-            presence.final_present,
+            true,
+            true,
         )?)),
         (false, false) => Ok(RecoveryOutcome::Quarantined(quarantine_idempotent(
             store,
             guard,
             QUARANTINE_MISSING,
-            presence.stage_present,
-            presence.final_present,
+            false,
+            false,
         )?)),
         (true, false) => {
             let prepared = PreparedPublication::from_guard(guard);
-            let published = publish_prepared(prepared, recorder, options)?;
-            Ok(RecoveryOutcome::Published(published))
+            match publish_prepared(prepared, recorder, options) {
+                Ok(published) => Ok(RecoveryOutcome::Published(published)),
+                Err(PublicationError::AmbiguousPublication) => Ok(RecoveryOutcome::Quarantined(
+                    quarantine_idempotent(store, guard, QUARANTINE_AMBIGUOUS, true, true)?,
+                )),
+                Err(e) => Err(e),
+            }
         }
-        (false, true) => {
-            let published = finalize_from_final_only(guard, recorder, options)?;
-            Ok(RecoveryOutcome::Published(published))
-        }
+        (false, true) => match finalize_from_final_only(guard, recorder, options, false) {
+            Ok(published) => Ok(RecoveryOutcome::Published(published)),
+            Err(_) => Ok(RecoveryOutcome::Quarantined(quarantine_idempotent(
+                store,
+                guard,
+                QUARANTINE_PUBLISHED_FINAL_INVALID,
+                false,
+                true,
+            )?)),
+        },
     }
 }
 
@@ -106,22 +138,22 @@ fn recover_published(
     store: &LedgerStore,
     presence: super::publish::PublicationPresence,
 ) -> Result<RecoveryOutcome, PublicationError> {
-    if presence.stage_present {
+    if presence.stage_present() {
         return Ok(RecoveryOutcome::Quarantined(quarantine_idempotent(
             store,
             guard,
             QUARANTINE_PUBLISHED_AMBIGUOUS,
-            presence.stage_present,
-            presence.final_present,
+            true,
+            presence.final_present(),
         )?));
     }
-    if !presence.final_present {
+    if !presence.final_present() {
         return Ok(RecoveryOutcome::Quarantined(quarantine_idempotent(
             store,
             guard,
             QUARANTINE_PUBLISHED_FINAL_INVALID,
-            presence.stage_present,
-            presence.final_present,
+            false,
+            false,
         )?));
     }
     let identity = guard.identity();
@@ -132,8 +164,8 @@ fn recover_published(
             store,
             guard,
             QUARANTINE_PUBLISHED_FINAL_INVALID,
-            presence.stage_present,
-            presence.final_present,
+            false,
+            true,
         )?)),
     }
 }

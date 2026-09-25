@@ -225,6 +225,56 @@ pub(crate) fn open_root_dir(path: &Path) -> Result<OwnedDirHandle, FsError> {
     Ok(opened.into_dir_handle(abs))
 }
 
+pub(crate) fn probe_child_dir(
+    parent: &DirHandle,
+    name: &str,
+) -> Result<super::dir::ChildDirProbe, FsError> {
+    let parent_path = parent.windows_handle().absolute_path();
+    let child_path = parent_path.join(name);
+    match open_directory_at_path(&child_path) {
+        Ok(opened) => {
+            if is_reparse_point(opened.raw())? {
+                return Err(FsError::SymlinkOrReparseComponent(name.to_string()));
+            }
+            Ok(super::dir::ChildDirProbe::Directory(
+                DirHandle::from_windows(opened.into_dir_handle(child_path)),
+            ))
+        }
+        Err(FsError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
+            Ok(super::dir::ChildDirProbe::Missing)
+        }
+        Err(FsError::Io(e))
+            if e.kind() == io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(5) =>
+        {
+            Err(FsError::Io(e))
+        }
+        Err(FsError::Io(e)) => {
+            use windows_sys::Win32::Storage::FileSystem::{
+                CreateFileW, GetFileAttributesW, FILE_ATTRIBUTE_DIRECTORY,
+            };
+            let wide = wide_path(&child_path);
+            let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+            if attrs == u32::MAX {
+                let err = unsafe { GetLastError() };
+                if err == windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND
+                    || err == windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND
+                {
+                    return Ok(super::dir::ChildDirProbe::Missing);
+                }
+                return Err(FsError::Io(io::Error::from_raw_os_error(err as i32)));
+            }
+            if (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 {
+                if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                    return Err(FsError::SymlinkOrReparseComponent(name.to_string()));
+                }
+                return Err(FsError::NotADirectory(name.to_string()));
+            }
+            Err(FsError::Io(e))
+        }
+        Err(other) => Err(other),
+    }
+}
+
 pub(crate) fn open_dir_at(parent: &DirHandle, name: &str) -> Result<DirHandle, FsError> {
     let parent_path = parent.windows_handle().absolute_path();
     let child_path = parent_path.join(name);

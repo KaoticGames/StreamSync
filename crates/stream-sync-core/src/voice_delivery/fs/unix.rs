@@ -45,6 +45,29 @@ pub(crate) fn open_root_dir(path: &Path) -> Result<rustix::fd::OwnedFd, FsError>
     }
 }
 
+/// Descriptor-relative child probe: `Missing` or opened directory handle (no-follow).
+pub(crate) fn probe_child_dir(
+    parent: &DirHandle,
+    name: &str,
+) -> Result<super::dir::ChildDirProbe, FsError> {
+    use rustix::fs::{statat, AtFlags, FileType};
+    match statat(parent.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(rustix::io::Errno::NOENT) => Ok(super::dir::ChildDirProbe::Missing),
+        Err(e) => Err(FsError::Io(e.into())),
+        Ok(stat) => {
+            let ft = FileType::from_raw_mode(stat.st_mode);
+            if ft == FileType::Symlink {
+                return Err(FsError::SymlinkOrReparseComponent(name.to_string()));
+            }
+            if ft == FileType::Directory {
+                open_dir_at(parent, name).map(super::dir::ChildDirProbe::Directory)
+            } else {
+                Err(FsError::NotADirectory(name.to_string()))
+            }
+        }
+    }
+}
+
 pub(crate) fn open_dir_at(parent: &DirHandle, name: &str) -> Result<DirHandle, FsError> {
     reject_symlink_at(parent, name)?;
     let flags =

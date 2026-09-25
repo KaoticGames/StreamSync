@@ -16,6 +16,12 @@ use super::windows;
 use rustix::fd::AsFd;
 use std::path::Path;
 
+/// Result of a no-follow probe for a single child basename under a held parent directory.
+pub(crate) enum ChildDirProbe {
+    Missing,
+    Directory(DirHandle),
+}
+
 /// Owned directory handle — root or descendant of an opened `DestRoot`.
 ///
 /// On Unix, operations are relative to the held directory file descriptor. On Windows, child operations
@@ -64,6 +70,23 @@ impl DirHandle {
     pub(crate) fn windows_handle(&self) -> &windows::OwnedDirHandle {
         match &self.inner {
             DirHandleInner::Windows(h) => h,
+        }
+    }
+
+    pub(crate) fn probe_child_dir(&self, name: &str) -> Result<ChildDirProbe, FsError> {
+        super::validate_single_component(name)?;
+        #[cfg(unix)]
+        {
+            unix::probe_child_dir(self, name)
+        }
+        #[cfg(windows)]
+        {
+            windows::probe_child_dir(self, name)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = name;
+            Err(FsError::Unsupported)
         }
     }
 

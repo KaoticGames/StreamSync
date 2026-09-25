@@ -199,7 +199,7 @@ impl DeliverySessionGuard {
         verify_exact_staging_membership(staging_dir, self.manifest())?;
         let marker = DeliveryMarker::from_manifest(self.identity(), self.manifest());
         write_marker_create_new(self, staging_dir, &marker)?;
-        prove_post_marker_membership(staging_dir, self.manifest(), self.identity())?;
+        verify_marker_directory_membership(staging_dir, self.manifest(), self.identity())?;
         let staging_durability = sync_dir_exact(staging_dir)?;
         let ledger = LedgerStore::open_for_guard(self)?;
         let sealed = ledger.commit(self, LedgerState::Sealed)?;
@@ -217,27 +217,53 @@ fn ensure_no_preexisting_marker(staging_dir: &DirHandle) -> Result<(), MarkerErr
     Ok(())
 }
 
-pub(crate) fn prove_post_marker_membership(
-    staging_dir: &DirHandle,
+/// Full exact verification for a directory that must contain the ownership marker and stems.
+pub(crate) fn verify_marker_directory_membership(
+    dir: &DirHandle,
     manifest: &ValidatedManifest,
     identity: &DeliveryImmutableIdentity,
 ) -> Result<(), MarkerError> {
-    let names: std::collections::HashSet<String> =
-        staging_dir.list_child_names()?.into_iter().collect();
-    let expected_stems: std::collections::HashSet<String> =
+    let expected_wavs: std::collections::HashSet<String> =
         manifest.stems.iter().map(|s| s.file_name.clone()).collect();
-    if names.len() != expected_stems.len() + 1 {
-        return Err(MarkerError::UnexpectedEntry("membership size".into()));
+    let mut seen_stems = std::collections::HashSet::new();
+    let mut marker_seen = false;
+    for name in dir.list_child_names()? {
+        if name == MARKER_FILENAME {
+            if marker_seen {
+                return Err(MarkerError::UnexpectedEntry(format!("duplicate {name}")));
+            }
+            marker_seen = true;
+            continue;
+        }
+        if name.ends_with(".partial") {
+            return Err(MarkerError::UnexpectedEntry(name));
+        }
+        if !name.ends_with(".wav") {
+            return Err(MarkerError::UnexpectedEntry(name));
+        }
+        if !expected_wavs.contains(&name) {
+            return Err(MarkerError::UnexpectedEntry(name));
+        }
+        if !seen_stems.insert(name.clone()) {
+            return Err(MarkerError::UnexpectedEntry(format!("duplicate {name}")));
+        }
+        let stem = manifest
+            .stems
+            .iter()
+            .find(|s| s.file_name == name)
+            .expect("contains");
+        let file = open_existing_file_at(dir, &name)?;
+        verify_stem_from_handle(&file, stem)?;
     }
-    if !names.contains(MARKER_FILENAME) {
+    if !marker_seen {
         return Err(MarkerError::MissingStem(MARKER_FILENAME.into()));
     }
-    for stem in &expected_stems {
-        if !names.contains(stem) {
-            return Err(MarkerError::MissingStem(stem.clone()));
+    for stem in &manifest.stems {
+        if !seen_stems.contains(&stem.file_name) {
+            return Err(MarkerError::MissingStem(stem.file_name.clone()));
         }
     }
-    let marker_bytes = staging_dir.read_file_all(MARKER_FILENAME)?;
+    let marker_bytes = dir.read_file_all(MARKER_FILENAME)?;
     let parsed = DeliveryMarker::parse(&marker_bytes, identity, manifest)?;
     validate_marker_stems_match_manifest(&parsed, manifest)?;
     Ok(())

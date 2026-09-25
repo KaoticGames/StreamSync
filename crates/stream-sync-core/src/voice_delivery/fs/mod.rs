@@ -10,6 +10,7 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
+pub(crate) use dir::ChildDirProbe;
 pub use dir::{DestRoot, DirHandle, PortableParentComponent, ValidatedFinalName};
 #[allow(unused_imports)] // public surface for later slices
 pub use durability::{sync_dir_exact, sync_file, NamespaceDurability};
