@@ -393,4 +393,16 @@ mod windows_handle_rename_no_replace {
         let err = rename_no_replace_same_parent(&parent, &st, "");
         assert!(matches!(err, Err(FsError::InvalidComponent(_))));
     }
+
+    /// Mirrors `DeliverySessionGuard` retaining final-parent and staging handles during publication rename.
+    #[test]
+    fn rename_succeeds_with_retained_parent_and_staging_handles() {
+        let (_tmp, parent) = temp_final_parent();
+        let st = stage("33333333333333333333333333333333");
+        parent.create_child_dir(&st).expect("stage");
+        let _retained_parent = parent.clone_handle().expect("clone parent");
+        let _retained_staging = parent.open_child_dir(&st).expect("open staging");
+        rename_no_replace_same_parent(&parent, &st, "published-retained").expect("rename");
+        assert!(parent.open_child_dir("published-retained").is_ok());
+    }
 }

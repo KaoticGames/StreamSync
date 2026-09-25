@@ -6,6 +6,12 @@
 //! `RootDirectory = NULL` and the full absolute destination UTF-16 path (`ReplaceIfExists = FALSE`).
 //! Atomic no-replace on local NTFS holds, but path resolution is cooperative (accidental/stale state),
 //! not a defense against malicious same-user ancestor replacement.
+//!
+//! Retained directory capability handles (`DestRoot`, final-parent, staging) include `FILE_SHARE_DELETE`
+//! so application-managed stage→final renames and recovery layout changes can proceed while
+//! `DeliverySessionGuard` still holds those handles. That is required for cooperative rename geometry;
+//! malicious same-user deletion of guarded paths remains out of scope — the delivery-domain lock
+//! coordinates StreamSync instances.
 
 use super::dir::DirHandle;
 use super::error::FsError;
@@ -178,13 +184,20 @@ fn map_exists_win32(err: u32) -> Option<FsError> {
     }
 }
 
+/// Share mode for directory handles retained across same-parent rename/removal (session guard).
+pub(crate) const DIRECTORY_CAPABILITY_SHARE: u32 =
+    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+/// Share mode for voice stem/partial/marker files that may need to coexist with same-parent rename.
+pub(crate) const VOICE_FILE_SHARE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
 fn open_directory_at_path(path: &Path) -> Result<OwnedWinHandle, FsError> {
     let wide = wide_path(path);
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
             FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            DIRECTORY_CAPABILITY_SHARE,
             std::ptr::null(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -250,7 +263,7 @@ pub(crate) fn probe_child_dir(
         }
         Err(FsError::Io(e)) => {
             use windows_sys::Win32::Storage::FileSystem::{
-                CreateFileW, GetFileAttributesW, FILE_ATTRIBUTE_DIRECTORY,
+                GetFileAttributesW, FILE_ATTRIBUTE_DIRECTORY,
             };
             let wide = wide_path(&child_path);
             let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
@@ -356,7 +369,7 @@ fn open_file_at_path(path: &Path, create_new: bool) -> Result<VoiceFile, FsError
         CreateFileW(
             wide.as_ptr(),
             FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            VOICE_FILE_SHARE,
             std::ptr::null(),
             if create_new {
                 windows_sys::Win32::Storage::FileSystem::CREATE_NEW
@@ -400,7 +413,7 @@ pub(crate) fn open_file_create_or_open(
         CreateFileW(
             wide.as_ptr(),
             FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            VOICE_FILE_SHARE,
             std::ptr::null(),
             OPEN_ALWAYS,
             FILE_FLAG_OPEN_REPARSE_POINT,
@@ -439,7 +452,7 @@ pub(crate) fn open_lock_file(
                 CreateFileW(
                     wide.as_ptr(),
                     FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    VOICE_FILE_SHARE,
                     std::ptr::null(),
                     OPEN_ALWAYS,
                     FILE_FLAG_OPEN_REPARSE_POINT,
@@ -459,6 +472,21 @@ pub(crate) fn open_lock_file(
         }
     }
     Err(FsError::InvalidComponent("empty lock path".into()))
+}
+
+#[cfg(test)]
+mod win32_share_mode_constants {
+    use super::*;
+
+    #[test]
+    fn directory_capability_share_includes_delete() {
+        assert_ne!(DIRECTORY_CAPABILITY_SHARE & FILE_SHARE_DELETE, 0);
+    }
+
+    #[test]
+    fn voice_file_share_includes_delete() {
+        assert_ne!(VOICE_FILE_SHARE & FILE_SHARE_DELETE, 0);
+    }
 }
 
 #[cfg(test)]

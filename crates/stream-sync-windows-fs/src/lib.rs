@@ -13,7 +13,7 @@ mod win {
     use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FileRenameInfo, SetFileInformationByHandle, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
 
     use crate::rename_buffer::{build_no_replace_rename_buffer, built_rename_info_view};
@@ -50,7 +50,7 @@ mod win {
             CreateFileW(
                 wide.as_ptr(),
                 FILE_GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 std::ptr::null(),
                 OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS,

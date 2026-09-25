@@ -4,6 +4,8 @@
 //!
 //! **Windows:** holds a directory `HANDLE` plus a validated absolute path used for single-component
 //! `CreateFileW` / `CreateDirectoryW` walks with reparse rejection (accidental/stale-state safety).
+//! Directory opens use `FILE_SHARE_DELETE` so retained session handles (root, final-parent, staging)
+//! do not block cooperative stage→final rename; malicious same-user deletion is not in scope.
 //! This is not Linux `openat` capability semantics and does not defend against malicious same-user
 //! replacement or races on ancestor directories.
 
