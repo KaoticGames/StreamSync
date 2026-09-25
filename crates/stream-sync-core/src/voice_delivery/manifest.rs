@@ -1,7 +1,6 @@
 //! Manifest stem validation and canonical digest (explicit stem order preserved).
 
 use crate::voice_delivery::bounds::{RIFF_MAX_CHUNK_BYTES, STEREO_PCM_FRAME_BYTES};
-use crate::voice_delivery::fs::validate_single_component;
 use crate::voice_delivery::hash::{hex_digest, sha256_hex_reader};
 use crate::voice_delivery::wav::minimal_wav_header;
 use serde::{Deserialize, Serialize};

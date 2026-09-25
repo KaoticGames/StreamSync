@@ -2,6 +2,7 @@
 
 use crate::voice_delivery::fs::durability::{sync_dir_exact, sync_file, NamespaceDurability};
 use crate::voice_delivery::fs::file::open_existing_file_at;
+use crate::voice_delivery::fs::PortableParentComponent;
 use crate::voice_delivery::fs::{DirHandle, FsError, VoiceFile};
 use crate::voice_delivery::hash::{sha256_hex_reader, DEFAULT_STREAM_CHUNK};
 use crate::voice_delivery::identity::DeliveryImmutableIdentity;
@@ -31,7 +32,7 @@ pub struct DeliveryMarker {
     pub delivery_uuid: String,
     pub manifest_digest: String,
     pub staging_token: String,
-    pub final_parent_relative: Vec<String>,
+    pub final_parent_relative: Vec<PortableParentComponent>,
     pub final_session_name: String,
     pub stems: Vec<StemMarkerEntry>,
     pub record_digest: String,
@@ -109,7 +110,11 @@ impl DeliveryMarker {
         serde_json::to_vec(&tmp).map_err(|e| MarkerError::Parse(e.to_string()))
     }
 
-    pub fn parse(bytes: &[u8], identity: &DeliveryImmutableIdentity) -> Result<Self, MarkerError> {
+    pub fn parse(
+        bytes: &[u8],
+        identity: &DeliveryImmutableIdentity,
+        manifest: &ValidatedManifest,
+    ) -> Result<Self, MarkerError> {
         let marker: Self =
             serde_json::from_slice(bytes).map_err(|_| MarkerError::Parse("json".into()))?;
         if marker.schema_version != MARKER_SCHEMA_VERSION {
@@ -126,11 +131,13 @@ impl DeliveryMarker {
             return Err(MarkerError::IdentityMismatch);
         }
         validate_marker_stems(&marker)?;
+        validate_marker_stems_match_manifest(&marker, manifest)?;
         Ok(marker)
     }
 }
 
 fn validate_marker_stems(marker: &DeliveryMarker) -> Result<(), MarkerError> {
+    let mut seen = std::collections::HashSet::new();
     for stem in &marker.stems {
         if stem.sha256.len() != 64
             || !stem
@@ -139,6 +146,29 @@ fn validate_marker_stems(marker: &DeliveryMarker) -> Result<(), MarkerError> {
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         {
             return Err(MarkerError::Parse("stem digest".into()));
+        }
+        if !seen.insert(stem.file_name.clone()) {
+            return Err(MarkerError::StemVerification("duplicate stem".into()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_marker_stems_match_manifest(
+    marker: &DeliveryMarker,
+    manifest: &ValidatedManifest,
+) -> Result<(), MarkerError> {
+    if marker.stems.len() != manifest.stems.len() {
+        return Err(MarkerError::StemVerification("stem count".into()));
+    }
+    for (m_stem, man) in marker.stems.iter().zip(manifest.stems.iter()) {
+        if m_stem.file_name != man.file_name
+            || m_stem.byte_count != man.byte_count
+            || m_stem.sha256 != man.sha256
+        {
+            return Err(MarkerError::StemVerification(
+                "manifest stem mismatch".into(),
+            ));
         }
     }
     Ok(())
@@ -206,7 +236,8 @@ fn prove_post_marker_membership(
         }
     }
     let marker_bytes = staging_dir.read_file_all(MARKER_FILENAME)?;
-    DeliveryMarker::parse(&marker_bytes, identity)?;
+    let parsed = DeliveryMarker::parse(&marker_bytes, identity, manifest)?;
+    validate_marker_stems_match_manifest(&parsed, manifest)?;
     Ok(())
 }
 
@@ -297,8 +328,8 @@ pub fn verify_exact_staging_membership(
 #[cfg(test)]
 mod publish_intent_before_rename {
     use super::*;
+    use crate::voice_delivery::fs::PortableParentComponent;
     use crate::voice_delivery::hash::SyntheticByteSource;
-    use crate::voice_delivery::lock::acquire_delivery_domain_lock;
     use crate::voice_delivery::wav::minimal_wav_header;
     fn write_minimal_stem(staging: &DirHandle, name: &str, data_bytes: u64) -> StemManifestEntry {
         let header = minimal_wav_header(data_bytes).unwrap();
@@ -329,22 +360,24 @@ mod publish_intent_before_rename {
         let tmp = tempfile::tempdir().unwrap();
         let root = crate::voice_delivery::fs::DestRoot::open(tmp.path()).unwrap();
         let stage = ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef";
-        root.create_child_dir(stage).unwrap();
-        let staging = root.open_child_dir(stage).unwrap();
         let data_bytes = 4u64;
+        root.create_child_dir("guild").unwrap();
+        let guild_dir = root.open_child_dir("guild").unwrap();
+        guild_dir.create_child_dir(stage).unwrap();
+        let staging = guild_dir.open_child_dir(stage).unwrap();
         let stem = write_minimal_stem(&staging, "a.wav", data_bytes);
-        let stems = vec![stem];
-        let manifest = ValidatedManifest::validate(stems).unwrap();
-        let identity = DeliveryImmutableIdentity::new(
+        let manifest = ValidatedManifest::validate(vec![stem]).unwrap();
+        let guard = DeliverySessionGuard::begin(
+            root,
             "delivery-intent",
-            &manifest,
+            manifest,
             stage,
-            vec!["guild".into()],
+            vec![PortableParentComponent::validate("guild").unwrap()],
             "published-name",
+            true,
         )
         .unwrap();
-        let lock = acquire_delivery_domain_lock(&root, "delivery-intent", true).unwrap();
-        let guard = DeliverySessionGuard::open(root, identity, manifest, lock).unwrap();
+        assert!(tmp.path().join("guild").join(stage).is_dir());
         let ledger = LedgerStore::open_for_guard(&guard).unwrap();
         ledger.commit(&guard, LedgerState::Receiving).unwrap();
         let mut recorder = PublishIntentRecorder::default();
@@ -365,16 +398,104 @@ mod publish_intent_before_rename {
         let staging = root.open_child_dir(stage).unwrap();
         let data_bytes = 4u64;
         let stem = write_minimal_stem(&staging, "a.wav", data_bytes);
-        let stems = vec![stem];
-        let manifest = ValidatedManifest::validate(stems).unwrap();
-        let identity =
-            DeliveryImmutableIdentity::new("delivery-no-rename", &manifest, stage, vec![], "final")
-                .unwrap();
-        let lock = acquire_delivery_domain_lock(&root, "delivery-no-rename", true).unwrap();
-        let guard = DeliverySessionGuard::open(root, identity, manifest, lock).unwrap();
+        let manifest = ValidatedManifest::validate(vec![stem]).unwrap();
+        let guard = DeliverySessionGuard::begin(
+            root,
+            "delivery-no-rename",
+            manifest,
+            stage,
+            vec![],
+            "final",
+            true,
+        )
+        .unwrap();
         let ledger = LedgerStore::open_for_guard(&guard).unwrap();
         ledger.commit(&guard, LedgerState::Receiving).unwrap();
         guard.seal_and_write_publish_intent().unwrap();
         assert!(guard.dest_root().open_child_dir(stage).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod marker_manifest_adversarial {
+    use super::*;
+    use crate::voice_delivery::fs::PortableParentComponent;
+
+    fn identity_and_manifest() -> (DeliveryImmutableIdentity, ValidatedManifest) {
+        let manifest = ValidatedManifest::validate(vec![StemManifestEntry {
+            file_name: "a.wav".into(),
+            byte_count: 44,
+            sha256: "a".repeat(64),
+        }])
+        .unwrap();
+        let identity = DeliveryImmutableIdentity::new(
+            "marker-adv",
+            &manifest,
+            ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
+            vec![PortableParentComponent::validate("guild").unwrap()],
+            "final",
+        )
+        .unwrap();
+        (identity, manifest)
+    }
+
+    #[test]
+    fn marker_with_substituted_stem_hash_rejected() {
+        let (identity, manifest) = identity_and_manifest();
+        let mut marker = DeliveryMarker::from_manifest(&identity, &manifest);
+        marker.stems[0].sha256 = "b".repeat(64);
+        let bytes = marker.serialize().unwrap();
+        assert!(matches!(
+            DeliveryMarker::parse(&bytes, &identity, &manifest),
+            Err(MarkerError::StemVerification(_))
+        ));
+    }
+
+    #[test]
+    fn marker_with_extra_stem_rejected() {
+        let (identity, manifest) = identity_and_manifest();
+        let mut marker = DeliveryMarker::from_manifest(&identity, &manifest);
+        marker.stems.push(StemMarkerEntry {
+            file_name: "extra.wav".into(),
+            byte_count: 44,
+            sha256: "c".repeat(64),
+        });
+        let bytes = marker.serialize().unwrap();
+        assert!(matches!(
+            DeliveryMarker::parse(&bytes, &identity, &manifest),
+            Err(MarkerError::StemVerification(_))
+        ));
+    }
+
+    #[test]
+    fn marker_with_reordered_stems_rejected() {
+        let manifest = ValidatedManifest::validate(vec![
+            StemManifestEntry {
+                file_name: "a.wav".into(),
+                byte_count: 44,
+                sha256: "a".repeat(64),
+            },
+            StemManifestEntry {
+                file_name: "b.wav".into(),
+                byte_count: 44,
+                sha256: "b".repeat(64),
+            },
+        ])
+        .unwrap();
+        let identity = DeliveryImmutableIdentity::new(
+            "marker-order",
+            &manifest,
+            ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
+            vec![],
+            "final",
+        )
+        .unwrap();
+        let mut marker = DeliveryMarker::from_manifest(&identity, &manifest);
+        marker.stems.reverse();
+        let bytes = marker.serialize().unwrap();
+        assert!(matches!(
+            DeliveryMarker::parse(&bytes, &identity, &manifest),
+            Err(MarkerError::StemVerification(_))
+        ));
     }
 }

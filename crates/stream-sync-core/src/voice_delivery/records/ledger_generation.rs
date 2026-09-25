@@ -5,6 +5,7 @@ use super::generation_read::{
     GenerationScanError, ParseFailureKind,
 };
 use super::{record_digest_hex, GenerationIoError};
+use crate::voice_delivery::fs::PortableParentComponent;
 use crate::voice_delivery::identity::DeliveryImmutableIdentity;
 use crate::voice_delivery::session::DeliverySessionGuard;
 use crate::voice_delivery::state::{validate_ledger_transition, LedgerState};
@@ -20,7 +21,7 @@ pub struct LedgerGeneration {
     pub delivery_uuid: String,
     pub manifest_digest: String,
     pub staging_token: String,
-    pub final_parent_relative: Vec<String>,
+    pub final_parent_relative: Vec<PortableParentComponent>,
     pub final_session_name: String,
     pub generation: u64,
     pub record_digest: String,
@@ -85,7 +86,7 @@ impl LedgerStore {
                     Ok(())
                 }
             },
-            |name, data| parse_ledger_file(name, data),
+            parse_ledger_file,
         )
         .map_err(map_scan_err)
     }
@@ -187,8 +188,8 @@ pub fn validate_ledger_record(record: &LedgerGeneration) -> Result<(), LedgerGen
 mod ledger_generation_wins_valid {
     use super::*;
     use crate::voice_delivery::fs::DestRoot;
+    use crate::voice_delivery::fs::PortableParentComponent;
     use crate::voice_delivery::ids::delivery_opaque_dir_id;
-    use crate::voice_delivery::lock::acquire_delivery_domain_lock;
     use crate::voice_delivery::manifest::{StemManifestEntry, ValidatedManifest};
     use crate::voice_delivery::session::DeliverySessionGuard;
     use std::fs;
@@ -206,18 +207,17 @@ mod ledger_generation_wins_valid {
             sha256: "a".repeat(64),
         }];
         let manifest = ValidatedManifest::validate(stems).unwrap();
-        let identity = DeliveryImmutableIdentity::new(
+        let guard = DeliverySessionGuard::begin(
+            root,
             "delivery-test-uuid",
-            &manifest,
+            manifest,
             ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
-            vec!["guild".into()],
+            vec![PortableParentComponent::validate("guild").unwrap()],
             "session-final",
+            true,
         )
         .unwrap();
-        root.create_child_dir(".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef")
-            .unwrap();
-        let lock = acquire_delivery_domain_lock(&root, "delivery-test-uuid", true).unwrap();
-        let guard = DeliverySessionGuard::open(root, identity.clone(), manifest, lock).unwrap();
+        let identity = guard.identity().clone();
         (tmp, guard, identity)
     }
 

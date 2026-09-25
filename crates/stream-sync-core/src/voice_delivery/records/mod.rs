@@ -43,7 +43,11 @@ pub fn parse_generation_filename(name: &str) -> Option<u64> {
     if mid.len() > 1 && mid.starts_with('0') {
         return None;
     }
-    mid.parse().ok()
+    let n = mid.parse().ok()?;
+    if n > MAX_GENERATION {
+        return None;
+    }
+    Some(n)
 }
 
 pub fn generation_filename(generation: u64) -> Result<String, GenerationIoError> {
@@ -66,4 +70,27 @@ pub fn next_generation_after_max(max_observed: u64) -> Result<u64, GenerationIoE
 pub(crate) fn record_digest_hex(payload_without_digest: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     crate::voice_delivery::hash::hex_digest(&Sha256::digest(payload_without_digest))
+}
+
+#[cfg(test)]
+mod generation_domain_bounds {
+    use super::*;
+
+    #[test]
+    fn parse_generation_accepts_max_and_rejects_max_plus_one() {
+        let max_name = generation_filename(MAX_GENERATION).unwrap();
+        assert_eq!(parse_generation_filename(&max_name), Some(MAX_GENERATION));
+        let over = format!("{GEN_PREFIX}{}1{GEN_SUFFIX}", MAX_GENERATION);
+        assert!(parse_generation_filename(&over).is_none());
+        let file_over = format!("{GEN_PREFIX}{}{GEN_SUFFIX}", MAX_GENERATION + 1);
+        assert!(parse_generation_filename(&file_over).is_none());
+    }
+
+    #[test]
+    fn generation_filename_rejects_above_max() {
+        assert!(matches!(
+            generation_filename(MAX_GENERATION + 1),
+            Err(GenerationIoError::Exhausted)
+        ));
+    }
 }

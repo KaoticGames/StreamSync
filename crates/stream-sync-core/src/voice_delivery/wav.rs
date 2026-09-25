@@ -166,7 +166,8 @@ mod canonical_wav_header_field_mutations {
         let file_len = 44 + data_bytes;
         assert!(validate_canonical_pcm_wav_header(&h, Some(file_len)).is_ok());
 
-        let cases: Vec<(&str, Box<dyn FnMut(&mut Vec<u8>)>)> = vec![
+        type Mutator = Box<dyn FnMut(&mut Vec<u8>)>;
+        let cases: Vec<(&str, Mutator)> = vec![
             ("riff magic", Box::new(|b| b[0] = b'X')),
             ("wave magic", Box::new(|b| b[9] = b'X')),
             ("fmt magic", Box::new(|b| b[13] = b'X')),
