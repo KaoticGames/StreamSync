@@ -1,12 +1,12 @@
-//! Immutable checkpoint generation records.
+//! Immutable checkpoint generation records (per stem artifact directory).
 
-use super::{
-    generation_filename, next_generation_after_max, parse_generation_filename, record_digest_hex,
-    GenerationIoError,
+use super::generation_read::{
+    allocate_next_generation, select_highest_valid, write_generation_create_new, GenerationRecord,
+    GenerationScanError, ParseFailureKind,
 };
-use crate::voice_delivery::fs::durability::{sync_dir_exact, sync_file};
-use crate::voice_delivery::fs::{DestRoot, DirHandle, FsError};
-use crate::voice_delivery::identity::{DeliveryImmutableIdentity, StemArtifactId};
+use super::{record_digest_hex, GenerationIoError};
+use crate::voice_delivery::identity::StemArtifactId;
+use crate::voice_delivery::manifest::ValidatedManifest;
 use crate::voice_delivery::session::DeliverySessionGuard;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -27,6 +27,12 @@ pub struct CheckpointGeneration {
     pub record_digest: String,
 }
 
+impl GenerationRecord for CheckpointGeneration {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CheckpointGenerationError {
     #[error("structurally invalid checkpoint record")]
@@ -35,6 +41,8 @@ pub enum CheckpointGenerationError {
     ChecksumMismatch,
     #[error("identity mismatch")]
     IdentityMismatch,
+    #[error("checkpoint bounds violation")]
+    Bounds,
     #[error(transparent)]
     Io(#[from] GenerationIoError),
     #[error("parse: {0}")]
@@ -42,112 +50,140 @@ pub enum CheckpointGenerationError {
 }
 
 pub struct CheckpointStore {
-    pub(crate) dir: DirHandle,
+    pub(crate) dir: crate::voice_delivery::fs::DirHandle,
+    artifact: StemArtifactId,
 }
 
 impl CheckpointStore {
-    pub fn open_at_root(
-        root: &DestRoot,
-        identity: &DeliveryImmutableIdentity,
-    ) -> Result<Self, FsError> {
-        let comps = crate::voice_delivery::ids::checkpoint_dir_relative_components(
-            &identity.opaque_delivery_id,
-        );
-        let mut current = root.handle().clone_handle()?;
-        for comp in comps.iter() {
-            current = current.create_or_open_child_dir(comp)?;
-        }
-        Ok(Self { dir: current })
+    pub fn open_for_guard(
+        guard: &DeliverySessionGuard,
+        artifact: StemArtifactId,
+    ) -> Result<Self, CheckpointGenerationError> {
+        guard
+            .assert_same_delivery_uuid(&artifact.delivery_uuid)
+            .map_err(|_| CheckpointGenerationError::IdentityMismatch)?;
+        let dir = guard
+            .checkpoint_dir_for(&artifact.checkpoint_dir_key())
+            .map_err(|e| CheckpointGenerationError::Parse(e.to_string()))?;
+        Ok(Self { dir, artifact })
     }
 
     pub fn read_highest_valid(
         &self,
-        artifact: &StemArtifactId,
     ) -> Result<Option<CheckpointGeneration>, CheckpointGenerationError> {
-        let mut best: Option<CheckpointGeneration> = None;
-        for name in self
-            .dir
-            .list_child_names()
-            .map_err(|e| CheckpointGenerationError::Parse(e.to_string()))?
-        {
-            if parse_generation_filename(&name).is_none() {
-                continue;
-            }
-            let data = match self.dir.read_file_all(&name) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            match parse_checkpoint_bytes(&data) {
-                Ok(rec) => {
-                    if !artifact_matches(&rec, artifact) {
-                        return Err(CheckpointGenerationError::IdentityMismatch);
-                    }
-                    if best
-                        .as_ref()
-                        .map(|b| rec.generation > b.generation)
-                        .unwrap_or(true)
+        let artifact = &self.artifact;
+        select_highest_valid::<CheckpointGeneration, _, _>(
+            &self.dir,
+            |rec: &CheckpointGeneration| {
+                if rec.delivery_uuid != artifact.delivery_uuid
+                    || rec.manifest_digest != artifact.manifest_digest
+                    || rec.stem_portable_name != artifact.stem_portable_name
+                {
+                    if artifact.delivery_uuid != rec.delivery_uuid
+                        || artifact.manifest_digest != rec.manifest_digest
                     {
-                        best = Some(rec);
+                        Err(ParseFailureKind::ForeignIdentity)
+                    } else {
+                        Err(ParseFailureKind::MalformedContent)
                     }
+                } else {
+                    Ok(())
                 }
-                Err(CheckpointGenerationError::ChecksumMismatch) => {
-                    return Err(CheckpointGenerationError::ChecksumMismatch);
-                }
-                Err(_) => {}
-            }
-        }
-        Ok(best)
+            },
+            |name, data| parse_checkpoint_file(name, data),
+        )
+        .map_err(map_scan_err)
     }
 
     pub fn commit(
         &self,
-        _guard: &DeliverySessionGuard,
-        artifact: &StemArtifactId,
-        expected_total_bytes: u64,
-        expected_full_sha256: &str,
+        guard: &DeliverySessionGuard,
+        manifest: &ValidatedManifest,
         durable_contiguous_len: u64,
         prefix_digest: &str,
     ) -> Result<CheckpointGeneration, CheckpointGenerationError> {
-        let max_observed = scan_max_generation_number(&self.dir)?;
-        let generation = next_generation_after_max(max_observed)?;
+        guard
+            .assert_same_delivery_uuid(&self.artifact.delivery_uuid)
+            .map_err(|_| CheckpointGenerationError::IdentityMismatch)?;
+        let stem = self
+            .artifact
+            .manifest_entry(manifest)
+            .map_err(|_| CheckpointGenerationError::IdentityMismatch)?;
+        validate_checkpoint_fields(
+            durable_contiguous_len,
+            prefix_digest,
+            stem.byte_count,
+            &stem.sha256,
+        )?;
+        let generation = allocate_next_generation(&self.dir).map_err(map_scan_err)?;
         let record = CheckpointGeneration {
             schema_version: CHECKPOINT_SCHEMA_VERSION,
-            delivery_uuid: artifact.delivery_uuid.clone(),
-            manifest_digest: artifact.manifest_digest.clone(),
-            stem_portable_name: artifact.stem_portable_name.clone(),
-            expected_total_bytes,
-            expected_full_sha256: expected_full_sha256.to_string(),
+            delivery_uuid: self.artifact.delivery_uuid.clone(),
+            manifest_digest: self.artifact.manifest_digest.clone(),
+            stem_portable_name: self.artifact.stem_portable_name.clone(),
+            expected_total_bytes: stem.byte_count,
+            expected_full_sha256: stem.sha256.clone(),
             generation,
             durable_contiguous_len,
             prefix_digest: prefix_digest.to_string(),
             record_digest: String::new(),
         };
         let bytes = serialize_with_digest(&record)?;
-        let name = generation_filename(generation)?;
-        write_generation_create_new(&self.dir, &name, &bytes)?;
+        write_generation_create_new(&self.dir, generation, &bytes).map_err(map_scan_err)?;
         parse_checkpoint_bytes(&bytes)
     }
 }
 
-fn artifact_matches(rec: &CheckpointGeneration, artifact: &StemArtifactId) -> bool {
-    rec.delivery_uuid == artifact.delivery_uuid
-        && rec.manifest_digest == artifact.manifest_digest
-        && rec.stem_portable_name == artifact.stem_portable_name
+fn validate_checkpoint_fields(
+    durable_contiguous_len: u64,
+    prefix_digest: &str,
+    expected_total_bytes: u64,
+    expected_full_sha256: &str,
+) -> Result<(), CheckpointGenerationError> {
+    if durable_contiguous_len > expected_total_bytes {
+        return Err(CheckpointGenerationError::Bounds);
+    }
+    if prefix_digest.len() != 64
+        || !prefix_digest
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(CheckpointGenerationError::Invalid);
+    }
+    if expected_full_sha256.len() != 64
+        || !expected_full_sha256
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(CheckpointGenerationError::Invalid);
+    }
+    Ok(())
 }
 
-fn scan_max_generation_number(dir: &DirHandle) -> Result<u64, CheckpointGenerationError> {
-    let mut max = 0u64;
-    for name in dir
-        .list_child_names()
-        .map_err(|e| CheckpointGenerationError::Parse(e.to_string()))?
-    {
-        if let Some(n) = parse_generation_filename(&name) {
-            max = max.max(n);
-        } else if name.starts_with(super::GEN_PREFIX) {
-            max = max.saturating_add(1);
-        }
+fn map_scan_err(err: GenerationScanError) -> CheckpointGenerationError {
+    match err {
+        GenerationScanError::IdentityMismatch => CheckpointGenerationError::IdentityMismatch,
+        GenerationScanError::ChecksumMismatch => CheckpointGenerationError::ChecksumMismatch,
+        GenerationScanError::Io(e) => CheckpointGenerationError::Io(e),
+        GenerationScanError::Parse(s) => CheckpointGenerationError::Parse(s),
     }
-    Ok(max)
+}
+
+fn parse_checkpoint_file(
+    name: &str,
+    data: &[u8],
+) -> Result<CheckpointGeneration, ParseFailureKind> {
+    let file_gen =
+        super::parse_generation_filename(name).ok_or(ParseFailureKind::MalformedContent)?;
+    let record = parse_checkpoint_bytes(data).map_err(|e| match e {
+        CheckpointGenerationError::ChecksumMismatch => ParseFailureKind::ChecksumMismatch,
+        CheckpointGenerationError::IdentityMismatch => ParseFailureKind::ForeignIdentity,
+        _ => ParseFailureKind::MalformedContent,
+    })?;
+    if record.generation != file_gen {
+        return Err(ParseFailureKind::FilenameGenerationMismatch);
+    }
+    Ok(record)
 }
 
 fn serialize_with_digest(
@@ -177,11 +213,26 @@ pub fn validate_checkpoint_record(
     if record.schema_version != CHECKPOINT_SCHEMA_VERSION {
         return Err(CheckpointGenerationError::Invalid);
     }
-    if record.record_digest.len() != 64 || record.prefix_digest.len() != 64 {
+    if record.record_digest.len() != 64
+        || record.prefix_digest.len() != 64
+        || record.expected_full_sha256.len() != 64
+    {
         return Err(CheckpointGenerationError::Invalid);
     }
-    if record.expected_full_sha256.len() != 64 {
-        return Err(CheckpointGenerationError::Invalid);
+    for field in [
+        &record.record_digest,
+        &record.prefix_digest,
+        &record.expected_full_sha256,
+    ] {
+        if !field
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(CheckpointGenerationError::Invalid);
+        }
+    }
+    if record.durable_contiguous_len > record.expected_total_bytes {
+        return Err(CheckpointGenerationError::Bounds);
     }
     let mut tmp = record.clone();
     let expected = tmp.record_digest.clone();
@@ -191,21 +242,5 @@ pub fn validate_checkpoint_record(
     if digest != expected {
         return Err(CheckpointGenerationError::ChecksumMismatch);
     }
-    Ok(())
-}
-
-fn write_generation_create_new(
-    dir: &DirHandle,
-    name: &str,
-    bytes: &[u8],
-) -> Result<(), CheckpointGenerationError> {
-    let mut file = dir.create_new_file(name).map_err(|e| match e {
-        FsError::AlreadyExists => CheckpointGenerationError::Io(GenerationIoError::AlreadyExists),
-        other => CheckpointGenerationError::Parse(other.to_string()),
-    })?;
-    file.write_all_at(0, bytes)
-        .map_err(|e| CheckpointGenerationError::Parse(e.to_string()))?;
-    sync_file(&file).map_err(|e| CheckpointGenerationError::Parse(e.to_string()))?;
-    let _ = sync_dir_exact(dir);
     Ok(())
 }

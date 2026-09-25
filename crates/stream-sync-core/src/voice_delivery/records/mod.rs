@@ -1,6 +1,7 @@
 //! Immutable generation files (ledger + checkpoint).
 
 pub(crate) mod checkpoint_generation;
+pub(crate) mod generation_read;
 pub(crate) mod ledger_generation;
 
 pub(crate) const GEN_PREFIX: &str = "gen-";
@@ -37,6 +38,9 @@ pub fn parse_generation_filename(name: &str) -> Option<u64> {
         return None;
     }
     if !mid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if mid.len() > 1 && mid.starts_with('0') {
         return None;
     }
     mid.parse().ok()
