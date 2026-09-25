@@ -364,6 +364,7 @@ pub(crate) fn list_child_names(parent: &DirHandle) -> Result<Vec<String>, FsErro
     let path = parent.windows_handle().absolute_path();
     let mut names = Vec::new();
     for entry in std::fs::read_dir(&path).map_err(FsError::from)? {
+        let entry = entry.map_err(FsError::from)?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if name == "." || name == ".." {
             continue;

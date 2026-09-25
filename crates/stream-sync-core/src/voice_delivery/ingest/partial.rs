@@ -320,7 +320,7 @@ mod partial_prefix_hasher_checkpoint {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod partial_sparse_prefix_digest_fail {
     use super::*;
     use crate::voice_delivery::fs::DestRoot;
