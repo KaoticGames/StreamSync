@@ -9,6 +9,7 @@ mod config_types;
 mod control_plane;
 mod delegated_lifecycle;
 mod delegated_refresh_observability;
+mod delegated_secrets;
 mod diagnostics;
 mod discord_voice;
 mod dock_capability;
@@ -24,10 +25,18 @@ mod streamelements;
 mod syndicate_connection;
 mod test_alert;
 mod twitch;
+mod voice_delivery;
 
 pub use delegated_lifecycle::{
     redact_connection_key, AuthorityLeaseSnapshot, TeardownPhase, MAX_DELEGATED_REVOCATION_DELAY,
     SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,
+};
+pub use delegated_secrets::{
+    all_delegated_bundle_slot_keys, delegated_bundle_slot_key,
+    delegated_secret_store_authority_remain, legacy_revision_bundle_key,
+    read_bound_delegated_bundle, read_bound_delegated_bundle_with_provenance,
+    validate_delegated_session_coherence, write_delegated_bundle_create, BoundBundleProvenance,
+    DelegatedCommittedIdentity, DelegatedSecretBundle,
 };
 pub use syndicate_connection::connection_key_events_url;
 pub use twitch::{disconnect_twitch, TwitchServices};
@@ -70,11 +79,23 @@ pub use storage::{
 pub use storage::{
     committed_delegated_session_parse, delegated_committing_path, delegated_replace_pending_path,
     delegated_temp_and_quarantine_variants, inventory_delegated_startup_authority,
-    recover_delegated_replace_pending, remove_file_durable, write_authority_bearing_secret,
+    read_delegated_revoke_marker_high_water, recover_delegated_replace_pending,
+    remove_file_durable, write_authority_bearing_secret, write_delegated_revoke_marker_high_water,
     write_delegated_revoke_pending, write_delegated_revoked_tombstone,
     write_identity_rollback_pending, write_json, INJECT_COMMITTING_REMOVE_FAILURE,
 };
 pub use store_lock::{try_acquire_instance_lock, InstanceLockError};
+
+/// Integration-test hooks for durable apply rollback (not a public API surface).
+#[doc(hidden)]
+pub mod test_support {
+    pub use crate::delegated_secrets::authority_gates::{
+        install as install_delegated_authority_gate, DelegatedAuthorityBoundary,
+    };
+    pub use crate::twitch::identity_commit::{
+        rollback_superseded_apply, DurableApplySnapshot, LiveApplySnapshot,
+    };
+}
 
 /// Back-compat alias.
 pub use storage::bootstrap_twitch_env_from_rust as bootstrap_twitch_env_from_repo;

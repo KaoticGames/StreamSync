@@ -11,57 +11,63 @@ env:
 
 jobs:
   quality:
-    name: fmt clippy test npm version
-    runs-on: ubuntu-latest
+    uses: ./.github/workflows/quality.yml
+
+  phase0c-windows:
+    name: Phase 0C voice_delivery (Windows)
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-17
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Linux desktop deps
+      - name: voice_delivery Windows runtime tests
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libssl-dev
-
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: cargo test
-        run: cargo test --workspace
-
-      - name: npm install
-        run: npm ci
-
-      - name: npm test (js + privileged-fetch)
-        run: npm run test:js
-
-      - name: version consistency
-        run: npm run test:version
-
-      - name: desktop icon validity
-        run: npm run test:icons
-
-      - name: installer smoke checklist present
-        run: test -f docs/INSTALLER_SMOKE.md
+          set -e
+          cargo test -p stream-sync-windows-fs
+          cargo test -p stream-sync-core 'voice_delivery::fs::' -- --nocapture
+          cargo test -p stream-sync-core 'voice_delivery::lock::' -- --nocapture --test-threads=1
+          cargo test -p stream-sync-core 'voice_delivery::ids::' -- --nocapture
+          count_suite_tests() { cargo test -p stream-sync-core "$1" -- --list 2>/dev/null | grep -cE ": test\r?$" || true; }
+          run_suite() { n=$(count_suite_tests "$1"); echo "filter '$1' matched $n tests"; test "$n" -gt 0; cargo test -p stream-sync-core "$1" -- --nocapture; }
+          run_suite 'voice_delivery::bounds::'
+          run_suite 'voice_delivery::wav::'
+          run_suite 'voice_delivery::hash::'
+          run_suite 'voice_delivery::manifest::'
+          run_suite 'voice_delivery::records::'
+          run_suite 'voice_delivery::ingest::'
+          run_suite 'voice_delivery::marker::'
+          run_suite 'voice_delivery::session::'
+          run_suite 'voice_delivery::state::'
+          run_suite 'partial_prefix_hasher_checkpoint'
+          run_suite 'partial_contiguous_overlap_behavior'
+          run_suite 'partial_restart_single_prefix_pass'
+          run_suite 'checkpoint_adversarial'
+          run_suite 'checkpoint_store_guard_lifetime'
+          run_suite 'portable_parent_component_deserialize_bypass'
+          run_suite 'session_constructor_substitution'
+          run_suite 'generation_domain_bounds'
+          run_suite 'ledger_generation_wins_valid'
+          run_suite 'publish_intent_before_rename'
+          run_suite 'recover_rename_outcome_matrix'
+          run_suite 'injectable_rename_outcome_matrix'
+          run_suite 'publication_child_probe_matrix'
+          run_suite 'post_seal_corruption'
+          run_suite 'publication_reparse_collision'
+          run_suite 'publication_durability_order'
+          run_suite 'crash_child_process_publication'
+          run_suite 'delivery_bound_lock'
+        shell: bash
 
   windows-installer:
     name: Windows NSIS installer
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-17
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: "20"
 
@@ -75,7 +81,7 @@ jobs:
         run: node scripts/check-desktop-icons.js
 
       - name: NSIS installer
-        run: npx tauri build --bundles nsis --ci
+        run: npx tauri build --bundles nsis --ci --no-sign --config tauri.ci.conf.json
         working-directory: crates/stream-sync-desktop
 
   signed-release:

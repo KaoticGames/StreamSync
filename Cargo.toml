@@ -4,6 +4,7 @@ members = [
     "crates/stream-sync-core",
     "crates/stream-sync-server",
     "crates/stream-sync-desktop",
+    "crates/stream-sync-windows-fs",
 ]
 default-members = ["crates/stream-sync-desktop"]
 

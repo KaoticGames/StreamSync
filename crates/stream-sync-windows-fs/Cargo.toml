@@ -1,0 +1,13 @@
+[package]
+name = "stream-sync-windows-fs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Narrow Win32 filesystem helpers for StreamSync voice delivery (rename buffers, storage qualification)"
+
+[dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+] }

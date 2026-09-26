@@ -106,9 +106,7 @@ pub async fn redeem_connect_key(
         .unwrap_or(stored.device_id.as_str())
         .to_string();
     if device_id.trim().is_empty() {
-        return Err(anyhow!(
-            "Missing local device id for Discord connect."
-        ));
+        return Err(anyhow!("Missing local device id for Discord connect."));
     }
     let url = format!(
         "{}/api/stream-sync/discord-connect-keys/redeem",
@@ -127,7 +125,7 @@ pub async fn redeem_connect_key(
 
     let status = res.status().as_u16();
     let body: Value = res.json().await.unwrap_or_else(|_| json!({}));
-    if status < 200 || status >= 300 || body.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+    if !(200..300).contains(&status) || body.get("ok").and_then(|v| v.as_bool()) == Some(false) {
         let detail = body
             .get("message")
             .or_else(|| body.get("error"))
@@ -208,11 +206,7 @@ async fn ingest_loop(state: Arc<AppState>) {
     let mut active_files: HashMap<PathBuf, Instant> = HashMap::new();
     loop {
         let cfg = state.discord_voice_config.read().await.clone();
-        let Some(key) = cfg
-            .host_token
-            .clone()
-            .filter(|v| v.starts_with("sdk_"))
-        else {
+        let Some(key) = cfg.host_token.clone().filter(|v| v.starts_with("sdk_")) else {
             break;
         };
         let parent_folder = cfg
@@ -353,7 +347,7 @@ async fn poll_pending_chunk(key: &str) -> Result<PendingPoll> {
 
     let status = res.status().as_u16();
     let body: Value = res.json().await.unwrap_or_else(|_| json!({}));
-    if status < 200 || status >= 300 {
+    if !(200..300).contains(&status) {
         let msg = body
             .get("message")
             .or_else(|| body.get("error"))
@@ -577,7 +571,7 @@ fn parse_pending_chunk(value: &Value) -> Result<PendingChunk> {
     })
 }
 
-fn first_chunk_value<'a>(body: &'a Value) -> Option<&'a Value> {
+fn first_chunk_value(body: &Value) -> Option<&Value> {
     body.get("chunks")
         .and_then(Value::as_array)
         .and_then(|arr| arr.first())
