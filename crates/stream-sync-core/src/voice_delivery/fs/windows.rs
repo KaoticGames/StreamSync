@@ -208,7 +208,7 @@ fn handle_attribute_tag_info(handle: HANDLE) -> Result<FILE_ATTRIBUTE_TAG_INFO, 
 
 enum DirectoryOpenContext {
     Root { not_directory_label: String },
-    ChildComponent(&str),
+    ChildComponent(String),
 }
 
 fn validate_opened_directory_handle(
@@ -219,9 +219,7 @@ fn validate_opened_directory_handle(
     if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
         return Err(match ctx {
             DirectoryOpenContext::Root { .. } => FsError::SymlinkOrReparseRoot,
-            DirectoryOpenContext::ChildComponent(name) => {
-                FsError::SymlinkOrReparseComponent(name.to_string())
-            }
+            DirectoryOpenContext::ChildComponent(name) => FsError::SymlinkOrReparseComponent(name),
         });
     }
     if (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 {
@@ -229,7 +227,7 @@ fn validate_opened_directory_handle(
             DirectoryOpenContext::Root {
                 not_directory_label,
             } => not_directory_label,
-            DirectoryOpenContext::ChildComponent(name) => name.to_string(),
+            DirectoryOpenContext::ChildComponent(name) => name,
         };
         return Err(FsError::NotADirectory(label));
     }
@@ -314,7 +312,10 @@ pub(crate) fn probe_child_dir(
 ) -> Result<super::dir::ChildDirProbe, FsError> {
     let parent_path = parent.windows_handle().absolute_path();
     let child_path = parent_path.join(name);
-    match open_directory_at_path(&child_path, DirectoryOpenContext::ChildComponent(name)) {
+    match open_directory_at_path(
+        &child_path,
+        DirectoryOpenContext::ChildComponent(name.to_string()),
+    ) {
         Ok(opened) => Ok(super::dir::ChildDirProbe::Directory(
             DirHandle::from_windows(opened.into_dir_handle(child_path)),
         )),
@@ -329,7 +330,10 @@ pub(crate) fn probe_child_dir(
 pub(crate) fn open_dir_at(parent: &DirHandle, name: &str) -> Result<DirHandle, FsError> {
     let parent_path = parent.windows_handle().absolute_path();
     let child_path = parent_path.join(name);
-    let opened = open_directory_at_path(&child_path, DirectoryOpenContext::ChildComponent(name))?;
+    let opened = open_directory_at_path(
+        &child_path,
+        DirectoryOpenContext::ChildComponent(name.to_string()),
+    )?;
     Ok(DirHandle::from_windows(opened.into_dir_handle(child_path)))
 }
 
@@ -345,7 +349,10 @@ pub(crate) fn mkdir_at(parent: &DirHandle, name: &str) -> Result<(), FsError> {
         }
         return Err(FsError::Io(io::Error::from_raw_os_error(err as i32)));
     }
-    let opened = open_directory_at_path(&child_path, DirectoryOpenContext::ChildComponent(name))?;
+    let opened = open_directory_at_path(
+        &child_path,
+        DirectoryOpenContext::ChildComponent(name.to_string()),
+    )?;
     drop(opened);
     Ok(())
 }
@@ -559,7 +566,7 @@ mod file_rename_buffer_tests {
 #[cfg(all(test, windows))]
 mod probe_child_dir_tests {
     use super::*;
-    use crate::voice_delivery::fs::DestRoot;
+    use crate::voice_delivery::fs::{ChildDirProbe, DestRoot};
     use std::fs;
     use std::os::windows::process::CommandExt;
     use std::process::Command;
@@ -621,7 +628,10 @@ mod probe_child_dir_tests {
         let file_path = tmp.path().join("not-a-dir.txt");
         fs::write(&file_path, b"x").expect("file");
         let name = "not-a-dir.txt";
-        match open_directory_at_path(&file_path, DirectoryOpenContext::ChildComponent(name)) {
+        match open_directory_at_path(
+            &file_path,
+            DirectoryOpenContext::ChildComponent(name.to_string()),
+        ) {
             Err(FsError::NotADirectory(label)) => assert_eq!(label, name),
             Err(other) => panic!("expected NotADirectory, got {other:?}"),
             Ok(_) => panic!("expected NotADirectory error"),
@@ -650,10 +660,10 @@ mod probe_child_dir_tests {
         match parent.probe_child_dir(child_name) {
             Err(FsError::NotADirectory(name)) => assert_eq!(name, child_name),
             Err(other) => panic!("expected NotADirectory, got {other:?}"),
-            Ok(super::dir::ChildDirProbe::Directory(_)) => {
+            Ok(ChildDirProbe::Directory(_)) => {
                 panic!("expected NotADirectory error")
             }
-            Ok(super::dir::ChildDirProbe::Missing) => panic!("expected NotADirectory error"),
+            Ok(ChildDirProbe::Missing) => panic!("expected NotADirectory error"),
         }
     }
 
