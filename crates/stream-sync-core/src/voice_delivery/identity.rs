@@ -41,6 +41,25 @@ impl DeliveryImmutableIdentity {
         final_parent_relative: Vec<PortableParentComponent>,
         final_session_name: &str,
     ) -> Result<Self, IdentityError> {
+        Self::new_with_manifest_digest(
+            delivery_uuid,
+            manifest.digest(),
+            manifest,
+            staging_token,
+            final_parent_relative,
+            final_session_name,
+        )
+    }
+
+    /// Bind identity using the Syndicate API manifest digest (not the local stem-list digest).
+    pub fn new_with_manifest_digest(
+        delivery_uuid: impl Into<String>,
+        manifest_digest: impl Into<String>,
+        manifest: &ValidatedManifest,
+        staging_token: impl Into<String>,
+        final_parent_relative: Vec<PortableParentComponent>,
+        final_session_name: &str,
+    ) -> Result<Self, IdentityError> {
         let delivery_uuid = delivery_uuid.into();
         if delivery_uuid.is_empty() {
             return Err(IdentityError::Invalid("empty delivery uuid".into()));
@@ -48,11 +67,12 @@ impl DeliveryImmutableIdentity {
         let staging_token = staging_token.into();
         validate_stage_basename(&staging_token)?;
         let final_name = ValidatedFinalName::validate(final_session_name)?;
-        let manifest_digest = manifest.digest();
+        let manifest_digest = manifest_digest.into();
         if manifest_digest.len() != 64 {
             return Err(IdentityError::Invalid("manifest digest length".into()));
         }
         let opaque_delivery_id = delivery_opaque_dir_id(&delivery_uuid);
+        let _ = manifest;
         Ok(Self {
             delivery_uuid,
             manifest_digest,
