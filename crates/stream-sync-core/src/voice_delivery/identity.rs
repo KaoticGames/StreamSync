@@ -9,7 +9,10 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryImmutableIdentity {
     pub delivery_uuid: String,
+    /// Syndicate API `manifestDigest` (canonical finalized manifest identity).
     pub manifest_digest: String,
+    /// Local validated stem-list digest (`ValidatedManifest::digest()`).
+    pub stem_set_digest: String,
     pub opaque_delivery_id: String,
     pub staging_token: String,
     pub final_parent_relative: Vec<PortableParentComponent>,
@@ -34,25 +37,8 @@ pub enum IdentityError {
 }
 
 impl DeliveryImmutableIdentity {
-    pub fn new(
-        delivery_uuid: impl Into<String>,
-        manifest: &ValidatedManifest,
-        staging_token: impl Into<String>,
-        final_parent_relative: Vec<PortableParentComponent>,
-        final_session_name: &str,
-    ) -> Result<Self, IdentityError> {
-        Self::new_with_manifest_digest(
-            delivery_uuid,
-            manifest.digest(),
-            manifest,
-            staging_token,
-            final_parent_relative,
-            final_session_name,
-        )
-    }
-
-    /// Bind identity using the Syndicate API manifest digest (not the local stem-list digest).
-    pub fn new_with_manifest_digest(
+    /// Bind identity using authoritative API manifest digest and validated stem manifest.
+    pub fn new_bound(
         delivery_uuid: impl Into<String>,
         manifest_digest: impl Into<String>,
         manifest: &ValidatedManifest,
@@ -71,14 +57,41 @@ impl DeliveryImmutableIdentity {
         if manifest_digest.len() != 64 {
             return Err(IdentityError::Invalid("manifest digest length".into()));
         }
+        let stem_set_digest = manifest.digest();
         let opaque_delivery_id = delivery_opaque_dir_id(&delivery_uuid);
-        let _ = manifest;
         Ok(Self {
             delivery_uuid,
             manifest_digest,
+            stem_set_digest,
             opaque_delivery_id,
             staging_token,
             final_parent_relative,
+            final_session_name: final_name.as_str().to_string(),
+        })
+    }
+
+    pub fn assert_stem_manifest(&self, manifest: &ValidatedManifest) -> Result<(), IdentityError> {
+        if self.stem_set_digest != manifest.digest() {
+            return Err(IdentityError::Mismatch);
+        }
+        Ok(())
+    }
+
+    pub fn from_ledger_record(
+        record: &crate::voice_delivery::records::ledger_generation::LedgerGeneration,
+    ) -> Result<Self, IdentityError> {
+        validate_stage_basename(&record.staging_token)?;
+        let final_name = ValidatedFinalName::validate(&record.final_session_name)?;
+        if record.manifest_digest.len() != 64 || record.stem_set_digest.len() != 64 {
+            return Err(IdentityError::Invalid("digest length".into()));
+        }
+        Ok(Self {
+            delivery_uuid: record.delivery_uuid.clone(),
+            manifest_digest: record.manifest_digest.clone(),
+            stem_set_digest: record.stem_set_digest.clone(),
+            opaque_delivery_id: delivery_opaque_dir_id(&record.delivery_uuid),
+            staging_token: record.staging_token.clone(),
+            final_parent_relative: record.final_parent_relative.clone(),
             final_session_name: final_name.as_str().to_string(),
         })
     }
@@ -93,6 +106,7 @@ impl DeliveryImmutableIdentity {
     ) -> bool {
         self.delivery_uuid == record.delivery_uuid
             && self.manifest_digest == record.manifest_digest
+            && self.stem_set_digest == record.stem_set_digest
             && self.staging_token == record.staging_token
             && self.final_parent_relative == record.final_parent_relative
             && self.final_session_name == record.final_session_name
@@ -102,12 +116,14 @@ impl DeliveryImmutableIdentity {
         &self,
         delivery_uuid: &str,
         manifest_digest: &str,
+        stem_set_digest: &str,
         staging_token: &str,
         final_parent_relative: &[PortableParentComponent],
         final_session_name: &str,
     ) -> bool {
         self.delivery_uuid != delivery_uuid
             || self.manifest_digest != manifest_digest
+            || self.stem_set_digest != stem_set_digest
             || self.staging_token != staging_token
             || self.final_parent_relative.as_slice() != final_parent_relative
             || self.final_session_name != final_session_name

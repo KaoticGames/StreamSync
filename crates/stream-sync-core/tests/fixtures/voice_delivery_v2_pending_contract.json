@@ -1,0 +1,32 @@
+{
+  "ok": true,
+  "deliveries": [
+    {
+      "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+      "manifestDigest": "96881d02814a25a59b548b0ef30a4da3c0109f6371bc4b6ee23382447485168e",
+      "sealedAt": "2026-01-02T03:04:05.678Z",
+      "manifest": {
+        "version": 1,
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "guildId": "123456789012345678",
+        "channelId": "234567890123456789",
+        "sessionStartWallMs": 1,
+        "sessionStartMonotonicNs": "100",
+        "sealedStopWallMs": 2,
+        "sealedStopMonotonicNs": "200",
+        "targetSampleCount48k": 0,
+        "journalFormatVersion": 2,
+        "journalSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "stems": [
+          {
+            "discordUserId": "123456789012345678",
+            "pathNick": "user1",
+            "wavRelativePath": "user1.wav",
+            "wavBytes": 44,
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        ]
+      }
+    }
+  ]
+}

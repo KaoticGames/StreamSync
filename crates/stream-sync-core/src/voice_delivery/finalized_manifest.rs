@@ -7,6 +7,7 @@ use crate::voice_delivery::identity::{DeliveryImmutableIdentity, IdentityError};
 use crate::voice_delivery::ids::{new_opaque_stage_basename, validate_stage_basename};
 use crate::voice_delivery::manifest::{StemManifestEntry, ValidatedManifest};
 use crate::voice_delivery::wav::minimal_wav_header;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -19,7 +20,7 @@ pub const DISCORD_SNOWFLAKE_MIN: u128 = 4_194_304;
 pub const DISCORD_SNOWFLAKE_MAX: u128 = 9_223_372_036_854_775_807;
 pub const STEM_ID_MAX_LEN: usize = 64;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyndicateFinalizedStem {
     pub discord_user_id: String,
     pub path_nick: String,
@@ -28,7 +29,7 @@ pub struct SyndicateFinalizedStem {
     pub sha256: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyndicateFinalizedManifest {
     pub version: u32,
     pub session_id: String,
@@ -412,13 +413,11 @@ pub fn delivery_layout_from_manifest(
         .map_err(|e| fail(e.to_string()))?;
     let guild =
         PortableParentComponent::validate(&manifest.guild_id).map_err(|e| fail(e.to_string()))?;
-    let suffix: String = manifest
-        .session_id
-        .chars()
-        .filter(|c| *c != '-')
-        .take(8)
-        .collect();
-    let session_name = format!("{}-{}", manifest.sealed_stop_wall_ms, suffix);
+    let channel_slug = channel_slug_for_final_path(&manifest.channel_id);
+    let session_name = format!(
+        "{}-{}-{}",
+        manifest.sealed_stop_wall_ms, channel_slug, manifest.session_id
+    );
     let final_session =
         ValidatedFinalName::validate(&session_name).map_err(|e| fail(e.to_string()))?;
     let staging = stable_stage_token_for_session(&manifest.session_id)?;
@@ -427,6 +426,11 @@ pub fn delivery_layout_from_manifest(
         staging,
         final_session.as_str().to_string(),
     ))
+}
+
+fn channel_slug_for_final_path(channel_id: &str) -> String {
+    let digest = hex_digest(&Sha256::digest(channel_id.as_bytes()));
+    digest[..8].to_string()
 }
 
 fn stable_stage_token_for_session(session_id: &str) -> Result<String, FinalizedManifestError> {
@@ -446,7 +450,7 @@ pub fn bind_delivery_identity(
     }
     let validated = syndicate_to_validated_manifest(manifest)?;
     let (parent, staging, final_name) = delivery_layout_from_manifest(manifest)?;
-    let identity = DeliveryImmutableIdentity::new_with_manifest_digest(
+    let identity = DeliveryImmutableIdentity::new_bound(
         manifest.session_id.clone(),
         computed,
         &validated,
@@ -526,6 +530,61 @@ pub(crate) mod syndicate_manifest_tests {
         let mut raw = minimal_wav_value();
         raw["sessionId"] = serde_json::json!("550E8400-E29B-41D4-A716-446655440000");
         assert!(parse_syndicate_finalized_manifest(&raw).is_err());
+    }
+
+    #[test]
+    fn final_session_dir_includes_full_session_uuid() {
+        let raw = minimal_wav_value();
+        let m = parse_syndicate_finalized_manifest(&raw).unwrap();
+        let (_, _, final_name) = delivery_layout_from_manifest(&m).unwrap();
+        assert!(final_name.contains(&m.session_id));
+        assert_ne!(
+            final_name,
+            format!("{}-{}", m.sealed_stop_wall_ms, &m.session_id[..8])
+        );
+    }
+
+    #[test]
+    fn same_timestamp_prefix_uuid_different_suffix_yields_distinct_final_dirs() {
+        let mut raw_a = minimal_wav_value();
+        raw_a["sessionId"] = serde_json::json!("550e8400-e29b-41d4-a716-446655440000");
+        let mut raw_b = minimal_wav_value();
+        raw_b["sessionId"] = serde_json::json!("550e8400-e29b-41d4-a716-446655440001");
+        let ma = parse_syndicate_finalized_manifest(&raw_a).unwrap();
+        let mb = parse_syndicate_finalized_manifest(&raw_b).unwrap();
+        assert_eq!(ma.sealed_stop_wall_ms, mb.sealed_stop_wall_ms);
+        let (_, _, fa) = delivery_layout_from_manifest(&ma).unwrap();
+        let (_, _, fb) = delivery_layout_from_manifest(&mb).unwrap();
+        assert_ne!(fa, fb);
+    }
+
+    #[test]
+    fn cross_language_golden_manifest_digest() {
+        let manifest = serde_json::json!({
+            "version": 1,
+            "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+            "guildId": "123456789012345678",
+            "channelId": "234567890123456789",
+            "sessionStartWallMs": 1,
+            "sessionStartMonotonicNs": "100",
+            "sealedStopWallMs": 2,
+            "sealedStopMonotonicNs": "200",
+            "targetSampleCount48k": 0,
+            "journalFormatVersion": 2,
+            "journalSha256": "a".repeat(64),
+            "stems": [{
+                "discordUserId": "123456789012345678",
+                "pathNick": "user1",
+                "wavRelativePath": "user1.wav",
+                "wavBytes": 44,
+                "sha256": "b".repeat(64),
+            }],
+        });
+        let parsed = parse_syndicate_finalized_manifest(&manifest).unwrap();
+        assert_eq!(
+            compute_finalized_manifest_digest(&parsed),
+            "96881d02814a25a59b548b0ef30a4da3c0109f6371bc4b6ee23382447485168e"
+        );
     }
 
     #[test]

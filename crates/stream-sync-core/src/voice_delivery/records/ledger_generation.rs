@@ -13,7 +13,7 @@ use crate::voice_delivery::state::{validate_ledger_transition, LedgerState};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const LEDGER_SCHEMA_VERSION: u32 = 1;
+pub const LEDGER_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerGeneration {
@@ -21,6 +21,7 @@ pub struct LedgerGeneration {
     pub state: LedgerState,
     pub delivery_uuid: String,
     pub manifest_digest: String,
+    pub stem_set_digest: String,
     pub staging_token: String,
     pub final_parent_relative: Vec<PortableParentComponent>,
     pub final_session_name: String,
@@ -86,6 +87,7 @@ impl LedgerStore {
                 if identity.foreign_identity_in_record(
                     &rec.delivery_uuid,
                     &rec.manifest_digest,
+                    &rec.stem_set_digest,
                     &rec.staging_token,
                     &rec.final_parent_relative,
                     &rec.final_session_name,
@@ -196,6 +198,7 @@ impl LedgerStore {
             state,
             delivery_uuid: self.identity.delivery_uuid.clone(),
             manifest_digest: self.identity.manifest_digest.clone(),
+            stem_set_digest: self.identity.stem_set_digest.clone(),
             staging_token: self.identity.staging_token.clone(),
             final_parent_relative: self.identity.final_parent_relative.clone(),
             final_session_name: self.identity.final_session_name.clone(),
@@ -345,7 +348,7 @@ mod ledger_generation_wins_valid {
             sha256: "a".repeat(64),
         }];
         let manifest = ValidatedManifest::validate(stems).unwrap();
-        let guard = DeliverySessionGuard::begin(
+        let guard = DeliverySessionGuard::begin_uniform_digest(
             root,
             "delivery-test-uuid",
             manifest,
@@ -389,6 +392,7 @@ mod ledger_generation_wins_valid {
             state: LedgerState::Receiving,
             delivery_uuid: _identity.delivery_uuid.clone(),
             manifest_digest: _identity.manifest_digest.clone(),
+            stem_set_digest: _identity.stem_set_digest.clone(),
             staging_token: _identity.staging_token.clone(),
             final_parent_relative: _identity.final_parent_relative.clone(),
             final_session_name: _identity.final_session_name.clone(),
@@ -418,6 +422,7 @@ mod ledger_generation_wins_valid {
             state: LedgerState::Receiving,
             delivery_uuid: "other".into(),
             manifest_digest: identity.manifest_digest.clone(),
+            stem_set_digest: identity.stem_set_digest.clone(),
             staging_token: identity.staging_token.clone(),
             final_parent_relative: identity.final_parent_relative.clone(),
             final_session_name: identity.final_session_name.clone(),

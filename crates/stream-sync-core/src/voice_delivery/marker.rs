@@ -17,7 +17,7 @@ use std::io::Seek;
 use thiserror::Error;
 
 pub const MARKER_FILENAME: &str = ".streamsync-delivery.json";
-pub const MARKER_SCHEMA_VERSION: u32 = 1;
+pub const MARKER_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StemMarkerEntry {
@@ -31,6 +31,7 @@ pub struct DeliveryMarker {
     pub schema_version: u32,
     pub delivery_uuid: String,
     pub manifest_digest: String,
+    pub stem_set_digest: String,
     pub staging_token: String,
     pub final_parent_relative: Vec<PortableParentComponent>,
     pub final_session_name: String,
@@ -85,6 +86,7 @@ impl DeliveryMarker {
             schema_version: MARKER_SCHEMA_VERSION,
             delivery_uuid: identity.delivery_uuid.clone(),
             manifest_digest: identity.manifest_digest.clone(),
+            stem_set_digest: identity.stem_set_digest.clone(),
             staging_token: identity.staging_token.clone(),
             final_parent_relative: identity.final_parent_relative.clone(),
             final_session_name: identity.final_session_name.clone(),
@@ -178,6 +180,7 @@ impl DeliveryImmutableIdentity {
     pub fn matches_marker(&self, marker: &DeliveryMarker) -> bool {
         self.delivery_uuid == marker.delivery_uuid
             && self.manifest_digest == marker.manifest_digest
+            && self.stem_set_digest == marker.stem_set_digest
             && self.staging_token == marker.staging_token
             && self.final_parent_relative == marker.final_parent_relative
             && self.final_session_name == marker.final_session_name
@@ -189,7 +192,7 @@ impl DeliverySessionGuard {
     pub fn seal_and_write_publish_intent(
         &self,
     ) -> Result<(LedgerGeneration, LedgerGeneration, NamespaceDurability), MarkerError> {
-        if self.manifest().digest() != self.identity().manifest_digest {
+        if self.identity().stem_set_digest != self.manifest().digest() {
             return Err(MarkerError::IdentityMismatch);
         }
         let staging_dir = self
@@ -395,7 +398,7 @@ mod publish_intent_before_rename {
         let staging = guild_dir.open_child_dir(stage).unwrap();
         let stem = write_minimal_stem(&staging, "a.wav", data_bytes);
         let manifest = ValidatedManifest::validate(vec![stem]).unwrap();
-        let guard = DeliverySessionGuard::begin(
+        let guard = DeliverySessionGuard::begin_uniform_digest(
             root,
             "delivery-intent",
             manifest,
@@ -427,7 +430,7 @@ mod publish_intent_before_rename {
         let data_bytes = 4u64;
         let stem = write_minimal_stem(&staging, "a.wav", data_bytes);
         let manifest = ValidatedManifest::validate(vec![stem]).unwrap();
-        let guard = DeliverySessionGuard::begin(
+        let guard = DeliverySessionGuard::begin_uniform_digest(
             root,
             "delivery-no-rename",
             manifest,
@@ -456,8 +459,9 @@ mod marker_manifest_adversarial {
             sha256: "a".repeat(64),
         }])
         .unwrap();
-        let identity = DeliveryImmutableIdentity::new(
+        let identity = DeliveryImmutableIdentity::new_bound(
             "marker-adv",
+            manifest.digest(),
             &manifest,
             ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
             vec![PortableParentComponent::validate("guild").unwrap()],
@@ -510,8 +514,9 @@ mod marker_manifest_adversarial {
             },
         ])
         .unwrap();
-        let identity = DeliveryImmutableIdentity::new(
+        let identity = DeliveryImmutableIdentity::new_bound(
             "marker-order",
+            manifest.digest(),
             &manifest,
             ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
             vec![],

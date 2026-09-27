@@ -161,6 +161,13 @@ impl DirHandle {
         super::file::create_new_file_at(self, name)
     }
 
+    pub(crate) fn open_or_create_file(
+        &self,
+        name: &str,
+    ) -> Result<super::file::VoiceFile, FsError> {
+        super::file::open_or_create_file_at(self, name)
+    }
+
     pub(crate) fn read_file_all(&self, name: &str) -> Result<Vec<u8>, FsError> {
         let file = super::file::open_existing_file_at(self, name)?;
         let len = file.len()?;
@@ -390,10 +397,11 @@ mod portable_parent_component_deserialize_bypass {
     fn ledger_json_with_parent(component: &str) -> String {
         format!(
             r#"{{
-              "schema_version": 1,
+              "schema_version": 2,
               "state": "receiving",
               "delivery_uuid": "uuid",
               "manifest_digest": "{}",
+              "stem_set_digest": "{}",
               "staging_token": ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
               "final_parent_relative": ["{}"],
               "final_session_name": "final",
@@ -401,6 +409,7 @@ mod portable_parent_component_deserialize_bypass {
               "record_digest": "{}"
             }}"#,
             "a".repeat(64),
+            "b".repeat(64),
             component.replace('"', "\\\""),
             "c".repeat(64)
         )
@@ -434,9 +443,10 @@ mod portable_parent_component_deserialize_bypass {
     fn rejects_nonportable_parent_in_marker_json() {
         let json = format!(
             r#"{{
-              "schema_version": 1,
+              "schema_version": 2,
               "delivery_uuid": "u",
               "manifest_digest": "{}",
+              "stem_set_digest": "{}",
               "staging_token": ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
               "final_parent_relative": [".hidden"],
               "final_session_name": "final",
@@ -444,7 +454,8 @@ mod portable_parent_component_deserialize_bypass {
               "record_digest": "{}"
             }}"#,
             "a".repeat(64),
-            "b".repeat(64)
+            "b".repeat(64),
+            "c".repeat(64)
         );
         assert!(serde_json::from_str::<DeliveryMarker>(&json).is_err());
     }
