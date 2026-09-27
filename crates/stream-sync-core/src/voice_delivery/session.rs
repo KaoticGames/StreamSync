@@ -153,6 +153,17 @@ impl DeliverySessionGuard {
         Ok(current)
     }
 
+    pub(crate) fn receipt_dir(&self) -> Result<DirHandle, FsError> {
+        let comps = crate::voice_delivery::ids::receipt_dir_relative_components(
+            &self.identity.opaque_delivery_id,
+        );
+        let mut current = self.root.handle().clone_handle()?;
+        for comp in comps.iter() {
+            current = current.create_or_open_child_dir(comp)?;
+        }
+        Ok(current)
+    }
+
     pub(crate) fn checkpoint_dir_for(
         &self,
         stem_checkpoint_key: &str,

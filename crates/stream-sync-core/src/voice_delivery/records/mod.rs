@@ -3,6 +3,7 @@
 pub(crate) mod checkpoint_generation;
 pub(crate) mod generation_read;
 pub(crate) mod ledger_generation;
+pub(crate) mod receipt_generation;
 
 pub(crate) const GEN_PREFIX: &str = "gen-";
 pub(crate) const GEN_SUFFIX: &str = ".json";

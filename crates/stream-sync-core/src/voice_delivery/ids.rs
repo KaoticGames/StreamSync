@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 const LOCK_DIR: &str = ".streamsync-control";
 const LOCKS_SEGMENT: &str = "locks";
 const LEDGERS_SEGMENT: &str = "ledgers";
+const RECEIPTS_SEGMENT: &str = "receipts";
 const CHECKPOINTS_SEGMENT: &str = "checkpoints";
 const STAGE_PREFIX: &str = ".streamsync-stage-";
 const STAGE_HEX_LEN: usize = 32;
@@ -21,6 +22,15 @@ pub fn ledger_dir_relative_components(opaque_delivery_id: &str) -> [String; 3] {
     [
         LOCK_DIR.to_string(),
         LEDGERS_SEGMENT.to_string(),
+        opaque_delivery_id.to_string(),
+    ]
+}
+
+/// Relative components from `DEST_ROOT` to immutable receipt generation directory.
+pub fn receipt_dir_relative_components(opaque_delivery_id: &str) -> [String; 3] {
+    [
+        LOCK_DIR.to_string(),
+        RECEIPTS_SEGMENT.to_string(),
         opaque_delivery_id.to_string(),
     ]
 }

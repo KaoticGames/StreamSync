@@ -14,9 +14,7 @@ use crate::voice_delivery::marker::verify_stem_from_handle;
 use crate::voice_delivery::publication::{
     prepare_publication, publish_prepared, recover_delivery, PublishOptions, RecoveryOutcome,
 };
-use crate::voice_delivery::receipt_state::{
-    read_receipt_state, write_receipt_state_replace, ReceiptPhase, ReceiptStateRecord,
-};
+use crate::voice_delivery::receipt_state::{ReceiptGenerationError, ReceiptPhase, ReceiptStore};
 use crate::voice_delivery::records::ledger_generation::LedgerStore;
 use crate::voice_delivery::session::DeliverySessionGuard;
 use crate::voice_delivery::state::LedgerState;
@@ -322,35 +320,37 @@ impl FinalizedVoiceDelivery {
         }
         let gen = published.unwrap().generation;
         let local_receipt_id = format!("{}:{}", identity.delivery_uuid, gen);
-        let ledger_dir = guard
-            .ledger_dir()
+        let receipt = ReceiptStore::open_for_guard(guard)
             .map_err(|e| OrchestratorError::Other(e.to_string()))?;
-        if let Some(state) = read_receipt_state(&ledger_dir, identity)
-            .map_err(|e| OrchestratorError::Other(e.to_string()))?
-        {
-            if state.phase == ReceiptPhase::Acked {
-                return Ok(());
-            }
-            if state.local_receipt_id != local_receipt_id {
+        match receipt.read_highest_valid() {
+            Ok(Some(state)) if state.phase == ReceiptPhase::Acked => {
+                if state.local_receipt_id == local_receipt_id {
+                    return Ok(());
+                }
                 return Err(OrchestratorError::Other("receipt id drift".into()));
             }
-        } else {
-            let pending = ReceiptStateRecord::pending(identity, &local_receipt_id);
-            write_receipt_state_replace(&ledger_dir, &pending)
-                .map_err(|e| OrchestratorError::Other(e.to_string()))?;
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                receipt
+                    .commit_pending(&local_receipt_id)
+                    .map_err(|e| OrchestratorError::Other(e.to_string()))?;
+            }
+            Err(ReceiptGenerationError::IdentityMismatch) => {
+                return Err(OrchestratorError::Other("receipt identity conflict".into()));
+            }
+            Err(e) => return Err(OrchestratorError::Other(e.to_string())),
         }
         let body = ReceiptRequestBody {
             manifest_digest: identity.manifest_digest.clone(),
             device_id: self.device_id.clone(),
-            local_receipt_id,
+            local_receipt_id: local_receipt_id.clone(),
             local_publication_state: LOCAL_PUBLICATION_STATE.into(),
         };
         client
             .post_receipt(&identity.delivery_uuid, &body)
             .map_err(map_client_err)?;
-        let mut acked = ReceiptStateRecord::pending(identity, &body.local_receipt_id);
-        acked.phase = ReceiptPhase::Acked;
-        write_receipt_state_replace(&ledger_dir, &acked)
+        receipt
+            .commit_acked(&local_receipt_id)
             .map_err(|e| OrchestratorError::Other(e.to_string()))?;
         Ok(())
     }
@@ -359,13 +359,14 @@ impl FinalizedVoiceDelivery {
 #[cfg(test)]
 mod orchestrator_e2e {
     use super::*;
-    use crate::voice_delivery::client::{MockVoiceV2Client, PendingDelivery};
+    use crate::voice_delivery::client::{MockVoiceV2Client, PendingDelivery, VoiceV2ClientError};
     use crate::voice_delivery::finalized_manifest::{
-        compute_finalized_manifest_digest, parse_syndicate_finalized_manifest,
-        syndicate_manifest_tests::minimal_wav_value,
+        bind_delivery_identity, compute_finalized_manifest_digest,
+        parse_syndicate_finalized_manifest, syndicate_manifest_tests::minimal_wav_value,
     };
     use crate::voice_delivery::hash::hex_digest;
     use sha2::{Digest, Sha256};
+    use std::time::Duration;
 
     fn build_wav_bytes() -> (Vec<u8>, String) {
         let header = crate::voice_delivery::wav::minimal_wav_header(0).unwrap();
@@ -396,6 +397,41 @@ mod orchestrator_e2e {
         let mut phase = DeliveryPhase::Waiting;
         orch.deliver_pending(&mock, &pending, &mut phase).unwrap();
         assert_eq!(phase, DeliveryPhase::Completed);
+        assert_eq!(mock.receipt_calls(), 1);
+    }
+
+    #[test]
+    fn published_receipt_pending_survives_retry_after_then_acks_without_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wav, sha) = build_wav_bytes();
+        let mut raw = minimal_wav_value();
+        raw["stems"][0]["sha256"] = serde_json::json!(sha);
+        let manifest = parse_syndicate_finalized_manifest(&raw).unwrap();
+        let digest = compute_finalized_manifest_digest(&manifest);
+        let pending = PendingDelivery {
+            session_id: manifest.session_id.clone(),
+            manifest_digest: digest,
+            sealed_at: "2020-01-01T00:00:00.000Z".into(),
+            manifest,
+        };
+        let mock = MockVoiceV2Client::new();
+        mock.set_stem_bytes(&pending.session_id, "user1", wav);
+        mock.set_pending(vec![pending.clone()]);
+        mock.push_receipt_error(VoiceV2ClientError::RetryAfter(Duration::from_secs(4)));
+        let orch = FinalizedVoiceDelivery::open_recording_parent(tmp.path())
+            .unwrap()
+            .with_device_id("device-test");
+        let mut phase = DeliveryPhase::Waiting;
+        let err = orch
+            .deliver_pending(&mock, &pending, &mut phase)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OrchestratorError::ClientRetryable(VoiceV2ClientError::RetryAfter(_))
+        ));
+        let mut phase2 = DeliveryPhase::Waiting;
+        orch.deliver_pending(&mock, &pending, &mut phase2).unwrap();
+        assert_eq!(phase2, DeliveryPhase::Completed);
         assert_eq!(mock.receipt_calls(), 1);
     }
 
