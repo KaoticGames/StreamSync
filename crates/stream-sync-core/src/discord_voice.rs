@@ -1,6 +1,7 @@
 //! Discord voice ingest worker + host heartbeat for delegated Stream Sync sessions.
 
 use crate::app_state::{AppState, DiscordVoiceLastWrite};
+use crate::config_types::VoiceDeliveryProtocol;
 use crate::delegated_lifecycle::{
     clear_finished_generation_task, connection_key_authorization, generation_task_alive,
     install_generation_task, release_generation_slot_if_owned,
@@ -70,6 +71,9 @@ pub async fn status_json(state: &AppState) -> Value {
                 "bytes": w.bytes,
             })
         }),
+        "voiceDeliveryProtocol": cfg.voice_delivery_protocol,
+        "v2Phase": runtime.v2_phase,
+        "v2LastPublishedPath": runtime.v2_last_published,
     })
 }
 
@@ -136,6 +140,7 @@ pub async fn redeem_connect_key(
     {
         let mut cfg = state.discord_voice_config.write().await;
         cfg.host_token = Some(trimmed.to_string());
+        cfg.voice_delivery_protocol = VoiceDeliveryProtocol::V2;
         if cfg.device_id.trim().is_empty() {
             cfg.device_id = device_id;
         }
@@ -204,6 +209,11 @@ pub async fn stop_ingest_worker_for_generation(
 async fn ingest_loop(state: Arc<AppState>) {
     let mut next_heartbeat = Instant::now();
     let mut active_files: HashMap<PathBuf, Instant> = HashMap::new();
+    let protocol = state
+        .discord_voice_config
+        .read()
+        .await
+        .voice_delivery_protocol;
     loop {
         let cfg = state.discord_voice_config.read().await.clone();
         let Some(key) = cfg.host_token.clone().filter(|v| v.starts_with("sdk_")) else {
@@ -230,7 +240,9 @@ async fn ingest_loop(state: Arc<AppState>) {
             next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
         }
 
-        let wait = if let Some(parent) = parent_folder {
+        let wait = if protocol == VoiceDeliveryProtocol::V2 {
+            crate::discord_voice_v2::v2_poll_and_deliver_once(&state).await
+        } else if let Some(parent) = parent_folder {
             match poll_pending_chunk(&key).await {
                 Ok(pending) => {
                     let mut next_wait = pending.retry_after;

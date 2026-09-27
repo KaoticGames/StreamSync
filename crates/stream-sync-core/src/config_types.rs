@@ -564,8 +564,22 @@ pub struct TwitchTokenFile {
     pub scopes: Option<Vec<String>>,
 }
 
+/// Voice delivery protocol mode for the Discord ingest worker (immutable per process once started).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceDeliveryProtocol {
+    Legacy,
+    V2,
+}
+
+impl Default for VoiceDeliveryProtocol {
+    fn default() -> Self {
+        Self::V2
+    }
+}
+
 /// Persisted Discord voice ingest configuration (local recording destination + stable host id).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscordVoiceConfigFile {
     #[serde(default)]
     pub device_id: String,
@@ -574,6 +588,19 @@ pub struct DiscordVoiceConfigFile {
     /// Consumed Discord pairing token (`sdk_…`). Used as Bearer for voice APIs.
     #[serde(default)]
     pub host_token: Option<String>,
+    #[serde(default)]
+    pub voice_delivery_protocol: VoiceDeliveryProtocol,
+}
+
+impl Default for DiscordVoiceConfigFile {
+    fn default() -> Self {
+        Self {
+            device_id: String::new(),
+            recording_parent: None,
+            host_token: None,
+            voice_delivery_protocol: VoiceDeliveryProtocol::V2,
+        }
+    }
 }
 
 /// Persisted Syndicate connection-key (takeover) session. Not mixed into personal tokens.

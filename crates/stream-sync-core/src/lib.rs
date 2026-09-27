@@ -12,6 +12,7 @@ mod delegated_refresh_observability;
 mod delegated_secrets;
 mod diagnostics;
 mod discord_voice;
+mod discord_voice_v2;
 mod dock_capability;
 mod export;
 mod kick;

@@ -496,6 +496,8 @@ pub struct DiscordVoiceLastWrite {
 pub struct DiscordVoiceRuntime {
     pub last_error: Option<String>,
     pub last_write: Option<DiscordVoiceLastWrite>,
+    pub v2_phase: Option<String>,
+    pub v2_last_published: Option<String>,
 }
 
 /// Deterministic failure injection for durable delegated-store operations (tests).
