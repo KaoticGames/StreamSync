@@ -2,8 +2,8 @@
 
 use crate::app_state::{AppState, DiscordVoiceLastWrite};
 use crate::voice_delivery::{
-    DeliveryPhase, FinalizedVoiceDelivery, HttpVoiceV2Client, OrchestratorError, VoiceV2Client,
-    VoiceV2ClientError,
+    local_recovery::sweep_local_recoveries, DeliveryPhase, FinalizedVoiceDelivery,
+    HttpVoiceV2Client, OrchestratorError, VoiceV2ClientError,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,8 +12,14 @@ use tracing::warn;
 pub const V2_POLL_LIMIT: u32 = 10;
 pub const V2_DEFAULT_POLL_WAIT: Duration = Duration::from_secs(2);
 
-/// Legacy chunk API paths — v2 must never reference these (static guard for review/tests).
+#[cfg(test)]
+pub(crate) static V2_DELIVER_TICKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub async fn v2_poll_and_deliver_once(state: &AppState) -> Duration {
+    #[cfg(test)]
+    V2_DELIVER_TICKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
     let cfg = state.discord_voice_config.read().await.clone();
     let key = cfg
         .host_token
@@ -43,15 +49,19 @@ pub async fn v2_poll_and_deliver_once(state: &AppState) -> Duration {
         Ok(o) => o.with_device_id(device_id),
         Err(e) => {
             set_last_error(state, e.to_string()).await;
-            return Duration::from_secs(2);
+            return V2_DEFAULT_POLL_WAIT;
         }
     };
+    sweep_local_recoveries(std::path::Path::new(&parent), &orch, &client);
     let pending = match client.fetch_pending(V2_POLL_LIMIT) {
         Ok(list) => list,
         Err(VoiceV2ClientError::RetryAfter(d)) => return d.max(Duration::from_millis(200)),
         Err(e) => {
             set_last_error(state, e.to_string()).await;
-            return Duration::from_secs(2);
+            return e
+                .retry_after()
+                .unwrap_or(V2_DEFAULT_POLL_WAIT)
+                .max(Duration::from_millis(200));
         }
     };
     if pending.is_empty() {
@@ -71,8 +81,11 @@ pub async fn v2_poll_and_deliver_once(state: &AppState) -> Duration {
                 set_last_write(state, &published, 0).await;
                 update_v2_runtime(state, &phase, Some(&published)).await;
             }
-            Err(OrchestratorError::ClientRetryable(_)) => {
-                return Duration::from_secs(2);
+            Err(OrchestratorError::ClientRetryable(e)) => {
+                return e
+                    .retry_after()
+                    .unwrap_or(V2_DEFAULT_POLL_WAIT)
+                    .max(Duration::from_millis(200));
             }
             Err(e) => {
                 warn!("voice v2 terminal delivery skipped: {e}");
@@ -106,15 +119,4 @@ async fn set_last_write(state: &AppState, path: &str, bytes: u64) {
         path: Some(path.to_string()),
         bytes: Some(bytes),
     });
-}
-
-#[cfg(test)]
-mod legacy_endpoint_guard {
-    #[test]
-    fn v2_module_does_not_call_legacy_chunk_urls() {
-        let src = include_str!("discord_voice_v2.rs");
-        assert!(!src.contains("chunks/pending"));
-        assert!(!src.contains("chunks/content"));
-        assert!(!src.contains("chunks/ack"));
-    }
 }

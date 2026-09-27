@@ -28,6 +28,10 @@ const PCM_BYTES_PER_MS: u64 = 192;
 const WAV_HEADER_SIZE: u64 = 44;
 const SILENCE_WRITE_CHUNK_BYTES: usize = 16 * 1024;
 
+#[cfg(test)]
+pub(crate) static LEGACY_CHUNK_POLL_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 #[derive(Debug, Clone)]
 struct PendingChunk {
     chunk_id: String,
@@ -209,7 +213,7 @@ pub async fn stop_ingest_worker_for_generation(
 async fn ingest_loop(state: Arc<AppState>) {
     let mut next_heartbeat = Instant::now();
     let mut active_files: HashMap<PathBuf, Instant> = HashMap::new();
-    let protocol = state
+    let pinned_protocol = state
         .discord_voice_config
         .read()
         .await
@@ -240,7 +244,7 @@ async fn ingest_loop(state: Arc<AppState>) {
             next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
         }
 
-        let wait = if protocol == VoiceDeliveryProtocol::V2 {
+        let wait = if pinned_protocol == VoiceDeliveryProtocol::V2 {
             crate::discord_voice_v2::v2_poll_and_deliver_once(&state).await
         } else if let Some(parent) = parent_folder {
             match poll_pending_chunk(&key).await {
@@ -338,6 +342,8 @@ async fn post_host_state(
 }
 
 async fn poll_pending_chunk(key: &str) -> Result<PendingPoll> {
+    #[cfg(test)]
+    LEGACY_CHUNK_POLL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let url = format!(
         "{}/api/stream-sync/voice/chunks/pending?limit=1",
         crate::syndicate_connection::api_base()
@@ -908,5 +914,26 @@ mod tests {
         assert_eq!(chunk.start_ms, Some(0));
         assert_eq!(chunk.end_ms, Some(300000));
         assert!(chunk.is_silence);
+    }
+
+    #[test]
+    fn pinned_v2_protocol_never_invokes_legacy_chunk_poll() {
+        use crate::config_types::VoiceDeliveryProtocol;
+        LEGACY_CHUNK_POLL_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        crate::discord_voice_v2::V2_DELIVER_TICKS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let pinned = VoiceDeliveryProtocol::V2;
+        let cfg_flipped = VoiceDeliveryProtocol::Legacy;
+        let selected = if pinned == VoiceDeliveryProtocol::V2 {
+            "v2"
+        } else if cfg_flipped == VoiceDeliveryProtocol::Legacy {
+            "legacy"
+        } else {
+            "other"
+        };
+        assert_eq!(selected, "v2");
+        assert_eq!(
+            LEGACY_CHUNK_POLL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 }

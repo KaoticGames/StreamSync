@@ -16,7 +16,7 @@ Under the user-selected **recording parent** (`recording_parent`):
 
 ## API (Syndicate)
 
-- `GET /api/stream-sync/voice/v2/deliveries/pending?limit=N` — sealed deliveries; client expects each item to include `manifest` (strict Syndicate finalized manifest) plus `manifestDigest` and `sessionId`.
+Syndicate shared protocol reference: ChatBot git **`70b50a07`** (`@syndicate/voice-delivery-v2-protocol`). Pending item exact keys: `{ sessionId, manifestDigest, sealedAt, manifest }`; cross-language golden digest fixture lives in `crates/stream-sync-core/tests/fixtures/voice_delivery_v2_pending_contract.json`.
 - `GET /api/stream-sync/voice/v2/deliveries/:sessionId/stems/:stemId?offset=&length=` — requires `206`, `Content-Range`, `ETag` stem SHA, bounded 8 MiB ranges.
 - `POST /api/stream-sync/voice/v2/deliveries/:sessionId/receipt` — after local `Published` ledger state.
 
