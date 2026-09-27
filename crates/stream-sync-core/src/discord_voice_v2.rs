@@ -3,7 +3,7 @@
 use crate::app_state::{AppState, DiscordVoiceLastWrite};
 use crate::voice_delivery::{
     local_recovery::sweep_local_recoveries, DeliveryPhase, FinalizedVoiceDelivery,
-    HttpVoiceV2Client, OrchestratorError, VoiceV2ClientError,
+    HttpVoiceV2Client, OrchestratorError, VoiceV2Client, VoiceV2ClientError,
 };
 use std::sync::Arc;
 use std::time::Duration;
