@@ -278,7 +278,7 @@ mod checkpoint_adversarial {
             sha256: "d".repeat(64),
         }])
         .unwrap();
-        let guard = DeliverySessionGuard::begin(
+        let guard = DeliverySessionGuard::begin_uniform_digest(
             DestRoot::open(tmp.path()).unwrap(),
             "cp-adv",
             manifest,
@@ -382,7 +382,7 @@ mod checkpoint_store_guard_lifetime {
             sha256: "a".repeat(64),
         }])
         .unwrap();
-        DeliverySessionGuard::begin(
+        DeliverySessionGuard::begin_uniform_digest(
             DestRoot::open(tmp.path()).unwrap(),
             delivery_id,
             manifest,

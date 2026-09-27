@@ -65,7 +65,7 @@ pub fn sealed_publish_intent_fixture(
         .iter()
         .map(|c| PortableParentComponent::validate(c).unwrap())
         .collect();
-    let guard = DeliverySessionGuard::begin(
+    let guard = DeliverySessionGuard::begin_uniform_digest(
         root,
         delivery_id,
         manifest,

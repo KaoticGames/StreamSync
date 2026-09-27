@@ -122,9 +122,16 @@ mod recover_rename_outcome_matrix {
         let stem = write_minimal_stem(&staging, "a.wav", 4);
         let manifest =
             crate::voice_delivery::manifest::ValidatedManifest::validate(vec![stem]).unwrap();
-        let guard =
-            DeliverySessionGuard::begin(root, "recv-only", manifest, &stage, vec![], "final", true)
-                .unwrap();
+        let guard = DeliverySessionGuard::begin_uniform_digest(
+            root,
+            "recv-only",
+            manifest,
+            &stage,
+            vec![],
+            "final",
+            true,
+        )
+        .unwrap();
         let store = LedgerStore::open_for_guard(&guard).unwrap();
         store.commit(&guard, LedgerState::Receiving).unwrap();
         let outcome = recover_delivery(&guard, None).unwrap();
@@ -142,7 +149,7 @@ mod recover_rename_outcome_matrix {
         let stem = write_minimal_stem(&staging, "a.wav", 4);
         let manifest =
             crate::voice_delivery::manifest::ValidatedManifest::validate(vec![stem]).unwrap();
-        let guard = DeliverySessionGuard::begin(
+        let guard = DeliverySessionGuard::begin_uniform_digest(
             root,
             "sealed-adv",
             manifest,
@@ -883,7 +890,7 @@ mod crash_child_process_publication {
         ])
         .unwrap();
         assert_eq!(manifest.digest(), manifest_digest);
-        let guard = DeliverySessionGuard::begin(
+        let guard = DeliverySessionGuard::begin_uniform_digest(
             root,
             &delivery,
             manifest,
@@ -964,7 +971,7 @@ mod crash_child_process_publication {
                     .env("STREAMSYNC_PUB_DELIVERY_ID", &delivery_id)
                     .env("STREAMSYNC_PUB_FINAL_NAME", &final_name)
                     .env("STREAMSYNC_PUB_STAGE", &stage)
-                    .env("STREAMSYNC_PUB_MANIFEST_DIGEST", manifest_digest)
+                    .env("STREAMSYNC_PUB_MANIFEST_DIGEST", &manifest_digest)
                     .stdout(Stdio::null())
                     .stderr(Stdio::piped())
                     .spawn()
@@ -1000,13 +1007,20 @@ mod crash_child_process_publication {
                     );
                 }
                 let root = crate::voice_delivery::fs::DestRoot::open(&tmp_path).unwrap();
+                let identity =
+                    crate::voice_delivery::identity::DeliveryImmutableIdentity::new_bound(
+                        &delivery_id,
+                        &manifest_digest,
+                        &manifest,
+                        &stage,
+                        vec![],
+                        &final_name,
+                    )
+                    .unwrap();
                 let guard = DeliverySessionGuard::begin_for_recovery(
                     root,
-                    &delivery_id,
+                    identity,
                     manifest.clone(),
-                    &stage,
-                    vec![],
-                    &final_name,
                     true,
                 )
                 .unwrap();

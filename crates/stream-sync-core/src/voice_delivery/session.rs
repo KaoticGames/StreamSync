@@ -31,8 +31,34 @@ pub struct DeliverySessionGuard {
 }
 
 impl DeliverySessionGuard {
-    /// Acquire the stable delivery lock and bind root, identity, manifest, final-parent, and staging.
+    /// Acquire lock and bind an already-validated authoritative identity + stem manifest.
+    pub fn begin_bound(
+        root: DestRoot,
+        identity: DeliveryImmutableIdentity,
+        manifest: ValidatedManifest,
+        create_staging_if_missing: bool,
+        try_wait_lock: bool,
+    ) -> Result<Self, SessionError> {
+        identity
+            .assert_stem_manifest(&manifest)
+            .map_err(|_| SessionError::IdentityMismatch)?;
+        validate_stage_basename(&identity.staging_token)?;
+        let lock = acquire_delivery_domain_lock(&root, &identity.delivery_uuid, try_wait_lock)?;
+        Self::assemble(root, identity, manifest, lock, create_staging_if_missing)
+    }
+
+    /// First open for a new download (creates staging when absent).
     pub fn begin(
+        root: DestRoot,
+        identity: DeliveryImmutableIdentity,
+        manifest: ValidatedManifest,
+        try_wait_lock: bool,
+    ) -> Result<Self, SessionError> {
+        Self::begin_bound(root, identity, manifest, true, try_wait_lock)
+    }
+
+    /// Local/tests when authoritative API digest is unavailable (stem digest only).
+    pub(crate) fn begin_uniform_digest(
         root: DestRoot,
         delivery_uuid: impl Into<String>,
         manifest: ValidatedManifest,
@@ -41,50 +67,26 @@ impl DeliverySessionGuard {
         final_session_name: &str,
         try_wait_lock: bool,
     ) -> Result<Self, SessionError> {
-        let identity = DeliveryImmutableIdentity::new(
+        let identity = DeliveryImmutableIdentity::new_bound(
             delivery_uuid,
+            manifest.digest(),
             &manifest,
             staging_token,
             final_parent_relative,
             final_session_name,
         )
         .map_err(|e| SessionError::Invalid(e.to_string()))?;
-        if identity.manifest_digest != manifest.digest() {
-            return Err(SessionError::Invalid(
-                "manifest digest does not match identity".into(),
-            ));
-        }
-        validate_stage_basename(&identity.staging_token)?;
-        let lock = acquire_delivery_domain_lock(&root, &identity.delivery_uuid, try_wait_lock)?;
-        Self::assemble(root, identity, manifest, lock, true)
+        Self::begin(root, identity, manifest, try_wait_lock)
     }
 
     /// Reopen a delivery session for recovery without synthesizing a missing staging directory.
     pub(crate) fn begin_for_recovery(
         root: DestRoot,
-        delivery_uuid: impl Into<String>,
+        identity: DeliveryImmutableIdentity,
         manifest: ValidatedManifest,
-        staging_token: impl Into<String>,
-        final_parent_relative: Vec<PortableParentComponent>,
-        final_session_name: &str,
         try_wait_lock: bool,
     ) -> Result<Self, SessionError> {
-        let identity = DeliveryImmutableIdentity::new(
-            delivery_uuid,
-            &manifest,
-            staging_token,
-            final_parent_relative,
-            final_session_name,
-        )
-        .map_err(|e| SessionError::Invalid(e.to_string()))?;
-        if identity.manifest_digest != manifest.digest() {
-            return Err(SessionError::Invalid(
-                "manifest digest does not match identity".into(),
-            ));
-        }
-        validate_stage_basename(&identity.staging_token)?;
-        let lock = acquire_delivery_domain_lock(&root, &identity.delivery_uuid, try_wait_lock)?;
-        Self::assemble(root, identity, manifest, lock, false)
+        Self::begin_bound(root, identity, manifest, false, try_wait_lock)
     }
 
     fn assemble(
@@ -197,12 +199,30 @@ mod delivery_bound_lock {
         format!(".streamsync-stage-{suffix}")
     }
 
+    fn test_identity(
+        uuid: &str,
+        manifest: &ValidatedManifest,
+        stage: &str,
+        parent: Vec<PortableParentComponent>,
+        final_name: &str,
+    ) -> DeliveryImmutableIdentity {
+        DeliveryImmutableIdentity::new_bound(
+            uuid,
+            manifest.digest(),
+            manifest,
+            stage,
+            parent,
+            final_name,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn lock_for_delivery_a_cannot_commit_delivery_b_ledger() {
         let tmp = tempfile::tempdir().unwrap();
         let root = DestRoot::open(tmp.path()).unwrap();
         let manifest_a = stem_manifest();
-        let guard_a = DeliverySessionGuard::begin(
+        let guard_a = DeliverySessionGuard::begin_uniform_digest(
             root,
             "delivery-a",
             manifest_a,
@@ -215,7 +235,7 @@ mod delivery_bound_lock {
 
         let root_b = DestRoot::open(tmp.path()).unwrap();
         let manifest_b = stem_manifest();
-        let guard_b = DeliverySessionGuard::begin(
+        let guard_b = DeliverySessionGuard::begin_uniform_digest(
             root_b,
             "delivery-b",
             manifest_b,
@@ -266,28 +286,38 @@ mod session_constructor_substitution {
         let digest_a = {
             let guard_a = DeliverySessionGuard::begin(
                 DestRoot::open(tmp.path()).unwrap(),
-                uuid,
+                DeliveryImmutableIdentity::new_bound(
+                    uuid,
+                    manifest_a().digest(),
+                    &manifest_a(),
+                    stage_a,
+                    vec![PortableParentComponent::validate("guild").unwrap()],
+                    "sess-a",
+                )
+                .unwrap(),
                 manifest_a(),
-                stage_a,
-                vec![PortableParentComponent::validate("guild").unwrap()],
-                "sess-a",
                 true,
             )
             .unwrap();
             assert!(tmp.path().join("guild").join(stage_a).is_dir());
-            guard_a.identity().manifest_digest.clone()
+            guard_a.identity().stem_set_digest.clone()
         };
         let guard_b = DeliverySessionGuard::begin(
             DestRoot::open(tmp.path()).unwrap(),
-            uuid,
+            DeliveryImmutableIdentity::new_bound(
+                uuid,
+                manifest_b().digest(),
+                &manifest_b(),
+                stage_b,
+                vec![PortableParentComponent::validate("guild").unwrap()],
+                "sess-b",
+            )
+            .unwrap(),
             manifest_b(),
-            stage_b,
-            vec![PortableParentComponent::validate("guild").unwrap()],
-            "sess-b",
             true,
         )
         .unwrap();
-        assert_ne!(digest_a, guard_b.identity().manifest_digest);
+        assert_ne!(digest_a, guard_b.identity().stem_set_digest);
         assert_ne!(stage_a, guard_b.identity().staging_token);
         assert!(tmp.path().join("guild").join(stage_b).is_dir());
         assert!(!tmp.path().join(stage_a).exists());
@@ -298,16 +328,22 @@ mod session_constructor_substitution {
         let tmp = tempfile::tempdir().unwrap();
         let root = DestRoot::open(tmp.path()).unwrap();
         let stage = ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef";
+        let m = manifest_a();
         let guard = DeliverySessionGuard::begin(
             root,
-            "geo-test",
-            manifest_a(),
-            stage,
-            vec![
-                PortableParentComponent::validate("guild").unwrap(),
-                PortableParentComponent::validate("channel").unwrap(),
-            ],
-            "published",
+            DeliveryImmutableIdentity::new_bound(
+                "geo-test",
+                m.digest(),
+                &m,
+                stage,
+                vec![
+                    PortableParentComponent::validate("guild").unwrap(),
+                    PortableParentComponent::validate("channel").unwrap(),
+                ],
+                "published",
+            )
+            .unwrap(),
+            m,
             true,
         )
         .unwrap();
@@ -315,5 +351,23 @@ mod session_constructor_substitution {
         assert!(expected.is_dir());
         assert!(!tmp.path().join(stage).exists());
         let _ = guard.final_parent_dir();
+    }
+
+    #[test]
+    fn begin_bound_rejects_stem_manifest_substitution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = DestRoot::open(tmp.path()).unwrap();
+        let m = manifest_a();
+        let identity = DeliveryImmutableIdentity::new_bound(
+            "sub-test",
+            "c".repeat(64),
+            &m,
+            ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
+            vec![],
+            "final",
+        )
+        .unwrap();
+        let err = DeliverySessionGuard::begin_bound(root, identity, manifest_b(), true, true);
+        assert!(matches!(err, Err(SessionError::IdentityMismatch)));
     }
 }

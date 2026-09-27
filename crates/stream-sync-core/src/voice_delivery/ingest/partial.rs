@@ -294,7 +294,7 @@ mod partial_prefix_hasher_checkpoint {
             sha256: "a".repeat(64),
         }];
         let manifest = ValidatedManifest::validate(stems).unwrap();
-        let guard = DeliverySessionGuard::begin(
+        let guard = DeliverySessionGuard::begin_uniform_digest(
             DestRoot::open(tmp.path()).unwrap(),
             "delivery-partial",
             manifest.clone(),
@@ -346,7 +346,7 @@ mod partial_sparse_prefix_digest_fail {
             sha256: "c".repeat(64),
         }];
         let manifest = ValidatedManifest::validate(stems).unwrap();
-        let guard = DeliverySessionGuard::begin(
+        let guard = DeliverySessionGuard::begin_uniform_digest(
             root,
             "delivery-sparse",
             manifest,
@@ -401,7 +401,7 @@ mod partial_resume_adversarial {
             sha256: sha.to_string(),
         }])
         .unwrap();
-        let guard = DeliverySessionGuard::begin(
+        let guard = DeliverySessionGuard::begin_uniform_digest(
             DestRoot::open(tmp.path()).unwrap(),
             "partial-adv",
             manifest,
@@ -494,7 +494,7 @@ mod partial_contiguous_overlap_behavior {
             sha256: "b".repeat(64),
         }])
         .unwrap();
-        let guard = DeliverySessionGuard::begin(
+        let guard = DeliverySessionGuard::begin_uniform_digest(
             DestRoot::open(tmp.path()).unwrap(),
             "overlap-beh",
             manifest,
@@ -568,7 +568,7 @@ mod partial_restart_single_prefix_pass {
             sha256: "c".repeat(64),
         }])
         .unwrap();
-        let guard = DeliverySessionGuard::begin(
+        let guard = DeliverySessionGuard::begin_uniform_digest(
             DestRoot::open(tmp.path()).unwrap(),
             "one-pass",
             manifest,
