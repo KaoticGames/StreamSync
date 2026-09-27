@@ -1,7 +1,8 @@
 //! Narrow orchestration API over durable voice_delivery primitives (Phase 5).
 
+use crate::voice_delivery::api_binding::persist_api_binding_if_absent;
 use crate::voice_delivery::client::{
-    validate_stem_range_response, PendingDelivery, ReceiptRequestBody, VoiceV2Client,
+    validate_stem_range_meta, PendingDelivery, ReceiptRequestBody, VoiceV2Client,
     VoiceV2ClientError, VOICE_V2_MAX_CHUNK_BYTES,
 };
 use crate::voice_delivery::finalized_manifest::{bind_delivery_identity, SyndicateFinalizedStem};
@@ -13,11 +14,16 @@ use crate::voice_delivery::marker::verify_stem_from_handle;
 use crate::voice_delivery::publication::{
     prepare_publication, publish_prepared, recover_delivery, PublishOptions, RecoveryOutcome,
 };
+use crate::voice_delivery::receipt_state::{
+    read_receipt_state, write_receipt_state_replace, ReceiptPhase, ReceiptStateRecord,
+};
 use crate::voice_delivery::records::ledger_generation::LedgerStore;
 use crate::voice_delivery::session::DeliverySessionGuard;
 use crate::voice_delivery::state::LedgerState;
 use crate::voice_delivery::PartialStemWriter;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
 
 pub const LOCAL_PUBLICATION_STATE: &str = "published";
@@ -43,6 +49,15 @@ pub enum OrchestratorError {
     Session(#[from] crate::voice_delivery::session::SessionError),
     #[error("orchestrator: {0}")]
     Other(String),
+}
+
+impl OrchestratorError {
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            OrchestratorError::ClientRetryable(e) => e.retry_after(),
+            _ => None,
+        }
+    }
 }
 
 fn map_client_err(e: VoiceV2ClientError) -> OrchestratorError {
@@ -82,28 +97,45 @@ impl FinalizedVoiceDelivery {
         let (manifest, identity) =
             bind_delivery_identity(&pending.manifest, &pending.manifest_digest)
                 .map_err(|e| OrchestratorError::Other(e.to_string()))?;
-        self.deliver_bound(client, &pending.manifest, manifest, identity, phase)
+        self.deliver_bound(
+            client,
+            &pending.manifest,
+            &pending.sealed_at,
+            manifest,
+            identity,
+            phase,
+        )
     }
 
-    fn deliver_bound<C: VoiceV2Client>(
+    pub(crate) fn deliver_bound<C: VoiceV2Client>(
         &self,
         client: &C,
         syndicate: &crate::voice_delivery::finalized_manifest::SyndicateFinalizedManifest,
+        sealed_at: &str,
         manifest: ValidatedManifest,
         identity: DeliveryImmutableIdentity,
         phase: &mut DeliveryPhase,
     ) -> Result<(), OrchestratorError> {
         let root =
             DestRoot::open(&self.parent).map_err(|e| OrchestratorError::Other(e.to_string()))?;
-        let guard = DeliverySessionGuard::begin(
+        let guard = self.open_session_for_delivery(
             root,
-            identity.delivery_uuid.clone(),
+            identity.clone(),
             manifest,
-            identity.staging_token.clone(),
-            identity.final_parent_components().to_vec(),
-            &identity.final_session_name,
-            true,
+            &syndicate.session_id,
         )?;
+        let ledger_dir = guard
+            .ledger_dir()
+            .map_err(|e| OrchestratorError::Other(e.to_string()))?;
+        persist_api_binding_if_absent(
+            &ledger_dir,
+            guard.identity(),
+            guard.manifest(),
+            syndicate,
+            sealed_at,
+        )
+        .map_err(|e| OrchestratorError::Other(e.to_string()))?;
+
         let ledger = LedgerStore::open_for_guard(&guard)
             .map_err(|e| OrchestratorError::Other(e.to_string()))?;
         if ledger
@@ -145,6 +177,33 @@ impl FinalizedVoiceDelivery {
         Ok(())
     }
 
+    fn open_session_for_delivery(
+        &self,
+        root: DestRoot,
+        identity: DeliveryImmutableIdentity,
+        manifest: ValidatedManifest,
+        _session_id: &str,
+    ) -> Result<DeliverySessionGuard, OrchestratorError> {
+        if let Ok(guard) = DeliverySessionGuard::begin_for_recovery(
+            DestRoot::open(&self.parent).map_err(|e| OrchestratorError::Other(e.to_string()))?,
+            identity.clone(),
+            manifest.clone(),
+            true,
+        ) {
+            let ledger = LedgerStore::open_for_guard(&guard)
+                .map_err(|e| OrchestratorError::Other(e.to_string()))?;
+            if ledger
+                .read_highest_valid()
+                .ok()
+                .flatten()
+                .is_some_and(|g| g.state == LedgerState::Published)
+            {
+                return Ok(guard);
+            }
+        }
+        DeliverySessionGuard::begin_bound(root, identity, manifest, true, true).map_err(Into::into)
+    }
+
     fn download_all_stems<C: VoiceV2Client>(
         &self,
         client: &C,
@@ -178,13 +237,27 @@ impl FinalizedVoiceDelivery {
             };
             let remaining = stem.wav_bytes - offset;
             let req_len = remaining.min(VOICE_V2_MAX_CHUNK_BYTES);
-            let resp = client
-                .fetch_stem_range(&syndicate.session_id, &stem.path_nick, offset, req_len)
+            let mut cursor = Cursor::new(Vec::new());
+            let meta = client
+                .fetch_stem_range(
+                    &syndicate.session_id,
+                    &stem.path_nick,
+                    offset,
+                    req_len,
+                    &mut cursor,
+                )
                 .map_err(map_client_err)?;
-            validate_stem_range_response(&resp, offset, stem.wav_bytes, &stem.sha256)
-                .map_err(map_client_err)?;
+            let bytes = cursor.into_inner();
+            validate_stem_range_meta(
+                &meta,
+                offset,
+                stem.wav_bytes,
+                &stem.sha256,
+                bytes.len() as u64,
+            )
+            .map_err(map_client_err)?;
             writer
-                .write_contiguous(offset, &resp.body)
+                .write_contiguous(offset, &bytes)
                 .map_err(|e| OrchestratorError::Other(e.to_string()))?;
             writer
                 .commit_checkpoint()
@@ -248,15 +321,37 @@ impl FinalizedVoiceDelivery {
             return Ok(());
         }
         let gen = published.unwrap().generation;
+        let local_receipt_id = format!("{}:{}", identity.delivery_uuid, gen);
+        let ledger_dir = guard
+            .ledger_dir()
+            .map_err(|e| OrchestratorError::Other(e.to_string()))?;
+        if let Some(state) = read_receipt_state(&ledger_dir, identity)
+            .map_err(|e| OrchestratorError::Other(e.to_string()))?
+        {
+            if state.phase == ReceiptPhase::Acked {
+                return Ok(());
+            }
+            if state.local_receipt_id != local_receipt_id {
+                return Err(OrchestratorError::Other("receipt id drift".into()));
+            }
+        } else {
+            let pending = ReceiptStateRecord::pending(identity, &local_receipt_id);
+            write_receipt_state_replace(&ledger_dir, &pending)
+                .map_err(|e| OrchestratorError::Other(e.to_string()))?;
+        }
         let body = ReceiptRequestBody {
             manifest_digest: identity.manifest_digest.clone(),
             device_id: self.device_id.clone(),
-            local_receipt_id: format!("{}:{}", identity.delivery_uuid, gen),
+            local_receipt_id,
             local_publication_state: LOCAL_PUBLICATION_STATE.into(),
         };
         client
             .post_receipt(&identity.delivery_uuid, &body)
             .map_err(map_client_err)?;
+        let mut acked = ReceiptStateRecord::pending(identity, &body.local_receipt_id);
+        acked.phase = ReceiptPhase::Acked;
+        write_receipt_state_replace(&ledger_dir, &acked)
+            .map_err(|e| OrchestratorError::Other(e.to_string()))?;
         Ok(())
     }
 }
@@ -302,5 +397,16 @@ mod orchestrator_e2e {
         orch.deliver_pending(&mock, &pending, &mut phase).unwrap();
         assert_eq!(phase, DeliveryPhase::Completed);
         assert_eq!(mock.receipt_calls(), 1);
+    }
+
+    #[test]
+    fn api_manifest_digest_differs_from_stem_set_digest() {
+        let raw = minimal_wav_value();
+        let syndicate = parse_syndicate_finalized_manifest(&raw).unwrap();
+        let api_digest = compute_finalized_manifest_digest(&syndicate);
+        let (manifest, identity) = bind_delivery_identity(&syndicate, &api_digest).unwrap();
+        assert_eq!(identity.manifest_digest, api_digest);
+        assert_eq!(identity.stem_set_digest, manifest.digest());
+        assert_ne!(identity.manifest_digest, identity.stem_set_digest);
     }
 }

@@ -1,15 +1,18 @@
 //! Phase 0C durable voice delivery + Phase 5 finalized-stem host orchestration.
 
+mod api_binding;
 mod bounds;
 mod client;
 mod finalized_manifest;
 mod hash;
 mod identity;
 mod ingest;
+pub mod local_recovery;
 mod manifest;
 mod marker;
 mod orchestrator;
 mod publication;
+mod receipt_state;
 mod records;
 mod session;
 mod state;
@@ -18,6 +21,7 @@ mod wav;
 mod ids;
 mod lock;
 
+pub use client::parse_pending_response;
 pub use client::{HttpVoiceV2Client, VoiceV2Client, VoiceV2ClientError};
 pub use finalized_manifest::{
     compute_finalized_manifest_digest, parse_syndicate_finalized_manifest,
