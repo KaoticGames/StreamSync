@@ -3,7 +3,7 @@
 use super::dir::{DirHandle, ValidatedFinalName};
 use super::error::FsError;
 use super::rename_no_replace_same_parent;
-use crate::voice_delivery::ids::{new_opaque_stage_basename, validate_stage_basename};
+use crate::voice_delivery::ids::validate_stage_basename;
 
 /// Publication operations constrained to a single open final-parent directory.
 pub struct FinalParentPublication {
@@ -15,12 +15,10 @@ impl FinalParentPublication {
         Self { final_parent }
     }
 
-    pub(crate) fn final_parent(&self) -> &DirHandle {
-        &self.final_parent
-    }
-
     /// Create `.streamsync-stage-<random128>` as a direct child of the final-parent handle.
+    #[cfg(test)]
     pub fn create_stage_dir(&self) -> Result<String, FsError> {
+        use crate::voice_delivery::ids::new_opaque_stage_basename;
         let name = new_opaque_stage_basename();
         self.final_parent.create_child_dir(&name)?;
         Ok(name)

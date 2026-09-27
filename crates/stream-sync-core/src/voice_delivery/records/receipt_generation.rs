@@ -187,7 +187,6 @@ impl<'guard> ReceiptStore<'guard> {
 fn map_scan_err(err: GenerationScanError) -> ReceiptGenerationError {
     match err {
         GenerationScanError::IdentityMismatch => ReceiptGenerationError::IdentityMismatch,
-        GenerationScanError::ChecksumMismatch => ReceiptGenerationError::ChecksumMismatch,
         GenerationScanError::Io(e) => ReceiptGenerationError::Io(e),
         GenerationScanError::Parse(s) => ReceiptGenerationError::Parse(s),
     }

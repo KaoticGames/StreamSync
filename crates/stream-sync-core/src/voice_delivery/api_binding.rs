@@ -1,8 +1,7 @@
 //! Durable accepted API manifest metadata bound to delivery identity (control dir).
 
 use crate::voice_delivery::finalized_manifest::{
-    compute_finalized_manifest_digest, parse_syndicate_finalized_manifest,
-    SyndicateFinalizedManifest,
+    compute_finalized_manifest_digest, SyndicateFinalizedManifest,
 };
 use crate::voice_delivery::fs::{DirHandle, FsError};
 use crate::voice_delivery::identity::DeliveryImmutableIdentity;

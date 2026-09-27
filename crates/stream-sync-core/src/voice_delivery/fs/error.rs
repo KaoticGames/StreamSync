@@ -28,12 +28,3 @@ pub enum FsError {
     #[error(transparent)]
     Io(#[from] io::Error),
 }
-
-impl FsError {
-    pub(crate) fn from_io(err: io::Error) -> Self {
-        if err.kind() == io::ErrorKind::AlreadyExists {
-            return FsError::AlreadyExists;
-        }
-        FsError::Io(err)
-    }
-}

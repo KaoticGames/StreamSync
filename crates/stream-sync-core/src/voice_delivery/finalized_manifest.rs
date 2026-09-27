@@ -4,7 +4,7 @@ use crate::voice_delivery::bounds::STEREO_PCM_FRAME_BYTES;
 use crate::voice_delivery::fs::{PortableParentComponent, ValidatedFinalName};
 use crate::voice_delivery::hash::hex_digest;
 use crate::voice_delivery::identity::{DeliveryImmutableIdentity, IdentityError};
-use crate::voice_delivery::ids::{new_opaque_stage_basename, validate_stage_basename};
+use crate::voice_delivery::ids::validate_stage_basename;
 use crate::voice_delivery::manifest::{StemManifestEntry, ValidatedManifest};
 use crate::voice_delivery::wav::minimal_wav_header;
 use serde::{Deserialize, Serialize};
@@ -125,7 +125,7 @@ fn validate_discord_snowflake(v: &str, field: &str) -> Result<String, FinalizedM
     let as_big = v
         .parse::<u128>()
         .map_err(|_| fail(format!("{field} snowflake out of Discord bounds")))?;
-    if as_big < DISCORD_SNOWFLAKE_MIN || as_big > DISCORD_SNOWFLAKE_MAX {
+    if !(DISCORD_SNOWFLAKE_MIN..=DISCORD_SNOWFLAKE_MAX).contains(&as_big) {
         return Err(fail(format!("{field} snowflake out of Discord bounds")));
     }
     Ok(v.to_string())
@@ -460,11 +460,6 @@ pub fn bind_delivery_identity(
     )
     .map_err(|e: IdentityError| fail(e.to_string()))?;
     Ok((validated, identity))
-}
-
-/// Fresh opaque staging token when no ledger exists yet (first open).
-pub fn fresh_staging_token() -> String {
-    new_opaque_stage_basename()
 }
 
 #[cfg(test)]

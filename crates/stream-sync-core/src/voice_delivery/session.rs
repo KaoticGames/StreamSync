@@ -1,11 +1,14 @@
 //! Proof of held delivery-domain lock bound to one destination root and identity.
 
-use crate::voice_delivery::fs::{DestRoot, DirHandle, FsError, PortableParentComponent};
+use crate::voice_delivery::fs::{DestRoot, DirHandle, FsError};
 use crate::voice_delivery::identity::DeliveryImmutableIdentity;
 use crate::voice_delivery::ids::{ledger_dir_relative_components, validate_stage_basename};
 use crate::voice_delivery::lock::{acquire_delivery_domain_lock, DeliveryDomainLock, LockError};
 use crate::voice_delivery::manifest::ValidatedManifest;
 use thiserror::Error;
+
+#[cfg(test)]
+use crate::voice_delivery::fs::PortableParentComponent;
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -58,6 +61,7 @@ impl DeliverySessionGuard {
     }
 
     /// Local/tests when authoritative API digest is unavailable (stem digest only).
+    #[cfg(test)]
     pub(crate) fn begin_uniform_digest(
         root: DestRoot,
         delivery_uuid: impl Into<String>,
@@ -208,24 +212,6 @@ mod delivery_bound_lock {
 
     fn stage_token(suffix: &str) -> String {
         format!(".streamsync-stage-{suffix}")
-    }
-
-    fn test_identity(
-        uuid: &str,
-        manifest: &ValidatedManifest,
-        stage: &str,
-        parent: Vec<PortableParentComponent>,
-        final_name: &str,
-    ) -> DeliveryImmutableIdentity {
-        DeliveryImmutableIdentity::new_bound(
-            uuid,
-            manifest.digest(),
-            manifest,
-            stage,
-            parent,
-            final_name,
-        )
-        .unwrap()
     }
 
     #[test]

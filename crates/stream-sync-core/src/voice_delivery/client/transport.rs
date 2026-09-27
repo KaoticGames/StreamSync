@@ -1,4 +1,4 @@
-use super::errors::{VoiceV2ClientError, VoiceV2ErrorClass};
+use super::errors::VoiceV2ClientError;
 use crate::voice_delivery::finalized_manifest::{
     compute_finalized_manifest_digest, parse_syndicate_finalized_manifest,
     SyndicateFinalizedManifest,
@@ -548,6 +548,7 @@ impl VoiceV2Client for MockVoiceV2Client {
 #[cfg(test)]
 mod client_parse_tests {
     use super::*;
+    use crate::voice_delivery::client::errors::VoiceV2ErrorClass;
     use crate::voice_delivery::finalized_manifest::syndicate_manifest_tests::minimal_wav_value;
 
     #[test]

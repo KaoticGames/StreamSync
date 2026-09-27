@@ -63,20 +63,6 @@ pub enum MarkerError {
     Parse(String),
 }
 
-/// Proves PublishIntent is durable without invoking any publication rename API (slice 10+).
-#[derive(Default)]
-pub struct PublishIntentRecorder {
-    pub intent_observed: bool,
-}
-
-impl PublishIntentRecorder {
-    pub fn observe_intent(&mut self, state: LedgerState) {
-        if state == LedgerState::PublishIntent {
-            self.intent_observed = true;
-        }
-    }
-}
-
 impl DeliveryMarker {
     pub fn from_manifest(
         identity: &DeliveryImmutableIdentity,
@@ -360,14 +346,14 @@ pub fn verify_exact_staging_membership(
 mod publish_intent_before_rename {
     use super::*;
     use crate::voice_delivery::fs::PortableParentComponent;
-    use crate::voice_delivery::hash::SyntheticByteSource;
+    use crate::voice_delivery::hash::synthetic_byte_at;
     use crate::voice_delivery::wav::minimal_wav_header;
     fn write_minimal_stem(staging: &DirHandle, name: &str, data_bytes: u64) -> StemManifestEntry {
         let header = minimal_wav_header(data_bytes).unwrap();
         let mut body = Vec::new();
         let mut pos = 0u64;
         while pos < data_bytes {
-            body.push(SyntheticByteSource::byte_at(pos));
+            body.push(synthetic_byte_at(pos));
             pos += 1;
         }
         let mut file = staging.create_new_file(name).unwrap();
@@ -411,10 +397,7 @@ mod publish_intent_before_rename {
         assert!(tmp.path().join("guild").join(stage).is_dir());
         let ledger = LedgerStore::open_for_guard(&guard).unwrap();
         ledger.commit(&guard, LedgerState::Receiving).unwrap();
-        let mut recorder = PublishIntentRecorder::default();
         let (_sealed, intent, _dur) = guard.seal_and_write_publish_intent().unwrap();
-        recorder.observe_intent(intent.state);
-        assert!(recorder.intent_observed);
         assert_eq!(intent.state, LedgerState::PublishIntent);
         let highest = ledger.read_highest_valid().unwrap().unwrap();
         assert_eq!(highest.state, LedgerState::PublishIntent);

@@ -47,47 +47,20 @@ pub fn sha256_hex_reader<R: Read>(mut reader: R, chunk_size: usize) -> Result<St
     Ok(hex_digest(&hasher.finalize()))
 }
 
-/// Hash exactly `len` bytes from `reader` starting at its current position (caller must seek).
-pub fn sha256_hex_prefix<R: Read>(
-    mut reader: R,
-    len: u64,
-    chunk_size: usize,
-) -> Result<String, HashError> {
-    reject_zero_chunk(chunk_size)?;
-    let mut hasher = Sha256::new();
-    let mut remaining = len;
-    let mut buf = vec![0u8; chunk_size];
-    while remaining > 0 {
-        let take = remaining.min(chunk_size as u64);
-        let take_usize = usize::try_from(take).map_err(|_| HashError::LengthOverflow)?;
-        reader.read_exact(&mut buf[..take_usize])?;
-        hasher.update(&buf[..take_usize]);
-        remaining -= take;
-    }
-    Ok(hex_digest(&hasher.finalize()))
-}
-
 /// Incremental hasher for live ingest; `prefix_digest_hex` clones state in O(1).
 pub struct LiveSha256 {
     hasher: Sha256,
-    bytes_hashed: u64,
 }
 
 impl LiveSha256 {
     pub fn new() -> Self {
         Self {
             hasher: Sha256::new(),
-            bytes_hashed: 0,
         }
     }
 
     pub fn update(&mut self, data: &[u8]) {
         self.hasher.update(data);
-        self.bytes_hashed += data.len() as u64;
-    }
-
-    pub fn bytes_hashed(&self) -> u64 {
-        self.bytes_hashed
     }
 
     pub fn prefix_digest_hex(&self) -> String {
@@ -101,43 +74,10 @@ impl Default for LiveSha256 {
     }
 }
 
-/// Deterministic synthetic byte stream (no full materialization in RAM).
-pub struct SyntheticByteSource {
-    total_len: u64,
-    pos: u64,
-}
-
-impl SyntheticByteSource {
-    pub fn new(total_len: u64) -> Self {
-        Self { total_len, pos: 0 }
-    }
-
-    pub fn byte_at(offset: u64) -> u8 {
-        ((offset.wrapping_mul(0x9E37_79B9)) >> 24) as u8
-    }
-}
-
-impl Read for SyntheticByteSource {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.pos >= self.total_len {
-            return Ok(0);
-        }
-        let mut written = 0usize;
-        for slot in buf.iter_mut() {
-            if self.pos >= self.total_len {
-                break;
-            }
-            *slot = Self::byte_at(self.pos);
-            self.pos += 1;
-            written += 1;
-        }
-        Ok(written)
-    }
-}
-
-pub fn streaming_sha256_synthetic(total_len: u64, chunk_size: usize) -> Result<String, HashError> {
-    reject_zero_chunk(chunk_size)?;
-    sha256_hex_reader(SyntheticByteSource::new(total_len), chunk_size)
+/// Deterministic test fixture byte (matches historical `SyntheticByteSource` stream).
+#[cfg(test)]
+pub(crate) fn synthetic_byte_at(offset: u64) -> u8 {
+    ((offset.wrapping_mul(0x9E37_79B9)) >> 24) as u8
 }
 
 #[cfg(test)]
@@ -161,7 +101,7 @@ mod streaming_hash_matches_materialized_file {
         while remaining > 0 {
             let take = remaining.min(chunk_size as u64) as usize;
             for (i, slot) in buf[..take].iter_mut().enumerate() {
-                *slot = SyntheticByteSource::byte_at(offset + i as u64);
+                *slot = synthetic_byte_at(offset + i as u64);
             }
             f.write_all(&buf[..take]).unwrap();
             offset += take as u64;
@@ -188,7 +128,7 @@ mod streaming_hash_matches_materialized_file {
         while remaining > 0 {
             let take = remaining.min(32 * 1024) as usize;
             for (i, slot) in buf[..take].iter_mut().enumerate() {
-                *slot = SyntheticByteSource::byte_at(offset + i as u64);
+                *slot = synthetic_byte_at(offset + i as u64);
             }
             hasher.update(&buf[..take]);
             offset += take as u64;

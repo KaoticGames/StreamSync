@@ -20,13 +20,6 @@ pub enum LockError {
 /// RAII exclusive lock; dropping unlocks but **never** deletes the lock file.
 pub struct DeliveryDomainLock {
     file: File,
-    lock_path_display: String,
-}
-
-impl DeliveryDomainLock {
-    pub fn lock_path_display(&self) -> &str {
-        &self.lock_path_display
-    }
 }
 
 /// True when a non-blocking lock attempt failed because another holder has the file locked.
@@ -53,7 +46,6 @@ pub(crate) fn acquire_delivery_domain_lock(
 ) -> Result<DeliveryDomainLock, LockError> {
     let components = lock_file_relative_components(canonical_delivery_id);
     let rel: Vec<String> = components.into();
-    let display = rel.join("/");
     let file = open_lock_file_at_root(dest_root, &rel)?;
     if try_wait {
         match file.try_lock_exclusive() {
@@ -64,10 +56,7 @@ pub(crate) fn acquire_delivery_domain_lock(
     } else {
         file.lock_exclusive()?;
     }
-    Ok(DeliveryDomainLock {
-        file,
-        lock_path_display: display,
-    })
+    Ok(DeliveryDomainLock { file })
 }
 
 impl Drop for DeliveryDomainLock {

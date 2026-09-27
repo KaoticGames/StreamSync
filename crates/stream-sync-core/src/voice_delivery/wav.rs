@@ -77,10 +77,6 @@ pub fn minimal_wav_header(data_bytes: u64) -> Result<Vec<u8>, WavError> {
     Ok(h)
 }
 
-pub fn parse_wav_data_chunk_len(header: &[u8]) -> Result<u64, WavError> {
-    validate_canonical_pcm_wav_header(header, None)
-}
-
 /// Validate the canonical 44-byte stereo PCM WAV header from `minimal_wav_header`.
 /// When `file_len` is provided, RIFF size must equal `file_len - 8` and the file must cover header + data (+ optional pad).
 pub fn validate_canonical_pcm_wav_header(
@@ -233,7 +229,10 @@ mod wav_header_read_uses_fixed_44_bytes_without_usize_file_length {
         let mut header_buf = [0u8; 44];
         let mut rf = File::open(&path).unwrap();
         rf.read_exact(&mut header_buf).unwrap();
-        assert_eq!(parse_wav_data_chunk_len(&header_buf).unwrap(), data_bytes);
+        assert_eq!(
+            validate_canonical_pcm_wav_header(&header_buf, None).unwrap(),
+            data_bytes
+        );
         assert!(validate_canonical_pcm_wav_header(&header_buf, Some(total_len)).is_err());
     }
 }

@@ -110,10 +110,6 @@ pub struct PreparedPublication<'guard> {
 }
 
 impl<'guard> PreparedPublication<'guard> {
-    pub(crate) fn guard(&self) -> &'guard DeliverySessionGuard {
-        self.guard
-    }
-
     pub(crate) fn from_guard(guard: &'guard DeliverySessionGuard) -> Self {
         Self { guard }
     }

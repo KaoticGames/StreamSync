@@ -161,13 +161,6 @@ impl DirHandle {
         super::file::create_new_file_at(self, name)
     }
 
-    pub(crate) fn open_or_create_file(
-        &self,
-        name: &str,
-    ) -> Result<super::file::VoiceFile, FsError> {
-        super::file::open_or_create_file_at(self, name)
-    }
-
     pub(crate) fn read_file_all(&self, name: &str) -> Result<Vec<u8>, FsError> {
         let file = super::file::open_existing_file_at(self, name)?;
         let len = file.len()?;
@@ -240,10 +233,12 @@ impl DestRoot {
         Ok(current)
     }
 
+    #[cfg(test)]
     pub(crate) fn open_child_dir(&self, name: &str) -> Result<DirHandle, FsError> {
         self.handle.open_child_dir(name)
     }
 
+    #[cfg(test)]
     pub(crate) fn create_child_dir(&self, name: &str) -> Result<(), FsError> {
         self.handle.create_child_dir(name)
     }
@@ -382,12 +377,6 @@ impl PortableParentComponent {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-}
-
-pub(crate) fn portable_parent_components_as_str_slice(
-    components: &[PortableParentComponent],
-) -> Vec<&str> {
-    components.iter().map(|c| c.as_str()).collect()
 }
 
 #[cfg(test)]

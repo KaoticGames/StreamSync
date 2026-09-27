@@ -263,6 +263,9 @@ impl FinalizedVoiceDelivery {
                 .commit_checkpoint()
                 .map_err(|e| OrchestratorError::Other(e.to_string()))?;
         }
+        writer
+            .assert_download_complete()
+            .map_err(|e| OrchestratorError::Other(e.to_string()))?;
         self.promote_partial_to_wav(guard, &wav_name, &writer)?;
         Ok(())
     }

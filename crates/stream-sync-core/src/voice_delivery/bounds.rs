@@ -6,12 +6,6 @@ pub const SAMPLE_RATE_HZ: u64 = 48_000;
 pub const CHANNELS_STEREO: u16 = 2;
 pub const BYTES_PER_SAMPLE: u16 = 2;
 
-pub const SESSION_4_5H_SAMPLE_FRAMES: u64 = 777_600_000;
-pub const SESSION_4_5H_DATA_BYTES: u64 = 3_110_400_000;
-
-pub const SESSION_6H_SAMPLE_FRAMES: u64 = 1_036_800_000;
-pub const SESSION_6H_DATA_BYTES: u64 = 4_147_200_000;
-
 pub const STEREO_PCM_FRAME_BYTES: u64 = (CHANNELS_STEREO as u64) * (BYTES_PER_SAMPLE as u64);
 
 pub const RIFF_PCM_OVERHEAD_BYTES: u64 = 36;
@@ -20,15 +14,13 @@ pub const RIFF_MAX_CHUNK_BYTES: u64 =
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BoundsError {
-    #[error("sample frame count overflow")]
-    SampleFramesOverflow,
     #[error("data byte count overflow")]
     DataBytesOverflow,
     #[error("session exceeds RIFF/WAV size limit ({RIFF_MAX_CHUNK_BYTES} data bytes)")]
     ExceedsRiffLimit,
 }
 
-pub fn wav_data_bytes_for_frames(
+pub(crate) fn wav_data_bytes_for_frames(
     sample_frames: u64,
     channels: u16,
     bytes_per_sample: u16,
@@ -45,13 +37,19 @@ pub fn wav_data_bytes_for_frames(
     Ok(product)
 }
 
-pub fn validate_plan_session_bounds(sample_frames: u64) -> Result<u64, BoundsError> {
+pub(crate) fn validate_plan_session_bounds(sample_frames: u64) -> Result<u64, BoundsError> {
     wav_data_bytes_for_frames(sample_frames, CHANNELS_STEREO, BYTES_PER_SAMPLE)
 }
 
 #[cfg(test)]
 mod plan_duration_bounds_match_unsigned_expectations {
     use super::*;
+
+    pub const SESSION_4_5H_SAMPLE_FRAMES: u64 = 777_600_000;
+    pub const SESSION_4_5H_DATA_BYTES: u64 = 3_110_400_000;
+
+    pub const SESSION_6H_SAMPLE_FRAMES: u64 = 1_036_800_000;
+    pub const SESSION_6H_DATA_BYTES: u64 = 4_147_200_000;
 
     #[test]
     fn plan_duration_bounds_match_unsigned_expectations() {

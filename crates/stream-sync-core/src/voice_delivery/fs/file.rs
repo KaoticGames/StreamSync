@@ -35,17 +35,8 @@ impl VoiceFile {
         self.file.write_all(data).map_err(FsError::from)
     }
 
-    pub fn append(&mut self, data: &[u8]) -> Result<(), FsError> {
-        self.file.seek(SeekFrom::End(0)).map_err(FsError::from)?;
-        self.file.write_all(data).map_err(FsError::from)
-    }
-
     pub fn std_file(&self) -> &std::fs::File {
         &self.file
-    }
-
-    pub fn std_file_mut(&mut self) -> &mut std::fs::File {
-        &mut self.file
     }
 }
 

@@ -28,6 +28,8 @@ pub enum PartialError {
     UncheckpointedTail,
     #[error("prefix digest mismatch at checkpoint")]
     PrefixDigestMismatch,
+    #[error("full stem digest does not match manifest")]
+    FullDigestMismatch,
     #[error("invalid stream chunk size")]
     InvalidChunkSize,
     #[error(transparent)]
@@ -212,6 +214,17 @@ impl<'guard> PartialStemWriter<'guard> {
 
     pub fn prefix_digest_hex(&self) -> String {
         self.hasher.prefix_digest_hex()
+    }
+
+    /// When the contiguous prefix covers the full stem, require the live hash to match the manifest.
+    pub fn assert_download_complete(&self) -> Result<(), PartialError> {
+        if self.live_contiguous_len != self.expected_total {
+            return Err(PartialError::CheckpointInvalid);
+        }
+        if self.hasher.prefix_digest_hex() != self.expected_full_sha256 {
+            return Err(PartialError::FullDigestMismatch);
+        }
+        Ok(())
     }
 }
 

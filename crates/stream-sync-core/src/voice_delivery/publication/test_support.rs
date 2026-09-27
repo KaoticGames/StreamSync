@@ -2,9 +2,8 @@
 
 use crate::voice_delivery::fs::DirHandle;
 use crate::voice_delivery::fs::{DestRoot, PortableParentComponent};
-use crate::voice_delivery::hash::SyntheticByteSource;
+use crate::voice_delivery::hash::synthetic_byte_at;
 use crate::voice_delivery::manifest::{StemManifestEntry, ValidatedManifest};
-use crate::voice_delivery::marker::verify_exact_staging_membership;
 use crate::voice_delivery::session::DeliverySessionGuard;
 use crate::voice_delivery::wav::minimal_wav_header;
 
@@ -18,7 +17,7 @@ pub fn write_minimal_stem(staging: &DirHandle, name: &str, data_bytes: u64) -> S
     let mut body = Vec::new();
     let mut pos = 0u64;
     while pos < data_bytes {
-        body.push(SyntheticByteSource::byte_at(pos));
+        body.push(synthetic_byte_at(pos));
         pos += 1;
     }
     let mut file = staging.create_new_file(name).unwrap();
@@ -83,8 +82,4 @@ pub fn sealed_publish_intent_fixture(
         .unwrap();
     guard.seal_and_write_publish_intent().unwrap();
     SealedFixture { tmp, guard, stage }
-}
-
-pub fn ensure_stems_without_marker(guard: &DeliverySessionGuard) {
-    verify_exact_staging_membership(guard.staging_dir().unwrap(), guard.manifest()).unwrap();
 }

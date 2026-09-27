@@ -1,11 +1,12 @@
 //! Manifest stem validation and canonical digest (explicit stem order preserved).
 
-use crate::voice_delivery::bounds::{RIFF_MAX_CHUNK_BYTES, STEREO_PCM_FRAME_BYTES};
-use crate::voice_delivery::hash::{hex_digest, sha256_hex_reader};
+use crate::voice_delivery::bounds::{
+    validate_plan_session_bounds, BoundsError, STEREO_PCM_FRAME_BYTES,
+};
+use crate::voice_delivery::hash::hex_digest;
 use crate::voice_delivery::wav::minimal_wav_header;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::Cursor;
 use thiserror::Error;
 
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -90,6 +91,17 @@ fn is_windows_reserved_device_stem(file_name: &str) -> bool {
     )
 }
 
+fn bounds_error_to_manifest(e: BoundsError) -> ManifestError {
+    match e {
+        BoundsError::DataBytesOverflow => ManifestError::Invalid {
+            reason: "byte_count overflow".into(),
+        },
+        BoundsError::ExceedsRiffLimit => ManifestError::Invalid {
+            reason: "byte_count exceeds RIFF limit".into(),
+        },
+    }
+}
+
 fn validate_stem_byte_count(byte_count: u64) -> Result<(), ManifestError> {
     if byte_count < 44 {
         return Err(ManifestError::Invalid {
@@ -102,11 +114,8 @@ fn validate_stem_byte_count(byte_count: u64) -> Result<(), ManifestError> {
             reason: "byte_count data region not frame aligned".into(),
         });
     }
-    if data_bytes > RIFF_MAX_CHUNK_BYTES {
-        return Err(ManifestError::Invalid {
-            reason: "byte_count exceeds RIFF limit".into(),
-        });
-    }
+    let sample_frames = data_bytes / STEREO_PCM_FRAME_BYTES;
+    validate_plan_session_bounds(sample_frames).map_err(bounds_error_to_manifest)?;
     minimal_wav_header(data_bytes).map_err(|e| ManifestError::Invalid {
         reason: e.to_string(),
     })?;
@@ -197,11 +206,6 @@ impl ValidatedManifest {
     pub fn digest(&self) -> String {
         manifest_digest_from_stems(&self.stems)
     }
-}
-
-/// Stream-hash manifest JSON bytes (for tests and verification helpers).
-pub fn digest_json_bytes(json: &[u8], chunk_size: usize) -> Result<String, ManifestError> {
-    sha256_hex_reader(Cursor::new(json), chunk_size).map_err(|e| ManifestError::Hash(e.to_string()))
 }
 
 #[cfg(test)]

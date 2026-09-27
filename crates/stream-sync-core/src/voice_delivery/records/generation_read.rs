@@ -2,7 +2,6 @@
 
 use super::{
     generation_filename, next_generation_after_max, parse_generation_filename, GenerationIoError,
-    GEN_PREFIX,
 };
 use crate::voice_delivery::fs::{DirHandle, FsError};
 use thiserror::Error;
@@ -11,8 +10,6 @@ use thiserror::Error;
 pub enum GenerationScanError {
     #[error("identity mismatch")]
     IdentityMismatch,
-    #[error("record checksum mismatch")]
-    ChecksumMismatch,
     #[error(transparent)]
     Io(#[from] GenerationIoError),
     #[error("parse: {0}")]
@@ -184,9 +181,4 @@ pub fn write_generation_create_new(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NamespaceDurabilityReceipt {
     pub durability: crate::voice_delivery::fs::durability::NamespaceDurability,
-}
-
-/// Policy: ignore unrelated names; reject ambiguous gen-prefix garbage for allocation elsewhere.
-pub fn is_unrelated_generation_name(name: &str) -> bool {
-    name.starts_with(GEN_PREFIX) && parse_generation_filename(name).is_none()
 }

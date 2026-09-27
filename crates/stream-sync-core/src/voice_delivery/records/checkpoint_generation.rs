@@ -180,7 +180,6 @@ fn validate_checkpoint_fields(
 fn map_scan_err(err: GenerationScanError) -> CheckpointGenerationError {
     match err {
         GenerationScanError::IdentityMismatch => CheckpointGenerationError::IdentityMismatch,
-        GenerationScanError::ChecksumMismatch => CheckpointGenerationError::ChecksumMismatch,
         GenerationScanError::Io(e) => CheckpointGenerationError::Io(e),
         GenerationScanError::Parse(s) => CheckpointGenerationError::Parse(s),
     }

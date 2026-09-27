@@ -10,8 +10,6 @@ use thiserror::Error;
 pub enum PublicationError {
     #[error("publication requires durable PublishIntent ledger state")]
     NotPublishIntent,
-    #[error("recovery cannot publish while receiving")]
-    ReceivingNoPublish,
     #[error("destination already exists")]
     DestinationExists,
     #[error("unrelated pre-existing destination")]
@@ -26,10 +24,6 @@ pub enum PublicationError {
     RenameFailed { detail: String },
     #[error("rename outcome indeterminate: {detail}")]
     RenameIndeterminate { detail: String },
-    #[error("published final directory invalid")]
-    PublishedFinalInvalid,
-    #[error("terminal quarantined state")]
-    Quarantined,
     #[error(transparent)]
     Session(#[from] SessionError),
     #[error(transparent)]

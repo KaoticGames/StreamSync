@@ -565,17 +565,12 @@ pub struct TwitchTokenFile {
 }
 
 /// Voice delivery protocol mode for the Discord ingest worker (immutable per process once started).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VoiceDeliveryProtocol {
     Legacy,
+    #[default]
     V2,
-}
-
-impl Default for VoiceDeliveryProtocol {
-    fn default() -> Self {
-        Self::V2
-    }
 }
 
 /// Persisted Discord voice ingest configuration (local recording destination + stable host id).

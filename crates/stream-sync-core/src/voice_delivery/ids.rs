@@ -64,7 +64,8 @@ pub fn lock_file_relative_components(canonical_delivery_id: &str) -> [String; 3]
 }
 
 /// Opaque staging directory basename: `.streamsync-stage-<32 lowercase hex>` (128-bit UUID simple form).
-pub fn new_opaque_stage_basename() -> String {
+#[cfg(test)]
+pub(crate) fn new_opaque_stage_basename() -> String {
     format!(".streamsync-stage-{}", uuid::Uuid::new_v4().simple())
 }
 

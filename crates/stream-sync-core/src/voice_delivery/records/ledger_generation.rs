@@ -274,7 +274,6 @@ enum LedgerExtra {
 fn map_scan_err(err: GenerationScanError) -> LedgerGenerationError {
     match err {
         GenerationScanError::IdentityMismatch => LedgerGenerationError::IdentityMismatch,
-        GenerationScanError::ChecksumMismatch => LedgerGenerationError::ChecksumMismatch,
         GenerationScanError::Io(e) => LedgerGenerationError::Io(e),
         GenerationScanError::Parse(s) => LedgerGenerationError::Parse(s),
     }
