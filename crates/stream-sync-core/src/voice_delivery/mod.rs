@@ -8,6 +8,7 @@ mod hash;
 mod identity;
 mod ingest;
 pub mod local_recovery;
+pub use local_recovery::LocalRecoverySweepOutcome;
 mod manifest;
 mod marker;
 mod orchestrator;
@@ -22,7 +23,7 @@ mod ids;
 mod lock;
 
 pub use client::parse_pending_response;
-pub use client::{HttpVoiceV2Client, VoiceV2Client, VoiceV2ClientError};
+pub use client::{HttpVoiceV2Client, MockVoiceV2Client, VoiceV2Client, VoiceV2ClientError};
 pub use finalized_manifest::{
     compute_finalized_manifest_digest, parse_syndicate_finalized_manifest,
     SyndicateFinalizedManifest,

@@ -215,6 +215,52 @@ impl LedgerStore {
     }
 }
 
+/// Scan an opaque ledger directory without a pre-bound session identity.
+pub fn read_highest_valid_in_opaque_dir(
+    dir: &crate::voice_delivery::fs::DirHandle,
+) -> Result<Option<LedgerGeneration>, LedgerGenerationError> {
+    let mut anchor: Option<(
+        String,
+        String,
+        String,
+        String,
+        Vec<crate::voice_delivery::fs::PortableParentComponent>,
+        String,
+    )> = None;
+    select_highest_valid::<LedgerGeneration, _, _>(
+        dir,
+        |rec: &LedgerGeneration| {
+            let key = (
+                rec.delivery_uuid.clone(),
+                rec.manifest_digest.clone(),
+                rec.stem_set_digest.clone(),
+                rec.staging_token.clone(),
+                rec.final_parent_relative.clone(),
+                rec.final_session_name.clone(),
+            );
+            match &anchor {
+                None => {
+                    anchor = Some(key);
+                    Ok(())
+                }
+                Some(a) if *a == key => Ok(()),
+                Some(_) => Err(ParseFailureKind::ForeignIdentity),
+            }
+        },
+        parse_ledger_file,
+    )
+    .map_err(map_scan_err)
+}
+
+pub fn opaque_dir_has_canonical_generations(
+    dir: &crate::voice_delivery::fs::DirHandle,
+) -> Result<bool, LedgerGenerationError> {
+    Ok(
+        super::generation_read::scan_max_canonical_generation_number(dir).map_err(map_scan_err)?
+            > 0,
+    )
+}
+
 enum LedgerExtra {
     None,
     Published(NamespaceDurability),
