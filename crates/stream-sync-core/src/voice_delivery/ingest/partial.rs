@@ -151,6 +151,10 @@ impl<'guard> PartialStemWriter<'guard> {
         self.durable_contiguous_len
     }
 
+    pub fn partial_basename(&self) -> String {
+        self.artifact.partial_basename()
+    }
+
     pub fn write_contiguous(&mut self, offset: u64, data: &[u8]) -> Result<(), PartialError> {
         let len = data.len();
         let end = offset

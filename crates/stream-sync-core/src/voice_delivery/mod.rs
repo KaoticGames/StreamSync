@@ -1,13 +1,14 @@
-//! Phase 0C voice delivery: filesystem foundation (slices 0–4) + media/manifest + slices 6–9.
-//! Not yet wired into the overlay server — `dead_code` allowed until integration lands.
-#![allow(dead_code)]
+//! Phase 0C durable voice delivery + Phase 5 finalized-stem host orchestration.
 
 mod bounds;
+mod client;
+mod finalized_manifest;
 mod hash;
 mod identity;
 mod ingest;
 mod manifest;
 mod marker;
+mod orchestrator;
 mod publication;
 mod records;
 mod session;
@@ -16,6 +17,14 @@ mod wav;
 
 mod ids;
 mod lock;
+
+pub use client::{HttpVoiceV2Client, VoiceV2Client, VoiceV2ClientError};
+pub use finalized_manifest::{
+    compute_finalized_manifest_digest, parse_syndicate_finalized_manifest,
+    SyndicateFinalizedManifest,
+};
+pub use ingest::{PartialError, PartialStemWriter};
+pub use orchestrator::{DeliveryPhase, FinalizedVoiceDelivery, OrchestratorError};
 
 pub(crate) mod fs;
 
