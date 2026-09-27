@@ -128,6 +128,15 @@ impl DeliveryImmutableIdentity {
             || self.final_parent_relative.as_slice() != final_parent_relative
             || self.final_session_name != final_session_name
     }
+
+    pub fn foreign_identity_in_receipt_record(
+        &self,
+        record: &crate::voice_delivery::records::receipt_generation::ReceiptGeneration,
+    ) -> bool {
+        self.delivery_uuid != record.delivery_uuid
+            || self.manifest_digest != record.manifest_digest
+            || self.stem_set_digest != record.stem_set_digest
+    }
 }
 
 impl StemArtifactId {

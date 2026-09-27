@@ -14,7 +14,9 @@ use crate::voice_delivery::marker::verify_stem_from_handle;
 use crate::voice_delivery::publication::{
     prepare_publication, publish_prepared, recover_delivery, PublishOptions, RecoveryOutcome,
 };
-use crate::voice_delivery::receipt_state::{ReceiptGenerationError, ReceiptPhase, ReceiptStore};
+use crate::voice_delivery::receipt_state::{
+    ReceiptGenerationError, ReceiptHistoryState, ReceiptPhase, ReceiptStore,
+};
 use crate::voice_delivery::records::ledger_generation::LedgerStore;
 use crate::voice_delivery::session::DeliverySessionGuard;
 use crate::voice_delivery::state::LedgerState;
@@ -322,18 +324,24 @@ impl FinalizedVoiceDelivery {
         let local_receipt_id = format!("{}:{}", identity.delivery_uuid, gen);
         let receipt = ReceiptStore::open_for_guard(guard)
             .map_err(|e| OrchestratorError::Other(e.to_string()))?;
-        match receipt.read_highest_valid() {
-            Ok(Some(state)) if state.phase == ReceiptPhase::Acked => {
+        match receipt.scan_history() {
+            Ok(ReceiptHistoryState::Valid(state)) if state.phase == ReceiptPhase::Acked => {
                 if state.local_receipt_id == local_receipt_id {
                     return Ok(());
                 }
                 return Err(OrchestratorError::Other("receipt id drift".into()));
             }
-            Ok(Some(_)) => {}
-            Ok(None) => {
+            Ok(ReceiptHistoryState::Valid(_)) => {}
+            Ok(ReceiptHistoryState::Absent) => {
                 receipt
                     .commit_pending(&local_receipt_id)
                     .map_err(|e| OrchestratorError::Other(e.to_string()))?;
+            }
+            Ok(ReceiptHistoryState::CorruptHistory) => {
+                return Err(OrchestratorError::Other("receipt corrupt history".into()));
+            }
+            Ok(ReceiptHistoryState::IdentityConflict) => {
+                return Err(OrchestratorError::Other("receipt identity conflict".into()));
             }
             Err(ReceiptGenerationError::IdentityMismatch) => {
                 return Err(OrchestratorError::Other("receipt identity conflict".into()));
@@ -432,6 +440,69 @@ mod orchestrator_e2e {
         let mut phase2 = DeliveryPhase::Waiting;
         orch.deliver_pending(&mock, &pending, &mut phase2).unwrap();
         assert_eq!(phase2, DeliveryPhase::Completed);
+        assert_eq!(mock.receipt_calls(), 1);
+    }
+
+    #[test]
+    fn corrupt_receipt_history_does_not_repost() {
+        use crate::voice_delivery::records::generation_filename;
+        use crate::voice_delivery::records::parse_generation_filename;
+        let tmp = tempfile::tempdir().unwrap();
+        let (wav, sha) = build_wav_bytes();
+        let mut raw = minimal_wav_value();
+        raw["stems"][0]["sha256"] = serde_json::json!(sha);
+        let syndicate = parse_syndicate_finalized_manifest(&raw).unwrap();
+        let digest = compute_finalized_manifest_digest(&syndicate);
+        let pending = PendingDelivery {
+            session_id: syndicate.session_id.clone(),
+            manifest_digest: digest,
+            sealed_at: "2020-01-01T00:00:00.000Z".into(),
+            manifest: syndicate,
+        };
+        let mock = MockVoiceV2Client::new();
+        mock.set_stem_bytes(&pending.session_id, "user1", wav);
+        mock.set_pending(vec![pending.clone()]);
+        let orch = FinalizedVoiceDelivery::open_recording_parent(tmp.path())
+            .unwrap()
+            .with_device_id("device-test");
+        let mut phase = DeliveryPhase::Waiting;
+        orch.deliver_pending(&mock, &pending, &mut phase).unwrap();
+        assert_eq!(mock.receipt_calls(), 1);
+
+        let (manifest, identity) =
+            bind_delivery_identity(&pending.manifest, &pending.manifest_digest).unwrap();
+        let receipt_path = tmp
+            .path()
+            .join(".streamsync-control/receipts")
+            .join(identity.opaque_delivery_id.clone());
+        for name in std::fs::read_dir(&receipt_path)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+        {
+            if parse_generation_filename(&name).is_some() {
+                std::fs::remove_file(receipt_path.join(&name)).unwrap();
+            }
+        }
+        let corrupt = generation_filename(1).unwrap();
+        std::fs::write(receipt_path.join(corrupt), b"{ corrupt receipt only").unwrap();
+
+        let mut phase2 = DeliveryPhase::ReceiptPending;
+        let err = orch
+            .deliver_bound(
+                &mock,
+                &pending.manifest,
+                &pending.sealed_at,
+                manifest,
+                identity,
+                &mut phase2,
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("corrupt"),
+            "expected corrupt receipt failure, got: {msg}"
+        );
         assert_eq!(mock.receipt_calls(), 1);
     }
 

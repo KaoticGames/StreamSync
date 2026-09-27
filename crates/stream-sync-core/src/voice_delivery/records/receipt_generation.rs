@@ -1,8 +1,8 @@
 //! Immutable receipt generation records under `.streamsync-control/receipts/`.
 
 use super::generation_read::{
-    allocate_next_generation, select_highest_valid, write_generation_create_new, GenerationRecord,
-    GenerationScanError, ParseFailureKind,
+    allocate_next_generation, classify_highest_valid, write_generation_create_new,
+    GenerationRecord, GenerationScanError, HighestValidOutcome, ParseFailureKind,
 };
 use super::{record_digest_hex, GenerationIoError};
 use crate::voice_delivery::identity::DeliveryImmutableIdentity;
@@ -46,6 +46,8 @@ pub enum ReceiptGenerationError {
     ChecksumMismatch,
     #[error("identity mismatch")]
     IdentityMismatch,
+    #[error("receipt history corrupt")]
+    CorruptHistory,
     #[error("illegal receipt transition")]
     Transition,
     #[error("receipt id drift")]
@@ -54,6 +56,14 @@ pub enum ReceiptGenerationError {
     Io(#[from] GenerationIoError),
     #[error("parse: {0}")]
     Parse(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiptHistoryState {
+    Absent,
+    Valid(ReceiptGeneration),
+    CorruptHistory,
+    IdentityConflict,
 }
 
 pub struct ReceiptStore<'guard> {
@@ -76,29 +86,30 @@ impl<'guard> ReceiptStore<'guard> {
         })
     }
 
-    pub fn read_highest_valid(&self) -> Result<Option<ReceiptGeneration>, ReceiptGenerationError> {
+    /// Classify receipt generation history (absent, valid, corrupt, or identity conflict).
+    pub fn scan_history(&self) -> Result<ReceiptHistoryState, ReceiptGenerationError> {
         let identity = &self.identity;
-        select_highest_valid::<ReceiptGeneration, _, _>(
+        match classify_highest_valid::<ReceiptGeneration, _, _>(
             &self.dir,
-            |rec: &ReceiptGeneration| {
-                if rec.delivery_uuid != identity.delivery_uuid
-                    || rec.manifest_digest != identity.manifest_digest
-                    || rec.stem_set_digest != identity.stem_set_digest
-                {
-                    if rec.delivery_uuid != identity.delivery_uuid
-                        || rec.manifest_digest != identity.manifest_digest
-                    {
-                        Err(ParseFailureKind::ForeignIdentity)
-                    } else {
-                        Err(ParseFailureKind::MalformedContent)
-                    }
-                } else {
-                    Ok(())
-                }
-            },
+            |rec| receipt_identity_matches(identity, rec),
             parse_receipt_file,
         )
-        .map_err(map_scan_err)
+        .map_err(map_scan_err)?
+        {
+            HighestValidOutcome::Absent => Ok(ReceiptHistoryState::Absent),
+            HighestValidOutcome::Valid(rec) => Ok(ReceiptHistoryState::Valid(rec)),
+            HighestValidOutcome::CorruptHistory => Ok(ReceiptHistoryState::CorruptHistory),
+            HighestValidOutcome::IdentityConflict => Ok(ReceiptHistoryState::IdentityConflict),
+        }
+    }
+
+    pub fn read_highest_valid(&self) -> Result<Option<ReceiptGeneration>, ReceiptGenerationError> {
+        match self.scan_history()? {
+            ReceiptHistoryState::Absent => Ok(None),
+            ReceiptHistoryState::Valid(rec) => Ok(Some(rec)),
+            ReceiptHistoryState::CorruptHistory => Err(ReceiptGenerationError::CorruptHistory),
+            ReceiptHistoryState::IdentityConflict => Err(ReceiptGenerationError::IdentityMismatch),
+        }
     }
 
     pub fn commit_pending(
@@ -182,6 +193,17 @@ fn map_scan_err(err: GenerationScanError) -> ReceiptGenerationError {
     }
 }
 
+fn receipt_identity_matches(
+    identity: &DeliveryImmutableIdentity,
+    rec: &ReceiptGeneration,
+) -> Result<(), ParseFailureKind> {
+    if identity.foreign_identity_in_receipt_record(rec) {
+        Err(ParseFailureKind::ForeignIdentity)
+    } else {
+        Ok(())
+    }
+}
+
 fn parse_receipt_file(name: &str, data: &[u8]) -> Result<ReceiptGeneration, ParseFailureKind> {
     let file_gen =
         super::parse_generation_filename(name).ok_or(ParseFailureKind::MalformedContent)?;
@@ -241,6 +263,258 @@ mod receipt_generation_tests {
 
     fn stage_token(suffix: &str) -> String {
         format!(".streamsync-stage-{suffix}")
+    }
+
+    fn open_fixture(
+        delivery_uuid: &str,
+    ) -> (
+        tempfile::TempDir,
+        DeliverySessionGuard,
+        DeliveryImmutableIdentity,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::voice_delivery::fs::DestRoot::open(tmp.path()).unwrap();
+        let manifest = stem_manifest();
+        let identity = DeliveryImmutableIdentity::new_bound(
+            delivery_uuid,
+            manifest.digest(),
+            &manifest,
+            stage_token("01234567890123456789012345678901"),
+            vec![],
+            "final",
+        )
+        .unwrap();
+        let guard = DeliverySessionGuard::begin(root, identity.clone(), manifest, true).unwrap();
+        (tmp, guard, identity)
+    }
+
+    fn signed_receipt_bytes(
+        identity: &DeliveryImmutableIdentity,
+        phase: ReceiptPhase,
+        generation: u64,
+        local_receipt_id: &str,
+        overrides: ReceiptOverrides<'_>,
+    ) -> Vec<u8> {
+        let record = ReceiptGeneration {
+            schema_version: RECEIPT_SCHEMA_VERSION,
+            phase,
+            delivery_uuid: overrides
+                .delivery_uuid
+                .unwrap_or(&identity.delivery_uuid)
+                .to_string(),
+            manifest_digest: overrides
+                .manifest_digest
+                .unwrap_or(&identity.manifest_digest)
+                .to_string(),
+            stem_set_digest: overrides
+                .stem_set_digest
+                .unwrap_or(&identity.stem_set_digest)
+                .to_string(),
+            local_receipt_id: local_receipt_id.to_string(),
+            generation,
+            record_digest: String::new(),
+        };
+        serialize_with_digest(&record).unwrap()
+    }
+
+    struct ReceiptOverrides<'a> {
+        delivery_uuid: Option<&'a str>,
+        manifest_digest: Option<&'a str>,
+        stem_set_digest: Option<&'a str>,
+    }
+
+    fn plant_generation(dir: &crate::voice_delivery::fs::DirHandle, gen: u64, bytes: &[u8]) {
+        let name = crate::voice_delivery::records::generation_filename(gen).unwrap();
+        dir.create_new_file(&name)
+            .unwrap()
+            .write_all_at(0, bytes)
+            .unwrap();
+    }
+
+    #[test]
+    fn empty_receipt_dir_scan_is_absent() {
+        let (_tmp, guard, _identity) = open_fixture("receipt-absent-empty");
+        let store = ReceiptStore::open_for_guard(&guard).unwrap();
+        assert_eq!(store.scan_history().unwrap(), ReceiptHistoryState::Absent);
+        assert!(store.read_highest_valid().unwrap().is_none());
+    }
+
+    #[test]
+    fn all_malformed_generations_are_corrupt_history() {
+        let (_tmp, guard, _identity) = open_fixture("receipt-all-malformed");
+        let store = ReceiptStore::open_for_guard(&guard).unwrap();
+        let dir = store.dir.clone_handle().unwrap();
+        plant_generation(&dir, 1, b"{not-json");
+        plant_generation(&dir, 2, b"also bad");
+        assert_eq!(
+            store.scan_history().unwrap(),
+            ReceiptHistoryState::CorruptHistory
+        );
+        assert!(matches!(
+            store.read_highest_valid(),
+            Err(ReceiptGenerationError::CorruptHistory)
+        ));
+    }
+
+    #[test]
+    fn checksum_corrupt_generation_is_corrupt_history() {
+        let (_tmp, guard, identity) = open_fixture("receipt-checksum-corrupt");
+        let store = ReceiptStore::open_for_guard(&guard).unwrap();
+        let dir = store.dir.clone_handle().unwrap();
+        let bytes = signed_receipt_bytes(
+            &identity,
+            ReceiptPhase::Pending,
+            3,
+            "rid",
+            ReceiptOverrides {
+                delivery_uuid: None,
+                manifest_digest: None,
+                stem_set_digest: None,
+            },
+        );
+        let mut corrupt = bytes;
+        corrupt.extend_from_slice(b"tamper");
+        plant_generation(&dir, 3, &corrupt);
+        assert_eq!(
+            store.scan_history().unwrap(),
+            ReceiptHistoryState::CorruptHistory
+        );
+    }
+
+    #[test]
+    fn stem_digest_mismatch_is_identity_conflict() {
+        let (_tmp, guard, identity) = open_fixture("receipt-stem-mismatch");
+        let store = ReceiptStore::open_for_guard(&guard).unwrap();
+        let dir = store.dir.clone_handle().unwrap();
+        let wrong_stem = "b".repeat(64);
+        let bytes = signed_receipt_bytes(
+            &identity,
+            ReceiptPhase::Pending,
+            1,
+            "rid",
+            ReceiptOverrides {
+                delivery_uuid: None,
+                manifest_digest: None,
+                stem_set_digest: Some(&wrong_stem),
+            },
+        );
+        plant_generation(&dir, 1, &bytes);
+        assert_eq!(
+            store.scan_history().unwrap(),
+            ReceiptHistoryState::IdentityConflict
+        );
+    }
+
+    #[test]
+    fn api_manifest_digest_mismatch_is_identity_conflict() {
+        let (_tmp, guard, identity) = open_fixture("receipt-api-mismatch");
+        let store = ReceiptStore::open_for_guard(&guard).unwrap();
+        let dir = store.dir.clone_handle().unwrap();
+        let wrong_api = "c".repeat(64);
+        let bytes = signed_receipt_bytes(
+            &identity,
+            ReceiptPhase::Pending,
+            1,
+            "rid",
+            ReceiptOverrides {
+                delivery_uuid: None,
+                manifest_digest: Some(&wrong_api),
+                stem_set_digest: None,
+            },
+        );
+        plant_generation(&dir, 1, &bytes);
+        assert_eq!(
+            store.scan_history().unwrap(),
+            ReceiptHistoryState::IdentityConflict
+        );
+    }
+
+    #[test]
+    fn valid_foreign_delivery_is_identity_conflict() {
+        let (_tmp, guard, identity) = open_fixture("receipt-foreign-delivery");
+        let store = ReceiptStore::open_for_guard(&guard).unwrap();
+        let dir = store.dir.clone_handle().unwrap();
+        let bytes = signed_receipt_bytes(
+            &identity,
+            ReceiptPhase::Pending,
+            1,
+            "rid",
+            ReceiptOverrides {
+                delivery_uuid: Some("other-delivery"),
+                manifest_digest: None,
+                stem_set_digest: None,
+            },
+        );
+        plant_generation(&dir, 1, &bytes);
+        assert_eq!(
+            store.scan_history().unwrap(),
+            ReceiptHistoryState::IdentityConflict
+        );
+    }
+
+    #[test]
+    fn valid_exact_plus_valid_foreign_is_identity_conflict() {
+        let (_tmp, guard, identity) = open_fixture("receipt-exact-and-foreign");
+        let store = ReceiptStore::open_for_guard(&guard).unwrap();
+        let dir = store.dir.clone_handle().unwrap();
+        let exact = signed_receipt_bytes(
+            &identity,
+            ReceiptPhase::Pending,
+            1,
+            "rid",
+            ReceiptOverrides {
+                delivery_uuid: None,
+                manifest_digest: None,
+                stem_set_digest: None,
+            },
+        );
+        plant_generation(&dir, 1, &exact);
+        let foreign = signed_receipt_bytes(
+            &identity,
+            ReceiptPhase::Pending,
+            2,
+            "rid",
+            ReceiptOverrides {
+                delivery_uuid: Some("foreign"),
+                manifest_digest: None,
+                stem_set_digest: None,
+            },
+        );
+        plant_generation(&dir, 2, &foreign);
+        assert_eq!(
+            store.scan_history().unwrap(),
+            ReceiptHistoryState::IdentityConflict
+        );
+    }
+
+    #[test]
+    fn acked_with_corrupt_higher_generation_stays_acked() {
+        let (_tmp, guard, identity) = open_fixture("receipt-acked-corrupt-high");
+        let store = ReceiptStore::open_for_guard(&guard).unwrap();
+        let rid = format!("{}:1", identity.delivery_uuid);
+        store.commit_pending(&rid).unwrap();
+        store.commit_acked(&rid).unwrap();
+        let dir = store.dir.clone_handle().unwrap();
+        plant_generation(&dir, 50, b"{ corrupt after ack");
+        let acked = store.read_highest_valid().unwrap().unwrap();
+        assert_eq!(acked.phase, ReceiptPhase::Acked);
+        assert_eq!(
+            store.scan_history().unwrap(),
+            ReceiptHistoryState::Valid(acked)
+        );
+    }
+
+    #[test]
+    fn generation_allocates_beyond_malformed_observed_max() {
+        let (_tmp, guard, identity) = open_fixture("receipt-alloc-past-malformed");
+        let store = ReceiptStore::open_for_guard(&guard).unwrap();
+        let dir = store.dir.clone_handle().unwrap();
+        let rid = format!("{}:1", identity.delivery_uuid);
+        store.commit_pending(&rid).unwrap();
+        plant_generation(&dir, 40, b"{bad");
+        let acked = store.commit_acked(&rid).unwrap();
+        assert_eq!(acked.generation, 41);
+        assert_eq!(scan_max_canonical_generation_number(&dir).unwrap(), 41);
     }
 
     #[test]
