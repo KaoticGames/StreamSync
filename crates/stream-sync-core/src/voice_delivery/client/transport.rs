@@ -438,6 +438,7 @@ struct MockVoiceV2State {
     receipt_calls: usize,
     fail_next_range: bool,
     retry_after_next: bool,
+    receipt_errors: Vec<VoiceV2ClientError>,
 }
 
 impl MockVoiceV2Client {
@@ -463,6 +464,10 @@ impl MockVoiceV2Client {
 
     pub fn set_fail_next_range(&self, fail: bool) {
         self.inner.lock().unwrap().fail_next_range = fail;
+    }
+
+    pub fn push_receipt_error(&self, err: VoiceV2ClientError) {
+        self.inner.lock().unwrap().receipt_errors.push(err);
     }
 }
 
@@ -528,6 +533,10 @@ impl VoiceV2Client for MockVoiceV2Client {
         _body: &ReceiptRequestBody,
     ) -> Result<(), VoiceV2ClientError> {
         let mut state = self.inner.lock().unwrap();
+        if let Some(err) = state.receipt_errors.first().cloned() {
+            state.receipt_errors.remove(0);
+            return Err(err);
+        }
         state.receipt_calls += 1;
         if session_id.is_empty() {
             return Err(VoiceV2ClientError::DeliveryNotFound);
