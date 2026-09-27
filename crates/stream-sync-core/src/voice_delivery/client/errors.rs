@@ -26,8 +26,11 @@ pub enum VoiceV2ClientError {
     Parse(String),
     #[error("range response mismatch: {0}")]
     RangeMismatch(String),
-    #[error("network: {0}")]
-    Network(String),
+    #[error("network: {message}")]
+    Network {
+        message: String,
+        retry_after: Option<std::time::Duration>,
+    },
     #[error("retry after {0:?}")]
     RetryAfter(std::time::Duration),
 }
@@ -35,7 +38,7 @@ pub enum VoiceV2ClientError {
 impl VoiceV2ClientError {
     pub fn class(&self) -> VoiceV2ErrorClass {
         match self {
-            VoiceV2ClientError::RetryAfter(_) | VoiceV2ClientError::Network(_) => {
+            VoiceV2ClientError::RetryAfter(_) | VoiceV2ClientError::Network { .. } => {
                 VoiceV2ErrorClass::Retryable
             }
             VoiceV2ClientError::Unauthorized
@@ -47,6 +50,21 @@ impl VoiceV2ClientError {
             | VoiceV2ClientError::IdentityConflict
             | VoiceV2ClientError::Parse(_)
             | VoiceV2ClientError::RangeMismatch(_) => VoiceV2ErrorClass::Terminal,
+        }
+    }
+
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            VoiceV2ClientError::RetryAfter(d) => Some(*d),
+            VoiceV2ClientError::Network { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    pub fn network(message: impl Into<String>, retry_after: Option<std::time::Duration>) -> Self {
+        VoiceV2ClientError::Network {
+            message: message.into(),
+            retry_after,
         }
     }
 }

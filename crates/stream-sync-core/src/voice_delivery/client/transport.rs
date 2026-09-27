@@ -6,8 +6,13 @@ use crate::voice_delivery::finalized_manifest::{
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+pub const VOICE_V2_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const VOICE_V2_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const RANGE_READ_BUF: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingDelivery {
@@ -26,13 +31,12 @@ pub struct ReceiptRequestBody {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StemRangeResponse {
+pub struct StemRangeMeta {
     pub status: u16,
-    pub body: Vec<u8>,
-    pub content_range: Option<String>,
-    pub content_length: Option<u64>,
-    pub etag: Option<String>,
-    pub total_length: Option<u64>,
+    pub content_range: String,
+    pub content_length: u64,
+    pub etag: String,
+    pub total_length: u64,
 }
 
 pub trait VoiceV2Client: Send + Sync {
@@ -43,7 +47,8 @@ pub trait VoiceV2Client: Send + Sync {
         stem_id: &str,
         offset: u64,
         length: u64,
-    ) -> Result<StemRangeResponse, VoiceV2ClientError>;
+        writer: &mut dyn Write,
+    ) -> Result<StemRangeMeta, VoiceV2ClientError>;
     fn post_receipt(
         &self,
         session_id: &str,
@@ -117,6 +122,13 @@ pub fn parse_pending_response(body: &Value) -> Result<Vec<PendingDelivery>, Voic
 }
 
 pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    parse_retry_after_at(headers, Utc::now())
+}
+
+pub fn parse_retry_after_at(
+    headers: &reqwest::header::HeaderMap,
+    now: DateTime<Utc>,
+) -> Option<Duration> {
     let raw = headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())?;
@@ -124,7 +136,6 @@ pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duratio
         return Some(Duration::from_secs(secs.min(60)));
     }
     if let Ok(dt) = DateTime::parse_from_rfc2822(raw) {
-        let now = Utc::now();
         let target = dt.with_timezone(&Utc);
         if target > now {
             let secs = (target - now).num_seconds().max(0) as u64;
@@ -134,7 +145,11 @@ pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duratio
     None
 }
 
-pub fn map_http_status(status: u16, code: Option<&str>) -> VoiceV2ClientError {
+pub fn map_http_status(
+    status: u16,
+    code: Option<&str>,
+    retry_after: Option<Duration>,
+) -> VoiceV2ClientError {
     match status {
         401 => VoiceV2ClientError::Unauthorized,
         403 => VoiceV2ClientError::ForbiddenBinding,
@@ -142,8 +157,10 @@ pub fn map_http_status(status: u16, code: Option<&str>) -> VoiceV2ClientError {
         409 if code == Some("receipt_conflict") => VoiceV2ClientError::ReceiptConflict,
         409 if code == Some("identity_conflict") => VoiceV2ClientError::IdentityConflict,
         416 => VoiceV2ClientError::InvalidRange,
-        429 | 503 | 500 | 502 | 504 => VoiceV2ClientError::Network(format!("HTTP {status}")),
-        _ => VoiceV2ClientError::Network(format!("HTTP {status}")),
+        429 | 503 | 500 | 502 | 504 => {
+            VoiceV2ClientError::network(format!("HTTP {status}"), retry_after)
+        }
+        _ => VoiceV2ClientError::network(format!("HTTP {status}"), retry_after),
     }
 }
 
@@ -153,45 +170,78 @@ pub fn parse_error_code(body: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-pub fn validate_stem_range_response(
-    resp: &StemRangeResponse,
+pub fn validate_stem_range_meta(
+    meta: &StemRangeMeta,
     offset: u64,
     expected_total: u64,
     expected_sha: &str,
+    bytes_written: u64,
 ) -> Result<(), VoiceV2ClientError> {
-    if resp.status != 206 {
+    if meta.status != 206 {
         return Err(VoiceV2ClientError::RangeMismatch(format!(
             "expected 206 got {}",
-            resp.status
+            meta.status
         )));
     }
-    let len = resp.body.len() as u64;
-    if resp.content_length != Some(len) {
+    if bytes_written == 0 {
+        return Err(VoiceV2ClientError::RangeMismatch("empty range body".into()));
+    }
+    if meta.content_length != bytes_written {
         return Err(VoiceV2ClientError::RangeMismatch("content-length".into()));
     }
-    let end = offset + len - 1;
-    let cr = resp
-        .content_range
-        .as_deref()
-        .ok_or_else(|| VoiceV2ClientError::RangeMismatch("content-range missing".into()))?;
+    let end = offset
+        .checked_add(bytes_written)
+        .and_then(|v| v.checked_sub(1))
+        .ok_or_else(|| VoiceV2ClientError::RangeMismatch("range overflow".into()))?;
     let expected_cr = format!("bytes {offset}-{end}/{expected_total}");
-    if cr != expected_cr {
+    if meta.content_range != expected_cr {
         return Err(VoiceV2ClientError::RangeMismatch(format!(
-            "content-range {cr} != {expected_cr}"
+            "content-range {} != {expected_cr}",
+            meta.content_range
         )));
     }
-    if resp.total_length != Some(expected_total) {
+    if meta.total_length != expected_total {
         return Err(VoiceV2ClientError::RangeMismatch("total length".into()));
     }
-    let etag = resp
-        .etag
-        .as_deref()
-        .ok_or_else(|| VoiceV2ClientError::RangeMismatch("etag missing".into()))?;
     let quoted = format!("\"{expected_sha}\"");
-    if etag != quoted {
+    if meta.etag != quoted {
         return Err(VoiceV2ClientError::RangeMismatch("etag mismatch".into()));
     }
     Ok(())
+}
+
+pub fn read_bounded_range_body<R: Read>(
+    mut reader: R,
+    expected_len: u64,
+    max_cap: u64,
+    writer: &mut dyn Write,
+) -> Result<u64, VoiceV2ClientError> {
+    if expected_len == 0 || expected_len > max_cap {
+        return Err(VoiceV2ClientError::InvalidRange);
+    }
+    let mut remaining = expected_len;
+    let mut buf = vec![0u8; RANGE_READ_BUF.min(expected_len as usize).max(1)];
+    let mut written = 0u64;
+    while remaining > 0 {
+        let chunk = remaining.min(buf.len() as u64) as usize;
+        let n = reader
+            .read(&mut buf[..chunk])
+            .map_err(|e| VoiceV2ClientError::network(e.to_string(), None))?;
+        if n == 0 {
+            return Err(VoiceV2ClientError::RangeMismatch("early EOF".into()));
+        }
+        writer
+            .write_all(&buf[..n])
+            .map_err(|e| VoiceV2ClientError::RangeMismatch(e.to_string()))?;
+        written += n as u64;
+        remaining -= n as u64;
+    }
+    let mut extra = [0u8; 1];
+    match reader.read(&mut extra) {
+        Ok(0) => Ok(written),
+        Ok(_) => Err(VoiceV2ClientError::RangeMismatch("extra body byte".into())),
+        Err(e) => Err(VoiceV2ClientError::network(e.to_string(), None)),
+    }
 }
 
 pub struct HttpVoiceV2Client {
@@ -203,7 +253,8 @@ pub struct HttpVoiceV2Client {
 impl HttpVoiceV2Client {
     pub fn new(base_url: impl Into<String>, bearer: impl Into<String>) -> Self {
         let http = reqwest::blocking::Client::builder()
-            .timeout(crate::delegated_lifecycle::SYNDICATE_HTTP_TIMEOUT)
+            .connect_timeout(VOICE_V2_CONNECT_TIMEOUT)
+            .timeout(VOICE_V2_REQUEST_TIMEOUT)
             .build()
             .expect("voice v2 blocking HTTP client");
         Self {
@@ -227,7 +278,7 @@ impl VoiceV2Client for HttpVoiceV2Client {
             .header("Authorization", self.auth_header())
             .header("Accept", "application/json")
             .send()
-            .map_err(|e| VoiceV2ClientError::Network(e.to_string()))?;
+            .map_err(|e| VoiceV2ClientError::network(e.to_string(), None))?;
         if let Some(wait) = parse_retry_after(res.headers()) {
             return Err(VoiceV2ClientError::RetryAfter(wait));
         }
@@ -239,6 +290,7 @@ impl VoiceV2Client for HttpVoiceV2Client {
             return Err(map_http_status(
                 status.as_u16(),
                 parse_error_code(&body).as_deref(),
+                None,
             ));
         }
         parse_pending_response(&body)
@@ -250,7 +302,11 @@ impl VoiceV2Client for HttpVoiceV2Client {
         stem_id: &str,
         offset: u64,
         length: u64,
-    ) -> Result<StemRangeResponse, VoiceV2ClientError> {
+        writer: &mut dyn Write,
+    ) -> Result<StemRangeMeta, VoiceV2ClientError> {
+        if length == 0 || length > super::VOICE_V2_MAX_CHUNK_BYTES {
+            return Err(VoiceV2ClientError::InvalidRange);
+        }
         let url = format!(
             "{}/api/stream-sync/voice/v2/deliveries/{}/stems/{}?offset={}&length={}",
             self.base_url, session_id, stem_id, offset, length
@@ -260,8 +316,9 @@ impl VoiceV2Client for HttpVoiceV2Client {
             .get(url)
             .header("Authorization", self.auth_header())
             .send()
-            .map_err(|e| VoiceV2ClientError::Network(e.to_string()))?;
-        if let Some(wait) = parse_retry_after(res.headers()) {
+            .map_err(|e| VoiceV2ClientError::network(e.to_string(), None))?;
+        let retry_after = parse_retry_after(res.headers());
+        if let Some(wait) = retry_after {
             return Err(VoiceV2ClientError::RetryAfter(wait));
         }
         let status = res.status().as_u16();
@@ -270,36 +327,51 @@ impl VoiceV2Client for HttpVoiceV2Client {
         }
         if !res.status().is_success() && status != 206 {
             let body: Value = res.json().unwrap_or(Value::Null);
-            return Err(map_http_status(status, parse_error_code(&body).as_deref()));
+            return Err(map_http_status(
+                status,
+                parse_error_code(&body).as_deref(),
+                retry_after,
+            ));
         }
         let content_range = res
             .headers()
             .get(reqwest::header::CONTENT_RANGE)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .ok_or_else(|| VoiceV2ClientError::RangeMismatch("content-range missing".into()))?
+            .to_string();
         let content_length = res
             .headers()
             .get(reqwest::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse().ok());
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| VoiceV2ClientError::RangeMismatch("content-length missing".into()))?;
+        if content_length == 0 || content_length > super::VOICE_V2_MAX_CHUNK_BYTES {
+            return Err(VoiceV2ClientError::RangeMismatch(
+                "content-length cap".into(),
+            ));
+        }
+        if content_length != length {
+            return Err(VoiceV2ClientError::RangeMismatch(
+                "content-length != requested".into(),
+            ));
+        }
         let etag = res
             .headers()
             .get(reqwest::header::ETAG)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .ok_or_else(|| VoiceV2ClientError::RangeMismatch("etag missing".into()))?
+            .to_string();
         let total_length = content_range
-            .as_deref()
-            .and_then(|cr| cr.rsplit('/').next())
-            .and_then(|s| s.parse().ok());
-        let body = res
-            .bytes()
-            .map_err(|e| VoiceV2ClientError::Network(e.to_string()))?
-            .to_vec();
-        Ok(StemRangeResponse {
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| VoiceV2ClientError::RangeMismatch("total in content-range".into()))?;
+        let written =
+            read_bounded_range_body(res, content_length, super::VOICE_V2_MAX_CHUNK_BYTES, writer)?;
+        Ok(StemRangeMeta {
             status,
-            body,
             content_range,
-            content_length,
+            content_length: written,
             etag,
             total_length,
         })
@@ -326,8 +398,9 @@ impl VoiceV2Client for HttpVoiceV2Client {
                 "localPublicationState": body.local_publication_state,
             }))
             .send()
-            .map_err(|e| VoiceV2ClientError::Network(e.to_string()))?;
-        if let Some(wait) = parse_retry_after(res.headers()) {
+            .map_err(|e| VoiceV2ClientError::network(e.to_string(), None))?;
+        let retry_after = parse_retry_after(res.headers());
+        if let Some(wait) = retry_after {
             return Err(VoiceV2ClientError::RetryAfter(wait));
         }
         let status = res.status();
@@ -336,12 +409,14 @@ impl VoiceV2Client for HttpVoiceV2Client {
             return Err(map_http_status(
                 status.as_u16(),
                 parse_error_code(&parsed).as_deref(),
+                retry_after,
             ));
         }
         if !status.is_success() {
             return Err(map_http_status(
                 status.as_u16(),
                 parse_error_code(&parsed).as_deref(),
+                retry_after,
             ));
         }
         if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
@@ -406,7 +481,8 @@ impl VoiceV2Client for MockVoiceV2Client {
         stem_id: &str,
         offset: u64,
         length: u64,
-    ) -> Result<StemRangeResponse, VoiceV2ClientError> {
+        writer: &mut dyn Write,
+    ) -> Result<StemRangeMeta, VoiceV2ClientError> {
         let state = self.inner.lock().unwrap();
         if state.fail_next_range {
             return Err(VoiceV2ClientError::RangeMismatch("injected".into()));
@@ -419,9 +495,17 @@ impl VoiceV2Client for MockVoiceV2Client {
         if offset >= file.len() as u64 {
             return Err(VoiceV2ClientError::InvalidRange);
         }
+        if length == 0 || length > super::VOICE_V2_MAX_CHUNK_BYTES {
+            return Err(VoiceV2ClientError::InvalidRange);
+        }
         let end = (offset + length).min(file.len() as u64);
-        let slice = file[offset as usize..end as usize].to_vec();
-        let slice_len = slice.len() as u64;
+        let slice_len = end - offset;
+        if slice_len == 0 {
+            return Err(VoiceV2ClientError::InvalidRange);
+        }
+        writer
+            .write_all(&file[offset as usize..end as usize])
+            .map_err(|e| VoiceV2ClientError::RangeMismatch(e.to_string()))?;
         let total = file.len() as u64;
         let end_inclusive = offset + slice_len - 1;
         use sha2::Digest;
@@ -429,13 +513,12 @@ impl VoiceV2Client for MockVoiceV2Client {
             "\"{}\"",
             crate::voice_delivery::hash::hex_digest(&sha2::Sha256::digest(file.as_slice()))
         );
-        Ok(StemRangeResponse {
+        Ok(StemRangeMeta {
             status: 206,
-            body: slice,
-            content_range: Some(format!("bytes {offset}-{end_inclusive}/{total}")),
-            content_length: Some(slice_len),
-            etag: Some(etag),
-            total_length: Some(total),
+            content_range: format!("bytes {offset}-{end_inclusive}/{total}"),
+            content_length: slice_len,
+            etag,
+            total_length: total,
         })
     }
 
@@ -482,5 +565,48 @@ mod client_parse_tests {
             VoiceV2ClientError::Unauthorized.class(),
             VoiceV2ErrorClass::Terminal
         );
+    }
+
+    #[test]
+    fn retry_after_http_date_uses_injected_clock() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        let now = chrono::DateTime::parse_from_rfc2822("Wed, 21 Oct 2015 07:00:00 GMT")
+            .unwrap()
+            .with_timezone(&Utc);
+        let wait = parse_retry_after_at(&headers, now).unwrap();
+        assert_eq!(wait, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn bounded_reader_rejects_extra_byte() {
+        let data = b"hello";
+        let mut out = Vec::new();
+        let err = read_bounded_range_body(&data[..], 4, 8, &mut out).unwrap_err();
+        assert!(matches!(err, VoiceV2ClientError::RangeMismatch(_)));
+    }
+
+    #[test]
+    fn bounded_reader_rejects_early_eof() {
+        let data = b"hi";
+        let mut out = Vec::new();
+        let err = read_bounded_range_body(&data[..], 4, 8, &mut out).unwrap_err();
+        assert!(matches!(err, VoiceV2ClientError::RangeMismatch(_)));
+    }
+
+    #[test]
+    fn validate_meta_rejects_zero_length() {
+        let meta = StemRangeMeta {
+            status: 206,
+            content_range: "bytes 0-0/10".into(),
+            content_length: 0,
+            etag: "\"x\"".into(),
+            total_length: 10,
+        };
+        assert!(validate_stem_range_meta(&meta, 0, 10, "x", 0).is_err());
     }
 }
