@@ -16,18 +16,22 @@ Under the user-selected **recording parent** (`recording_parent`):
 
 ## API (Syndicate)
 
-Syndicate shared protocol reference: ChatBot git **`70b50a07`** (`@syndicate/voice-delivery-v2-protocol`). Pending item exact keys: `{ sessionId, manifestDigest, sealedAt, manifest }`; cross-language golden digest fixture lives in `crates/stream-sync-core/tests/fixtures/voice_delivery_v2_pending_contract.json`.
+Syndicate shared protocol reference: ChatBot git **`f2b2214f`** (`@syndicate/voice-delivery-v2-protocol`). Pending item exact keys: `{ sessionId, manifestDigest, sealedAt, manifest }`; cross-language golden digest fixture lives in `crates/stream-sync-core/tests/fixtures/voice_delivery_v2_pending_contract.json`.
+
+Syndicate v2 uses **private R2 transport** (no Render persistent disks for stem bytes). The API does not stream stem bodies directly.
 
 - `GET /api/stream-sync/voice/v2/deliveries/pending?limit=N` — strict pending list with embedded finalized manifest per item.
-- `GET /api/stream-sync/voice/v2/deliveries/:sessionId/stems/:stemId?offset=&length=` — requires `206`, `Content-Range`, `ETag` stem SHA, bounded 8 MiB ranges.
+- `GET /api/stream-sync/voice/v2/deliveries/:sessionId/stems/:stemId` — authenticated; requires `Range: bytes=<start>-<end>` (no `offset`/`length` query). Responds **307** to a short-lived presigned **HTTPS** R2 URL for the same byte range. StreamSync follows **once**, strips `Authorization` and control headers on the R2 hop, requires **206** with exact `Content-Range` / `Content-Length`, streams into checkpoints. R2 `ETag` is opaque (multipart); full stem SHA-256 is verified locally via `PartialStemWriter` before publish.
 - `POST /api/stream-sync/voice/v2/deliveries/:sessionId/receipt` — after local `Published` ledger state.
 
-Bearer: existing SDK host token (`connection_key_authorization`).
+Bearer: existing SDK host token (`connection_key_authorization`). Pending and receipt routes must not follow cross-host redirects.
+
+Bot/API retention: bot transient artifacts remain until API **receipt** and the configured retention window (default **24h**, `VOICE_DELIVERY_BOT_RETENTION_HOURS`) before the bot **completed** tombstone.
 
 ## Retry / recovery
 
-- Retryable: network, `Retry-After`, 429/503/5xx.
-- Terminal: manifest/identity/range/ETag mismatch → quarantine local delivery, queue continues.
+- Retryable: network, `Retry-After`, 429/503/5xx, expired presigned R2 **401/403** (fresh API redirect for the same range, bounded backoff; never reuse the old presigned URL).
+- Terminal: manifest/identity/range mismatch, insecure redirect target, binding/auth errors → quarantine local delivery, queue continues.
 - Crash restart: reopen `DeliverySessionGuard`, resume checkpoints/partials, recover `PublishIntent` / `Published`, retry receipt without re-download.
 
 ## Status JSON
@@ -41,12 +45,13 @@ cd crates\stream-sync-desktop
 npx tauri build --bundles nsis --ci --no-sign --config tauri.ci.conf.json
 ```
 
-On a Windows host with NTFS recording folder: connect SDK key, seal a test session on Syndicate staging, confirm pending → download → publish path under `syndicate-discord-voice/<guildId>/`, receipt accepted, no `chunks/pending` traffic (proxy log).
+On a Windows host with NTFS recording folder: connect SDK key, seal a test session on Syndicate staging, confirm pending → R2 redirect download → publish path under `syndicate-discord-voice/<guildId>/`, receipt accepted, no `chunks/pending` traffic (proxy log).
 
 ## Linux dev
 
 ```bash
+cargo test -p stream-sync-core voice_delivery_v2_r2_redirect
 cargo test -p stream-sync-core voice_delivery::
-cargo clippy -p stream-sync-core -- -D warnings
+cargo clippy --workspace -- -D warnings
 npm test
 ```

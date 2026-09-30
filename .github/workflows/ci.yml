@@ -36,6 +36,7 @@ jobs:
           run_suite 'voice_delivery::manifest::'
           run_suite 'voice_delivery::records::'
           run_suite 'voice_delivery::ingest::'
+          cargo test -p stream-sync-core --test voice_delivery_v2_r2_redirect -- --nocapture
           run_suite 'voice_delivery::marker::'
           run_suite 'voice_delivery::session::'
           run_suite 'voice_delivery::state::'
