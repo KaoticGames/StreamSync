@@ -376,3 +376,68 @@ fn receipt_rejects_cross_host_redirect() {
         .unwrap_err();
     assert!(matches!(err, VoiceV2ClientError::InsecureRedirect(_)));
 }
+
+#[test]
+fn presigned_redirect_network_error_omits_url_and_signing_material() {
+    use stream_sync_core::voice_delivery::OrchestratorError;
+
+    const TOPSECRET: &str = "TOPSECRET";
+    const AKIA: &str = "AKIAEXAMPLEKEY";
+    const SECTOK: &str = "sectok";
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let presigned = format!(
+        "http://127.0.0.1:{dead_port}/obj?X-Amz-Signature={TOPSECRET}&X-Amz-Credential={AKIA}&token={SECTOK}"
+    );
+    let api = MiniServer::spawn(move |_, stream| {
+        write_response(
+            stream,
+            "307 Temporary Redirect",
+            &[("Location", &presigned)],
+            b"",
+        );
+    });
+    let client = test_client(&api.addr, dead_port);
+    let mut out = Vec::new();
+    let err = client
+        .fetch_stem_range(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "user1",
+            0,
+            4,
+            &mut out,
+        )
+        .unwrap_err();
+
+    let display = err.to_string();
+    let debug = format!("{err:?}");
+    for leaked in [
+        TOPSECRET,
+        AKIA,
+        SECTOK,
+        "X-Amz-Signature=",
+        dead_port.to_string().as_str(),
+    ] {
+        assert!(
+            !display.contains(leaked),
+            "display leaked {leaked}: {display}"
+        );
+        assert!(!debug.contains(leaked), "debug leaked {leaked}: {debug}");
+    }
+    assert!(
+        matches!(err, VoiceV2ClientError::Network { .. }),
+        "expected network error, got {err:?}"
+    );
+
+    let orch = OrchestratorError::ClientRetryable(err);
+    let orch_display = orch.to_string();
+    let orch_debug = format!("{orch:?}");
+    for leaked in [TOPSECRET, AKIA, SECTOK] {
+        assert!(!orch_display.contains(leaked));
+        assert!(!orch_debug.contains(leaked));
+    }
+    assert!(orch_display.contains("network"));
+}

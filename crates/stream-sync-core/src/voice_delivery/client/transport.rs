@@ -1,4 +1,4 @@
-use super::errors::VoiceV2ClientError;
+use super::errors::{network_from_reqwest, parse_from_reqwest, VoiceV2ClientError};
 use super::redirect::{
     redirect_status, validate_stem_redirect_location, VOICE_V2_PRESIGN_RETRY_BACKOFF,
     VOICE_V2_PRESIGN_RETRY_MAX, VOICE_V2_STEM_REDIRECT_MAX,
@@ -416,9 +416,7 @@ impl HttpVoiceV2Client {
         )?;
         let mut req = self.http.get(target);
         req = req.header(reqwest::header::RANGE, range);
-        let res = req
-            .send()
-            .map_err(|e| VoiceV2ClientError::network(e.to_string(), None))?;
+        let res = req.send().map_err(network_from_reqwest)?;
         if redirect_status(res.status().as_u16()) {
             let _ = res.bytes();
             return Err(VoiceV2ClientError::InsecureRedirect(format!(
@@ -450,15 +448,13 @@ impl VoiceV2Client for HttpVoiceV2Client {
             .header("Authorization", self.auth_header())
             .header("Accept", "application/json")
             .send()
-            .map_err(|e| VoiceV2ClientError::network(e.to_string(), None))?;
+            .map_err(network_from_reqwest)?;
         if let Some(wait) = parse_retry_after(res.headers()) {
             return Err(VoiceV2ClientError::RetryAfter(wait));
         }
         let res = self.reject_api_redirect(res)?;
         let status = res.status();
-        let body: Value = res
-            .json()
-            .map_err(|e| VoiceV2ClientError::Parse(e.to_string()))?;
+        let body: Value = res.json().map_err(parse_from_reqwest)?;
         if !status.is_success() {
             return Err(map_http_status(
                 status.as_u16(),
@@ -494,7 +490,7 @@ impl VoiceV2Client for HttpVoiceV2Client {
                 .header("Authorization", self.auth_header())
                 .header(reqwest::header::RANGE, &range)
                 .send()
-                .map_err(|e| VoiceV2ClientError::network(e.to_string(), None))?;
+                .map_err(network_from_reqwest)?;
             let retry_after = parse_retry_after(res.headers());
             if let Some(wait) = retry_after {
                 return Err(VoiceV2ClientError::RetryAfter(wait));
@@ -558,7 +554,7 @@ impl VoiceV2Client for HttpVoiceV2Client {
                 "localPublicationState": body.local_publication_state,
             }))
             .send()
-            .map_err(|e| VoiceV2ClientError::network(e.to_string(), None))?;
+            .map_err(network_from_reqwest)?;
         let retry_after = parse_retry_after(res.headers());
         if let Some(wait) = retry_after {
             return Err(VoiceV2ClientError::RetryAfter(wait));
