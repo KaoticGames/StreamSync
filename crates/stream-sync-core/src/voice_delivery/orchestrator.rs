@@ -248,14 +248,8 @@ impl FinalizedVoiceDelivery {
                 )
                 .map_err(map_client_err)?;
             let bytes = cursor.into_inner();
-            validate_stem_range_meta(
-                &meta,
-                offset,
-                stem.wav_bytes,
-                &stem.sha256,
-                bytes.len() as u64,
-            )
-            .map_err(map_client_err)?;
+            validate_stem_range_meta(&meta, offset, stem.wav_bytes, bytes.len() as u64)
+                .map_err(map_client_err)?;
             writer
                 .write_contiguous(offset, &bytes)
                 .map_err(|e| OrchestratorError::Other(e.to_string()))?;
@@ -507,6 +501,41 @@ mod orchestrator_e2e {
             "expected corrupt receipt failure, got: {msg}"
         );
         assert_eq!(mock.receipt_calls(), 1);
+    }
+
+    #[test]
+    fn wrong_stem_bytes_fail_after_download_despite_multipart_etag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_wav, sha) = build_wav_bytes();
+        let mut raw = minimal_wav_value();
+        raw["stems"][0]["sha256"] = serde_json::json!(sha);
+        let manifest = parse_syndicate_finalized_manifest(&raw).unwrap();
+        let digest = compute_finalized_manifest_digest(&manifest);
+        let pending = PendingDelivery {
+            session_id: manifest.session_id.clone(),
+            manifest_digest: digest,
+            sealed_at: "2020-01-01T00:00:00.000Z".into(),
+            manifest,
+        };
+        let mock = MockVoiceV2Client::new();
+        mock.set_stem_bytes(
+            &pending.session_id,
+            "user1",
+            b"wrong-bytes-not-wav".to_vec(),
+        );
+        mock.set_pending(vec![pending.clone()]);
+        let orch = FinalizedVoiceDelivery::open_recording_parent(tmp.path())
+            .unwrap()
+            .with_device_id("device-test");
+        let mut phase = DeliveryPhase::Waiting;
+        let err = orch
+            .deliver_pending(&mock, &pending, &mut phase)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hash") || msg.contains("WAV") || msg.contains("mismatch"),
+            "{msg}"
+        );
     }
 
     #[test]

@@ -1,4 +1,8 @@
 use super::errors::VoiceV2ClientError;
+use super::redirect::{
+    redirect_status, validate_stem_redirect_location, VOICE_V2_PRESIGN_RETRY_BACKOFF,
+    VOICE_V2_PRESIGN_RETRY_MAX, VOICE_V2_STEM_REDIRECT_MAX,
+};
 use crate::voice_delivery::finalized_manifest::{
     compute_finalized_manifest_digest, parse_syndicate_finalized_manifest,
     SyndicateFinalizedManifest,
@@ -174,7 +178,6 @@ pub fn validate_stem_range_meta(
     meta: &StemRangeMeta,
     offset: u64,
     expected_total: u64,
-    expected_sha: &str,
     bytes_written: u64,
 ) -> Result<(), VoiceV2ClientError> {
     if meta.status != 206 {
@@ -202,10 +205,6 @@ pub fn validate_stem_range_meta(
     }
     if meta.total_length != expected_total {
         return Err(VoiceV2ClientError::RangeMismatch("total length".into()));
-    }
-    let quoted = format!("\"{expected_sha}\"");
-    if meta.etag != quoted {
-        return Err(VoiceV2ClientError::RangeMismatch("etag mismatch".into()));
     }
     Ok(())
 }
@@ -248,90 +247,115 @@ pub struct HttpVoiceV2Client {
     base_url: String,
     bearer: String,
     http: reqwest::blocking::Client,
+    stem_redirect_allowlist: Vec<String>,
+    allow_http_stem_redirects: bool,
+    presign_retry_backoff: Duration,
 }
 
 impl HttpVoiceV2Client {
     pub fn new(base_url: impl Into<String>, bearer: impl Into<String>) -> Self {
+        Self::build(base_url, bearer, Self::default_options())
+    }
+
+    fn default_options() -> HttpVoiceV2ClientOptions {
+        HttpVoiceV2ClientOptions {
+            stem_redirect_allowlist: Vec::new(),
+            allow_http_stem_redirects: false,
+            presign_retry_backoff: VOICE_V2_PRESIGN_RETRY_BACKOFF,
+        }
+    }
+
+    fn build(
+        base_url: impl Into<String>,
+        bearer: impl Into<String>,
+        options: HttpVoiceV2ClientOptions,
+    ) -> Self {
         let http = reqwest::blocking::Client::builder()
             .connect_timeout(VOICE_V2_CONNECT_TIMEOUT)
             .timeout(VOICE_V2_REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("voice v2 blocking HTTP client");
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             bearer: bearer.into(),
             http,
+            stem_redirect_allowlist: options.stem_redirect_allowlist,
+            allow_http_stem_redirects: options.allow_http_stem_redirects,
+            presign_retry_backoff: options.presign_retry_backoff,
         }
+    }
+
+    /// Integration tests only: allow `http://127.0.0.1:<port>` presigned targets.
+    pub fn with_stem_redirect_allowlist(mut self, hosts: Vec<String>) -> Self {
+        self.stem_redirect_allowlist = hosts;
+        self
+    }
+
+    pub fn with_test_http_stem_redirects(mut self, allow: bool) -> Self {
+        self.allow_http_stem_redirects = allow;
+        self
+    }
+
+    pub fn with_presign_retry_backoff(mut self, backoff: Duration) -> Self {
+        self.presign_retry_backoff = backoff;
+        self
     }
 
     fn auth_header(&self) -> String {
         crate::delegated_lifecycle::connection_key_authorization(&self.bearer)
     }
-}
 
-impl VoiceV2Client for HttpVoiceV2Client {
-    fn fetch_pending(&self, limit: u32) -> Result<Vec<PendingDelivery>, VoiceV2ClientError> {
-        let url = format!("{}{}?limit={}", self.base_url, super::PENDING_PATH, limit);
-        let res = self
-            .http
-            .get(url)
-            .header("Authorization", self.auth_header())
-            .header("Accept", "application/json")
-            .send()
-            .map_err(|e| VoiceV2ClientError::network(e.to_string(), None))?;
-        if let Some(wait) = parse_retry_after(res.headers()) {
-            return Err(VoiceV2ClientError::RetryAfter(wait));
-        }
-        let status = res.status();
-        let body: Value = res
-            .json()
-            .map_err(|e| VoiceV2ClientError::Parse(e.to_string()))?;
-        if !status.is_success() {
-            return Err(map_http_status(
-                status.as_u16(),
-                parse_error_code(&body).as_deref(),
-                None,
-            ));
-        }
-        parse_pending_response(&body)
+    fn stem_url(&self, session_id: &str, stem_id: &str) -> String {
+        format!(
+            "{}/api/stream-sync/voice/v2/deliveries/{session_id}/stems/{stem_id}",
+            self.base_url
+        )
     }
 
-    fn fetch_stem_range(
+    fn range_header_value(offset: u64, length: u64) -> Result<String, VoiceV2ClientError> {
+        let end = offset
+            .checked_add(length)
+            .and_then(|v| v.checked_sub(1))
+            .ok_or(VoiceV2ClientError::InvalidRange)?;
+        Ok(format!("bytes={offset}-{end}"))
+    }
+
+    fn reject_api_redirect(
         &self,
-        session_id: &str,
-        stem_id: &str,
-        offset: u64,
+        res: reqwest::blocking::Response,
+    ) -> Result<reqwest::blocking::Response, VoiceV2ClientError> {
+        let status = res.status().as_u16();
+        if !redirect_status(status) {
+            return Ok(res);
+        }
+        let _ = res.bytes();
+        Err(VoiceV2ClientError::InsecureRedirect(
+            "redirect not allowed for route".into(),
+        ))
+    }
+
+    fn parse_stem_206_response(
+        &self,
+        res: reqwest::blocking::Response,
         length: u64,
         writer: &mut dyn Write,
     ) -> Result<StemRangeMeta, VoiceV2ClientError> {
-        if length == 0 || length > super::VOICE_V2_MAX_CHUNK_BYTES {
-            return Err(VoiceV2ClientError::InvalidRange);
-        }
-        let url = format!(
-            "{}/api/stream-sync/voice/v2/deliveries/{}/stems/{}?offset={}&length={}",
-            self.base_url, session_id, stem_id, offset, length
-        );
-        let res = self
-            .http
-            .get(url)
-            .header("Authorization", self.auth_header())
-            .send()
-            .map_err(|e| VoiceV2ClientError::network(e.to_string(), None))?;
-        let retry_after = parse_retry_after(res.headers());
-        if let Some(wait) = retry_after {
-            return Err(VoiceV2ClientError::RetryAfter(wait));
-        }
         let status = res.status().as_u16();
         if status == 404 {
             return Err(VoiceV2ClientError::StemNotFound);
         }
-        if !res.status().is_success() && status != 206 {
-            let body: Value = res.json().unwrap_or(Value::Null);
-            return Err(map_http_status(
-                status,
-                parse_error_code(&body).as_deref(),
-                retry_after,
-            ));
+        if status != 206 {
+            let retry_after = parse_retry_after(res.headers());
+            if let Ok(body) = res.text() {
+                let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                return Err(map_http_status(
+                    status,
+                    parse_error_code(&parsed).as_deref(),
+                    retry_after,
+                ));
+            }
+            return Err(map_http_status(status, None, retry_after));
         }
         let content_range = res
             .headers()
@@ -359,7 +383,7 @@ impl VoiceV2Client for HttpVoiceV2Client {
             .headers()
             .get(reqwest::header::ETAG)
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| VoiceV2ClientError::RangeMismatch("etag missing".into()))?
+            .unwrap_or("")
             .to_string();
         let total_length = content_range
             .rsplit('/')
@@ -375,6 +399,142 @@ impl VoiceV2Client for HttpVoiceV2Client {
             etag,
             total_length,
         })
+    }
+
+    fn follow_stem_redirect(
+        &self,
+        location: &str,
+        range: &str,
+        writer: &mut dyn Write,
+        length: u64,
+    ) -> Result<StemRangeMeta, VoiceV2ClientError> {
+        let target = validate_stem_redirect_location(
+            location,
+            &self.base_url,
+            &self.stem_redirect_allowlist,
+            self.allow_http_stem_redirects,
+        )?;
+        let mut req = self.http.get(target);
+        req = req.header(reqwest::header::RANGE, range);
+        let res = req
+            .send()
+            .map_err(|e| VoiceV2ClientError::network(e.to_string(), None))?;
+        if redirect_status(res.status().as_u16()) {
+            let _ = res.bytes();
+            return Err(VoiceV2ClientError::InsecureRedirect(format!(
+                "too many redirects (max {VOICE_V2_STEM_REDIRECT_MAX})"
+            )));
+        }
+        let status = res.status().as_u16();
+        if status == 401 || status == 403 {
+            let _ = res.bytes();
+            return Err(VoiceV2ClientError::PresignDenied);
+        }
+        self.parse_stem_206_response(res, length, writer)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HttpVoiceV2ClientOptions {
+    stem_redirect_allowlist: Vec<String>,
+    allow_http_stem_redirects: bool,
+    presign_retry_backoff: Duration,
+}
+
+impl VoiceV2Client for HttpVoiceV2Client {
+    fn fetch_pending(&self, limit: u32) -> Result<Vec<PendingDelivery>, VoiceV2ClientError> {
+        let url = format!("{}{}?limit={}", self.base_url, super::PENDING_PATH, limit);
+        let res = self
+            .http
+            .get(url)
+            .header("Authorization", self.auth_header())
+            .header("Accept", "application/json")
+            .send()
+            .map_err(|e| VoiceV2ClientError::network(e.to_string(), None))?;
+        if let Some(wait) = parse_retry_after(res.headers()) {
+            return Err(VoiceV2ClientError::RetryAfter(wait));
+        }
+        let res = self.reject_api_redirect(res)?;
+        let status = res.status();
+        let body: Value = res
+            .json()
+            .map_err(|e| VoiceV2ClientError::Parse(e.to_string()))?;
+        if !status.is_success() {
+            return Err(map_http_status(
+                status.as_u16(),
+                parse_error_code(&body).as_deref(),
+                None,
+            ));
+        }
+        parse_pending_response(&body)
+    }
+
+    fn fetch_stem_range(
+        &self,
+        session_id: &str,
+        stem_id: &str,
+        offset: u64,
+        length: u64,
+        writer: &mut dyn Write,
+    ) -> Result<StemRangeMeta, VoiceV2ClientError> {
+        if length == 0 || length > super::VOICE_V2_MAX_CHUNK_BYTES {
+            return Err(VoiceV2ClientError::InvalidRange);
+        }
+        let range = Self::range_header_value(offset, length)?;
+        let url = self.stem_url(session_id, stem_id);
+        let mut last_presign_denied = VoiceV2ClientError::PresignDenied;
+
+        for attempt in 0..VOICE_V2_PRESIGN_RETRY_MAX {
+            if attempt > 0 {
+                std::thread::sleep(self.presign_retry_backoff);
+            }
+            let res = self
+                .http
+                .get(&url)
+                .header("Authorization", self.auth_header())
+                .header(reqwest::header::RANGE, &range)
+                .send()
+                .map_err(|e| VoiceV2ClientError::network(e.to_string(), None))?;
+            let retry_after = parse_retry_after(res.headers());
+            if let Some(wait) = retry_after {
+                return Err(VoiceV2ClientError::RetryAfter(wait));
+            }
+            let status = res.status().as_u16();
+            if status == 404 {
+                return Err(VoiceV2ClientError::StemNotFound);
+            }
+            if redirect_status(status) {
+                let location = res
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| {
+                        VoiceV2ClientError::InsecureRedirect("missing location".into())
+                    })?;
+                let _ = res.bytes();
+                match self.follow_stem_redirect(&location, &range, writer, length) {
+                    Ok(meta) => return Ok(meta),
+                    Err(VoiceV2ClientError::PresignDenied) => {
+                        last_presign_denied = VoiceV2ClientError::PresignDenied;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            if status != 206 {
+                let body: Value = res.json().unwrap_or(Value::Null);
+                return Err(map_http_status(
+                    status,
+                    parse_error_code(&body).as_deref(),
+                    retry_after,
+                ));
+            }
+            return self.parse_stem_206_response(res, length, writer);
+        }
+        Err(last_presign_denied)
     }
 
     fn post_receipt(
@@ -403,6 +563,7 @@ impl VoiceV2Client for HttpVoiceV2Client {
         if let Some(wait) = retry_after {
             return Err(VoiceV2ClientError::RetryAfter(wait));
         }
+        let res = self.reject_api_redirect(res)?;
         let status = res.status();
         let parsed: Value = res.json().unwrap_or(Value::Null);
         if status == 409 {
@@ -609,6 +770,18 @@ mod client_parse_tests {
     }
 
     #[test]
+    fn validate_meta_accepts_opaque_multipart_etag() {
+        let meta = StemRangeMeta {
+            status: 206,
+            content_range: "bytes 0-3/8".into(),
+            content_length: 4,
+            etag: "\"abc-2\"".into(),
+            total_length: 8,
+        };
+        validate_stem_range_meta(&meta, 0, 8, 4).unwrap();
+    }
+
+    #[test]
     fn validate_meta_rejects_zero_length() {
         let meta = StemRangeMeta {
             status: 206,
@@ -617,6 +790,6 @@ mod client_parse_tests {
             etag: "\"x\"".into(),
             total_length: 10,
         };
-        assert!(validate_stem_range_meta(&meta, 0, 10, "x", 0).is_err());
+        assert!(validate_stem_range_meta(&meta, 0, 10, 0).is_err());
     }
 }

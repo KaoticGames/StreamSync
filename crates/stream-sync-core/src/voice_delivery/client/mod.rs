@@ -1,6 +1,7 @@
 //! StreamSync host HTTP client for Syndicate voice delivery v2.
 
 mod errors;
+mod redirect;
 mod transport;
 
 pub use errors::{VoiceV2ClientError, VoiceV2ErrorClass};

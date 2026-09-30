@@ -26,6 +26,10 @@ pub enum VoiceV2ClientError {
     Parse(String),
     #[error("range response mismatch: {0}")]
     RangeMismatch(String),
+    #[error("insecure redirect: {0}")]
+    InsecureRedirect(String),
+    #[error("presigned stem access denied")]
+    PresignDenied,
     #[error("network: {message}")]
     Network {
         message: String,
@@ -49,7 +53,9 @@ impl VoiceV2ClientError {
             | VoiceV2ClientError::ReceiptConflict
             | VoiceV2ClientError::IdentityConflict
             | VoiceV2ClientError::Parse(_)
-            | VoiceV2ClientError::RangeMismatch(_) => VoiceV2ErrorClass::Terminal,
+            | VoiceV2ClientError::RangeMismatch(_)
+            | VoiceV2ClientError::InsecureRedirect(_) => VoiceV2ErrorClass::Terminal,
+            VoiceV2ClientError::PresignDenied => VoiceV2ErrorClass::Retryable,
         }
     }
 
