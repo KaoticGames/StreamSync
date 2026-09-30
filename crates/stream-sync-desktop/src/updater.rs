@@ -1,10 +1,51 @@
-//! Check-for-updates opens the Syndicate HTTPS page with this app's version.
-//! No client-shipped HMAC secret. The page compares `v` to Syndicate's current build.
+//! Update URL helpers and manifest validation for the in-app updater.
+//! The Syndicate HTTPS page remains the branded browser fallback.
 
 use reqwest::Url;
+use semver::Version;
 
 pub const DEFAULT_DOWNLOAD_PAGE: &str = "https://syndicateai.net/update";
 pub const UPDATE_APP_ID: &str = "stream-sync";
+pub const GITHUB_RELEASE_HOST: &str = "github.com";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateManifest {
+    pub version: String,
+    pub notes: String,
+    pub release_url: String,
+}
+
+/// Compare installed vs candidate semver. Returns true when candidate is newer.
+pub fn is_newer_version(current: &str, candidate: &str) -> Result<bool, String> {
+    let current = Version::parse(current).map_err(|e| e.to_string())?;
+    let candidate = Version::parse(candidate).map_err(|e| e.to_string())?;
+    Ok(candidate > current)
+}
+
+/// Fail closed on malformed or untrusted manifest metadata before offering an update.
+pub fn validate_update_manifest(
+    manifest: &UpdateManifest,
+    current_version: &str,
+) -> Result<(), String> {
+    Version::parse(&manifest.version).map_err(|_| "invalid manifest version".to_string())?;
+    if !is_newer_version(current_version, &manifest.version)? {
+        return Err("manifest version is not newer".into());
+    }
+    let url = Url::parse(&manifest.release_url).map_err(|_| "invalid release URL".to_string())?;
+    if url.scheme() != "https" {
+        return Err("release URL must use https".into());
+    }
+    if url.host_str() != Some(GITHUB_RELEASE_HOST) {
+        return Err("unexpected release host".into());
+    }
+    if !url.path().starts_with(&format!(
+        "/KaoticGames/StreamSync/releases/tag/v{}",
+        manifest.version
+    )) {
+        return Err("unexpected release path".into());
+    }
+    Ok(())
+}
 
 /// Resolve the public update page. HTTPS only; reject leftover HMAC query params.
 pub fn resolve_download_page(env_page: Option<&str>) -> Result<String, String> {

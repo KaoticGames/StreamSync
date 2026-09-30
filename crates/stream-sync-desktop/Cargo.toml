@@ -36,3 +36,7 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 rfd = "0.15"
+semver = "1.0.28"
+
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
+tauri-plugin-updater = "2.11.0"

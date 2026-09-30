@@ -17,11 +17,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use stream_sync_core::{
-    connection_key_events_url, disconnect_twitch, fs_secret_store, paths_for_root,
-    remove_file_durable, sync_live_identity, write_delegated_revoke_pending,
+    all_delegated_bundle_slot_keys, connection_key_events_url, disconnect_twitch, fs_secret_store,
+    paths_for_root, remove_file_durable, sync_live_identity, write_delegated_revoke_pending,
     write_delegated_revoked_tombstone, write_json, AppState, DelegatedSessionFile, OverlayConfig,
     OverlayServer, TeardownPhase, TwitchActiveMode, TwitchActiveModeFile, TwitchServices,
     MAX_DELEGATED_REVOCATION_DELAY, SYNDICATE_HTTP_TIMEOUT, SYNDICATE_SSE_READ_TIMEOUT,
+    TWITCH_DELEGATED_ACCESS_TOKEN_KEY, TWITCH_DELEGATED_CONNECTION_KEY, TWITCH_PERSONAL_ACCESS_KEY,
 };
 use tower::ServiceExt;
 
@@ -526,12 +527,41 @@ async fn restart_after_revoke_keeps_personal_selectable_not_delegated() {
     );
     assert!(restarted.paths.twitch_delegated_revoked.is_file());
     assert!(!restarted.paths.twitch_delegated.is_file());
+    assert!(!restarted.delegated_secret_files_remain().unwrap());
+    assert!(!restarted.delegated_authority_artifacts_remain().unwrap());
 
-    let disk: stream_sync_core::TwitchTokenFile =
-        serde_json::from_str(&std::fs::read_to_string(&restarted.paths.twitch_tokens).unwrap())
-            .unwrap();
-    assert_eq!(disk.login.as_deref(), Some("personal_user"));
-    assert!(disk.access_token.is_some());
+    let store = fs_secret_store(&userdata);
+    for key in all_delegated_bundle_slot_keys() {
+        assert!(
+            store.get(&key).unwrap().is_none(),
+            "revoked delegated bundle slot {key} must not survive restart"
+        );
+    }
+    assert!(store
+        .get(TWITCH_DELEGATED_CONNECTION_KEY)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get(TWITCH_DELEGATED_ACCESS_TOKEN_KEY)
+        .unwrap()
+        .is_none());
+
+    let hydrated = restarted.personal_tokens.read().await.clone();
+    assert_eq!(hydrated.access_token.as_deref(), Some("personal-at"));
+    assert_eq!(hydrated.login.as_deref(), Some("personal_user"));
+    assert_eq!(hydrated.user_id.as_deref(), Some("42"));
+    assert!(
+        hydrated.access_token.is_some() && hydrated.login.is_some(),
+        "personal identity must remain selectable after revoke + restart"
+    );
+
+    let raw = std::fs::read_to_string(&restarted.paths.twitch_tokens).unwrap();
+    assert!(!raw.contains("personal-at"));
+    assert!(raw.contains("personal_user"));
+    assert_eq!(
+        store.get(TWITCH_PERSONAL_ACCESS_KEY).unwrap().as_deref(),
+        Some(b"personal-at".as_slice())
+    );
 }
 
 #[test]
@@ -812,7 +842,11 @@ async fn startup_resumes_pending_revoke_cleanup_at_generation_zero() {
         &sample_session(1, "ssk_test_placeholder_resume_pending"),
     )
     .unwrap();
-    write_delegated_revoke_pending(&userdata.join("twitch-delegated.revoke-pending")).unwrap();
+    write_delegated_revoke_pending(
+        &userdata.join("twitch-delegated.revoke-marker-hw"),
+        &userdata.join("twitch-delegated.revoke-pending"),
+    )
+    .unwrap();
 
     let (_router, state, services) = build_app_at(userdata.clone(), 0).await;
     assert!(state.delegated.read().await.is_none());

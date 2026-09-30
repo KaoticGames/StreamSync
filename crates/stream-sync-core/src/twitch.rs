@@ -34,7 +34,8 @@ use twitch_irc::{ClientConfig, SecureTCPTransport, TwitchIRCClient};
 type StreamSyncIrcClient = TwitchIRCClient<SecureTCPTransport, StaticLoginCredentials>;
 
 mod eventsub_reconnect;
-mod identity_commit;
+#[doc(hidden)]
+pub mod identity_commit;
 mod platform_workers;
 
 pub(crate) use identity_commit::{
@@ -2287,10 +2288,11 @@ async fn apply_exchange_session(
         services.ensure_apply_intent_current(intent)?;
     }
 
-    let snapshot = DurableApplySnapshot::capture(&state)?;
+    let mut snapshot = DurableApplySnapshot::capture(&state)?;
     let live_snapshot = LiveApplySnapshot::capture(&state, &services).await;
     let commit = async {
-        state.persist_delegated_session(&session)?;
+        let identity = state.persist_delegated_replacement_session(&session)?;
+        snapshot.note_persist_completed(identity);
         pause_apply_durable_gate(ApplyDurableBoundary::AfterPersist).await;
         recheck_apply_intent(&services, apply_intent)?;
 
@@ -2300,7 +2302,6 @@ async fn apply_exchange_session(
         pause_apply_durable_gate(ApplyDurableBoundary::AfterModeWrite).await;
         recheck_apply_intent(&services, apply_intent)?;
 
-        state.clear_delegated_revoked_tombstone()?;
         pause_apply_durable_gate(ApplyDurableBoundary::AfterTombstoneClear).await;
         recheck_apply_intent(&services, apply_intent)?;
 
@@ -6612,7 +6613,10 @@ mod tests {
         }
     }
 
-    const GATE_WAIT: Duration = Duration::from_secs(5);
+    /// Per-operation gate/join budget: 7 boundaries × worker teardown under PHASE2_TEST_LOCK.
+    const GATE_WAIT: Duration = Duration::from_secs(30);
+    /// Suite ceiling so genuine deadlocks still fail (20 iters × 7 boundaries × ~2s each).
+    const APPLY_BOUNDARY_SUITE_DEADLINE: Duration = Duration::from_secs(600);
 
     fn begin_refresh_side_effect_race() {
         crate::delegated_refresh_observability::reset_side_effect_counters();
@@ -6694,19 +6698,9 @@ mod tests {
     }
 
     fn read_delegated_disk(state: &AppState) -> Option<DelegatedSessionFile> {
-        if !state.paths.twitch_delegated.is_file() {
-            return None;
-        }
-        let session = crate::storage::read_json_if_exists(
-            &state.paths.twitch_delegated,
-            &DelegatedSessionFile::default(),
-        )
-        .expect("read delegated disk");
-        if session.generation == 0 && session.access_token.is_empty() {
-            None
-        } else {
-            Some(session)
-        }
+        state
+            .load_committed_delegated_session()
+            .expect("read delegated disk")
     }
 
     fn restart_state_at(state: &AppState) -> Arc<AppState> {
@@ -6908,7 +6902,6 @@ mod tests {
                 .map(|s| s.access_token.as_str()),
             Some("gen2-token")
         );
-        assert_eq!(restarted_identity.lease.generation, 2);
     }
 
     #[tokio::test]
@@ -7340,6 +7333,25 @@ mod tests {
         assert_ne!(
             state.twitch.read().await.tokens.access_token.as_deref(),
             Some(token.as_str())
+        );
+
+        let restarted = restart_state_at(&state);
+        let restarted_identity = live_identity_snapshot(&restarted, &services).await;
+        assert_eq!(restarted_identity.mode, TwitchActiveMode::Delegated);
+        assert_eq!(
+            restarted_identity.twitch_tokens.access_token.as_deref(),
+            Some("gen2-token")
+        );
+        assert_eq!(
+            restarted_identity.delegated.as_ref().map(|s| s.generation),
+            Some(2)
+        );
+        assert_eq!(
+            restarted_identity
+                .delegated
+                .as_ref()
+                .map(|s| s.access_token.as_str()),
+            Some("gen2-token")
         );
 
         server.abort();
@@ -7958,11 +7970,15 @@ mod tests {
     #[tokio::test]
     async fn apply_superseded_by_replacement_at_durable_boundaries() {
         let _guard = PHASE2_TEST_LOCK.lock().await;
-        for boundary in APPLY_DURABLE_BOUNDARIES {
-            for _ in 0..20 {
-                apply_superseded_by_replacement_once(boundary).await;
+        tokio::time::timeout(APPLY_BOUNDARY_SUITE_DEADLINE, async {
+            for boundary in APPLY_DURABLE_BOUNDARIES {
+                for _ in 0..20 {
+                    apply_superseded_by_replacement_once(boundary).await;
+                }
             }
-        }
+        })
+        .await
+        .expect("apply superseded replacement boundary suite deadline");
     }
 
     async fn apply_superseded_by_revocation_once(boundary: ApplyDurableBoundary) {

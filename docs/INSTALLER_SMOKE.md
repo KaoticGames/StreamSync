@@ -2,10 +2,20 @@
 
 Run this on a Windows machine after installing a **rebuild** of the NSIS setup, not a git pull of an already-installed app.
 
-Manual — not automated in CI. Check each box on the build you are about to ship.
+Manual — not automated in CI. Check each box on the **draft** GitHub Release asset before approving publish.
+
+## Draft → publish
+
+- [ ] Download `StreamSync-windows-x86_64-setup.exe` from the draft Release (not a local folder build)
+- [ ] Verify `SHA256SUMS.txt` matches the installer hash
+- [ ] When signed updater artifacts are present, confirm `latest.json` is reachable over HTTPS on the draft Release
+- [ ] Approve the `streamsync-release` environment only after the checklist below passes
+
+## Functional smoke
 
 - [ ] Installer launches Stream Sync once; a second launch does not attach to a foreign process on the overlay port
-- [ ] Help → Check for updates opens `https://syndicateai.net/update?app=stream-sync&v=<this version>`. No update secret. Page compares to Syndicate's current version.
+- [ ] Help → **Check for updates** reports current / available / unable (forced check; no silent failure)
+- [ ] Modal **Later** suppresses the same version on next launch; **Open update page** opens `https://syndicateai.net/update?app=stream-sync&v=<this version>`
 - [ ] Twitch Personal connect completes (PKCE). Identity and scopes come from `/oauth2/validate`
 - [ ] Twitch takeover / Delegated connect still works. Personal and Delegated never run as two live identities
 - [ ] Kick connect works for the live identity

@@ -1,6 +1,7 @@
 //! Discord voice ingest worker + host heartbeat for delegated Stream Sync sessions.
 
 use crate::app_state::{AppState, DiscordVoiceLastWrite};
+use crate::config_types::VoiceDeliveryProtocol;
 use crate::delegated_lifecycle::{
     clear_finished_generation_task, connection_key_authorization, generation_task_alive,
     install_generation_task, release_generation_slot_if_owned,
@@ -26,6 +27,10 @@ const MIN_LOOP_WAIT: Duration = Duration::from_millis(200);
 const PCM_BYTES_PER_MS: u64 = 192;
 const WAV_HEADER_SIZE: u64 = 44;
 const SILENCE_WRITE_CHUNK_BYTES: usize = 16 * 1024;
+
+#[cfg(test)]
+pub(crate) static LEGACY_CHUNK_POLL_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[derive(Debug, Clone)]
 struct PendingChunk {
@@ -70,6 +75,9 @@ pub async fn status_json(state: &AppState) -> Value {
                 "bytes": w.bytes,
             })
         }),
+        "voiceDeliveryProtocol": cfg.voice_delivery_protocol,
+        "v2Phase": runtime.v2_phase,
+        "v2LastPublishedPath": runtime.v2_last_published,
     })
 }
 
@@ -106,9 +114,7 @@ pub async fn redeem_connect_key(
         .unwrap_or(stored.device_id.as_str())
         .to_string();
     if device_id.trim().is_empty() {
-        return Err(anyhow!(
-            "Missing local device id for Discord connect."
-        ));
+        return Err(anyhow!("Missing local device id for Discord connect."));
     }
     let url = format!(
         "{}/api/stream-sync/discord-connect-keys/redeem",
@@ -127,7 +133,7 @@ pub async fn redeem_connect_key(
 
     let status = res.status().as_u16();
     let body: Value = res.json().await.unwrap_or_else(|_| json!({}));
-    if status < 200 || status >= 300 || body.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+    if !(200..300).contains(&status) || body.get("ok").and_then(|v| v.as_bool()) == Some(false) {
         let detail = body
             .get("message")
             .or_else(|| body.get("error"))
@@ -138,6 +144,7 @@ pub async fn redeem_connect_key(
     {
         let mut cfg = state.discord_voice_config.write().await;
         cfg.host_token = Some(trimmed.to_string());
+        cfg.voice_delivery_protocol = VoiceDeliveryProtocol::V2;
         if cfg.device_id.trim().is_empty() {
             cfg.device_id = device_id;
         }
@@ -206,13 +213,14 @@ pub async fn stop_ingest_worker_for_generation(
 async fn ingest_loop(state: Arc<AppState>) {
     let mut next_heartbeat = Instant::now();
     let mut active_files: HashMap<PathBuf, Instant> = HashMap::new();
+    let pinned_protocol = state
+        .discord_voice_config
+        .read()
+        .await
+        .voice_delivery_protocol;
     loop {
         let cfg = state.discord_voice_config.read().await.clone();
-        let Some(key) = cfg
-            .host_token
-            .clone()
-            .filter(|v| v.starts_with("sdk_"))
-        else {
+        let Some(key) = cfg.host_token.clone().filter(|v| v.starts_with("sdk_")) else {
             break;
         };
         let parent_folder = cfg
@@ -236,56 +244,83 @@ async fn ingest_loop(state: Arc<AppState>) {
             next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
         }
 
-        let wait = if let Some(parent) = parent_folder {
-            match poll_pending_chunk(&key).await {
-                Ok(pending) => {
-                    let mut next_wait = pending.retry_after;
-                    if let Some(chunk) = pending.chunk {
-                        match process_chunk(&key, Path::new(&parent), &chunk).await {
-                            Ok((target_path, bytes_written)) => {
-                                clear_last_error(&state).await;
-                                set_last_write(&state, &target_path, bytes_written).await;
-                                active_files.insert(target_path.clone(), Instant::now());
-                                if chunk
-                                    .stopped_at
-                                    .as_ref()
-                                    .is_some_and(|v| !v.trim().is_empty())
-                                {
-                                    let _ = finalize_wav_file(&target_path);
-                                    active_files.remove(&target_path);
-                                }
-                            }
-                            Err(err) => {
-                                set_last_error(&state, err.to_string()).await;
-                                next_wait = Duration::from_secs(2);
-                            }
-                        }
-                    } else {
-                        finalize_idle_files(&mut active_files);
-                    }
-                    next_wait
-                }
-                Err(err) => {
-                    set_last_error(&state, err.to_string()).await;
-                    finalize_idle_files(&mut active_files);
-                    Duration::from_secs(2)
-                }
-            }
-        } else {
-            set_last_error(
-                &state,
-                "Set a recording folder to start Discord voice ingest.".into(),
-            )
-            .await;
-            finalize_idle_files(&mut active_files);
-            Duration::from_secs(2)
-        };
+        let wait = run_ingest_iteration(
+            &state,
+            pinned_protocol,
+            parent_folder,
+            &key,
+            &mut active_files,
+            #[cfg(test)]
+            None,
+        )
+        .await;
 
         let until_heartbeat = next_heartbeat.saturating_duration_since(Instant::now());
         let sleep_for = normalize_retry_after(wait).min(until_heartbeat.max(MIN_LOOP_WAIT));
         tokio::time::sleep(sleep_for).await;
     }
     finalize_all_files(&active_files);
+}
+
+async fn run_ingest_iteration(
+    state: &AppState,
+    pinned_protocol: VoiceDeliveryProtocol,
+    parent_folder: Option<String>,
+    key: &str,
+    active_files: &mut HashMap<PathBuf, Instant>,
+    #[cfg(test)] v2_mock: Option<&crate::voice_delivery::MockVoiceV2Client>,
+) -> Duration {
+    if pinned_protocol == VoiceDeliveryProtocol::V2 {
+        #[cfg(test)]
+        if let Some(client) = v2_mock {
+            return crate::discord_voice_v2::v2_poll_and_deliver_once_with_mock(state, client)
+                .await;
+        }
+        crate::discord_voice_v2::v2_poll_and_deliver_once(state).await
+    } else if let Some(parent) = parent_folder {
+        match poll_pending_chunk(key).await {
+            Ok(pending) => {
+                let mut next_wait = pending.retry_after;
+                if let Some(chunk) = pending.chunk {
+                    match process_chunk(key, Path::new(&parent), &chunk).await {
+                        Ok((target_path, bytes_written)) => {
+                            clear_last_error(state).await;
+                            set_last_write(state, &target_path, bytes_written).await;
+                            active_files.insert(target_path.clone(), Instant::now());
+                            if chunk
+                                .stopped_at
+                                .as_ref()
+                                .is_some_and(|v| !v.trim().is_empty())
+                            {
+                                let _ = finalize_wav_file(&target_path);
+                                active_files.remove(&target_path);
+                            }
+                        }
+                        Err(err) => {
+                            set_last_error(state, err.to_string()).await;
+                            next_wait = Duration::from_secs(2);
+                        }
+                    }
+                } else {
+                    finalize_idle_files(active_files);
+                }
+                next_wait
+            }
+            Err(err) => {
+                set_last_error(state, err.to_string()).await;
+                finalize_idle_files(active_files);
+                Duration::from_secs(2)
+            }
+        }
+    } else {
+        set_last_error(
+            state,
+            "Set a recording folder to start Discord voice ingest.".into(),
+        )
+        .await;
+        finalize_idle_files(active_files);
+        Duration::from_secs(2)
+    }
 }
 
 async fn post_host_state(
@@ -332,6 +367,8 @@ async fn post_host_state(
 }
 
 async fn poll_pending_chunk(key: &str) -> Result<PendingPoll> {
+    #[cfg(test)]
+    LEGACY_CHUNK_POLL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let url = format!(
         "{}/api/stream-sync/voice/chunks/pending?limit=1",
         crate::syndicate_connection::api_base()
@@ -353,7 +390,7 @@ async fn poll_pending_chunk(key: &str) -> Result<PendingPoll> {
 
     let status = res.status().as_u16();
     let body: Value = res.json().await.unwrap_or_else(|_| json!({}));
-    if status < 200 || status >= 300 {
+    if !(200..300).contains(&status) {
         let msg = body
             .get("message")
             .or_else(|| body.get("error"))
@@ -577,7 +614,7 @@ fn parse_pending_chunk(value: &Value) -> Result<PendingChunk> {
     })
 }
 
-fn first_chunk_value<'a>(body: &'a Value) -> Option<&'a Value> {
+fn first_chunk_value(body: &Value) -> Option<&Value> {
     body.get("chunks")
         .and_then(Value::as_array)
         .and_then(|arr| arr.first())
@@ -902,5 +939,101 @@ mod tests {
         assert_eq!(chunk.start_ms, Some(0));
         assert_eq!(chunk.end_ms, Some(300000));
         assert!(chunk.is_silence);
+    }
+
+    #[tokio::test]
+    async fn pinned_protocol_selects_v2_or_legacy_iteration_without_flipping() {
+        use crate::app_state::AppState;
+        use crate::config_types::VoiceDeliveryProtocol;
+        use crate::storage;
+        use crate::voice_delivery::MockVoiceV2Client;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let userdata = tmp.path().join("userdata");
+        std::fs::create_dir_all(&userdata).unwrap();
+        let repo = storage::resolve_ui_assets_root();
+        let paths = storage::paths_for_root(&userdata, true).unwrap();
+        let state = AppState::new(
+            paths,
+            repo,
+            14211,
+            true,
+            crate::secret_store::memory_secret_store(),
+        )
+        .expect("app state");
+        {
+            let mut cfg = state.discord_voice_config.write().await;
+            cfg.host_token = Some("sdk_test_token".into());
+            cfg.recording_parent = Some(tmp.path().to_string_lossy().into_owned());
+            cfg.device_id = "device".into();
+            cfg.voice_delivery_protocol = VoiceDeliveryProtocol::V2;
+        }
+
+        LEGACY_CHUNK_POLL_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        crate::discord_voice_v2::V2_DELIVER_TICKS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let pinned = VoiceDeliveryProtocol::V2;
+        let mut active: HashMap<PathBuf, Instant> = HashMap::new();
+        let mock = MockVoiceV2Client::new();
+        mock.set_pending(vec![]);
+        let _ = run_ingest_iteration(
+            &state,
+            pinned,
+            Some(tmp.path().to_string_lossy().into_owned()),
+            "sdk_test_token",
+            &mut active,
+            Some(&mock),
+        )
+        .await;
+        assert!(
+            crate::discord_voice_v2::V2_DELIVER_TICKS.load(std::sync::atomic::Ordering::SeqCst) > 0
+        );
+        assert_eq!(
+            LEGACY_CHUNK_POLL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        LEGACY_CHUNK_POLL_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        crate::discord_voice_v2::V2_DELIVER_TICKS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let pinned_legacy = VoiceDeliveryProtocol::Legacy;
+        let _ = run_ingest_iteration(
+            &state,
+            pinned_legacy,
+            Some(tmp.path().to_string_lossy().into_owned()),
+            "sdk_test_token",
+            &mut active,
+            None,
+        )
+        .await;
+        assert_eq!(
+            crate::discord_voice_v2::V2_DELIVER_TICKS.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(
+            LEGACY_CHUNK_POLL_CALLS.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "legacy iteration must invoke chunk poll path"
+        );
+
+        {
+            let mut cfg = state.discord_voice_config.write().await;
+            cfg.voice_delivery_protocol = VoiceDeliveryProtocol::Legacy;
+        }
+        LEGACY_CHUNK_POLL_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        crate::discord_voice_v2::V2_DELIVER_TICKS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let _ = run_ingest_iteration(
+            &state,
+            pinned,
+            Some(tmp.path().to_string_lossy().into_owned()),
+            "sdk_test_token",
+            &mut active,
+            Some(&mock),
+        )
+        .await;
+        assert!(
+            crate::discord_voice_v2::V2_DELIVER_TICKS.load(std::sync::atomic::Ordering::SeqCst) > 0
+        );
+        assert_eq!(
+            LEGACY_CHUNK_POLL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 }

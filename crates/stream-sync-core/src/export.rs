@@ -398,6 +398,7 @@ mod tests {
             twitch_delegated: root.join("twitch-delegated.json"),
             twitch_delegated_revoked: root.join("twitch-delegated.revoked"),
             twitch_delegated_revoke_pending: root.join("twitch-delegated.revoke-pending"),
+            twitch_delegated_revoke_marker_hw: root.join("twitch-delegated.revoke-marker-hw"),
             twitch_active_mode: root.join("twitch-active-mode.json"),
             fonts_dir: root.join("fonts"),
             events_media_dir: root.join("events-media"),

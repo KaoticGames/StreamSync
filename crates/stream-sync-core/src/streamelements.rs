@@ -1110,6 +1110,7 @@ const SS_TEXT_PAD_Y: f64 = 12.0;
 /// SE alert text is HTML inside the widget, not a StreamSync rectangle.
 /// Size the SS text box from SE's font-size so overlay text-fit will not shrink it.
 /// Place textOver on the graphic (Studio preset position), not under the image box.
+#[allow(clippy::too_many_arguments)]
 fn text_box_from_se(
     img_x: f64,
     img_y: f64,
@@ -1879,7 +1880,7 @@ fn raster_px(bytes: &[u8]) -> Option<(u32, u32)> {
                 continue;
             }
             let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
-            if matches!(marker, 0xc0 | 0xc1 | 0xc2) && i + 8 < bytes.len() {
+            if (0xc0..=0xc2).contains(&marker) && i + 8 < bytes.len() {
                 let h = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
                 let w = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]) as u32;
                 return (w > 0 && h > 0).then_some((w, h));

@@ -11,6 +11,11 @@ commands.allow = [
   "open_se_account_page",
   "export_backup",
   "restore_backup",
+  "get_update_status",
   "check_for_updates",
+  "check_for_updates_manual",
+  "begin_update_install",
+  "dismiss_update",
+  "open_update_fallback_page",
   "purge_logs",
 ]

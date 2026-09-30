@@ -1490,3 +1490,74 @@ input[type="range"]::-ms-thumb {
   color: #111;
   font-weight: 800;
 }
+
+/* Update available modal */
+.update-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.72);
+  z-index: 10000;
+}
+
+.update-modal-backdrop.is-open {
+  display: flex;
+}
+
+.update-modal {
+  width: min(560px, 100%);
+  background: var(--bg-card);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45);
+}
+
+.update-modal__header {
+  padding: 20px 24px 0;
+}
+
+.update-modal__title {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.update-modal__body {
+  padding: 16px 24px;
+}
+
+.update-modal__version {
+  margin: 0 0 12px;
+  color: var(--text-main);
+}
+
+.update-modal__notes {
+  margin: 0;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-family: inherit;
+  color: var(--text-soft);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.update-modal__progress {
+  margin: 12px 0 0;
+  color: var(--accent);
+}
+
+.update-modal__footer {
+  padding: 0 24px 20px;
+}
+
+.update-modal__footer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}

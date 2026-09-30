@@ -166,10 +166,9 @@ pub fn prune_logs_older_than(logs_dir: &Path, now: DateTime<Utc>, days: i64) -> 
             })
             .map(|dt| dt < cutoff)
             .unwrap_or(false)
+            && fs::remove_file(&path).is_ok()
         {
-            if fs::remove_file(&path).is_ok() {
-                deleted += 1;
-            }
+            deleted += 1;
         }
     }
     Ok(deleted)
