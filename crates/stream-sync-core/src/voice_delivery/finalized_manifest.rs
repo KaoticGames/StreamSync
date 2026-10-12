@@ -6,6 +6,10 @@ use crate::voice_delivery::hash::hex_digest;
 use crate::voice_delivery::identity::{DeliveryImmutableIdentity, IdentityError};
 use crate::voice_delivery::ids::validate_stage_basename;
 use crate::voice_delivery::manifest::{StemManifestEntry, ValidatedManifest};
+use crate::voice_delivery::recovery_report::{
+    validate_recovery_report_byte_length, RECOVERY_REPORT_CONTENT_TYPE,
+    RECOVERY_REPORT_RELATIVE_PATH,
+};
 use crate::voice_delivery::wav::minimal_wav_header;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,6 +23,14 @@ pub const WAV_HEADER_BYTES: u64 = 44;
 pub const DISCORD_SNOWFLAKE_MIN: u128 = 4_194_304;
 pub const DISCORD_SNOWFLAKE_MAX: u128 = 9_223_372_036_854_775_807;
 pub const STEM_ID_MAX_LEN: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyndicateRecoveryReport {
+    pub relative_path: String,
+    pub byte_length: u64,
+    pub sha256: String,
+    pub content_type: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyndicateFinalizedStem {
@@ -43,6 +55,8 @@ pub struct SyndicateFinalizedManifest {
     pub journal_format_version: u32,
     pub journal_sha256: String,
     pub stems: Vec<SyndicateFinalizedStem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_report: Option<SyndicateRecoveryReport>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -201,21 +215,100 @@ pub fn canonicalize_finalized_manifest_for_digest(manifest: &SyndicateFinalizedM
             b.get("pathNick").and_then(|v| v.as_str()).unwrap_or(""),
         )
     });
-    let payload = serde_json::json!({
-        "channelId": manifest.channel_id,
-        "guildId": manifest.guild_id,
-        "journalFormatVersion": manifest.journal_format_version,
-        "journalSha256": manifest.journal_sha256,
-        "sealedStopMonotonicNs": manifest.sealed_stop_monotonic_ns,
-        "sealedStopWallMs": manifest.sealed_stop_wall_ms,
-        "sessionId": manifest.session_id,
-        "sessionStartMonotonicNs": manifest.session_start_monotonic_ns,
-        "sessionStartWallMs": manifest.session_start_wall_ms,
-        "stems": stems,
-        "targetSampleCount48k": manifest.target_sample_count_48k,
-        "version": manifest.version,
-    });
-    serde_json::to_string(&payload).expect("manifest json")
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "channelId".into(),
+        serde_json::Value::String(manifest.channel_id.clone()),
+    );
+    payload.insert(
+        "guildId".into(),
+        serde_json::Value::String(manifest.guild_id.clone()),
+    );
+    payload.insert(
+        "journalFormatVersion".into(),
+        serde_json::json!(manifest.journal_format_version),
+    );
+    payload.insert(
+        "journalSha256".into(),
+        serde_json::Value::String(manifest.journal_sha256.clone()),
+    );
+    if let Some(report) = &manifest.recovery_report {
+        payload.insert(
+            "recoveryReport".into(),
+            serde_json::json!({
+                "byteLength": report.byte_length,
+                "contentType": report.content_type,
+                "relativePath": report.relative_path,
+                "sha256": report.sha256,
+            }),
+        );
+    }
+    payload.insert(
+        "sealedStopMonotonicNs".into(),
+        serde_json::Value::String(manifest.sealed_stop_monotonic_ns.clone()),
+    );
+    payload.insert(
+        "sealedStopWallMs".into(),
+        serde_json::json!(manifest.sealed_stop_wall_ms),
+    );
+    payload.insert(
+        "sessionId".into(),
+        serde_json::Value::String(manifest.session_id.clone()),
+    );
+    payload.insert(
+        "sessionStartMonotonicNs".into(),
+        serde_json::Value::String(manifest.session_start_monotonic_ns.clone()),
+    );
+    payload.insert(
+        "sessionStartWallMs".into(),
+        serde_json::json!(manifest.session_start_wall_ms),
+    );
+    payload.insert("stems".into(), serde_json::Value::Array(stems));
+    payload.insert(
+        "targetSampleCount48k".into(),
+        serde_json::json!(manifest.target_sample_count_48k),
+    );
+    payload.insert("version".into(), serde_json::json!(manifest.version));
+    serde_json::to_string(&serde_json::Value::Object(payload)).expect("manifest json")
+}
+
+fn parse_recovery_report_field(
+    obj: &serde_json::Map<String, Value>,
+) -> Result<Option<SyndicateRecoveryReport>, FinalizedManifestError> {
+    let raw = match obj.get("recoveryReport") {
+        None => return Ok(None),
+        Some(v) => v,
+    };
+    if !is_plain_object(raw) {
+        return Err(fail("recoveryReport must be object"));
+    }
+    let report_obj = raw.as_object().expect("checked");
+    reject_unknown_keys(
+        report_obj,
+        &["relativePath", "byteLength", "sha256", "contentType"],
+    )?;
+    let relative_path = require_string(&report_obj["relativePath"], "recoveryReport.relativePath")?;
+    if relative_path != RECOVERY_REPORT_RELATIVE_PATH {
+        return Err(fail(
+            "recoveryReport.relativePath must be Syndicate Audio Recovery Report.txt",
+        ));
+    }
+    let byte_length = require_u64_field(&report_obj["byteLength"], "recoveryReport.byteLength")?;
+    validate_recovery_report_byte_length(byte_length).map_err(|e| fail(e.to_string()))?;
+    let content_type = require_string(&report_obj["contentType"], "recoveryReport.contentType")?;
+    if content_type != RECOVERY_REPORT_CONTENT_TYPE {
+        return Err(fail("recoveryReport.contentType must be text/plain"));
+    }
+    let sha256 = validate_sha256_hex(
+        &require_string(&report_obj["sha256"], "recoveryReport.sha256")?,
+        "recoveryReport.sha256",
+    )?;
+    Ok(Some(SyndicateRecoveryReport {
+        relative_path,
+        byte_length,
+        sha256,
+        content_type,
+    }))
 }
 
 pub fn compute_finalized_manifest_digest(manifest: &SyndicateFinalizedManifest) -> String {
@@ -244,6 +337,7 @@ pub fn parse_syndicate_finalized_manifest(
             "targetSampleCount48k",
             "journalFormatVersion",
             "journalSha256",
+            "recoveryReport",
             "stems",
         ],
     )?;
@@ -387,6 +481,7 @@ pub fn parse_syndicate_finalized_manifest(
             "finalized manifest journalSha256",
         )?,
         stems,
+        recovery_report: parse_recovery_report_field(obj)?,
     })
 }
 
@@ -450,6 +545,10 @@ pub fn bind_delivery_identity(
     }
     let validated = syndicate_to_validated_manifest(manifest)?;
     let (parent, staging, final_name) = delivery_layout_from_manifest(manifest)?;
+    let recovery_binding = manifest.recovery_report.as_ref().map(|r| {
+        crate::voice_delivery::recovery_report::RecoveryReportSpec::from_syndicate(r)
+            .identity_binding()
+    });
     let identity = DeliveryImmutableIdentity::new_bound(
         manifest.session_id.clone(),
         computed,
@@ -457,6 +556,7 @@ pub fn bind_delivery_identity(
         staging,
         parent,
         &final_name,
+        recovery_binding,
     )
     .map_err(|e: IdentityError| fail(e.to_string()))?;
     Ok((validated, identity))
@@ -580,6 +680,74 @@ pub(crate) mod syndicate_manifest_tests {
             compute_finalized_manifest_digest(&parsed),
             "96881d02814a25a59b548b0ef30a4da3c0109f6371bc4b6ee23382447485168e"
         );
+    }
+
+    #[test]
+    fn recovery_report_manifest_parse_adversarial() {
+        let mut raw = minimal_wav_value();
+        raw["recoveryReport"] = serde_json::json!({
+            "relativePath": "wrong.txt",
+            "byteLength": 1,
+            "sha256": "a".repeat(64),
+            "contentType": "text/plain",
+        });
+        assert!(parse_syndicate_finalized_manifest(&raw).is_err());
+
+        let mut raw2 = minimal_wav_value();
+        raw2["recoveryReport"] = serde_json::json!({
+            "relativePath": RECOVERY_REPORT_RELATIVE_PATH,
+            "byteLength": 1,
+            "sha256": "a".repeat(64),
+            "contentType": "text/html",
+        });
+        assert!(parse_syndicate_finalized_manifest(&raw2).is_err());
+
+        let mut raw3 = minimal_wav_value();
+        raw3["recoveryReport"] = serde_json::json!({
+            "relativePath": RECOVERY_REPORT_RELATIVE_PATH,
+            "byteLength": 0,
+            "sha256": "a".repeat(64),
+            "contentType": "text/plain",
+        });
+        assert!(parse_syndicate_finalized_manifest(&raw3).is_err());
+
+        let mut raw4 = minimal_wav_value();
+        raw4["recoveryReport"] = serde_json::json!({
+            "relativePath": RECOVERY_REPORT_RELATIVE_PATH,
+            "byteLength": 1,
+            "sha256": "A".repeat(64),
+            "contentType": "text/plain",
+        });
+        assert!(parse_syndicate_finalized_manifest(&raw4).is_err());
+
+        let mut raw5 = minimal_wav_value();
+        raw5["recoveryReport"] = serde_json::json!({
+            "relativePath": RECOVERY_REPORT_RELATIVE_PATH,
+            "byteLength": 1,
+            "sha256": "a".repeat(64),
+            "contentType": "text/plain",
+            "extra": true,
+        });
+        assert!(parse_syndicate_finalized_manifest(&raw5).is_err());
+    }
+
+    #[test]
+    fn recovery_report_changes_digest_old_manifest_unchanged() {
+        let raw = minimal_wav_value();
+        let without = parse_syndicate_finalized_manifest(&raw).unwrap();
+        let d0 = compute_finalized_manifest_digest(&without);
+        let without_again = parse_syndicate_finalized_manifest(&raw).unwrap();
+        assert_eq!(d0, compute_finalized_manifest_digest(&without_again));
+        let mut with = raw.clone();
+        with["recoveryReport"] = serde_json::json!({
+            "relativePath": RECOVERY_REPORT_RELATIVE_PATH,
+            "byteLength": 12,
+            "sha256": "c".repeat(64),
+            "contentType": "text/plain",
+        });
+        let parsed = parse_syndicate_finalized_manifest(&with).unwrap();
+        assert!(parsed.recovery_report.is_some());
+        assert_ne!(compute_finalized_manifest_digest(&parsed), d0);
     }
 
     #[test]

@@ -3,6 +3,9 @@
 use crate::voice_delivery::fs::{FsError, PortableParentComponent, ValidatedFinalName};
 use crate::voice_delivery::ids::{delivery_opaque_dir_id, validate_stage_basename};
 use crate::voice_delivery::manifest::ValidatedManifest;
+use crate::voice_delivery::recovery_report::{
+    RecoveryReportIdentityBinding, RecoveryReportSpec, RECOVERY_REPORT_RELATIVE_PATH,
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -17,6 +20,8 @@ pub struct DeliveryImmutableIdentity {
     pub staging_token: String,
     pub final_parent_relative: Vec<PortableParentComponent>,
     pub final_session_name: String,
+    /// When the authoritative manifest declares a recovery report.
+    pub recovery_report: Option<RecoveryReportIdentityBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -45,6 +50,7 @@ impl DeliveryImmutableIdentity {
         staging_token: impl Into<String>,
         final_parent_relative: Vec<PortableParentComponent>,
         final_session_name: &str,
+        recovery_report: Option<RecoveryReportIdentityBinding>,
     ) -> Result<Self, IdentityError> {
         let delivery_uuid = delivery_uuid.into();
         if delivery_uuid.is_empty() {
@@ -59,6 +65,14 @@ impl DeliveryImmutableIdentity {
         }
         let stem_set_digest = manifest.digest();
         let opaque_delivery_id = delivery_opaque_dir_id(&delivery_uuid);
+        if let Some(report) = &recovery_report {
+            if report.file_name != RECOVERY_REPORT_RELATIVE_PATH || report.byte_count == 0 {
+                return Err(IdentityError::Invalid("recovery report binding".into()));
+            }
+            if report.sha256.len() != 64 {
+                return Err(IdentityError::Invalid("recovery report sha".into()));
+            }
+        }
         Ok(Self {
             delivery_uuid,
             manifest_digest,
@@ -67,6 +81,7 @@ impl DeliveryImmutableIdentity {
             staging_token,
             final_parent_relative,
             final_session_name: final_name.as_str().to_string(),
+            recovery_report,
         })
     }
 
@@ -93,6 +108,19 @@ impl DeliveryImmutableIdentity {
             staging_token: record.staging_token.clone(),
             final_parent_relative: record.final_parent_relative.clone(),
             final_session_name: final_name.as_str().to_string(),
+            recovery_report: None,
+        })
+    }
+
+    pub fn recovery_report_required(&self) -> bool {
+        self.recovery_report.is_some()
+    }
+
+    pub fn recovery_report_spec(&self) -> Option<RecoveryReportSpec> {
+        self.recovery_report.as_ref().map(|b| RecoveryReportSpec {
+            file_name: b.file_name.clone(),
+            byte_count: b.byte_count,
+            sha256: b.sha256.clone(),
         })
     }
 
@@ -201,5 +229,70 @@ impl StemArtifactId {
             .iter()
             .find(|s| s.file_name == self.stem_portable_name)
             .ok_or(IdentityError::Mismatch)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RecoveryReportArtifactId {
+    delivery_uuid: String,
+    manifest_digest: String,
+}
+
+impl RecoveryReportArtifactId {
+    pub fn from_identity(identity: &DeliveryImmutableIdentity) -> Result<Self, IdentityError> {
+        if identity.recovery_report.is_none() {
+            return Err(IdentityError::Invalid(
+                "recovery report not declared".into(),
+            ));
+        }
+        Ok(Self {
+            delivery_uuid: identity.delivery_uuid.clone(),
+            manifest_digest: identity.manifest_digest.clone(),
+        })
+    }
+
+    pub(crate) fn delivery_uuid(&self) -> &str {
+        &self.delivery_uuid
+    }
+
+    pub(crate) fn manifest_digest(&self) -> &str {
+        &self.manifest_digest
+    }
+
+    pub(crate) fn matches_identity(&self, identity: &DeliveryImmutableIdentity) -> bool {
+        self.delivery_uuid == identity.delivery_uuid
+            && self.manifest_digest == identity.manifest_digest
+    }
+
+    fn identity_key(&self) -> String {
+        format!(
+            "{}:{}:recovery-report",
+            self.delivery_uuid, self.manifest_digest
+        )
+    }
+
+    pub fn checkpoint_dir_key(&self) -> String {
+        let digest = Sha256::digest(self.identity_key().as_bytes());
+        format!("{:x}", digest)
+    }
+
+    pub fn partial_basename(&self) -> String {
+        format!("{}.partial", self.checkpoint_dir_key())
+    }
+
+    pub fn expected_spec(
+        identity: &DeliveryImmutableIdentity,
+    ) -> Result<RecoveryReportSpec, IdentityError> {
+        let binding = identity
+            .recovery_report
+            .as_ref()
+            .ok_or(IdentityError::Invalid(
+                "recovery report not declared".into(),
+            ))?;
+        Ok(RecoveryReportSpec {
+            file_name: binding.file_name.clone(),
+            byte_count: binding.byte_count,
+            sha256: binding.sha256.clone(),
+        })
     }
 }

@@ -15,6 +15,7 @@ mod orchestrator;
 mod publication;
 mod receipt_state;
 mod records;
+mod recovery_report;
 mod session;
 mod state;
 mod wav;
@@ -24,15 +25,19 @@ mod lock;
 
 pub use client::parse_pending_response;
 pub use client::{
-    validate_stem_range_meta, HttpVoiceV2Client, MockVoiceV2Client, PendingDelivery,
-    ReceiptRequestBody, VoiceV2Client, VoiceV2ClientError,
+    validate_recovery_report_range_meta, validate_stem_range_meta, HttpVoiceV2Client,
+    MockVoiceV2Client, PendingDelivery, ReceiptRequestBody, StemRangeMeta, VoiceV2Client,
+    VoiceV2ClientError,
 };
 pub use finalized_manifest::{
     compute_finalized_manifest_digest, parse_syndicate_finalized_manifest,
     SyndicateFinalizedManifest,
 };
-pub use ingest::{PartialError, PartialStemWriter};
+pub use ingest::{PartialError, PartialRecoveryReportWriter, PartialStemWriter};
 pub use orchestrator::{DeliveryPhase, FinalizedVoiceDelivery, OrchestratorError};
+pub use recovery_report::{
+    recovery_report_spec_from_manifest, RecoveryReportSpec, RECOVERY_REPORT_RELATIVE_PATH,
+};
 
 pub(crate) mod fs;
 
