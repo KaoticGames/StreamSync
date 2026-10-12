@@ -5,6 +5,7 @@ use crate::voice_delivery::identity::DeliveryImmutableIdentity;
 use crate::voice_delivery::ids::{ledger_dir_relative_components, validate_stage_basename};
 use crate::voice_delivery::lock::{acquire_delivery_domain_lock, DeliveryDomainLock, LockError};
 use crate::voice_delivery::manifest::ValidatedManifest;
+use crate::voice_delivery::recovery_report::RecoveryReportSpec;
 use thiserror::Error;
 
 #[cfg(test)]
@@ -28,6 +29,7 @@ pub struct DeliverySessionGuard {
     root: DestRoot,
     identity: DeliveryImmutableIdentity,
     manifest: ValidatedManifest,
+    recovery_report: Option<RecoveryReportSpec>,
     final_parent: DirHandle,
     staging: Option<DirHandle>,
     _lock: DeliveryDomainLock,
@@ -39,15 +41,38 @@ impl DeliverySessionGuard {
         root: DestRoot,
         identity: DeliveryImmutableIdentity,
         manifest: ValidatedManifest,
+        recovery_report: Option<RecoveryReportSpec>,
         create_staging_if_missing: bool,
         try_wait_lock: bool,
     ) -> Result<Self, SessionError> {
         identity
             .assert_stem_manifest(&manifest)
             .map_err(|_| SessionError::IdentityMismatch)?;
+        if identity.recovery_report.is_some() {
+            if recovery_report.is_none() {
+                return Err(SessionError::IdentityMismatch);
+            }
+        } else if recovery_report.is_some() {
+            return Err(SessionError::IdentityMismatch);
+        }
+        if let (Some(binding), Some(spec)) = (&identity.recovery_report, &recovery_report) {
+            if binding.file_name != spec.file_name
+                || binding.byte_count != spec.byte_count
+                || binding.sha256 != spec.sha256
+            {
+                return Err(SessionError::IdentityMismatch);
+            }
+        }
         validate_stage_basename(&identity.staging_token)?;
         let lock = acquire_delivery_domain_lock(&root, &identity.delivery_uuid, try_wait_lock)?;
-        Self::assemble(root, identity, manifest, lock, create_staging_if_missing)
+        Self::assemble(
+            root,
+            identity,
+            manifest,
+            recovery_report,
+            lock,
+            create_staging_if_missing,
+        )
     }
 
     /// First open for a new download (creates staging when absent).
@@ -55,9 +80,17 @@ impl DeliverySessionGuard {
         root: DestRoot,
         identity: DeliveryImmutableIdentity,
         manifest: ValidatedManifest,
+        recovery_report: Option<RecoveryReportSpec>,
         try_wait_lock: bool,
     ) -> Result<Self, SessionError> {
-        Self::begin_bound(root, identity, manifest, true, try_wait_lock)
+        Self::begin_bound(
+            root,
+            identity,
+            manifest,
+            recovery_report,
+            true,
+            try_wait_lock,
+        )
     }
 
     /// Local/tests when authoritative API digest is unavailable (stem digest only).
@@ -78,9 +111,10 @@ impl DeliverySessionGuard {
             staging_token,
             final_parent_relative,
             final_session_name,
+            None,
         )
         .map_err(|e| SessionError::Invalid(e.to_string()))?;
-        Self::begin(root, identity, manifest, try_wait_lock)
+        Self::begin(root, identity, manifest, None, try_wait_lock)
     }
 
     /// Reopen a delivery session for recovery without synthesizing a missing staging directory.
@@ -88,15 +122,24 @@ impl DeliverySessionGuard {
         root: DestRoot,
         identity: DeliveryImmutableIdentity,
         manifest: ValidatedManifest,
+        recovery_report: Option<RecoveryReportSpec>,
         try_wait_lock: bool,
     ) -> Result<Self, SessionError> {
-        Self::begin_bound(root, identity, manifest, false, try_wait_lock)
+        Self::begin_bound(
+            root,
+            identity,
+            manifest,
+            recovery_report,
+            false,
+            try_wait_lock,
+        )
     }
 
     fn assemble(
         root: DestRoot,
         identity: DeliveryImmutableIdentity,
         manifest: ValidatedManifest,
+        recovery_report: Option<RecoveryReportSpec>,
         lock: DeliveryDomainLock,
         create_staging_if_missing: bool,
     ) -> Result<Self, SessionError> {
@@ -120,6 +163,7 @@ impl DeliverySessionGuard {
             root,
             identity,
             manifest,
+            recovery_report,
             final_parent,
             staging,
             _lock: lock,
@@ -132,6 +176,10 @@ impl DeliverySessionGuard {
 
     pub fn manifest(&self) -> &ValidatedManifest {
         &self.manifest
+    }
+
+    pub fn recovery_report(&self) -> Option<&RecoveryReportSpec> {
+        self.recovery_report.as_ref()
     }
 
     pub fn dest_root(&self) -> &DestRoot {
@@ -290,9 +338,11 @@ mod session_constructor_substitution {
                     stage_a,
                     vec![PortableParentComponent::validate("guild").unwrap()],
                     "sess-a",
+                    None,
                 )
                 .unwrap(),
                 manifest_a(),
+                None,
                 true,
             )
             .unwrap();
@@ -308,9 +358,11 @@ mod session_constructor_substitution {
                 stage_b,
                 vec![PortableParentComponent::validate("guild").unwrap()],
                 "sess-b",
+                None,
             )
             .unwrap(),
             manifest_b(),
+            None,
             true,
         )
         .unwrap();
@@ -338,9 +390,11 @@ mod session_constructor_substitution {
                     PortableParentComponent::validate("channel").unwrap(),
                 ],
                 "published",
+                None,
             )
             .unwrap(),
             m,
+            None,
             true,
         )
         .unwrap();
@@ -362,9 +416,10 @@ mod session_constructor_substitution {
             ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
             vec![],
             "final",
+            None,
         )
         .unwrap();
-        let err = DeliverySessionGuard::begin_bound(root, identity, manifest_b(), true, true);
+        let err = DeliverySessionGuard::begin_bound(root, identity, manifest_b(), None, true, true);
         assert!(matches!(err, Err(SessionError::IdentityMismatch)));
     }
 }

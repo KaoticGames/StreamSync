@@ -9,6 +9,9 @@ use crate::voice_delivery::identity::DeliveryImmutableIdentity;
 use crate::voice_delivery::manifest::{StemManifestEntry, ValidatedManifest};
 use crate::voice_delivery::records::ledger_generation::{LedgerGeneration, LedgerStore};
 use crate::voice_delivery::records::record_digest_hex;
+use crate::voice_delivery::recovery_report::{
+    verify_recovery_report_from_handle, RecoveryReportSpec, RECOVERY_REPORT_RELATIVE_PATH,
+};
 use crate::voice_delivery::session::DeliverySessionGuard;
 use crate::voice_delivery::state::LedgerState;
 use crate::voice_delivery::wav::validate_canonical_pcm_wav_header;
@@ -36,6 +39,8 @@ pub struct DeliveryMarker {
     pub final_parent_relative: Vec<PortableParentComponent>,
     pub final_session_name: String,
     pub stems: Vec<StemMarkerEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_report: Option<StemMarkerEntry>,
     pub record_digest: String,
 }
 
@@ -64,10 +69,16 @@ pub enum MarkerError {
 }
 
 impl DeliveryMarker {
-    pub fn from_manifest(
+    pub fn from_session(
         identity: &DeliveryImmutableIdentity,
         manifest: &ValidatedManifest,
+        recovery_report: Option<&RecoveryReportSpec>,
     ) -> Self {
+        let recovery_report = recovery_report.map(|r| StemMarkerEntry {
+            file_name: r.file_name.clone(),
+            byte_count: r.byte_count,
+            sha256: r.sha256.clone(),
+        });
         Self {
             schema_version: MARKER_SCHEMA_VERSION,
             delivery_uuid: identity.delivery_uuid.clone(),
@@ -85,6 +96,7 @@ impl DeliveryMarker {
                     sha256: s.sha256.clone(),
                 })
                 .collect(),
+            recovery_report,
             record_digest: String::new(),
         }
     }
@@ -120,6 +132,7 @@ impl DeliveryMarker {
         }
         validate_marker_stems(&marker)?;
         validate_marker_stems_match_manifest(&marker, manifest)?;
+        validate_marker_recovery_report(&marker, identity)?;
         Ok(marker)
     }
 }
@@ -140,6 +153,29 @@ fn validate_marker_stems(marker: &DeliveryMarker) -> Result<(), MarkerError> {
         }
     }
     Ok(())
+}
+
+fn validate_marker_recovery_report(
+    marker: &DeliveryMarker,
+    identity: &DeliveryImmutableIdentity,
+) -> Result<(), MarkerError> {
+    match (&identity.recovery_report, &marker.recovery_report) {
+        (None, None) => Ok(()),
+        (Some(binding), Some(entry)) => {
+            if entry.file_name != binding.file_name
+                || entry.byte_count != binding.byte_count
+                || entry.sha256 != binding.sha256
+            {
+                return Err(MarkerError::StemVerification(
+                    "recovery report mismatch".into(),
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(MarkerError::StemVerification(
+            "recovery report presence".into(),
+        )),
+    }
 }
 
 fn validate_marker_stems_match_manifest(
@@ -185,10 +221,16 @@ impl DeliverySessionGuard {
             .staging_dir()
             .map_err(|e| MarkerError::Parse(e.to_string()))?;
         ensure_no_preexisting_marker(staging_dir)?;
-        verify_exact_staging_membership(staging_dir, self.manifest())?;
-        let marker = DeliveryMarker::from_manifest(self.identity(), self.manifest());
+        verify_exact_staging_membership(staging_dir, self.manifest(), self.recovery_report())?;
+        let marker =
+            DeliveryMarker::from_session(self.identity(), self.manifest(), self.recovery_report());
         write_marker_create_new(self, staging_dir, &marker)?;
-        verify_marker_directory_membership(staging_dir, self.manifest(), self.identity())?;
+        verify_marker_directory_membership(
+            staging_dir,
+            self.manifest(),
+            self.identity(),
+            self.recovery_report(),
+        )?;
         let staging_durability = sync_dir_exact(staging_dir)?;
         let ledger = LedgerStore::open_for_guard(self)?;
         let sealed = ledger.commit(self, LedgerState::Sealed)?;
@@ -211,6 +253,7 @@ pub(crate) fn verify_marker_directory_membership(
     dir: &DirHandle,
     manifest: &ValidatedManifest,
     identity: &DeliveryImmutableIdentity,
+    recovery_report: Option<&RecoveryReportSpec>,
 ) -> Result<(), MarkerError> {
     let expected_wavs: std::collections::HashSet<String> =
         manifest.stems.iter().map(|s| s.file_name.clone()).collect();
@@ -226,6 +269,15 @@ pub(crate) fn verify_marker_directory_membership(
         }
         if name.ends_with(".partial") {
             return Err(MarkerError::UnexpectedEntry(name));
+        }
+        if name == RECOVERY_REPORT_RELATIVE_PATH {
+            let spec = recovery_report.ok_or_else(|| MarkerError::UnexpectedEntry(name.clone()))?;
+            if !seen_stems.insert(name.clone()) {
+                return Err(MarkerError::UnexpectedEntry(format!("duplicate {name}")));
+            }
+            let file = open_existing_file_at(dir, &name)?;
+            verify_recovery_report_from_handle(&file, spec)?;
+            continue;
         }
         if !name.ends_with(".wav") {
             return Err(MarkerError::UnexpectedEntry(name));
@@ -252,9 +304,15 @@ pub(crate) fn verify_marker_directory_membership(
             return Err(MarkerError::MissingStem(stem.file_name.clone()));
         }
     }
+    if let Some(spec) = recovery_report {
+        if !seen_stems.contains(&spec.file_name) {
+            return Err(MarkerError::MissingStem(spec.file_name.clone()));
+        }
+    }
     let marker_bytes = dir.read_file_all(MARKER_FILENAME)?;
     let parsed = DeliveryMarker::parse(&marker_bytes, identity, manifest)?;
     validate_marker_stems_match_manifest(&parsed, manifest)?;
+    validate_marker_recovery_report(&parsed, identity)?;
     Ok(())
 }
 
@@ -306,6 +364,7 @@ pub fn verify_stem_from_handle(
 pub fn verify_exact_staging_membership(
     staging_dir: &DirHandle,
     manifest: &ValidatedManifest,
+    recovery_report: Option<&RecoveryReportSpec>,
 ) -> Result<(), MarkerError> {
     let expected_wavs: std::collections::HashSet<String> =
         manifest.stems.iter().map(|s| s.file_name.clone()).collect();
@@ -316,6 +375,15 @@ pub fn verify_exact_staging_membership(
         }
         if name.ends_with(".partial") {
             return Err(MarkerError::UnexpectedEntry(name));
+        }
+        if name == RECOVERY_REPORT_RELATIVE_PATH {
+            let spec = recovery_report.ok_or_else(|| MarkerError::UnexpectedEntry(name.clone()))?;
+            if !seen.insert(name.clone()) {
+                return Err(MarkerError::UnexpectedEntry(format!("duplicate {name}")));
+            }
+            let file = open_existing_file_at(staging_dir, &name)?;
+            verify_recovery_report_from_handle(&file, spec)?;
+            continue;
         }
         if !name.ends_with(".wav") {
             return Err(MarkerError::UnexpectedEntry(name));
@@ -337,6 +405,11 @@ pub fn verify_exact_staging_membership(
     for stem in &manifest.stems {
         if !seen.contains(&stem.file_name) {
             return Err(MarkerError::MissingStem(stem.file_name.clone()));
+        }
+    }
+    if let Some(spec) = recovery_report {
+        if !seen.contains(&spec.file_name) {
+            return Err(MarkerError::MissingStem(spec.file_name.clone()));
         }
     }
     Ok(())
@@ -449,6 +522,7 @@ mod marker_manifest_adversarial {
             ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
             vec![PortableParentComponent::validate("guild").unwrap()],
             "final",
+            None,
         )
         .unwrap();
         (identity, manifest)
@@ -457,7 +531,7 @@ mod marker_manifest_adversarial {
     #[test]
     fn marker_with_substituted_stem_hash_rejected() {
         let (identity, manifest) = identity_and_manifest();
-        let mut marker = DeliveryMarker::from_manifest(&identity, &manifest);
+        let mut marker = DeliveryMarker::from_session(&identity, &manifest, None);
         marker.stems[0].sha256 = "b".repeat(64);
         let bytes = marker.serialize().unwrap();
         assert!(matches!(
@@ -469,7 +543,7 @@ mod marker_manifest_adversarial {
     #[test]
     fn marker_with_extra_stem_rejected() {
         let (identity, manifest) = identity_and_manifest();
-        let mut marker = DeliveryMarker::from_manifest(&identity, &manifest);
+        let mut marker = DeliveryMarker::from_session(&identity, &manifest, None);
         marker.stems.push(StemMarkerEntry {
             file_name: "extra.wav".into(),
             byte_count: 44,
@@ -504,9 +578,10 @@ mod marker_manifest_adversarial {
             ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
             vec![],
             "final",
+            None,
         )
         .unwrap();
-        let mut marker = DeliveryMarker::from_manifest(&identity, &manifest);
+        let mut marker = DeliveryMarker::from_session(&identity, &manifest, None);
         marker.stems.reverse();
         let bytes = marker.serialize().unwrap();
         assert!(matches!(

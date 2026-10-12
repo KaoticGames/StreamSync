@@ -191,9 +191,10 @@ mod local_recovery_tests {
             stage_token("01234567890123456789012345678901"),
             vec![],
             "published-final",
+            None,
         )
         .unwrap();
-        let guard = DeliverySessionGuard::begin(root, identity, manifest, true).unwrap();
+        let guard = DeliverySessionGuard::begin(root, identity, manifest, None, true).unwrap();
         let store = LedgerStore::open_for_guard(&guard).unwrap();
         store.commit(&guard, LedgerState::Receiving).unwrap();
         store.commit(&guard, LedgerState::Sealed).unwrap();

@@ -1015,12 +1015,14 @@ mod crash_child_process_publication {
                         &stage,
                         vec![],
                         &final_name,
+                        None,
                     )
                     .unwrap();
                 let guard = DeliverySessionGuard::begin_for_recovery(
                     root,
                     identity,
                     manifest.clone(),
+                    None,
                     true,
                 )
                 .unwrap();

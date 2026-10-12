@@ -281,9 +281,11 @@ mod receipt_generation_tests {
             stage_token("01234567890123456789012345678901"),
             vec![],
             "final",
+            None,
         )
         .unwrap();
-        let guard = DeliverySessionGuard::begin(root, identity.clone(), manifest, true).unwrap();
+        let guard =
+            DeliverySessionGuard::begin(root, identity.clone(), manifest, None, true).unwrap();
         (tmp, guard, identity)
     }
 
@@ -528,9 +530,11 @@ mod receipt_generation_tests {
             stage_token("01234567890123456789012345678901"),
             vec![],
             "final",
+            None,
         )
         .unwrap();
-        let guard = DeliverySessionGuard::begin(root, identity.clone(), manifest, true).unwrap();
+        let guard =
+            DeliverySessionGuard::begin(root, identity.clone(), manifest, None, true).unwrap();
         let store = ReceiptStore::open_for_guard(&guard).unwrap();
         let rid = format!("{}:1", identity.delivery_uuid);
         let pending = store.commit_pending(&rid).unwrap();
@@ -557,9 +561,11 @@ mod receipt_generation_tests {
             stage_token("01234567890123456789012345678901"),
             vec![],
             "final",
+            None,
         )
         .unwrap();
-        let guard = DeliverySessionGuard::begin(root, identity.clone(), manifest, true).unwrap();
+        let guard =
+            DeliverySessionGuard::begin(root, identity.clone(), manifest, None, true).unwrap();
         let store = ReceiptStore::open_for_guard(&guard).unwrap();
         let rid = format!("{}:9", identity.delivery_uuid);
         store.commit_pending(&rid).unwrap();
@@ -587,9 +593,11 @@ mod receipt_generation_tests {
             stage_token("01234567890123456789012345678901"),
             vec![],
             "final",
+            None,
         )
         .unwrap();
-        let guard = DeliverySessionGuard::begin(root, identity.clone(), manifest, true).unwrap();
+        let guard =
+            DeliverySessionGuard::begin(root, identity.clone(), manifest, None, true).unwrap();
         let ledger = LedgerStore::open_for_guard(&guard).unwrap();
         ledger.commit(&guard, LedgerState::Receiving).unwrap();
         let store = ReceiptStore::open_for_guard(&guard).unwrap();

@@ -2,4 +2,4 @@
 
 mod partial;
 
-pub use partial::{PartialError, PartialStemWriter};
+pub use partial::{PartialError, PartialRecoveryReportWriter, PartialStemWriter};

@@ -187,7 +187,7 @@ pub fn publish_prepared(
         PresenceSlot::Directory(h) => h,
         PresenceSlot::Missing => return Err(PublicationError::MissingPublication),
     };
-    verify_marker_directory_membership(staging, manifest, identity)?;
+    verify_marker_directory_membership(staging, manifest, identity, guard.recovery_report())?;
     if let Some(r) = recorder.as_mut() {
         r.record(PublicationOperation::StagingReverified);
     }
@@ -219,7 +219,7 @@ pub fn publish_prepared(
         hard_abort();
     }
 
-    verify_final_session_directory(final_parent, identity, manifest)?;
+    verify_final_session_directory(final_parent, identity, manifest, guard.recovery_report())?;
     if let Some(r) = recorder.as_mut() {
         r.record(PublicationOperation::FinalReopenVerify);
     }
@@ -275,7 +275,14 @@ fn reconcile_after_rename_error(
     let presence = observe_publication_presence(final_parent, identity)?;
     match (presence.stage_present(), presence.final_present()) {
         (false, true) => {
-            if verify_final_session_directory(final_parent, identity, manifest).is_ok() {
+            if verify_final_session_directory(
+                final_parent,
+                identity,
+                manifest,
+                guard.recovery_report(),
+            )
+            .is_ok()
+            {
                 return finalize_from_final_only(guard, recorder, options);
             }
             if matches!(rename_err, FsError::AlreadyExists) {
@@ -316,7 +323,7 @@ pub(crate) fn finalize_from_final_only(
     if let Some(r) = recorder.as_mut() {
         r.record(PublicationOperation::ParentNamespaceDurability);
     }
-    verify_final_session_directory(final_parent, identity, manifest)?;
+    verify_final_session_directory(final_parent, identity, manifest, guard.recovery_report())?;
     if let Some(r) = recorder.as_mut() {
         r.record(PublicationOperation::FinalReopenVerify);
     }
@@ -335,13 +342,14 @@ pub(crate) fn verify_final_session_directory(
     final_parent: &DirHandle,
     identity: &DeliveryImmutableIdentity,
     manifest: &ValidatedManifest,
+    recovery_report: Option<&crate::voice_delivery::recovery_report::RecoveryReportSpec>,
 ) -> Result<(), PublicationError> {
     let presence = observe_publication_presence(final_parent, identity)?;
     let final_dir = match presence.final_session {
         PresenceSlot::Directory(h) => h,
         PresenceSlot::Missing => return Err(PublicationError::MissingPublication),
     };
-    verify_marker_directory_membership(&final_dir, manifest, identity)?;
+    verify_marker_directory_membership(&final_dir, manifest, identity, recovery_report)?;
     Ok(())
 }
 
@@ -369,7 +377,13 @@ fn marker_matches_delivery(
     identity: &DeliveryImmutableIdentity,
     manifest: &ValidatedManifest,
 ) -> bool {
-    verify_marker_directory_membership(dir, manifest, identity).is_ok()
+    verify_marker_directory_membership(
+        dir,
+        manifest,
+        identity,
+        identity.recovery_report_spec().as_ref(),
+    )
+    .is_ok()
 }
 
 fn commit_published_with_optional_crash(

@@ -5,7 +5,7 @@ use super::generation_read::{
     GenerationScanError, ParseFailureKind,
 };
 use super::{record_digest_hex, GenerationIoError};
-use crate::voice_delivery::identity::StemArtifactId;
+use crate::voice_delivery::identity::{RecoveryReportArtifactId, StemArtifactId};
 use crate::voice_delivery::session::DeliverySessionGuard;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -51,10 +51,17 @@ pub enum CheckpointGenerationError {
 /// Checkpoint mutations are bound to the session guard that opened the store for the entire
 /// lifetime of `CheckpointStore<'guard>` (see `open_for_guard`). `commit` does not accept a
 /// separate guard argument.
+struct CheckpointArtifactBinding {
+    delivery_uuid: String,
+    manifest_digest: String,
+    portable_name: String,
+    checkpoint_dir_key: String,
+}
+
 pub struct CheckpointStore<'guard> {
     guard: &'guard DeliverySessionGuard,
     pub(crate) dir: crate::voice_delivery::fs::DirHandle,
-    artifact: StemArtifactId,
+    artifact: CheckpointArtifactBinding,
     expected_total_bytes: u64,
     expected_full_sha256: String,
 }
@@ -72,15 +79,50 @@ impl<'guard> CheckpointStore<'guard> {
             .map_err(|_| CheckpointGenerationError::IdentityMismatch)?;
         let expected_total_bytes = stem.byte_count;
         let expected_full_sha256 = stem.sha256.clone();
+        let binding = CheckpointArtifactBinding {
+            delivery_uuid: artifact.delivery_uuid().to_string(),
+            manifest_digest: artifact.manifest_digest().to_string(),
+            portable_name: artifact.stem_portable_name().to_string(),
+            checkpoint_dir_key: artifact.checkpoint_dir_key(),
+        };
         let dir = guard
-            .checkpoint_dir_for(&artifact.checkpoint_dir_key())
+            .checkpoint_dir_for(&binding.checkpoint_dir_key)
             .map_err(|e| CheckpointGenerationError::Parse(e.to_string()))?;
         Ok(Self {
             guard,
             dir,
-            artifact,
+            artifact: binding,
             expected_total_bytes,
             expected_full_sha256,
+        })
+    }
+
+    pub fn open_for_recovery_report(
+        guard: &'guard DeliverySessionGuard,
+        artifact: RecoveryReportArtifactId,
+    ) -> Result<Self, CheckpointGenerationError> {
+        if !artifact.matches_identity(guard.identity()) {
+            return Err(CheckpointGenerationError::IdentityMismatch);
+        }
+        let spec = crate::voice_delivery::identity::RecoveryReportArtifactId::expected_spec(
+            guard.identity(),
+        )
+        .map_err(|_| CheckpointGenerationError::IdentityMismatch)?;
+        let binding = CheckpointArtifactBinding {
+            delivery_uuid: artifact.delivery_uuid().to_string(),
+            manifest_digest: artifact.manifest_digest().to_string(),
+            portable_name: spec.file_name.clone(),
+            checkpoint_dir_key: artifact.checkpoint_dir_key(),
+        };
+        let dir = guard
+            .checkpoint_dir_for(&binding.checkpoint_dir_key)
+            .map_err(|e| CheckpointGenerationError::Parse(e.to_string()))?;
+        Ok(Self {
+            guard,
+            dir,
+            artifact: binding,
+            expected_total_bytes: spec.byte_count,
+            expected_full_sha256: spec.sha256,
         })
     }
 
@@ -93,12 +135,12 @@ impl<'guard> CheckpointStore<'guard> {
         select_highest_valid::<CheckpointGeneration, _, _>(
             &self.dir,
             |rec: &CheckpointGeneration| {
-                if rec.delivery_uuid != artifact.delivery_uuid()
-                    || rec.manifest_digest != artifact.manifest_digest()
-                    || rec.stem_portable_name != artifact.stem_portable_name()
+                if rec.delivery_uuid != artifact.delivery_uuid
+                    || rec.manifest_digest != artifact.manifest_digest
+                    || rec.stem_portable_name != artifact.portable_name
                 {
-                    if artifact.delivery_uuid() != rec.delivery_uuid
-                        || artifact.manifest_digest() != rec.manifest_digest
+                    if artifact.delivery_uuid != rec.delivery_uuid
+                        || artifact.manifest_digest != rec.manifest_digest
                     {
                         Err(ParseFailureKind::ForeignIdentity)
                     } else {
@@ -130,14 +172,16 @@ impl<'guard> CheckpointStore<'guard> {
         )?;
         let generation = allocate_next_generation(&self.dir).map_err(map_scan_err)?;
         let identity = self.guard.identity();
-        if !self.artifact.matches_identity(identity) {
+        if identity.delivery_uuid != self.artifact.delivery_uuid
+            || identity.manifest_digest != self.artifact.manifest_digest
+        {
             return Err(CheckpointGenerationError::IdentityMismatch);
         }
         let record = CheckpointGeneration {
             schema_version: CHECKPOINT_SCHEMA_VERSION,
             delivery_uuid: identity.delivery_uuid.clone(),
             manifest_digest: identity.manifest_digest.clone(),
-            stem_portable_name: self.artifact.stem_portable_name().to_string(),
+            stem_portable_name: self.artifact.portable_name.clone(),
             expected_total_bytes: self.expected_total_bytes,
             expected_full_sha256: self.expected_full_sha256.clone(),
             generation,

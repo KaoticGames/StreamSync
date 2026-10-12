@@ -3,7 +3,7 @@
 use crate::voice_delivery::fs::durability::sync_file;
 use crate::voice_delivery::fs::VoiceFile;
 use crate::voice_delivery::hash::{HashError, LiveSha256};
-use crate::voice_delivery::identity::StemArtifactId;
+use crate::voice_delivery::identity::{RecoveryReportArtifactId, StemArtifactId};
 use crate::voice_delivery::records::checkpoint_generation::CheckpointStore;
 use crate::voice_delivery::session::DeliverySessionGuard;
 use thiserror::Error;
@@ -52,7 +52,7 @@ pub struct PartialStemWriter<'guard> {
     durable_contiguous_len: u64,
     live_contiguous_len: u64,
     hasher: LiveSha256,
-    artifact: StemArtifactId,
+    partial_name: String,
     checkpoint_store: CheckpointStore<'guard>,
     chunk_size: usize,
 }
@@ -143,7 +143,84 @@ impl<'guard> PartialStemWriter<'guard> {
             durable_contiguous_len: durable,
             live_contiguous_len: durable,
             hasher,
-            artifact,
+            partial_name,
+            checkpoint_store,
+            chunk_size,
+        })
+    }
+
+    pub fn open_or_resume_recovery_report(
+        guard: &'guard DeliverySessionGuard,
+        chunk_size: usize,
+    ) -> Result<Self, PartialError> {
+        if chunk_size == 0 {
+            return Err(PartialError::InvalidChunkSize);
+        }
+        let artifact = RecoveryReportArtifactId::from_identity(guard.identity())
+            .map_err(|_| PartialError::BindingMismatch)?;
+        let spec = RecoveryReportArtifactId::expected_spec(guard.identity())
+            .map_err(|_| PartialError::BindingMismatch)?;
+        let expected_total = spec.byte_count;
+        let expected_full_sha256 = spec.sha256.clone();
+        let partial_name = artifact.partial_basename();
+        let checkpoint_store = CheckpointStore::open_for_recovery_report(guard, artifact)?;
+        let staging_dir = guard
+            .staging_dir()
+            .map_err(|e| PartialError::Io(e.to_string()))?;
+        let checkpoint = checkpoint_store.read_highest_valid()?;
+        let file = staging_dir
+            .open_or_create_partial(&partial_name)
+            .map_err(PartialError::Fs)?;
+        let physical = file.len()?;
+        let (durable, hasher) = if let Some(cp) = checkpoint {
+            if cp.expected_total_bytes != expected_total
+                || cp.expected_full_sha256 != expected_full_sha256
+            {
+                return Err(PartialError::BindingMismatch);
+            }
+            if cp.durable_contiguous_len > expected_total {
+                return Err(PartialError::CheckpointInvalid);
+            }
+            if physical > cp.durable_contiguous_len {
+                file.set_len(cp.durable_contiguous_len)?;
+                sync_file(&file)?;
+            } else if physical < cp.durable_contiguous_len {
+                return Err(PartialError::UncheckpointedTail);
+            }
+            let physical_after = file.len()?;
+            if physical_after > expected_total {
+                return Err(PartialError::OversizedExisting {
+                    existing: physical_after,
+                    expected: expected_total,
+                });
+            }
+            let mut live = LiveSha256::new();
+            hash_prefix_into(
+                &file,
+                cp.durable_contiguous_len,
+                chunk_size,
+                &mut live,
+                None,
+            )?;
+            if live.prefix_digest_hex() != cp.prefix_digest {
+                return Err(PartialError::PrefixDigestMismatch);
+            }
+            (cp.durable_contiguous_len, live)
+        } else {
+            if physical > 0 {
+                return Err(PartialError::CheckpointInvalid);
+            }
+            (0, LiveSha256::new())
+        };
+        Ok(Self {
+            _guard: guard,
+            file,
+            expected_total,
+            expected_full_sha256,
+            durable_contiguous_len: durable,
+            live_contiguous_len: durable,
+            hasher,
+            partial_name,
             checkpoint_store,
             chunk_size,
         })
@@ -154,7 +231,7 @@ impl<'guard> PartialStemWriter<'guard> {
     }
 
     pub fn partial_basename(&self) -> String {
-        self.artifact.partial_basename()
+        self.partial_name.clone()
     }
 
     pub fn write_contiguous(&mut self, offset: u64, data: &[u8]) -> Result<(), PartialError> {
@@ -227,6 +304,8 @@ impl<'guard> PartialStemWriter<'guard> {
         Ok(())
     }
 }
+
+pub type PartialRecoveryReportWriter<'guard> = PartialStemWriter<'guard>;
 
 fn verify_overlap_prefix(
     file: &VoiceFile,

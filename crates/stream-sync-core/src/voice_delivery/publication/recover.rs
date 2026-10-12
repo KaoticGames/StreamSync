@@ -65,7 +65,14 @@ pub fn recover_delivery(
                     )?));
                 }
             };
-            if verify_marker_directory_membership(staging, manifest, identity).is_err() {
+            if verify_marker_directory_membership(
+                staging,
+                manifest,
+                identity,
+                guard.recovery_report(),
+            )
+            .is_err()
+            {
                 return Ok(RecoveryOutcome::Quarantined(quarantine_idempotent(
                     &store,
                     guard,
@@ -163,7 +170,12 @@ fn recover_published(
     }
     let identity = guard.identity();
     let manifest = guard.manifest();
-    match verify_final_session_directory(guard.final_parent_dir(), identity, manifest) {
+    match verify_final_session_directory(
+        guard.final_parent_dir(),
+        identity,
+        manifest,
+        guard.recovery_report(),
+    ) {
         Ok(()) => Ok(RecoveryOutcome::IdempotentPublished),
         Err(_) => Ok(RecoveryOutcome::Quarantined(quarantine_idempotent(
             store,
