@@ -53,6 +53,13 @@ pub trait VoiceV2Client: Send + Sync {
         length: u64,
         writer: &mut dyn Write,
     ) -> Result<StemRangeMeta, VoiceV2ClientError>;
+    fn fetch_recovery_report_range(
+        &self,
+        session_id: &str,
+        offset: u64,
+        length: u64,
+        writer: &mut dyn Write,
+    ) -> Result<StemRangeMeta, VoiceV2ClientError>;
     fn post_receipt(
         &self,
         session_id: &str,
@@ -172,6 +179,21 @@ pub fn parse_error_code(body: &Value) -> Option<String> {
     body.get("code")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+pub fn validate_recovery_report_range_meta(
+    meta: &StemRangeMeta,
+    offset: u64,
+    expected_total: u64,
+    bytes_written: u64,
+    expected_sha256: &str,
+) -> Result<(), VoiceV2ClientError> {
+    validate_stem_range_meta(meta, offset, expected_total, bytes_written)?;
+    let etag = meta.etag.trim_matches('"');
+    if etag != expected_sha256 {
+        return Err(VoiceV2ClientError::RangeMismatch("etag sha".into()));
+    }
+    Ok(())
 }
 
 pub fn validate_stem_range_meta(
@@ -311,6 +333,80 @@ impl HttpVoiceV2Client {
             "{}/api/stream-sync/voice/v2/deliveries/{session_id}/stems/{stem_id}",
             self.base_url
         )
+    }
+
+    fn recovery_report_url(&self, session_id: &str) -> String {
+        format!(
+            "{}/api/stream-sync/voice/v2/deliveries/{session_id}/recovery-report",
+            self.base_url
+        )
+    }
+
+    fn fetch_ranged_resource(
+        &self,
+        url: &str,
+        offset: u64,
+        length: u64,
+        writer: &mut dyn Write,
+        not_found: VoiceV2ClientError,
+    ) -> Result<StemRangeMeta, VoiceV2ClientError> {
+        if length == 0 || length > super::VOICE_V2_MAX_CHUNK_BYTES {
+            return Err(VoiceV2ClientError::InvalidRange);
+        }
+        let range = Self::range_header_value(offset, length)?;
+        let mut last_presign_denied = VoiceV2ClientError::PresignDenied;
+
+        for attempt in 0..VOICE_V2_PRESIGN_RETRY_MAX {
+            if attempt > 0 {
+                std::thread::sleep(self.presign_retry_backoff);
+            }
+            let res = self
+                .http
+                .get(url)
+                .header("Authorization", self.auth_header())
+                .header(reqwest::header::RANGE, &range)
+                .send()
+                .map_err(network_from_reqwest)?;
+            let retry_after = parse_retry_after(res.headers());
+            if let Some(wait) = retry_after {
+                return Err(VoiceV2ClientError::RetryAfter(wait));
+            }
+            let status = res.status().as_u16();
+            if status == 404 {
+                return Err(not_found);
+            }
+            if redirect_status(status) {
+                let location = res
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| {
+                        VoiceV2ClientError::InsecureRedirect("missing location".into())
+                    })?;
+                let _ = res.bytes();
+                match self.follow_stem_redirect(&location, &range, writer, length) {
+                    Ok(meta) => return Ok(meta),
+                    Err(VoiceV2ClientError::PresignDenied) => {
+                        last_presign_denied = VoiceV2ClientError::PresignDenied;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            if status != 206 {
+                let body: Value = res.json().unwrap_or(Value::Null);
+                return Err(map_http_status(
+                    status,
+                    parse_error_code(&body).as_deref(),
+                    retry_after,
+                ));
+            }
+            return self.parse_stem_206_response(res, length, writer);
+        }
+        Err(last_presign_denied)
     }
 
     fn range_header_value(offset: u64, length: u64) -> Result<String, VoiceV2ClientError> {
@@ -473,64 +569,31 @@ impl VoiceV2Client for HttpVoiceV2Client {
         length: u64,
         writer: &mut dyn Write,
     ) -> Result<StemRangeMeta, VoiceV2ClientError> {
-        if length == 0 || length > super::VOICE_V2_MAX_CHUNK_BYTES {
-            return Err(VoiceV2ClientError::InvalidRange);
-        }
-        let range = Self::range_header_value(offset, length)?;
         let url = self.stem_url(session_id, stem_id);
-        let mut last_presign_denied = VoiceV2ClientError::PresignDenied;
+        self.fetch_ranged_resource(
+            &url,
+            offset,
+            length,
+            writer,
+            VoiceV2ClientError::StemNotFound,
+        )
+    }
 
-        for attempt in 0..VOICE_V2_PRESIGN_RETRY_MAX {
-            if attempt > 0 {
-                std::thread::sleep(self.presign_retry_backoff);
-            }
-            let res = self
-                .http
-                .get(&url)
-                .header("Authorization", self.auth_header())
-                .header(reqwest::header::RANGE, &range)
-                .send()
-                .map_err(network_from_reqwest)?;
-            let retry_after = parse_retry_after(res.headers());
-            if let Some(wait) = retry_after {
-                return Err(VoiceV2ClientError::RetryAfter(wait));
-            }
-            let status = res.status().as_u16();
-            if status == 404 {
-                return Err(VoiceV2ClientError::StemNotFound);
-            }
-            if redirect_status(status) {
-                let location = res
-                    .headers()
-                    .get(reqwest::header::LOCATION)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| {
-                        VoiceV2ClientError::InsecureRedirect("missing location".into())
-                    })?;
-                let _ = res.bytes();
-                match self.follow_stem_redirect(&location, &range, writer, length) {
-                    Ok(meta) => return Ok(meta),
-                    Err(VoiceV2ClientError::PresignDenied) => {
-                        last_presign_denied = VoiceV2ClientError::PresignDenied;
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            if status != 206 {
-                let body: Value = res.json().unwrap_or(Value::Null);
-                return Err(map_http_status(
-                    status,
-                    parse_error_code(&body).as_deref(),
-                    retry_after,
-                ));
-            }
-            return self.parse_stem_206_response(res, length, writer);
-        }
-        Err(last_presign_denied)
+    fn fetch_recovery_report_range(
+        &self,
+        session_id: &str,
+        offset: u64,
+        length: u64,
+        writer: &mut dyn Write,
+    ) -> Result<StemRangeMeta, VoiceV2ClientError> {
+        let url = self.recovery_report_url(session_id);
+        self.fetch_ranged_resource(
+            &url,
+            offset,
+            length,
+            writer,
+            VoiceV2ClientError::RecoveryReportNotFound,
+        )
     }
 
     fn post_receipt(
@@ -592,6 +655,7 @@ pub struct MockVoiceV2Client {
 struct MockVoiceV2State {
     pending: Vec<PendingDelivery>,
     stems: HashMap<(String, String), Vec<u8>>,
+    recovery_reports: HashMap<String, Vec<u8>>,
     receipt_calls: usize,
     fail_next_range: bool,
     retry_after_next: bool,
@@ -613,6 +677,14 @@ impl MockVoiceV2Client {
             .unwrap()
             .stems
             .insert((session_id.to_string(), stem_id.to_string()), bytes);
+    }
+
+    pub fn set_recovery_report_bytes(&self, session_id: &str, bytes: Vec<u8>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .recovery_reports
+            .insert(session_id.to_string(), bytes);
     }
 
     pub fn receipt_calls(&self) -> usize {
@@ -654,6 +726,51 @@ impl VoiceV2Client for MockVoiceV2Client {
             .stems
             .get(&key)
             .ok_or(VoiceV2ClientError::StemNotFound)?;
+        if offset >= file.len() as u64 {
+            return Err(VoiceV2ClientError::InvalidRange);
+        }
+        if length == 0 || length > super::VOICE_V2_MAX_CHUNK_BYTES {
+            return Err(VoiceV2ClientError::InvalidRange);
+        }
+        let end = (offset + length).min(file.len() as u64);
+        let slice_len = end - offset;
+        if slice_len == 0 {
+            return Err(VoiceV2ClientError::InvalidRange);
+        }
+        writer
+            .write_all(&file[offset as usize..end as usize])
+            .map_err(|e| VoiceV2ClientError::RangeMismatch(e.to_string()))?;
+        let total = file.len() as u64;
+        let end_inclusive = offset + slice_len - 1;
+        use sha2::Digest;
+        let etag = format!(
+            "\"{}\"",
+            crate::voice_delivery::hash::hex_digest(&sha2::Sha256::digest(file.as_slice()))
+        );
+        Ok(StemRangeMeta {
+            status: 206,
+            content_range: format!("bytes {offset}-{end_inclusive}/{total}"),
+            content_length: slice_len,
+            etag,
+            total_length: total,
+        })
+    }
+
+    fn fetch_recovery_report_range(
+        &self,
+        session_id: &str,
+        offset: u64,
+        length: u64,
+        writer: &mut dyn Write,
+    ) -> Result<StemRangeMeta, VoiceV2ClientError> {
+        let state = self.inner.lock().unwrap();
+        if state.fail_next_range {
+            return Err(VoiceV2ClientError::RangeMismatch("injected".into()));
+        }
+        let file = state
+            .recovery_reports
+            .get(session_id)
+            .ok_or(VoiceV2ClientError::RecoveryReportNotFound)?;
         if offset >= file.len() as u64 {
             return Err(VoiceV2ClientError::InvalidRange);
         }

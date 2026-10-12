@@ -16,6 +16,8 @@ pub enum VoiceV2ClientError {
     DeliveryNotFound,
     #[error("stem not found")]
     StemNotFound,
+    #[error("recovery report not found")]
+    RecoveryReportNotFound,
     #[error("invalid range")]
     InvalidRange,
     #[error("receipt conflict")]
@@ -49,6 +51,7 @@ impl VoiceV2ClientError {
             | VoiceV2ClientError::ForbiddenBinding
             | VoiceV2ClientError::DeliveryNotFound
             | VoiceV2ClientError::StemNotFound
+            | VoiceV2ClientError::RecoveryReportNotFound
             | VoiceV2ClientError::InvalidRange
             | VoiceV2ClientError::ReceiptConflict
             | VoiceV2ClientError::IdentityConflict
