@@ -1,7 +1,7 @@
 //! Resumable partial stem writer with immutable checkpoint generations.
 
 use crate::voice_delivery::fs::durability::sync_file;
-use crate::voice_delivery::fs::file::{open_existing_file_at, open_or_create_file_at};
+use crate::voice_delivery::fs::file::open_existing_file_at;
 use crate::voice_delivery::fs::FsError;
 use crate::voice_delivery::fs::VoiceFile;
 use crate::voice_delivery::hash::{HashError, LiveSha256};
@@ -380,14 +380,12 @@ fn truncate_stale_recovery_report_partial(
     let artifact = RecoveryReportArtifactId::from_identity(guard.identity())
         .map_err(|_| PartialError::BindingMismatch)?;
     let partial_name = artifact.partial_basename();
-    match open_or_create_file_at(staging, &partial_name) {
+    match open_existing_file_at(staging, &partial_name) {
         Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(PartialError::Fs(e)),
-        Ok(file) => {
-            file.set_len(0)?;
-            sync_file(&file)?;
-            Ok(())
-        }
+        Ok(_file) => staging
+            .remove_child_file(&partial_name)
+            .map_err(PartialError::Fs),
     }
 }
 
@@ -467,7 +465,9 @@ mod recovery_report_staging_reconcile {
     use crate::voice_delivery::session::DeliverySessionGuard;
     use sha2::{Digest, Sha256};
 
-    fn guard_with_report(body: &[u8]) -> (tempfile::TempDir, DeliverySessionGuard, RecoveryReportSpec) {
+    fn guard_with_report(
+        body: &[u8],
+    ) -> (tempfile::TempDir, DeliverySessionGuard, RecoveryReportSpec) {
         let tmp = tempfile::tempdir().unwrap();
         let manifest = ValidatedManifest::validate(vec![StemManifestEntry {
             file_name: "a.wav".into(),

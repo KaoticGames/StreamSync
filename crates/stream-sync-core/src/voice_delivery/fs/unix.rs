@@ -120,6 +120,12 @@ pub(crate) fn clone_dir_handle(dir: &DirHandle) -> Result<DirHandle, FsError> {
     Ok(DirHandle::from_owned_fd(dup))
 }
 
+pub(crate) fn unlink_file_at(parent: &DirHandle, name: &str) -> Result<(), FsError> {
+    reject_symlink_at(parent, name)?;
+    rustix::fs::unlinkat(parent.as_fd(), name, rustix::fs::AtFlags::empty())
+        .map_err(|e| FsError::Io(e.into()))
+}
+
 pub(crate) fn open_file_at(
     parent: &DirHandle,
     name: &str,

@@ -438,6 +438,11 @@ fn open_file_at_path(path: &Path, create_new: bool) -> Result<VoiceFile, FsError
     }
 }
 
+pub(crate) fn unlink_file_at(parent: &DirHandle, name: &str) -> Result<(), FsError> {
+    let path = parent.windows_handle().absolute_path().join(name);
+    std::fs::remove_file(&path).map_err(FsError::from)
+}
+
 pub(crate) fn open_file_at(
     parent: &DirHandle,
     name: &str,

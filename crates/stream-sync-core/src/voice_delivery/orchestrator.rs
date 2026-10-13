@@ -202,13 +202,11 @@ impl FinalizedVoiceDelivery {
         ) {
             let ledger = LedgerStore::open_for_guard(&guard)
                 .map_err(|e| OrchestratorError::Other(e.to_string()))?;
-            if ledger
-                .read_highest_valid()
-                .ok()
-                .flatten()
-                .is_some_and(|g| g.state == LedgerState::Published)
-            {
-                return Ok(guard);
+            match ledger.read_highest_valid() {
+                Ok(Some(h)) if h.state == LedgerState::Published => return Ok(guard),
+                Ok(Some(_)) if guard.staging_dir().is_ok() => return Ok(guard),
+                Ok(Some(_)) | Ok(None) => {}
+                Err(e) => return Err(OrchestratorError::Other(e.to_string())),
             }
         }
         DeliverySessionGuard::begin_bound(root, identity, manifest, recovery_report, true, true)
@@ -287,6 +285,22 @@ impl FinalizedVoiceDelivery {
         phase: &mut DeliveryPhase,
     ) -> Result<(), OrchestratorError> {
         let wav_name = format!("{}.wav", stem.path_nick);
+        let staging = guard
+            .staging_dir()
+            .map_err(|e| OrchestratorError::Other(e.to_string()))?;
+        if let Ok(file) =
+            crate::voice_delivery::fs::file::open_existing_file_at(staging, &wav_name)
+        {
+            let stem_entry = guard
+                .manifest()
+                .stems
+                .iter()
+                .find(|s| s.file_name == wav_name)
+                .expect("stem");
+            verify_stem_from_handle(&file, stem_entry)
+                .map_err(|e| OrchestratorError::Other(e.to_string()))?;
+            return Ok(());
+        }
         let chunk = VOICE_V2_MAX_CHUNK_BYTES as usize;
         let mut writer = PartialStemWriter::open_or_resume(guard, &wav_name, chunk)
             .map_err(|e| OrchestratorError::Other(e.to_string()))?;
@@ -729,5 +743,92 @@ mod orchestrator_e2e {
         assert_eq!(identity.manifest_digest, api_digest);
         assert_eq!(identity.stem_set_digest, manifest.digest());
         assert_ne!(identity.manifest_digest, identity.stem_set_digest);
+    }
+
+    #[test]
+    fn corrupt_recovery_report_bytes_block_receipt() {
+        use crate::voice_delivery::recovery_report::RECOVERY_REPORT_RELATIVE_PATH;
+        let tmp = tempfile::tempdir().unwrap();
+        let (wav, sha) = build_wav_bytes();
+        let good = b"good report\n";
+        let good_sha = hex_digest(&Sha256::digest(good));
+        let mut raw = minimal_wav_value();
+        raw["stems"][0]["sha256"] = serde_json::json!(sha);
+        raw["recoveryReport"] = serde_json::json!({
+            "relativePath": RECOVERY_REPORT_RELATIVE_PATH,
+            "byteLength": good.len(),
+            "sha256": good_sha,
+            "contentType": "text/plain",
+        });
+        let manifest = parse_syndicate_finalized_manifest(&raw).unwrap();
+        let digest = compute_finalized_manifest_digest(&manifest);
+        let pending = PendingDelivery {
+            session_id: manifest.session_id.clone(),
+            manifest_digest: digest,
+            sealed_at: "2020-01-01T00:00:00.000Z".into(),
+            manifest,
+        };
+        let mock = MockVoiceV2Client::new();
+        mock.set_stem_bytes(&pending.session_id, "user1", wav);
+        mock.set_recovery_report_bytes(&pending.session_id, b"bad report\n".to_vec());
+        mock.set_pending(vec![pending.clone()]);
+        let orch = FinalizedVoiceDelivery::open_recording_parent(tmp.path())
+            .unwrap()
+            .with_device_id("device-test");
+        let mut phase = DeliveryPhase::Waiting;
+        let err = orch
+            .deliver_pending(&mock, &pending, &mut phase)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hash") || msg.contains("mismatch") || msg.contains("recovery"),
+            "{msg}"
+        );
+        assert_eq!(mock.receipt_calls(), 0);
+    }
+
+    #[test]
+    fn recovery_report_receipt_retry_after_interrupt_completes_once() {
+        use crate::voice_delivery::recovery_report::RECOVERY_REPORT_RELATIVE_PATH;
+        let tmp = tempfile::tempdir().unwrap();
+        let (wav, sha) = build_wav_bytes();
+        let report_text = b"receipt-restart report\n";
+        let report_sha = hex_digest(&Sha256::digest(report_text));
+        let mut raw = minimal_wav_value();
+        raw["stems"][0]["sha256"] = serde_json::json!(sha);
+        raw["recoveryReport"] = serde_json::json!({
+            "relativePath": RECOVERY_REPORT_RELATIVE_PATH,
+            "byteLength": report_text.len(),
+            "sha256": report_sha,
+            "contentType": "text/plain",
+        });
+        let manifest = parse_syndicate_finalized_manifest(&raw).unwrap();
+        let digest = compute_finalized_manifest_digest(&manifest);
+        let pending = PendingDelivery {
+            session_id: manifest.session_id.clone(),
+            manifest_digest: digest,
+            sealed_at: "2020-01-01T00:00:00.000Z".into(),
+            manifest,
+        };
+        let mock = MockVoiceV2Client::new();
+        mock.set_stem_bytes(&pending.session_id, "user1", wav);
+        mock.set_recovery_report_bytes(&pending.session_id, report_text.to_vec());
+        mock.set_pending(vec![pending.clone()]);
+        mock.push_receipt_error(VoiceV2ClientError::RetryAfter(Duration::from_secs(2)));
+        let orch = FinalizedVoiceDelivery::open_recording_parent(tmp.path())
+            .unwrap()
+            .with_device_id("device-restart");
+        let mut phase = DeliveryPhase::Waiting;
+        let err = orch
+            .deliver_pending(&mock, &pending, &mut phase)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OrchestratorError::ClientRetryable(VoiceV2ClientError::RetryAfter(_))
+        ));
+        let mut phase2 = DeliveryPhase::Waiting;
+        orch.deliver_pending(&mock, &pending, &mut phase2).unwrap();
+        assert_eq!(phase2, DeliveryPhase::Completed);
+        assert_eq!(mock.receipt_calls(), 1);
     }
 }

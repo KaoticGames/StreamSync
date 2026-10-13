@@ -173,6 +173,23 @@ impl DirHandle {
         Ok(buf)
     }
 
+    pub(crate) fn remove_child_file(&self, name: &str) -> Result<(), FsError> {
+        super::validate_single_component(name)?;
+        #[cfg(unix)]
+        {
+            unix::unlink_file_at(self, name)
+        }
+        #[cfg(windows)]
+        {
+            windows::unlink_file_at(self, name)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = name;
+            Err(FsError::Unsupported)
+        }
+    }
+
     pub(crate) fn clone_handle(&self) -> Result<DirHandle, FsError> {
         #[cfg(unix)]
         {
