@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+  "guildId": "123456789012345678",
+  "channelId": "234567890123456789",
+  "sessionStartWallMs": 1,
+  "sessionStartMonotonicNs": "100",
+  "sealedStopWallMs": 2,
+  "sealedStopMonotonicNs": "200",
+  "targetSampleCount48k": 0,
+  "journalFormatVersion": 2,
+  "journalSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "stems": [
+    {
+      "discordUserId": "123456789012345678",
+      "pathNick": "user1",
+      "wavRelativePath": "user1.wav",
+      "wavBytes": 44,
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "recoveryReport": {
+    "relativePath": "Syndicate Audio Recovery Report.txt",
+    "byteLength": 64,
+    "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "contentType": "text/plain"
+  }
+}

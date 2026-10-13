@@ -18,6 +18,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["nsis"],
     "publisher": "Kaotic Games",
     "icon": [
@@ -47,7 +48,19 @@
       "../../events-alert-delivery.js": "events-alert-delivery.js",
       "../../events-overlay.js": "events-overlay.js",
       "../../events-se-import.js": "events-se-import.js",
-      "../../streamelements-auth-inject.js": "streamelements-auth-inject.js"
+      "../../streamelements-auth-inject.js": "streamelements-auth-inject.js",
+      "../../update-modal.js": "update-modal.js"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "windows": {
+        "installMode": "passive"
+      },
+      "endpoints": [
+        "https://github.com/KaoticGames/StreamSync/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwCldSVFB1YmxpYyBrZXkgcmVwbGFjZSBhdCBvcGVyYXRvciBHMSE="
     }
   }
 }

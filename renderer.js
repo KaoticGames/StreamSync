@@ -1198,6 +1198,8 @@ document.addEventListener("DOMContentLoaded", () => {
       });
     }
 
+    const statusLine = viewEl.querySelector("#help-update-status");
+
     if (btnUpdates) {
       btnUpdates.addEventListener("click", async () => {
         try {
@@ -1207,10 +1209,29 @@ document.addEventListener("DOMContentLoaded", () => {
           }
 
           const res = await window.electronAPI.checkForUpdates();
-          if (!res?.ok) {
-            alert(
-              "Failed to check for updates:\n" + (res?.error || "Unknown error")
-            );
+          const message =
+            window.StreamSyncUpdateModal?.formatManualResult?.(res) ||
+            (res?.status === "upToDate"
+              ? "You are on the latest version."
+              : res?.status === "updateAvailable"
+                ? `Update available: Stream Sync ${res.version}`
+                : res?.message || "Unable to check for updates.");
+          if (statusLine) {
+            statusLine.textContent = message;
+          }
+          if (res?.status === "updateAvailable" && window.StreamSyncUpdateModal) {
+            window.StreamSyncUpdateModal.wireUpdateModal?.(
+              (cmd, args) => window.__TAURI__?.core?.invoke(cmd, args),
+              (event, handler) =>
+                window.__TAURI__?.event?.listen(event, handler) ||
+                Promise.resolve(() => {})
+            )?.openModal?.({
+              version: res.version,
+              notes: res.notes || "",
+              releaseUrl: res.releaseUrl,
+            });
+          } else {
+            alert(message);
           }
         } catch (err) {
           alert("Failed to check for updates:\n" + (err?.message || String(err)));

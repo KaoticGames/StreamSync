@@ -1,57 +1,56 @@
-# Release build — NSIS installer
+# Release build — GitHub Releases + signed updater
 
-Local Windows installer for Stream Sync 2.1, same workflow as Electron: build on your machine, upload the NSIS `.exe` to Cloudflare R2.
+Stream Sync ships Windows x86_64 NSIS installers through **GitHub Releases**. CI must be green on `main` before tagging.
 
 ## Prerequisites
 
-- Rust stable, Node.js, npm
+- Rust stable, Node.js 20, npm
 - `.env` filled in (see `config/env.example`)
-- WebView2 (usually already on Windows 10/11)
-- Optional: Windows SDK `signtool` for code signing
+- WebView2 on Windows 10/11
+- **Operator gate (G1):** `tauri signer generate` — store `TAURI_SIGNING_PRIVATE_KEY` in GitHub Actions secrets and paste the matching public key into `crates/stream-sync-desktop/tauri.conf.json` `plugins.updater.pubkey`
 
-## Build (unsigned — smoke test)
+Until the signing secret and production pubkey are installed, release builds still produce the NSIS installer but updater artifacts (`.sig`, `latest.json`) are only uploaded when signing succeeds.
+
+## Local build (unsigned smoke test)
 
 ```powershell
-# Run from the repository root (the directory containing package.json)
 npm install
 npm run build
 ```
 
-`npm run build` runs `prepare-release` first (copies `.env` → `config/bundled.env`), then `tauri build`.
+`npm run build` runs `prepare-release` (`.env` → `config/bundled.env`) then `tauri build`.
 
-**Output:** `target\release\bundle\nsis\` — `Stream Sync_2.1.0_x64-setup.exe` (name may vary).
+**Output:** `target\release\bundle\nsis\Stream Sync_2.1.0_x64-setup.exe` (spacing per Tauri `productName`).
 
-Install that exe on a test machine and verify Twitch connect, overlays, and **Help → Check for updates**.
+Copy bytes unchanged to the canonical release name `StreamSync-windows-x86_64-setup.exe` in CI.
 
-## Code signing (recommended for R2 downloads)
+## GitHub Release workflow
 
-Uses the same Authenticode `.pfx` as electron-builder (`certs/kaotic-games.pfx`).
+1. Bump `2.1.0` consistently (`Cargo.toml`, `package.json`, `tauri.conf.json`, UI).
+2. Merge to `main` with green CI quality gates.
+3. Tag `vX.Y.Z` on `main` (must match `tauri.conf.json`).
+4. `release.yml` validates the tag, re-runs quality gates, builds NSIS, creates a **draft** Release with:
+   - `StreamSync-windows-x86_64-setup.exe`
+   - `SHA256SUMS.txt`
+   - `StreamSync-windows-x86_64-setup.exe.sig` (when signing secret present)
+   - `latest.json` (Phase 2+, when `.sig` exists)
+5. Complete [INSTALLER_SMOKE.md](INSTALLER_SMOKE.md) on the draft asset.
+6. Approve the `streamsync-release` environment to publish.
 
-### Option A — Certificate in Windows store (Tauri default)
+Stable human download URL:
 
-1. Import the PFX (PowerShell):
+`https://github.com/KaoticGames/StreamSync/releases/latest/download/StreamSync-windows-x86_64-setup.exe`
 
-```powershell
-$pwd = Read-Host "PFX password" -AsSecureString
-Import-PfxCertificate -FilePath ".\certs\kaotic-games.pfx" `
-  -CertStoreLocation Cert:\CurrentUser\My -Password $pwd
-```
+Updater manifest URL:
 
-2. Copy the certificate **Thumbprint** from `certmgr.msc` → Personal → Certificates.
+`https://github.com/KaoticGames/StreamSync/releases/latest/download/latest.json`
 
-3. Set in [`tauri.conf.json`](../crates/stream-sync-desktop/tauri.conf.json) under `bundle.windows`:
+## Signing layers
 
-```json
-"certificateThumbprint": "YOUR_THUMBPRINT_NO_SPACES"
-```
-
-`digestAlgorithm` and `timestampUrl` are already set.
-
-4. `npm run build` — Tauri signs the NSIS installer via `signtool`.
-
-### Option B — Unsigned build
-
-Leave `certificateThumbprint` unset. Fine for your own install testing; SmartScreen may warn on public downloads.
+| Mechanism | Purpose |
+|-----------|---------|
+| Tauri `.sig` | Authenticates downloaded updater artifact bytes before install. Does **not** sign the full `latest.json` manifest. |
+| Authenticode (`WINDOWS_CERT_P12`) | Windows SmartScreen / publisher name — deferred Phase 3 |
 
 ## What gets bundled
 
@@ -59,12 +58,10 @@ Leave `certificateThumbprint` unset. Fine for your own install testing; SmartScr
 |------|---------|
 | `config/bundled.env` | Twitch Client ID, redirect, port |
 | UI assets | `shell.html`, `overlay-server/`, `views/`, etc. |
-| Version `2.1.0` | `tauri.conf.json` + Cargo workspace |
+| Updater config | `plugins.updater` endpoints + pubkey |
 
-`%APPDATA%\Stream Sync\.env` still overrides bundled defaults for power users.
+`%APPDATA%\Stream Sync\.env` still overrides bundled defaults.
 
-## Upload
+## Legacy R2 flow
 
-Upload the signed (or test) setup `.exe` from `target\release\bundle\nsis\` to your R2 bucket / download page.
-
-No GitHub Actions required for this flow.
+Manual Cloudflare R2 upload is retired for new releases. Keep read-only buckets for old bookmarks until optional mirror work in Phase 3.

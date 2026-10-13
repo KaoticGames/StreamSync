@@ -328,8 +328,7 @@ impl FeedHub {
         }
 
         if !revoked_senders.is_empty() {
-            let failed_close =
-                Self::close_senders_concurrently(revoked_senders.iter().cloned().collect()).await;
+            let failed_close = Self::close_senders_concurrently(revoked_senders.clone()).await;
             self.clear_private_auth_for_senders(profile_id, &revoked_senders)
                 .await;
             if !failed_close.is_empty() {

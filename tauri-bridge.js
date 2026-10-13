@@ -74,6 +74,14 @@
       throw new Error("Stream Sync connections API unavailable");
     }
 
+    function tauriListen(event, handler) {
+      const eventApi = tauri.event || tauri.core?.event;
+      if (!eventApi || typeof eventApi.listen !== "function") {
+        return Promise.resolve(() => {});
+      }
+      return eventApi.listen(event, handler);
+    }
+
     window.electronAPI = {
       getOverlayBaseUrl: () => cachedBase,
       getOverlayPort: () => cachedPort,
@@ -97,7 +105,13 @@
       twitchDisconnect,
       kickConnect,
       purgeLogs: () => invoke("purge_logs"),
-      checkForUpdates: () => invoke("check_for_updates"),
+      getUpdateStatus: () => invoke("get_update_status"),
+      checkForUpdates: () => invoke("check_for_updates_manual"),
+      checkForUpdatesManual: () => invoke("check_for_updates_manual"),
+      beginUpdateInstall: (version) =>
+        invoke("begin_update_install", { version }),
+      dismissUpdate: (version) => invoke("dismiss_update", { version }),
+      openUpdateFallbackPage: () => invoke("open_update_fallback_page"),
       openSeAccountPage: (flow) => {
         if (typeof flow !== "string" || !flow.startsWith("ssl_")) {
           return Promise.reject(new Error("missing_login_flow"));
@@ -107,6 +121,16 @@
       exportBackup: () => invoke("export_backup"),
       restoreBackup: () => invoke("restore_backup"),
     };
+
+    if (window.StreamSyncUpdateModal?.wireUpdateModal) {
+      const updateController =
+        window.StreamSyncUpdateModal.wireUpdateModal(invoke, tauriListen);
+      Promise.resolve(updateController?.ready)
+        .then(() => invoke("check_for_updates_background"))
+        .catch((err) => {
+          console.warn("[tauri-bridge] launch update check:", err);
+        });
+    }
 
     console.log("[tauri-bridge] Stream Sync desktop APIs ready", cachedBase);
   }

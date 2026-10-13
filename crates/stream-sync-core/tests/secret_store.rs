@@ -2,10 +2,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use stream_sync_core::{
-    fs_secret_store, memory_secret_store, FailClosedSecretStore, KickTokenFile, OverlayConfig,
-    OverlayServer, SeSession, SecretStore, TwitchTokenFile, FAIL_CLOSED_SECRET_STORE_MESSAGE,
-    STREAMELEMENTS_JWT_KEY, TWITCH_DELEGATED_ACCESS_TOKEN_KEY, TWITCH_DELEGATED_CONNECTION_KEY,
-    TWITCH_PERSONAL_ACCESS_KEY,
+    all_delegated_bundle_slot_keys, fs_secret_store, memory_secret_store, FailClosedSecretStore,
+    KickTokenFile, OverlayConfig, OverlayServer, SeSession, SecretStore, TwitchTokenFile,
+    FAIL_CLOSED_SECRET_STORE_MESSAGE, STREAMELEMENTS_JWT_KEY, TWITCH_DELEGATED_ACCESS_TOKEN_KEY,
+    TWITCH_DELEGATED_CONNECTION_KEY, TWITCH_PERSONAL_ACCESS_KEY,
 };
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -181,6 +181,7 @@ async fn delegated_persist_does_not_serialize_connection_key_or_tokens() {
         channel_login: "takeover_chan".into(),
         channel_twitch_id: "999".into(),
         twitch_expires_at: "2099-01-01T00:00:00Z".into(),
+        kick_id: Some("ssk_test_placeholder_kick_id".into()),
         kick_access_token: Some("ssk_test_placeholder_delegated_kick_at".into()),
         kick_refresh_token: Some("ssk_test_placeholder_delegated_kick_rt".into()),
         ..Default::default()
@@ -192,14 +193,16 @@ async fn delegated_persist_does_not_serialize_connection_key_or_tokens() {
     assert!(!raw.contains("ssk_test_placeholder_delegated_kick_at"));
     assert!(!raw.contains("ssk_test_placeholder_delegated_kick_rt"));
     let store = fs_secret_store(&userdata);
-    assert_eq!(
-        store
-            .get(TWITCH_DELEGATED_CONNECTION_KEY)
-            .unwrap()
-            .as_deref(),
-        Some(b"ssk_test_placeholder_conn".as_slice())
+    assert!(
+        all_delegated_bundle_slot_keys()
+            .iter()
+            .any(|key| store.get(key).unwrap().is_some()),
+        "delegated secrets must be stored in bounded bundle slot"
     );
     state.durable_revoke_delegated().await.unwrap();
+    for key in all_delegated_bundle_slot_keys() {
+        assert!(store.get(&key).unwrap().is_none());
+    }
     assert!(store
         .get(TWITCH_DELEGATED_CONNECTION_KEY)
         .unwrap()

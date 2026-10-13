@@ -564,8 +564,17 @@ pub struct TwitchTokenFile {
     pub scopes: Option<Vec<String>>,
 }
 
+/// Voice delivery protocol mode for the Discord ingest worker (immutable per process once started).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceDeliveryProtocol {
+    Legacy,
+    #[default]
+    V2,
+}
+
 /// Persisted Discord voice ingest configuration (local recording destination + stable host id).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscordVoiceConfigFile {
     #[serde(default)]
     pub device_id: String,
@@ -574,6 +583,19 @@ pub struct DiscordVoiceConfigFile {
     /// Consumed Discord pairing token (`sdk_…`). Used as Bearer for voice APIs.
     #[serde(default)]
     pub host_token: Option<String>,
+    #[serde(default)]
+    pub voice_delivery_protocol: VoiceDeliveryProtocol,
+}
+
+impl Default for DiscordVoiceConfigFile {
+    fn default() -> Self {
+        Self {
+            device_id: String::new(),
+            recording_parent: None,
+            host_token: None,
+            voice_delivery_protocol: VoiceDeliveryProtocol::V2,
+        }
+    }
 }
 
 /// Persisted Syndicate connection-key (takeover) session. Not mixed into personal tokens.
@@ -582,8 +604,16 @@ pub struct DelegatedSessionFile {
     /// Monotonic session generation — stale workers must not mutate a newer session.
     #[serde(default)]
     pub generation: u64,
+    /// Revision of the bound external secret bundle (independent of generation for refresh).
+    #[serde(default)]
+    pub secret_revision: u64,
+    /// Fixed journal slot (0 or 1) holding the bound secret bundle.
+    #[serde(default)]
+    pub bundle_slot: u8,
+    #[serde(default)]
     pub connection_key: String,
     pub client_id: String,
+    #[serde(default)]
     pub access_token: String,
     pub channel_login: String,
     pub channel_twitch_id: String,
