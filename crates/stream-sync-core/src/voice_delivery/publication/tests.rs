@@ -1115,12 +1115,11 @@ mod windows_recovery_report_publication {
     use super::super::test_support::write_minimal_stem;
     use crate::voice_delivery::fs::{rename_no_replace_same_parent, DestRoot, FsError};
     use crate::voice_delivery::hash::hex_digest;
-    use crate::voice_delivery::identity::{
-        DeliveryImmutableIdentity, RecoveryReportIdentityBinding,
-    };
+    use crate::voice_delivery::identity::DeliveryImmutableIdentity;
     use crate::voice_delivery::manifest::ValidatedManifest;
     use crate::voice_delivery::recovery_report::{
-        RecoveryReportSpec, RECOVERY_REPORT_CONTENT_TYPE, RECOVERY_REPORT_RELATIVE_PATH,
+        RecoveryReportIdentityBinding, RecoveryReportSpec, RECOVERY_REPORT_CONTENT_TYPE,
+        RECOVERY_REPORT_RELATIVE_PATH,
     };
     use crate::voice_delivery::session::DeliverySessionGuard;
     use sha2::{Digest, Sha256};
