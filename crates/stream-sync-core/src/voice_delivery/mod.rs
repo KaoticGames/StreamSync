@@ -24,14 +24,15 @@ mod ids;
 mod lock;
 
 pub use client::parse_pending_response;
+pub use client::PENDING_PATH;
 pub use client::{
     validate_recovery_report_range_meta, validate_stem_range_meta, HttpVoiceV2Client,
     MockVoiceV2Client, PendingDelivery, ReceiptRequestBody, StemRangeMeta, VoiceV2Client,
     VoiceV2ClientError,
 };
 pub use finalized_manifest::{
-    compute_finalized_manifest_digest, parse_syndicate_finalized_manifest,
-    SyndicateFinalizedManifest,
+    canonicalize_finalized_manifest_for_digest, compute_finalized_manifest_digest,
+    parse_syndicate_finalized_manifest, SyndicateFinalizedManifest,
 };
 pub use ingest::{PartialError, PartialRecoveryReportWriter, PartialStemWriter};
 pub use orchestrator::{DeliveryPhase, FinalizedVoiceDelivery, OrchestratorError};

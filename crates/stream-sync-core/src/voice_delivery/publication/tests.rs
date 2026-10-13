@@ -1107,3 +1107,128 @@ mod crash_child_process_publication {
         }
     }
 }
+
+#[cfg(windows)]
+mod windows_recovery_report_publication {
+    use super::super::publish::{prepare_publication, publish_prepared, PublishOptions};
+    use super::super::recover::recover_delivery;
+    use super::super::test_support::write_minimal_stem;
+    use crate::voice_delivery::fs::{rename_no_replace_same_parent, DestRoot, FsError};
+    use crate::voice_delivery::hash::hex_digest;
+    use crate::voice_delivery::identity::{
+        DeliveryImmutableIdentity, RecoveryReportIdentityBinding,
+    };
+    use crate::voice_delivery::manifest::ValidatedManifest;
+    use crate::voice_delivery::recovery_report::{
+        RecoveryReportSpec, RECOVERY_REPORT_CONTENT_TYPE, RECOVERY_REPORT_RELATIVE_PATH,
+    };
+    use crate::voice_delivery::session::DeliverySessionGuard;
+    use sha2::{Digest, Sha256};
+
+    fn guard_with_report(
+        tmp: &tempfile::TempDir,
+        body: &[u8],
+    ) -> (DeliverySessionGuard, RecoveryReportSpec) {
+        let root = DestRoot::open(tmp.path()).unwrap();
+        let stage = super::super::test_support::stage_token("cafebabecafebabecafebabecafebabe");
+        root.handle()
+            .clone_handle()
+            .unwrap()
+            .create_child_dir(&stage)
+            .unwrap();
+        let staging = root.handle().open_child_dir(&stage).unwrap();
+        let stem = write_minimal_stem(&staging, "a.wav", 4);
+        let manifest = ValidatedManifest::validate(vec![stem]).unwrap();
+        let sha = hex_digest(&Sha256::digest(body));
+        let binding = RecoveryReportIdentityBinding {
+            file_name: RECOVERY_REPORT_RELATIVE_PATH.to_string(),
+            byte_count: body.len() as u64,
+            sha256: sha,
+            content_type: RECOVERY_REPORT_CONTENT_TYPE.to_string(),
+        };
+        let spec = RecoveryReportSpec {
+            file_name: binding.file_name.clone(),
+            byte_count: binding.byte_count,
+            sha256: binding.sha256.clone(),
+        };
+        let identity = DeliveryImmutableIdentity::new_bound(
+            "windows-report-pub",
+            manifest.digest(),
+            &manifest,
+            &stage,
+            vec![],
+            "final-windows-report",
+            Some(binding),
+        )
+        .unwrap();
+        let guard = DeliverySessionGuard::begin(root, identity, manifest, Some(spec.clone()), true)
+            .unwrap();
+        (guard, spec)
+    }
+
+    #[test]
+    fn fixed_filename_with_spaces_exact_existing_is_idempotent() {
+        let body = b"Windows recovery report exact\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let (guard, spec) = guard_with_report(&tmp, body);
+        let staging = guard.staging_dir().unwrap();
+        staging
+            .create_new_file(RECOVERY_REPORT_RELATIVE_PATH)
+            .unwrap()
+            .write_all_at(0, body)
+            .unwrap();
+        let mut partial = staging.create_new_file(".report.part").unwrap();
+        partial.write_all_at(0, body).unwrap();
+        assert!(matches!(
+            rename_no_replace_same_parent(&staging, ".report.part", &spec.file_name),
+            Err(FsError::AlreadyExists)
+        ));
+        let _ = tmp;
+    }
+
+    #[test]
+    fn differing_existing_report_conflicts_without_replace() {
+        let body = b"expected body\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let (guard, _spec) = guard_with_report(&tmp, body);
+        let staging = guard.staging_dir().unwrap();
+        staging
+            .create_new_file(RECOVERY_REPORT_RELATIVE_PATH)
+            .unwrap()
+            .write_all_at(0, b"other content\n")
+            .unwrap();
+        let mut partial = staging.create_new_file(".report.part").unwrap();
+        partial.write_all_at(0, body).unwrap();
+        assert!(rename_no_replace_same_parent(
+            &staging,
+            ".report.part",
+            RECOVERY_REPORT_RELATIVE_PATH
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn sealed_fixture_with_report_survives_publish_recovery() {
+        let body = b"publish with report\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let (guard, spec) = guard_with_report(&tmp, body);
+        let staging = guard.staging_dir().unwrap();
+        staging
+            .create_new_file(RECOVERY_REPORT_RELATIVE_PATH)
+            .unwrap()
+            .write_all_at(0, body)
+            .unwrap();
+        let ledger =
+            crate::voice_delivery::records::ledger_generation::LedgerStore::open_for_guard(&guard)
+                .unwrap();
+        ledger
+            .commit(&guard, crate::voice_delivery::state::LedgerState::Receiving)
+            .unwrap();
+        guard.seal_and_write_publish_intent().unwrap();
+        let prepared = prepare_publication(&guard).unwrap();
+        publish_prepared(prepared, None, PublishOptions::default()).unwrap();
+        let _ = recover_delivery(&guard, None).unwrap();
+        assert_eq!(spec.file_name, RECOVERY_REPORT_RELATIVE_PATH);
+        let _ = tmp;
+    }
+}

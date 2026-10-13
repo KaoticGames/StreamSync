@@ -1,9 +1,30 @@
 //! Recovery report range validation and mock client coverage.
 
+use sha2::{Digest, Sha256};
 use stream_sync_core::voice_delivery::{
-    validate_recovery_report_range_meta, MockVoiceV2Client, StemRangeMeta, VoiceV2Client,
-    VoiceV2ClientError,
+    canonicalize_finalized_manifest_for_digest, compute_finalized_manifest_digest,
+    parse_syndicate_finalized_manifest, validate_recovery_report_range_meta, MockVoiceV2Client,
+    StemRangeMeta, VoiceV2Client, VoiceV2ClientError,
 };
+
+const REVIEWER_FIXTURE: &str = include_str!(
+    "fixtures/voice_delivery_v2_finalized_manifest_with_recovery_report_reviewer.json"
+);
+
+#[test]
+fn reviewer_fixture_bytes_and_digest_gate() {
+    let digest = Sha256::digest(REVIEWER_FIXTURE.as_bytes());
+    let fixture_sha256 = format!("{:x}", digest);
+    assert!(!fixture_sha256.is_empty());
+    let raw: serde_json::Value = serde_json::from_str(REVIEWER_FIXTURE).unwrap();
+    let parsed = parse_syndicate_finalized_manifest(&raw).unwrap();
+    let canonical = canonicalize_finalized_manifest_for_digest(&parsed);
+    assert!(canonical.contains(r#""version":1,"recoveryReport":"#));
+    assert_eq!(
+        compute_finalized_manifest_digest(&parsed),
+        "6c6d8f7c4b5fe3d9db6490c6b966038c72f05961ee6c3dc2daa931670efd135a"
+    );
+}
 
 #[test]
 fn validate_recovery_report_meta_requires_sha_etag() {

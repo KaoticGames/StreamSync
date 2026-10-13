@@ -37,11 +37,18 @@ jobs:
           run_suite 'voice_delivery::records::'
           run_suite 'voice_delivery::ingest::'
           cargo test -p stream-sync-core --test voice_delivery_v2_r2_redirect -- --nocapture
+          cargo test -p stream-sync-core --test voice_delivery_v2_http_orchestrator_e2e -- --nocapture
           cargo test -p stream-sync-core --test voice_delivery_v2_recovery_report -- --nocapture
+          node scripts/verify-voice-delivery-v2-reviewer-fixture.mjs
           run_suite 'cross_language_golden_manifest_with_recovery_report_reviewer'
           run_suite 'ledger_persists_recovery_report_identity'
           run_suite 'delivers_manifest_with_recovery_report_then_receipts'
+          run_suite 'corrupt_recovery_report_bytes_block_receipt'
+          run_suite 'recovery_report_receipt_retry_after_interrupt_completes_once'
           run_suite 'recovery_report_api_307_r2_206_without_bearer'
+          run_suite 'http_orchestrator_publishes_wav_and_report_then_receipts'
+          run_suite 'reviewer_fixture_bytes_and_digest_gate'
+          run_suite 'windows_recovery_report_publication'
           run_suite 'voice_delivery::marker::'
           run_suite 'voice_delivery::session::'
           run_suite 'voice_delivery::state::'
