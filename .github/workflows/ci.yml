@@ -37,6 +37,11 @@ jobs:
           run_suite 'voice_delivery::records::'
           run_suite 'voice_delivery::ingest::'
           cargo test -p stream-sync-core --test voice_delivery_v2_r2_redirect -- --nocapture
+          cargo test -p stream-sync-core --test voice_delivery_v2_recovery_report -- --nocapture
+          run_suite 'cross_language_golden_manifest_with_recovery_report_reviewer'
+          run_suite 'ledger_persists_recovery_report_identity'
+          run_suite 'delivers_manifest_with_recovery_report_then_receipts'
+          run_suite 'recovery_report_api_307_r2_206_without_bearer'
           run_suite 'voice_delivery::marker::'
           run_suite 'voice_delivery::session::'
           run_suite 'voice_delivery::state::'

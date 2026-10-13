@@ -1,10 +1,15 @@
 //! Resumable partial stem writer with immutable checkpoint generations.
 
 use crate::voice_delivery::fs::durability::sync_file;
+use crate::voice_delivery::fs::file::{open_existing_file_at, open_or_create_file_at};
+use crate::voice_delivery::fs::FsError;
 use crate::voice_delivery::fs::VoiceFile;
 use crate::voice_delivery::hash::{HashError, LiveSha256};
 use crate::voice_delivery::identity::{RecoveryReportArtifactId, StemArtifactId};
 use crate::voice_delivery::records::checkpoint_generation::CheckpointStore;
+use crate::voice_delivery::recovery_report::{
+    verify_recovery_report_from_handle, RecoveryReportSpec,
+};
 use crate::voice_delivery::session::DeliverySessionGuard;
 use thiserror::Error;
 
@@ -156,9 +161,15 @@ impl<'guard> PartialStemWriter<'guard> {
         if chunk_size == 0 {
             return Err(PartialError::InvalidChunkSize);
         }
-        let artifact = RecoveryReportArtifactId::from_identity(guard.identity())
-            .map_err(|_| PartialError::BindingMismatch)?;
         let spec = RecoveryReportArtifactId::expected_spec(guard.identity())
+            .map_err(|_| PartialError::BindingMismatch)?;
+        match reconcile_recovery_report_staging(guard, &spec)? {
+            RecoveryReportStagingState::AlreadyPromoted => {
+                return Self::from_promoted_recovery_report(guard, chunk_size, &spec);
+            }
+            RecoveryReportStagingState::NeedDownload => {}
+        }
+        let artifact = RecoveryReportArtifactId::from_identity(guard.identity())
             .map_err(|_| PartialError::BindingMismatch)?;
         let expected_total = spec.byte_count;
         let expected_full_sha256 = spec.sha256.clone();
@@ -219,6 +230,35 @@ impl<'guard> PartialStemWriter<'guard> {
             expected_full_sha256,
             durable_contiguous_len: durable,
             live_contiguous_len: durable,
+            hasher,
+            partial_name,
+            checkpoint_store,
+            chunk_size,
+        })
+    }
+
+    fn from_promoted_recovery_report(
+        guard: &'guard DeliverySessionGuard,
+        chunk_size: usize,
+        spec: &RecoveryReportSpec,
+    ) -> Result<Self, PartialError> {
+        let artifact = RecoveryReportArtifactId::from_identity(guard.identity())
+            .map_err(|_| PartialError::BindingMismatch)?;
+        let partial_name = artifact.partial_basename();
+        let checkpoint_store = CheckpointStore::open_for_recovery_report(guard, artifact)?;
+        let staging_dir = guard
+            .staging_dir()
+            .map_err(|e| PartialError::Io(e.to_string()))?;
+        let file = open_existing_file_at(staging_dir, &spec.file_name).map_err(PartialError::Fs)?;
+        let mut hasher = LiveSha256::new();
+        hash_prefix_into(&file, spec.byte_count, chunk_size, &mut hasher, None)?;
+        Ok(Self {
+            _guard: guard,
+            file,
+            expected_total: spec.byte_count,
+            expected_full_sha256: spec.sha256.clone(),
+            durable_contiguous_len: spec.byte_count,
+            live_contiguous_len: spec.byte_count,
             hasher,
             partial_name,
             checkpoint_store,
@@ -307,6 +347,50 @@ impl<'guard> PartialStemWriter<'guard> {
 
 pub type PartialRecoveryReportWriter<'guard> = PartialStemWriter<'guard>;
 
+pub(crate) enum RecoveryReportStagingState {
+    NeedDownload,
+    AlreadyPromoted,
+}
+
+pub(crate) fn reconcile_recovery_report_staging(
+    guard: &DeliverySessionGuard,
+    spec: &RecoveryReportSpec,
+) -> Result<RecoveryReportStagingState, PartialError> {
+    let staging = guard
+        .staging_dir()
+        .map_err(|e| PartialError::Io(e.to_string()))?;
+    match open_existing_file_at(staging, &spec.file_name) {
+        Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(RecoveryReportStagingState::NeedDownload)
+        }
+        Err(e) => Err(PartialError::Fs(e)),
+        Ok(file) => {
+            verify_recovery_report_from_handle(&file, spec)
+                .map_err(|_| PartialError::BindingMismatch)?;
+            truncate_stale_recovery_report_partial(guard, staging)?;
+            Ok(RecoveryReportStagingState::AlreadyPromoted)
+        }
+    }
+}
+
+fn truncate_stale_recovery_report_partial(
+    guard: &DeliverySessionGuard,
+    staging: &crate::voice_delivery::fs::DirHandle,
+) -> Result<(), PartialError> {
+    let artifact = RecoveryReportArtifactId::from_identity(guard.identity())
+        .map_err(|_| PartialError::BindingMismatch)?;
+    let partial_name = artifact.partial_basename();
+    match open_or_create_file_at(staging, &partial_name) {
+        Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(PartialError::Fs(e)),
+        Ok(file) => {
+            file.set_len(0)?;
+            sync_file(&file)?;
+            Ok(())
+        }
+    }
+}
+
 fn verify_overlap_prefix(
     file: &VoiceFile,
     offset: u64,
@@ -366,6 +450,78 @@ impl StagingPartialOpen for crate::voice_delivery::fs::DirHandle {
         name: &str,
     ) -> Result<VoiceFile, crate::voice_delivery::fs::FsError> {
         crate::voice_delivery::fs::file::open_or_create_file_at(self, name)
+    }
+}
+
+#[cfg(test)]
+mod recovery_report_staging_reconcile {
+    use super::*;
+    use crate::voice_delivery::fs::DestRoot;
+    use crate::voice_delivery::hash::hex_digest;
+    use crate::voice_delivery::identity::DeliveryImmutableIdentity;
+    use crate::voice_delivery::manifest::{StemManifestEntry, ValidatedManifest};
+    use crate::voice_delivery::recovery_report::{
+        RecoveryReportIdentityBinding, RecoveryReportSpec, RECOVERY_REPORT_CONTENT_TYPE,
+        RECOVERY_REPORT_RELATIVE_PATH,
+    };
+    use crate::voice_delivery::session::DeliverySessionGuard;
+    use sha2::{Digest, Sha256};
+
+    fn guard_with_report(body: &[u8]) -> (tempfile::TempDir, DeliverySessionGuard, RecoveryReportSpec) {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = ValidatedManifest::validate(vec![StemManifestEntry {
+            file_name: "a.wav".into(),
+            byte_count: 44,
+            sha256: "a".repeat(64),
+        }])
+        .unwrap();
+        let sha = hex_digest(&Sha256::digest(body));
+        let binding = RecoveryReportIdentityBinding {
+            file_name: RECOVERY_REPORT_RELATIVE_PATH.to_string(),
+            byte_count: body.len() as u64,
+            sha256: sha,
+            content_type: RECOVERY_REPORT_CONTENT_TYPE.to_string(),
+        };
+        let spec = RecoveryReportSpec {
+            file_name: binding.file_name.clone(),
+            byte_count: binding.byte_count,
+            sha256: binding.sha256.clone(),
+        };
+        let identity = DeliveryImmutableIdentity::new_bound(
+            "recovery-staging-test",
+            manifest.digest(),
+            &manifest,
+            ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
+            vec![],
+            "final-report",
+            Some(binding),
+        )
+        .unwrap();
+        let guard = DeliverySessionGuard::begin(
+            DestRoot::open(tmp.path()).unwrap(),
+            identity,
+            manifest,
+            Some(spec.clone()),
+            true,
+        )
+        .unwrap();
+        (tmp, guard, spec)
+    }
+
+    #[test]
+    fn exact_final_report_skips_partial_resume() {
+        let body = b"final report\n";
+        let (tmp, guard, spec) = guard_with_report(body);
+        let staging = guard.staging_dir().unwrap();
+        staging
+            .create_new_file(RECOVERY_REPORT_RELATIVE_PATH)
+            .unwrap()
+            .write_all_at(0, body)
+            .unwrap();
+        let partial = PartialStemWriter::open_or_resume_recovery_report(&guard, 64).unwrap();
+        assert_eq!(partial.resumable_offset(), spec.byte_count);
+        partial.assert_download_complete().unwrap();
+        let _ = tmp;
     }
 }
 

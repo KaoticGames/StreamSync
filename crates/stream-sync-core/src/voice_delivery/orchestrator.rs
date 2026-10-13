@@ -6,8 +6,8 @@ use crate::voice_delivery::client::{
     ReceiptRequestBody, VoiceV2Client, VoiceV2ClientError, VOICE_V2_MAX_CHUNK_BYTES,
 };
 use crate::voice_delivery::finalized_manifest::{bind_delivery_identity, SyndicateFinalizedStem};
-use crate::voice_delivery::fs::rename_no_replace_same_parent;
 use crate::voice_delivery::fs::DestRoot;
+use crate::voice_delivery::fs::{rename_no_replace_same_parent, FsError};
 use crate::voice_delivery::identity::DeliveryImmutableIdentity;
 use crate::voice_delivery::manifest::ValidatedManifest;
 use crate::voice_delivery::marker::verify_stem_from_handle;
@@ -360,8 +360,20 @@ impl FinalizedVoiceDelivery {
             .staging_dir()
             .map_err(|e| OrchestratorError::Other(e.to_string()))?;
         let partial = writer.partial_basename();
-        rename_no_replace_same_parent(staging, &partial, &spec.file_name)
-            .map_err(|e| OrchestratorError::Other(e.to_string()))?;
+        match rename_no_replace_same_parent(staging, &partial, &spec.file_name) {
+            Ok(()) => {}
+            Err(FsError::AlreadyExists) => {
+                let file = crate::voice_delivery::fs::file::open_existing_file_at(
+                    staging,
+                    &spec.file_name,
+                )
+                .map_err(|e| OrchestratorError::Other(e.to_string()))?;
+                verify_recovery_report_from_handle(&file, spec)
+                    .map_err(|e| OrchestratorError::Other(e.to_string()))?;
+                return Ok(());
+            }
+            Err(e) => return Err(OrchestratorError::Other(e.to_string())),
+        }
         let file = crate::voice_delivery::fs::file::open_existing_file_at(staging, &spec.file_name)
             .map_err(|e| OrchestratorError::Other(e.to_string()))?;
         verify_recovery_report_from_handle(&file, spec)

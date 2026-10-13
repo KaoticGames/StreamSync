@@ -7,8 +7,8 @@ use std::thread;
 use std::time::Duration;
 
 use stream_sync_core::voice_delivery::{
-    validate_stem_range_meta, HttpVoiceV2Client, ReceiptRequestBody, VoiceV2Client,
-    VoiceV2ClientError,
+    validate_recovery_report_range_meta, validate_stem_range_meta, HttpVoiceV2Client,
+    ReceiptRequestBody, VoiceV2Client, VoiceV2ClientError,
 };
 
 #[derive(Default, Clone)]
@@ -182,6 +182,54 @@ fn api_307_r2_206_streams_range_without_bearer() {
     assert_eq!(meta.etag, "\"multipart-abc-2\"");
     assert_eq!(*api_hits.lock().unwrap(), 1);
     assert_eq!(*r2_hits.lock().unwrap(), 1);
+}
+
+#[test]
+fn recovery_report_api_307_r2_206_without_bearer() {
+    let report_bytes: Arc<Mutex<Vec<u8>>> =
+        Arc::new(Mutex::new(b"report-body-0123456789".to_vec()));
+    let sha = {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(report_bytes.lock().unwrap().as_slice()))
+    };
+    let etag = format!("\"{sha}\"");
+    let r2_bytes = report_bytes.clone();
+    let r2 = MiniServer::spawn(move |req, stream| {
+        assert_eq!(req.method, "GET");
+        assert!(req.auth.is_none(), "R2 must not receive Authorization");
+        assert_eq!(req.range.as_deref(), Some("bytes=0-7"));
+        let data = r2_bytes.lock().unwrap();
+        write_response(
+            stream,
+            "206 Partial Content",
+            &[
+                ("Content-Range", "bytes 0-7/20"),
+                ("Content-Length", "8"),
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("ETag", &etag),
+            ],
+            &data[0..8],
+        );
+    });
+    let r2_port = r2.addr.rsplit(':').next().unwrap().parse::<u16>().unwrap();
+    let r2_url = format!("http://127.0.0.1:{r2_port}/recovery?sig=secret");
+    let api = MiniServer::spawn(move |req, stream| {
+        assert!(req.path.contains("/recovery-report"));
+        assert!(req.auth.as_deref().is_some_and(|a| a.contains("sdk_test")));
+        write_response(
+            stream,
+            "307 Temporary Redirect",
+            &[("Location", &r2_url)],
+            b"",
+        );
+    });
+    let client = test_client(&api.addr, r2_port);
+    let mut out = Vec::new();
+    let meta = client
+        .fetch_recovery_report_range("550e8400-e29b-41d4-a716-446655440000", 0, 8, &mut out)
+        .expect("recovery report fetch");
+    validate_recovery_report_range_meta(&meta, 0, 20, 8, &sha).unwrap();
+    assert_eq!(out, b"report-b");
 }
 
 #[test]
