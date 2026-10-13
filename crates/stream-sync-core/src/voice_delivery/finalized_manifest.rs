@@ -196,6 +196,32 @@ fn compare_ascii(a: &str, b: &str) -> std::cmp::Ordering {
 
 /// Canonical JSON for manifest identity (stable key order, stems sorted by pathNick ASCII).
 pub fn canonicalize_finalized_manifest_for_digest(manifest: &SyndicateFinalizedManifest) -> String {
+    let base = canonicalize_finalized_manifest_base_for_digest(manifest);
+    match &manifest.recovery_report {
+        None => base,
+        Some(report) => {
+            let report_json = serde_json::json!({
+                "byteLength": report.byte_length,
+                "contentType": report.content_type,
+                "relativePath": report.relative_path,
+                "sha256": report.sha256,
+            });
+            let report_serialized =
+                serde_json::to_string(&report_json).expect("recovery report json");
+            assert!(base.ends_with('}'), "manifest canonical must be object");
+            let mut out = String::with_capacity(base.len() + report_serialized.len() + 24);
+            out.push_str(&base[..base.len() - 1]);
+            out.push_str(",\"recoveryReport\":");
+            out.push_str(&report_serialized);
+            out.push('}');
+            out
+        }
+    }
+}
+
+fn canonicalize_finalized_manifest_base_for_digest(
+    manifest: &SyndicateFinalizedManifest,
+) -> String {
     let mut stems: Vec<_> = manifest
         .stems
         .iter()
@@ -232,17 +258,6 @@ pub fn canonicalize_finalized_manifest_for_digest(manifest: &SyndicateFinalizedM
         "journalSha256".into(),
         serde_json::Value::String(manifest.journal_sha256.clone()),
     );
-    if let Some(report) = &manifest.recovery_report {
-        payload.insert(
-            "recoveryReport".into(),
-            serde_json::json!({
-                "byteLength": report.byte_length,
-                "contentType": report.content_type,
-                "relativePath": report.relative_path,
-                "sha256": report.sha256,
-            }),
-        );
-    }
     payload.insert(
         "sealedStopMonotonicNs".into(),
         serde_json::Value::String(manifest.sealed_stop_monotonic_ns.clone()),
@@ -651,6 +666,25 @@ pub(crate) mod syndicate_manifest_tests {
         let (_, _, fa) = delivery_layout_from_manifest(&ma).unwrap();
         let (_, _, fb) = delivery_layout_from_manifest(&mb).unwrap();
         assert_ne!(fa, fb);
+    }
+
+    #[test]
+    fn cross_language_golden_manifest_with_recovery_report_reviewer() {
+        let raw: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/voice_delivery_v2_finalized_manifest_with_recovery_report_reviewer.json"
+        ))
+        .expect("reviewer fixture json");
+        let parsed = parse_syndicate_finalized_manifest(&raw).expect("parse reviewer fixture");
+        let canonical = canonicalize_finalized_manifest_for_digest(&parsed);
+        let digest = compute_finalized_manifest_digest(&parsed);
+        assert_eq!(
+            digest,
+            "6c6d8f7c4b5fe3d9db6490c6b966038c72f05961ee6c3dc2daa931670efd135a"
+        );
+        assert_eq!(
+            canonical,
+            r#"{"channelId":"234567890123456789","guildId":"123456789012345678","journalFormatVersion":2,"journalSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sealedStopMonotonicNs":"200","sealedStopWallMs":2,"sessionId":"550e8400-e29b-41d4-a716-446655440000","sessionStartMonotonicNs":"100","sessionStartWallMs":1,"stems":[{"discordUserId":"123456789012345678","pathNick":"user1","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","wavBytes":44,"wavRelativePath":"user1.wav"}],"targetSampleCount48k":0,"version":1,"recoveryReport":{"byteLength":64,"contentType":"text/plain","relativePath":"Syndicate Audio Recovery Report.txt","sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}"#
+        );
     }
 
     #[test]
