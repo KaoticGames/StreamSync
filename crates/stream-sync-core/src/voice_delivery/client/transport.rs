@@ -181,17 +181,46 @@ pub fn parse_error_code(body: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Same range validation as stems: 206, Content-Range, and byte bounds. Object identity is
+/// manifest `sha256` + length (verified after download), not the opaque S3/R2 ETag.
 pub fn validate_recovery_report_range_meta(
     meta: &StemRangeMeta,
     offset: u64,
     expected_total: u64,
     bytes_written: u64,
-    expected_sha256: &str,
 ) -> Result<(), VoiceV2ClientError> {
-    validate_stem_range_meta(meta, offset, expected_total, bytes_written)?;
-    let etag = meta.etag.trim_matches('"');
-    if etag != expected_sha256 {
-        return Err(VoiceV2ClientError::RangeMismatch("etag sha".into()));
+    validate_stem_range_meta(meta, offset, expected_total, bytes_written)
+}
+
+/// Normalize a response ETag for opaque object-generation binding (empty/absent → none).
+pub fn normalize_opaque_object_etag(etag: &str) -> Option<String> {
+    let trimmed = etag.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// When R2 returns an ETag, require it stable across range responses for one checkpointed download.
+/// Never compare to manifest SHA256.
+pub fn bind_opaque_object_etag(
+    bound: &mut Option<String>,
+    response_etag: &str,
+) -> Result<(), VoiceV2ClientError> {
+    let next = normalize_opaque_object_etag(response_etag);
+    if next.is_none() {
+        return Ok(());
+    }
+    let next = next.unwrap();
+    match bound {
+        None => *bound = Some(next),
+        Some(prev) if prev == &next => {}
+        Some(_) => {
+            return Err(VoiceV2ClientError::RangeMismatch(
+                "opaque object etag changed".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -892,6 +921,23 @@ mod client_parse_tests {
             total_length: 8,
         };
         validate_stem_range_meta(&meta, 0, 8, 4).unwrap();
+        validate_recovery_report_range_meta(&meta, 0, 8, 4).unwrap();
+    }
+
+    #[test]
+    fn bind_opaque_etag_accepts_stable_generation_and_rejects_flip() {
+        let mut bound = None;
+        bind_opaque_object_etag(&mut bound, "\"opaque-md5-or-multipart-2\"").unwrap();
+        bind_opaque_object_etag(&mut bound, "\"opaque-md5-or-multipart-2\"").unwrap();
+        assert_eq!(bound.as_deref(), Some("\"opaque-md5-or-multipart-2\""));
+        assert!(bind_opaque_object_etag(&mut bound, "\"other-generation\"").is_err());
+    }
+
+    #[test]
+    fn bind_opaque_etag_ignores_absent_header() {
+        let mut bound = None;
+        bind_opaque_object_etag(&mut bound, "").unwrap();
+        assert!(bound.is_none());
     }
 
     #[test]

@@ -35,6 +35,8 @@ pub enum PartialError {
     PrefixDigestMismatch,
     #[error("full stem digest does not match manifest")]
     FullDigestMismatch,
+    #[error("opaque object etag changed across range responses")]
+    ObjectEtagMismatch,
     #[error("invalid stream chunk size")]
     InvalidChunkSize,
     #[error(transparent)]
@@ -60,6 +62,7 @@ pub struct PartialStemWriter<'guard> {
     partial_name: String,
     checkpoint_store: CheckpointStore<'guard>,
     chunk_size: usize,
+    bound_opaque_object_etag: Option<String>,
 }
 
 impl<'guard> PartialStemWriter<'guard> {
@@ -99,7 +102,7 @@ impl<'guard> PartialStemWriter<'guard> {
             .open_or_create_partial(&partial_name)
             .map_err(PartialError::Fs)?;
         let physical = file.len()?;
-        let (durable, hasher) = if let Some(cp) = checkpoint {
+        let (durable, hasher, bound_opaque_object_etag) = if let Some(cp) = checkpoint {
             if cp.expected_total_bytes != expected_total
                 || cp.expected_full_sha256 != expected_full_sha256
             {
@@ -133,12 +136,16 @@ impl<'guard> PartialStemWriter<'guard> {
             if digest != cp.prefix_digest {
                 return Err(PartialError::PrefixDigestMismatch);
             }
-            (cp.durable_contiguous_len, live)
+            (
+                cp.durable_contiguous_len,
+                live,
+                cp.opaque_object_etag.clone(),
+            )
         } else {
             if physical > 0 {
                 return Err(PartialError::CheckpointInvalid);
             }
-            (0, LiveSha256::new())
+            (0, LiveSha256::new(), None)
         };
         Ok(Self {
             _guard: guard,
@@ -151,6 +158,7 @@ impl<'guard> PartialStemWriter<'guard> {
             partial_name,
             checkpoint_store,
             chunk_size,
+            bound_opaque_object_etag,
         })
     }
 
@@ -183,7 +191,7 @@ impl<'guard> PartialStemWriter<'guard> {
             .open_or_create_partial(&partial_name)
             .map_err(PartialError::Fs)?;
         let physical = file.len()?;
-        let (durable, hasher) = if let Some(cp) = checkpoint {
+        let (durable, hasher, bound_opaque_object_etag) = if let Some(cp) = checkpoint {
             if cp.expected_total_bytes != expected_total
                 || cp.expected_full_sha256 != expected_full_sha256
             {
@@ -216,12 +224,16 @@ impl<'guard> PartialStemWriter<'guard> {
             if live.prefix_digest_hex() != cp.prefix_digest {
                 return Err(PartialError::PrefixDigestMismatch);
             }
-            (cp.durable_contiguous_len, live)
+            (
+                cp.durable_contiguous_len,
+                live,
+                cp.opaque_object_etag.clone(),
+            )
         } else {
             if physical > 0 {
                 return Err(PartialError::CheckpointInvalid);
             }
-            (0, LiveSha256::new())
+            (0, LiveSha256::new(), None)
         };
         Ok(Self {
             _guard: guard,
@@ -234,6 +246,7 @@ impl<'guard> PartialStemWriter<'guard> {
             partial_name,
             checkpoint_store,
             chunk_size,
+            bound_opaque_object_etag,
         })
     }
 
@@ -263,7 +276,16 @@ impl<'guard> PartialStemWriter<'guard> {
             partial_name,
             checkpoint_store,
             chunk_size,
+            bound_opaque_object_etag: None,
         })
+    }
+
+    pub fn note_opaque_object_etag(&mut self, response_etag: &str) -> Result<(), PartialError> {
+        crate::voice_delivery::client::bind_opaque_object_etag(
+            &mut self.bound_opaque_object_etag,
+            response_etag,
+        )
+        .map_err(|_| PartialError::ObjectEtagMismatch)
     }
 
     pub fn resumable_offset(&self) -> u64 {
@@ -322,9 +344,11 @@ impl<'guard> PartialStemWriter<'guard> {
         }
         sync_file(&self.file)?;
         let prefix = self.hasher.prefix_digest_hex();
-        let _cp = self
-            .checkpoint_store
-            .commit(self.live_contiguous_len, &prefix)?;
+        let _cp = self.checkpoint_store.commit(
+            self.live_contiguous_len,
+            &prefix,
+            self.bound_opaque_object_etag.as_deref(),
+        )?;
         self.durable_contiguous_len = self.live_contiguous_len;
         Ok(self.durable_contiguous_len)
     }
@@ -571,6 +595,21 @@ mod partial_prefix_hasher_checkpoint {
         let mut expected = Sha256::new();
         expected.update([1, 2, 3, 4, 5]);
         assert_eq!(digest, hex_digest(&expected.finalize()));
+    }
+
+    #[test]
+    fn opaque_etag_checkpoint_resume_rejects_generation_flip() {
+        let (_tmp, guard, _artifact) = fixture();
+        let mut w = PartialStemWriter::open_or_resume(&guard, "a.wav", 4096).unwrap();
+        w.note_opaque_object_etag("\"opaque-md5-or-multipart-2\"")
+            .unwrap();
+        w.write_contiguous(0, &[1, 2, 3, 4]).unwrap();
+        w.commit_checkpoint().unwrap();
+        let mut w2 = PartialStemWriter::open_or_resume(&guard, "a.wav", 4096).unwrap();
+        assert!(matches!(
+            w2.note_opaque_object_etag("\"opaque-CHANGED\""),
+            Err(PartialError::ObjectEtagMismatch)
+        ));
     }
 }
 

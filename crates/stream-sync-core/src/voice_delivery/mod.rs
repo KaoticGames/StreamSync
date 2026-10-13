@@ -26,9 +26,9 @@ mod lock;
 pub use client::parse_pending_response;
 pub use client::PENDING_PATH;
 pub use client::{
-    validate_recovery_report_range_meta, validate_stem_range_meta, HttpVoiceV2Client,
-    MockVoiceV2Client, PendingDelivery, ReceiptRequestBody, StemRangeMeta, VoiceV2Client,
-    VoiceV2ClientError,
+    bind_opaque_object_etag, validate_recovery_report_range_meta, validate_stem_range_meta,
+    HttpVoiceV2Client, MockVoiceV2Client, PendingDelivery, ReceiptRequestBody, StemRangeMeta,
+    VoiceV2Client, VoiceV2ClientError,
 };
 pub use finalized_manifest::{
     canonicalize_finalized_manifest_for_digest, compute_finalized_manifest_digest,

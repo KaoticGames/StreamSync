@@ -428,7 +428,10 @@ fn http_orchestrator_corrupt_report_hash_blocks_receipt() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("hash") || msg.contains("mismatch") || msg.contains("recovery"),
+        msg.contains("hash")
+            || msg.contains("mismatch")
+            || msg.contains("digest")
+            || msg.contains("recovery"),
         "{msg}"
     );
     assert_eq!(*harness.receipt_posts.lock().unwrap(), 0);

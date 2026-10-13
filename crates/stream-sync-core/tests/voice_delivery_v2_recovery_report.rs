@@ -27,21 +27,17 @@ fn reviewer_fixture_bytes_and_digest_gate() {
 }
 
 #[test]
-fn validate_recovery_report_meta_requires_sha_etag() {
+fn validate_recovery_report_meta_accepts_opaque_etag_not_sha() {
     let meta = StemRangeMeta {
         status: 206,
         content_range: "bytes 0-2/3".into(),
         content_length: 3,
-        etag: "\"deadbeef\"".into(),
+        etag: "\"opaque-md5-or-multipart-2\"".into(),
         total_length: 3,
     };
     let sha = "deadbeef".repeat(8);
-    assert!(validate_recovery_report_range_meta(&meta, 0, 3, 3, &sha).is_err());
-    let meta_ok = StemRangeMeta {
-        etag: format!("\"{sha}\""),
-        ..meta
-    };
-    validate_recovery_report_range_meta(&meta_ok, 0, 3, 3, &sha).unwrap();
+    validate_recovery_report_range_meta(&meta, 0, 3, 3).unwrap();
+    assert_ne!(meta.etag.trim_matches('"'), sha);
 }
 
 #[test]

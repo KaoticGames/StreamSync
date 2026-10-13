@@ -241,14 +241,11 @@ impl FinalizedVoiceDelivery {
                 .fetch_recovery_report_range(&syndicate.session_id, offset, req_len, &mut cursor)
                 .map_err(map_client_err)?;
             let bytes = cursor.into_inner();
-            validate_recovery_report_range_meta(
-                &meta,
-                offset,
-                spec.byte_count,
-                bytes.len() as u64,
-                &spec.sha256,
-            )
-            .map_err(map_client_err)?;
+            validate_recovery_report_range_meta(&meta, offset, spec.byte_count, bytes.len() as u64)
+                .map_err(map_client_err)?;
+            writer
+                .note_opaque_object_etag(&meta.etag)
+                .map_err(|e| OrchestratorError::Other(e.to_string()))?;
             writer
                 .write_contiguous(offset, &bytes)
                 .map_err(|e| OrchestratorError::Other(e.to_string()))?;
@@ -288,8 +285,7 @@ impl FinalizedVoiceDelivery {
         let staging = guard
             .staging_dir()
             .map_err(|e| OrchestratorError::Other(e.to_string()))?;
-        if let Ok(file) =
-            crate::voice_delivery::fs::file::open_existing_file_at(staging, &wav_name)
+        if let Ok(file) = crate::voice_delivery::fs::file::open_existing_file_at(staging, &wav_name)
         {
             let stem_entry = guard
                 .manifest()
@@ -325,6 +321,9 @@ impl FinalizedVoiceDelivery {
             let bytes = cursor.into_inner();
             validate_stem_range_meta(&meta, offset, stem.wav_bytes, bytes.len() as u64)
                 .map_err(map_client_err)?;
+            writer
+                .note_opaque_object_etag(&meta.etag)
+                .map_err(|e| OrchestratorError::Other(e.to_string()))?;
             writer
                 .write_contiguous(offset, &bytes)
                 .map_err(|e| OrchestratorError::Other(e.to_string()))?;

@@ -190,9 +190,11 @@ fn recovery_report_api_307_r2_206_without_bearer() {
         Arc::new(Mutex::new(b"report-body-0123456789".to_vec()));
     let sha = {
         use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(report_bytes.lock().unwrap().as_slice()))
+        format!(
+            "{:x}",
+            Sha256::digest(report_bytes.lock().unwrap().as_slice())
+        )
     };
-    let etag = format!("\"{sha}\"");
     let r2_bytes = report_bytes.clone();
     let r2 = MiniServer::spawn(move |req, stream| {
         assert_eq!(req.method, "GET");
@@ -206,7 +208,7 @@ fn recovery_report_api_307_r2_206_without_bearer() {
                 ("Content-Range", "bytes 0-7/20"),
                 ("Content-Length", "8"),
                 ("Content-Type", "text/plain; charset=utf-8"),
-                ("ETag", &etag),
+                ("ETag", "\"opaque-md5-or-multipart-2\""),
             ],
             &data[0..8],
         );
@@ -228,7 +230,8 @@ fn recovery_report_api_307_r2_206_without_bearer() {
     let meta = client
         .fetch_recovery_report_range("550e8400-e29b-41d4-a716-446655440000", 0, 8, &mut out)
         .expect("recovery report fetch");
-    validate_recovery_report_range_meta(&meta, 0, 20, 8, &sha).unwrap();
+    validate_recovery_report_range_meta(&meta, 0, 20, 8).unwrap();
+    assert_ne!(meta.etag, format!("\"{sha}\""));
     assert_eq!(out, b"report-b");
 }
 
@@ -488,4 +491,228 @@ fn presigned_redirect_network_error_omits_url_and_signing_material() {
         assert!(!orch_debug.contains(leaked));
     }
     assert!(orch_display.contains("network"));
+}
+
+const MINIMAL_WAV: [u8; 44] = [
+    82, 73, 70, 70, 36, 0, 0, 0, 87, 65, 86, 69, 102, 109, 116, 32, 16, 0, 0, 0, 1, 0, 2, 0, 128,
+    187, 0, 0, 0, 238, 2, 0, 4, 0, 16, 0, 100, 97, 116, 97, 0, 0, 0, 0,
+];
+
+fn pending_stem_only(wav: &[u8]) -> stream_sync_core::voice_delivery::PendingDelivery {
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+    use stream_sync_core::voice_delivery::{
+        compute_finalized_manifest_digest, parse_syndicate_finalized_manifest, PendingDelivery,
+    };
+    let stem_sha = format!("{:x}", Sha256::digest(wav));
+    let raw = json!({
+        "version": 1,
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "guildId": "123456789012345678",
+        "channelId": "234567890123456789",
+        "sessionStartWallMs": 1,
+        "sessionStartMonotonicNs": "100",
+        "sealedStopWallMs": 2,
+        "sealedStopMonotonicNs": "200",
+        "targetSampleCount48k": 0,
+        "journalFormatVersion": 2,
+        "journalSha256": "a".repeat(64),
+        "stems": [{
+            "discordUserId": "123456789012345678",
+            "pathNick": "user1",
+            "wavRelativePath": "user1.wav",
+            "wavBytes": wav.len(),
+            "sha256": stem_sha,
+        }],
+    });
+    let manifest = parse_syndicate_finalized_manifest(&raw).unwrap();
+    let digest = compute_finalized_manifest_digest(&manifest);
+    PendingDelivery {
+        session_id: manifest.session_id.clone(),
+        manifest_digest: digest,
+        sealed_at: "2020-01-01T00:00:00.000Z".into(),
+        manifest,
+    }
+}
+
+#[test]
+fn orchestrator_two_server_opaque_r2_etag_differs_from_sha_and_succeeds() {
+    use serde_json::json;
+    use stream_sync_core::voice_delivery::{DeliveryPhase, FinalizedVoiceDelivery, PENDING_PATH};
+    let tmp = tempfile::tempdir().unwrap();
+    let wav = MINIMAL_WAV.to_vec();
+    let pending = pending_stem_only(&wav);
+    let manifest_value = serde_json::to_value(&pending.manifest).unwrap();
+    let pending_json = json!({
+        "ok": true,
+        "deliveries": [{
+            "sessionId": pending.session_id,
+            "manifestDigest": pending.manifest_digest,
+            "sealedAt": pending.sealed_at,
+            "manifest": manifest_value,
+        }]
+    });
+    let receipt_posts = Arc::new(Mutex::new(0u32));
+    let stem_store = Arc::new(Mutex::new(wav.clone()));
+    let r2 = MiniServer::spawn({
+        let stem_store = stem_store.clone();
+        move |req, stream| {
+            assert!(req.auth.is_none());
+            let data = stem_store.lock().unwrap();
+            let range = req
+                .range
+                .as_deref()
+                .unwrap()
+                .strip_prefix("bytes=")
+                .unwrap();
+            let (start, end) = range.split_once('-').unwrap();
+            let start = start.parse::<usize>().unwrap();
+            let end = end.parse::<usize>().unwrap();
+            let slice = &data[start..=end];
+            write_response(
+                stream,
+                "206 Partial Content",
+                &[
+                    (
+                        "Content-Range",
+                        &format!("bytes {start}-{end}/{}", data.len()),
+                    ),
+                    ("Content-Length", &slice.len().to_string()),
+                    ("ETag", "\"opaque-md5-or-multipart-2\""),
+                ],
+                slice,
+            );
+        }
+    });
+    let r2_port = r2.addr.rsplit(':').next().unwrap().parse::<u16>().unwrap();
+    let r2_base = r2.addr.clone();
+    let receipt_posts2 = receipt_posts.clone();
+    let pending_store = Arc::new(Mutex::new(pending_json));
+    let api = MiniServer::spawn({
+        let pending_store = pending_store.clone();
+        move |req, stream| {
+            if req.path.starts_with(PENDING_PATH) {
+                let body = pending_store.lock().unwrap().to_string();
+                write_response(
+                    stream,
+                    "200 OK",
+                    &[("Content-Type", "application/json")],
+                    body.as_bytes(),
+                );
+                return;
+            }
+            if req.path.contains("/stems/") {
+                let loc = format!("{}/obj?sig=1", r2_base);
+                write_response(stream, "307 Temporary Redirect", &[("Location", &loc)], b"");
+                return;
+            }
+            if req.method == "POST" && req.path.ends_with("/receipt") {
+                *receipt_posts2.lock().unwrap() += 1;
+                write_response(
+                    stream,
+                    "200 OK",
+                    &[("Content-Type", "application/json")],
+                    br#"{"ok":true}"#,
+                );
+                return;
+            }
+            write_response(stream, "404 Not Found", &[], b"");
+        }
+    });
+    let client = HttpVoiceV2Client::new(&api.addr, "sdk_test")
+        .with_stem_redirect_allowlist(vec![format!("127.0.0.1:{r2_port}")])
+        .with_test_http_stem_redirects(true)
+        .with_presign_retry_backoff(Duration::from_millis(5));
+    let orch = FinalizedVoiceDelivery::open_recording_parent(tmp.path())
+        .unwrap()
+        .with_device_id("r2-opaque-etag");
+    let mut phase = DeliveryPhase::Waiting;
+    orch.deliver_pending(&client, &pending, &mut phase).unwrap();
+    assert_eq!(phase, DeliveryPhase::Completed);
+    assert_eq!(*receipt_posts.lock().unwrap(), 1);
+}
+
+#[test]
+fn orchestrator_two_server_corrupt_r2_body_fails_without_receipt() {
+    use serde_json::json;
+    use stream_sync_core::voice_delivery::{
+        DeliveryPhase, FinalizedVoiceDelivery, OrchestratorError, PENDING_PATH,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let wav = MINIMAL_WAV.to_vec();
+    let pending = pending_stem_only(&wav);
+    let manifest_value = serde_json::to_value(&pending.manifest).unwrap();
+    let pending_json = json!({
+        "ok": true,
+        "deliveries": [{
+            "sessionId": pending.session_id,
+            "manifestDigest": pending.manifest_digest,
+            "sealedAt": pending.sealed_at,
+            "manifest": manifest_value,
+        }]
+    });
+    let wav_len = wav.len();
+    let r2 = MiniServer::spawn(move |req, stream| {
+        let range = req
+            .range
+            .as_deref()
+            .unwrap()
+            .strip_prefix("bytes=")
+            .unwrap();
+        let (start, end) = range.split_once('-').unwrap();
+        let start = start.parse::<usize>().unwrap();
+        let end = end.parse::<usize>().unwrap();
+        let len = end + 1 - start;
+        write_response(
+            stream,
+            "206 Partial Content",
+            &[
+                ("Content-Range", &format!("bytes {start}-{end}/{wav_len}")),
+                ("Content-Length", &len.to_string()),
+                ("ETag", "\"opaque-md5-or-multipart-2\""),
+            ],
+            &vec![0u8; len],
+        );
+    });
+    let r2_port = r2.addr.rsplit(':').next().unwrap().parse::<u16>().unwrap();
+    let r2_base = r2.addr.clone();
+    let receipt_posts = Arc::new(Mutex::new(0u32));
+    let receipt_posts2 = receipt_posts.clone();
+    let pending_store = Arc::new(Mutex::new(pending_json));
+    let api = MiniServer::spawn({
+        let pending_store = pending_store.clone();
+        move |req, stream| {
+            if req.path.starts_with(PENDING_PATH) {
+                let body = pending_store.lock().unwrap().to_string();
+                write_response(
+                    stream,
+                    "200 OK",
+                    &[("Content-Type", "application/json")],
+                    body.as_bytes(),
+                );
+                return;
+            }
+            if req.path.contains("/stems/") {
+                let loc = format!("{}/obj?sig=1", r2_base);
+                write_response(stream, "307 Temporary Redirect", &[("Location", &loc)], b"");
+                return;
+            }
+            if req.method == "POST" && req.path.ends_with("/receipt") {
+                *receipt_posts2.lock().unwrap() += 1;
+            }
+            write_response(stream, "404 Not Found", &[], b"");
+        }
+    });
+    let client = HttpVoiceV2Client::new(&api.addr, "sdk_test")
+        .with_stem_redirect_allowlist(vec![format!("127.0.0.1:{r2_port}")])
+        .with_test_http_stem_redirects(true);
+    let orch = FinalizedVoiceDelivery::open_recording_parent(tmp.path())
+        .unwrap()
+        .with_device_id("r2-corrupt");
+    let mut phase = DeliveryPhase::Waiting;
+    let err = orch
+        .deliver_pending(&client, &pending, &mut phase)
+        .unwrap_err();
+    assert!(matches!(err, OrchestratorError::Other(_)));
+    assert_eq!(*receipt_posts.lock().unwrap(), 0);
 }

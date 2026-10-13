@@ -23,6 +23,8 @@ pub struct CheckpointGeneration {
     pub generation: u64,
     pub durable_contiguous_len: u64,
     pub prefix_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opaque_object_etag: Option<String>,
     pub record_digest: String,
 }
 
@@ -163,6 +165,7 @@ impl<'guard> CheckpointStore<'guard> {
         &self,
         durable_contiguous_len: u64,
         prefix_digest: &str,
+        opaque_object_etag: Option<&str>,
     ) -> Result<CheckpointGeneration, CheckpointGenerationError> {
         validate_checkpoint_fields(
             durable_contiguous_len,
@@ -177,6 +180,10 @@ impl<'guard> CheckpointStore<'guard> {
         {
             return Err(CheckpointGenerationError::IdentityMismatch);
         }
+        let opaque_object_etag = opaque_object_etag
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         let record = CheckpointGeneration {
             schema_version: CHECKPOINT_SCHEMA_VERSION,
             delivery_uuid: identity.delivery_uuid.clone(),
@@ -187,6 +194,7 @@ impl<'guard> CheckpointStore<'guard> {
             generation,
             durable_contiguous_len,
             prefix_digest: prefix_digest.to_string(),
+            opaque_object_etag,
             record_digest: String::new(),
         };
         let bytes = serialize_with_digest(&record)?;
@@ -294,6 +302,11 @@ pub fn validate_checkpoint_record(
     if record.durable_contiguous_len > record.expected_total_bytes {
         return Err(CheckpointGenerationError::Bounds);
     }
+    if let Some(etag) = &record.opaque_object_etag {
+        if etag.is_empty() || etag.len() > 256 {
+            return Err(CheckpointGenerationError::Invalid);
+        }
+    }
     let mut tmp = record.clone();
     let expected = tmp.record_digest.clone();
     tmp.record_digest = String::new();
@@ -342,7 +355,7 @@ mod checkpoint_adversarial {
                 .unwrap();
         let cp_key = artifact.checkpoint_dir_key();
         let store = CheckpointStore::open_for_guard(&guard, artifact).unwrap();
-        store.commit(32, &"a".repeat(64)).unwrap();
+        store.commit(32, &"a".repeat(64), None).unwrap();
         let cp_dir = tmp
             .path()
             .join(".streamsync-control/checkpoints")
@@ -358,6 +371,7 @@ mod checkpoint_adversarial {
             generation: 9,
             durable_contiguous_len: 32,
             prefix_digest: "e".repeat(64),
+            opaque_object_etag: None,
             record_digest: String::new(),
         };
         let bytes = {
@@ -397,6 +411,7 @@ mod checkpoint_adversarial {
             generation: 3,
             durable_contiguous_len: 0,
             prefix_digest: "a".repeat(64),
+            opaque_object_etag: None,
             record_digest: String::new(),
         };
         let bytes = serialize_with_digest(&foreign).unwrap();
@@ -460,7 +475,7 @@ mod checkpoint_store_guard_lifetime {
             StemArtifactId::from_manifest_stem(guard.identity(), guard.manifest(), "a.wav")
                 .unwrap();
         let store = CheckpointStore::open_for_guard(&guard, artifact).unwrap();
-        let rec = store.commit(8, &"b".repeat(64)).unwrap();
+        let rec = store.commit(8, &"b".repeat(64), None).unwrap();
         assert_eq!(rec.delivery_uuid, guard.identity().delivery_uuid);
         assert_eq!(rec.manifest_digest, guard.identity().manifest_digest);
     }
