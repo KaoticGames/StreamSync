@@ -5,7 +5,7 @@ use crate::voice_delivery::identity::DeliveryImmutableIdentity;
 use crate::voice_delivery::ids::{ledger_dir_relative_components, validate_stage_basename};
 use crate::voice_delivery::lock::{acquire_delivery_domain_lock, DeliveryDomainLock, LockError};
 use crate::voice_delivery::manifest::ValidatedManifest;
-use crate::voice_delivery::recovery_report::RecoveryReportSpec;
+use crate::voice_delivery::recovery_report::{RecoveryReportSpec, RECOVERY_REPORT_CONTENT_TYPE};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -59,6 +59,7 @@ impl DeliverySessionGuard {
             if binding.file_name != spec.file_name
                 || binding.byte_count != spec.byte_count
                 || binding.sha256 != spec.sha256
+                || binding.content_type != RECOVERY_REPORT_CONTENT_TYPE
             {
                 return Err(SessionError::IdentityMismatch);
             }

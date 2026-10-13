@@ -41,6 +41,24 @@ pub enum IdentityError {
     Fs(#[from] FsError),
 }
 
+fn ledger_recovery_matches(
+    identity: &Option<RecoveryReportIdentityBinding>,
+    ledger: &Option<
+        crate::voice_delivery::records::ledger_generation::LedgerRecoveryReportIdentity,
+    >,
+) -> bool {
+    match (identity, ledger) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.file_name == b.relative_path
+                && a.byte_count == b.byte_length
+                && a.sha256 == b.sha256
+                && a.content_type == b.content_type
+        }
+        _ => false,
+    }
+}
+
 impl DeliveryImmutableIdentity {
     /// Bind identity using authoritative API manifest digest and validated stem manifest.
     pub fn new_bound(
@@ -72,6 +90,13 @@ impl DeliveryImmutableIdentity {
             if report.sha256.len() != 64 {
                 return Err(IdentityError::Invalid("recovery report sha".into()));
             }
+            if report.content_type
+                != crate::voice_delivery::recovery_report::RECOVERY_REPORT_CONTENT_TYPE
+            {
+                return Err(IdentityError::Invalid(
+                    "recovery report content type".into(),
+                ));
+            }
         }
         Ok(Self {
             delivery_uuid,
@@ -100,6 +125,28 @@ impl DeliveryImmutableIdentity {
         if record.manifest_digest.len() != 64 || record.stem_set_digest.len() != 64 {
             return Err(IdentityError::Invalid("digest length".into()));
         }
+        let recovery_report = record
+            .recovery_report
+            .as_ref()
+            .map(|r| {
+                if r.relative_path != RECOVERY_REPORT_RELATIVE_PATH
+                    || r.byte_length == 0
+                    || r.sha256.len() != 64
+                    || r.content_type
+                        != crate::voice_delivery::recovery_report::RECOVERY_REPORT_CONTENT_TYPE
+                {
+                    return Err(IdentityError::Invalid(
+                        "recovery report ledger field".into(),
+                    ));
+                }
+                Ok(RecoveryReportIdentityBinding {
+                    file_name: r.relative_path.clone(),
+                    byte_count: r.byte_length,
+                    sha256: r.sha256.clone(),
+                    content_type: r.content_type.clone(),
+                })
+            })
+            .transpose()?;
         Ok(Self {
             delivery_uuid: record.delivery_uuid.clone(),
             manifest_digest: record.manifest_digest.clone(),
@@ -108,7 +155,7 @@ impl DeliveryImmutableIdentity {
             staging_token: record.staging_token.clone(),
             final_parent_relative: record.final_parent_relative.clone(),
             final_session_name: final_name.as_str().to_string(),
-            recovery_report: None,
+            recovery_report,
         })
     }
 
@@ -138,6 +185,7 @@ impl DeliveryImmutableIdentity {
             && self.staging_token == record.staging_token
             && self.final_parent_relative == record.final_parent_relative
             && self.final_session_name == record.final_session_name
+            && ledger_recovery_matches(&self.recovery_report, &record.recovery_report)
     }
 
     pub fn foreign_identity_in_record(

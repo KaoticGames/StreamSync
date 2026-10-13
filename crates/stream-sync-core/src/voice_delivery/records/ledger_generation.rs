@@ -16,6 +16,14 @@ use thiserror::Error;
 pub const LEDGER_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerRecoveryReportIdentity {
+    pub relative_path: String,
+    pub byte_length: u64,
+    pub sha256: String,
+    pub content_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerGeneration {
     pub schema_version: u32,
     pub state: LedgerState,
@@ -37,6 +45,8 @@ pub struct LedgerGeneration {
     pub observed_stage_present: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_final_present: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_report: Option<LedgerRecoveryReportIdentity>,
 }
 
 impl GenerationRecord for LedgerGeneration {
@@ -193,6 +203,16 @@ impl LedgerStore {
                 Some(observed_final_present),
             ),
         };
+        let recovery_report =
+            self.identity
+                .recovery_report
+                .as_ref()
+                .map(|b| LedgerRecoveryReportIdentity {
+                    relative_path: b.file_name.clone(),
+                    byte_length: b.byte_count,
+                    sha256: b.sha256.clone(),
+                    content_type: b.content_type.clone(),
+                });
         let record = LedgerGeneration {
             schema_version: LEDGER_SCHEMA_VERSION,
             state,
@@ -208,6 +228,7 @@ impl LedgerStore {
             quarantine_reason,
             observed_stage_present,
             observed_final_present,
+            recovery_report,
         };
         let bytes = serialize_with_digest(&record)?;
         write_generation_create_new(&self.dir, generation, &bytes).map_err(map_scan_err)?;
@@ -313,6 +334,15 @@ pub fn parse_ledger_bytes(data: &[u8]) -> Result<LedgerGeneration, LedgerGenerat
 pub fn validate_ledger_record(record: &LedgerGeneration) -> Result<(), LedgerGenerationError> {
     if record.schema_version != LEDGER_SCHEMA_VERSION {
         return Err(LedgerGenerationError::Invalid);
+    }
+    if let Some(report) = &record.recovery_report {
+        if report.relative_path.is_empty()
+            || report.byte_length == 0
+            || report.sha256.len() != 64
+            || report.content_type.is_empty()
+        {
+            return Err(LedgerGenerationError::Invalid);
+        }
     }
     if record.record_digest.len() != 64
         || !record
@@ -447,6 +477,7 @@ mod ledger_generation_wins_valid {
             quarantine_reason: None,
             observed_stage_present: None,
             observed_final_present: None,
+            recovery_report: None,
         };
         let bytes = serde_json::to_vec(&record).unwrap();
         fs::write(gen_dir_path.join("gen-5.json"), bytes).unwrap();
@@ -477,6 +508,7 @@ mod ledger_generation_wins_valid {
             quarantine_reason: None,
             observed_stage_present: None,
             observed_final_present: None,
+            recovery_report: None,
         };
         let bytes = serialize_with_digest(&other).unwrap();
         fs::write(gen_dir_path.join("gen-3.json"), bytes).unwrap();
@@ -497,6 +529,58 @@ mod ledger_generation_wins_valid {
             err,
             Err(crate::voice_delivery::fs::FsError::AlreadyExists)
         ));
+    }
+
+    #[test]
+    fn ledger_persists_recovery_report_identity() {
+        use crate::voice_delivery::recovery_report::{
+            RecoveryReportIdentityBinding, RECOVERY_REPORT_CONTENT_TYPE,
+            RECOVERY_REPORT_RELATIVE_PATH,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = DestRoot::open(tmp.path()).unwrap();
+        let stems = vec![StemManifestEntry {
+            file_name: "a.wav".into(),
+            byte_count: 44,
+            sha256: "a".repeat(64),
+        }];
+        let manifest = ValidatedManifest::validate(stems).unwrap();
+        let report_binding = RecoveryReportIdentityBinding {
+            file_name: RECOVERY_REPORT_RELATIVE_PATH.to_string(),
+            byte_count: 12,
+            sha256: "c".repeat(64),
+            content_type: RECOVERY_REPORT_CONTENT_TYPE.to_string(),
+        };
+        let identity = DeliveryImmutableIdentity::new_bound(
+            "ledger-report-uuid",
+            manifest.digest(),
+            &manifest,
+            ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
+            vec![],
+            "final-with-report",
+            Some(report_binding.clone()),
+        )
+        .unwrap();
+        let guard = DeliverySessionGuard::begin(
+            root,
+            identity.clone(),
+            manifest,
+            Some(crate::voice_delivery::recovery_report::RecoveryReportSpec {
+                file_name: report_binding.file_name.clone(),
+                byte_count: report_binding.byte_count,
+                sha256: report_binding.sha256.clone(),
+            }),
+            true,
+        )
+        .unwrap();
+        let store = LedgerStore::open_for_guard(&guard).unwrap();
+        let rec = store.commit(&guard, LedgerState::Receiving).unwrap();
+        assert_eq!(
+            rec.recovery_report.as_ref().unwrap().relative_path,
+            RECOVERY_REPORT_RELATIVE_PATH
+        );
+        let rebuilt = DeliveryImmutableIdentity::from_ledger_record(&rec).unwrap();
+        assert_eq!(rebuilt.recovery_report, Some(report_binding));
     }
 
     #[test]

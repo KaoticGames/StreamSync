@@ -4,6 +4,7 @@ use crate::voice_delivery::finalized_manifest::SyndicateRecoveryReport;
 use crate::voice_delivery::fs::VoiceFile;
 use crate::voice_delivery::hash::{sha256_hex_reader, DEFAULT_STREAM_CHUNK};
 use crate::voice_delivery::marker::MarkerError;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const RECOVERY_REPORT_RELATIVE_PATH: &str = "Syndicate Audio Recovery Report.txt";
@@ -18,11 +19,12 @@ pub struct RecoveryReportSpec {
     pub sha256: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryReportIdentityBinding {
     pub file_name: String,
     pub byte_count: u64,
     pub sha256: String,
+    pub content_type: String,
 }
 
 impl RecoveryReportSpec {
@@ -39,6 +41,7 @@ impl RecoveryReportSpec {
             file_name: self.file_name.clone(),
             byte_count: self.byte_count,
             sha256: self.sha256.clone(),
+            content_type: RECOVERY_REPORT_CONTENT_TYPE.to_string(),
         }
     }
 }
