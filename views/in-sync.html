@@ -39,17 +39,27 @@
       <div class="config-section in-sync-hud-mode">
         <label class="field-label" id="in-sync-mode-label">Processing mode</label>
         <div
-          id="in-sync-processing-mode"
-          class="ss-select ss-select--drop-up in-sync-mode-select"
-          data-selected="manual"
+          class="in-sync-mode-row"
           role="group"
           aria-labelledby="in-sync-mode-label"
         >
-          <button type="button" class="ss-select__btn" aria-haspopup="listbox">
+          <span class="in-sync-mode-side in-sync-mode-side--manual is-active" id="in-sync-mode-manual-label">
             Manual
+          </span>
+          <button
+            type="button"
+            id="in-sync-processing-mode-toggle"
+            class="toggle-switch"
+            aria-pressed="false"
+            aria-label="Processing mode: manual or automatic"
+            title="Switch between manual and automatic processing"
+          >
+            <span class="toggle-thumb"></span>
+            <span class="toggle-label">Manual</span>
           </button>
-          <span class="ss-select__chev" aria-hidden="true">▾</span>
-          <div class="ss-select__menu" role="listbox" aria-label="Processing mode"></div>
+          <span class="in-sync-mode-side in-sync-mode-side--automatic" id="in-sync-mode-automatic-label">
+            Automatic
+          </span>
         </div>
       </div>
 

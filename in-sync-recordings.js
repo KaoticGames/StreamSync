@@ -1,113 +1,23 @@
 // In-Sync Recordings functional UI (local finalization queue)
 
-var IN_SYNC_MODE_ITEMS = [
-  { id: "manual", name: "Manual" },
-  { id: "automatic_after_seal", name: "Automatic" },
-];
-
 function inSyncModeLabel(mode) {
   return mode === "automatic_after_seal" ? "Automatic" : "Manual";
 }
 
-function mountInSyncSyndicateSelect(rootEl, items, selectedId, onChange) {
-  var btn = rootEl.querySelector(".ss-select__btn");
-  var menu = rootEl.querySelector(".ss-select__menu");
-  if (!btn || !menu) return null;
-
-  function setExpanded(open) {
-    btn.setAttribute("aria-expanded", open ? "true" : "false");
+function setInSyncModeToggle(mode) {
+  var isAutomatic = mode === "automatic_after_seal";
+  var btn = document.getElementById("in-sync-processing-mode-toggle");
+  if (btn) {
+    btn.classList.toggle("on", isAutomatic);
+    btn.setAttribute("aria-pressed", isAutomatic ? "true" : "false");
+    var labelEl = btn.querySelector(".toggle-label");
+    if (labelEl) labelEl.textContent = inSyncModeLabel(mode);
   }
-
-  function render() {
-    var selected = items.find(function (i) {
-      return i.id === selectedId;
-    });
-    if (!selected && items.length) selected = items[0];
-    btn.textContent = selected ? selected.name : "Select…";
-    rootEl.dataset.selected = selectedId || "";
-    setExpanded(menu.classList.contains("open"));
-
-    menu.innerHTML = "";
-    items.forEach(function (it) {
-      var div = document.createElement("div");
-      div.className =
-        "ss-select__item" + (it.id === selectedId ? " selected" : "");
-      div.textContent = it.name;
-      div.dataset.id = it.id;
-      div.setAttribute("role", "option");
-      div.addEventListener("click", function () {
-        selectedId = it.id;
-        menu.classList.remove("open");
-        render();
-        if (typeof onChange === "function") onChange(it.id);
-      });
-      menu.appendChild(div);
-    });
-  }
-
-  function closeMenu() {
-    menu.classList.remove("open");
-    setExpanded(false);
-  }
-
-  function onOutsidePointer(e) {
-    if (!rootEl.contains(e.target)) closeMenu();
-  }
-
-  btn.addEventListener("click", function (e) {
-    e.preventDefault();
-    e.stopPropagation();
-    menu.classList.toggle("open");
-    setExpanded(menu.classList.contains("open"));
-  });
-
-  btn.addEventListener("keydown", function (e) {
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      e.stopPropagation();
-      menu.classList.toggle("open");
-      setExpanded(menu.classList.contains("open"));
-    }
-    if (e.key === "Escape") closeMenu();
-  });
-
-  document.addEventListener("mousedown", onOutsidePointer);
-  document.addEventListener("click", onOutsidePointer);
-
-  render();
-
-  return {
-    setSelected: function (id) {
-      selectedId = id;
-      render();
-    },
-    getSelected: function () {
-      return selectedId;
-    },
-    destroy: function () {
-      document.removeEventListener("mousedown", onOutsidePointer);
-      document.removeEventListener("click", onOutsidePointer);
-    },
-  };
+  var manualSide = document.getElementById("in-sync-mode-manual-label");
+  var autoSide = document.getElementById("in-sync-mode-automatic-label");
+  if (manualSide) manualSide.classList.toggle("is-active", !isAutomatic);
+  if (autoSide) autoSide.classList.toggle("is-active", isAutomatic);
 }
-
-(function initInSyncProcessingModeClickFallback() {
-  if (window.__inSyncProcessingModeClickFallback) return;
-  window.__inSyncProcessingModeClickFallback = true;
-
-  document.addEventListener("click", function (e) {
-    var btn = e.target.closest("#in-sync-processing-mode .ss-select__btn");
-    if (!btn) return;
-    var root = document.getElementById("in-sync-processing-mode");
-    if (!root || root.dataset.bound === "1") return;
-    e.preventDefault();
-    e.stopPropagation();
-    var menu = root.querySelector(".ss-select__menu");
-    if (!menu) return;
-    menu.classList.toggle("open");
-    btn.setAttribute("aria-expanded", menu.classList.contains("open") ? "true" : "false");
-  });
-})();
 
 async function inSyncPrivileged(path, options) {
   if (!window.streamSyncControlApi || !window.streamSyncControlApi.privilegedFetch) {
@@ -150,6 +60,7 @@ function applyInSyncEmptyUi() {
   if (cardProcessing) cardProcessing.textContent = "Nothing processing";
   if (cardMode) cardMode.textContent = "Manual";
   if (cardPublished) cardPublished.textContent = "None yet";
+  setInSyncModeToggle("manual");
   if (empty) {
     empty.hidden = false;
     empty.textContent = "No active session";
@@ -173,12 +84,7 @@ function applyInSyncStatus(status) {
   var published = status.publishedSessions || [];
   var events = status.progressEvents || [];
 
-  var selectRoot = document.getElementById("in-sync-processing-mode");
-  if (selectRoot && selectRoot.__ssWidget) {
-    selectRoot.__ssWidget.setSelected(
-      mode === "automatic_after_seal" ? "automatic_after_seal" : "manual"
-    );
-  }
+  setInSyncModeToggle(mode === "automatic_after_seal" ? "automatic_after_seal" : "manual");
 
   var hudStatus = document.getElementById("in-sync-hud-status");
   var hudPhase = document.getElementById("in-sync-hud-phase");
@@ -309,31 +215,33 @@ async function refreshInSyncRecordings() {
 }
 
 function wireInSyncRecordingsUi() {
-  var selectRoot = document.getElementById("in-sync-processing-mode");
-  if (selectRoot) {
-    if (selectRoot.__ssWidget && selectRoot.__ssWidget.destroy) {
-      selectRoot.__ssWidget.destroy();
-    }
-    delete selectRoot.dataset.bound;
-    var initial = selectRoot.dataset.selected || "manual";
-    selectRoot.__ssWidget = mountInSyncSyndicateSelect(
-      selectRoot,
-      IN_SYNC_MODE_ITEMS,
-      initial,
-      async function (id) {
-        try {
-          await inSyncPrivileged("/api/in-sync/processing-mode", {
-            method: "POST",
-            body: JSON.stringify({ mode: id }),
-          });
-          var cardMode = document.getElementById("in-sync-card-mode");
-          if (cardMode) cardMode.textContent = inSyncModeLabel(id);
-        } catch (e) {
-          console.error(e);
-        }
+  var modeToggle = document.getElementById("in-sync-processing-mode-toggle");
+  if (modeToggle && !modeToggle.dataset.bound) {
+    modeToggle.dataset.bound = "1";
+    modeToggle.addEventListener("click", async function () {
+      var previousMode =
+        modeToggle.getAttribute("aria-pressed") === "true"
+          ? "automatic_after_seal"
+          : "manual";
+      var nextMode =
+        previousMode === "automatic_after_seal" ? "manual" : "automatic_after_seal";
+
+      modeToggle.disabled = true;
+      try {
+        await inSyncPrivileged("/api/in-sync/processing-mode", {
+          method: "POST",
+          body: JSON.stringify({ mode: nextMode }),
+        });
+        setInSyncModeToggle(nextMode);
+        var cardMode = document.getElementById("in-sync-card-mode");
+        if (cardMode) cardMode.textContent = inSyncModeLabel(nextMode);
+      } catch (e) {
+        console.error(e);
+        setInSyncModeToggle(previousMode);
+      } finally {
+        modeToggle.disabled = false;
       }
-    );
-    if (selectRoot.__ssWidget) selectRoot.dataset.bound = "1";
+    });
   }
 
   var refreshBtn = document.getElementById("in-sync-refresh");

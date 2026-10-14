@@ -1461,13 +1461,6 @@ input[type="range"]::-ms-thumb {
   display: block;
 }
 
-/* Open upward (bottom docks / cramped bottoms) */
-.ss-select--drop-up .ss-select__menu {
-  top: auto;
-  bottom: calc(100% + 6px);
-  margin-top: 0;
-}
-
 .ss-select__item {
   padding: 10px 10px;
   border-radius: 10px;
@@ -1715,8 +1708,28 @@ input[type="range"]::-ms-thumb {
   margin-bottom: 10px;
 }
 
-.in-sync-mode-select {
-  max-width: 220px;
+.in-sync-mode-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.in-sync-mode-side {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-muted, #9ca3af);
+  user-select: none;
+}
+
+.in-sync-mode-side.is-active {
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.in-sync-mode-side--automatic.is-active {
+  color: var(--accent);
 }
 
 .in-sync-hud-actions {
