@@ -1,0 +1,35 @@
+<section id="in-sync-view" class="in-sync-view">
+  <header class="in-sync-header">
+    <h1>In-Sync — Recordings</h1>
+    <p class="in-sync-subtitle">Local journal finalization (functional baseline; workshop animation reserved).</p>
+  </header>
+
+  <div class="in-sync-controls">
+    <label>
+      Processing mode
+      <select id="in-sync-processing-mode">
+        <option value="manual">Manual (default)</option>
+        <option value="automatic_after_seal">Automatic after seal</option>
+      </select>
+    </label>
+    <button type="button" id="in-sync-refresh">Refresh</button>
+  </div>
+
+  <div id="in-sync-workshop-placeholder" class="in-sync-workshop-placeholder" aria-hidden="true">
+    <p>8-bit workshop panel (observational placeholder)</p>
+  </div>
+
+  <div id="in-sync-session-panel" class="in-sync-session-panel">
+    <p id="in-sync-empty">No active local finalization session.</p>
+    <dl id="in-sync-session-fields" class="in-sync-fields" hidden></dl>
+    <div class="in-sync-actions">
+      <button type="button" id="in-sync-process-now" disabled>Process Now</button>
+      <button type="button" id="in-sync-pause">Pause</button>
+      <button type="button" id="in-sync-resume">Resume</button>
+      <button type="button" id="in-sync-retry">Retry</button>
+      <button type="button" id="in-sync-reveal" disabled>Reveal output</button>
+      <button type="button" id="in-sync-open-report" disabled>Open recovery report</button>
+    </div>
+    <pre id="in-sync-progress-log" class="in-sync-progress-log"></pre>
+  </div>
+</section>
