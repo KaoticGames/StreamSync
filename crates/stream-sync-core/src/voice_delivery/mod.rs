@@ -23,6 +23,8 @@ mod wav;
 mod ids;
 mod lock;
 
+pub mod local_finalization;
+
 pub use client::parse_pending_response;
 pub use client::PENDING_PATH;
 pub use client::{
@@ -35,6 +37,12 @@ pub use finalized_manifest::{
     parse_syndicate_finalized_manifest, SyndicateFinalizedManifest,
 };
 pub use ingest::{PartialError, PartialRecoveryReportWriter, PartialStemWriter};
+pub use local_finalization::{
+    compute_local_finalization_manifest_digest, parse_local_finalization_manifest,
+    HttpLocalFinalizationClient, LocalFinalizationClient, LocalFinalizationOrchestrator,
+    LocalFinalizationPhase, LocalFinalizationProgressEvent, LocalPendingDelivery,
+    LOCAL_PENDING_PATH,
+};
 pub use orchestrator::{DeliveryPhase, FinalizedVoiceDelivery, OrchestratorError};
 pub use recovery_report::{
     recovery_report_spec_from_manifest, RecoveryReportSpec, RECOVERY_REPORT_RELATIVE_PATH,

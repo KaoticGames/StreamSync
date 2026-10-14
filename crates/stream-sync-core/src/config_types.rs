@@ -573,6 +573,14 @@ pub enum VoiceDeliveryProtocol {
     V2,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalProcessingMode {
+    #[default]
+    Manual,
+    AutomaticAfterSeal,
+}
+
 /// Persisted Discord voice ingest configuration (local recording destination + stable host id).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscordVoiceConfigFile {
@@ -585,6 +593,8 @@ pub struct DiscordVoiceConfigFile {
     pub host_token: Option<String>,
     #[serde(default)]
     pub voice_delivery_protocol: VoiceDeliveryProtocol,
+    #[serde(default)]
+    pub local_processing_mode: LocalProcessingMode,
 }
 
 impl Default for DiscordVoiceConfigFile {
@@ -594,6 +604,7 @@ impl Default for DiscordVoiceConfigFile {
             recording_parent: None,
             host_token: None,
             voice_delivery_protocol: VoiceDeliveryProtocol::V2,
+            local_processing_mode: LocalProcessingMode::Manual,
         }
     }
 }
