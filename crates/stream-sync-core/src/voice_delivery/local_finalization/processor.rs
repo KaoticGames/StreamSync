@@ -1,5 +1,6 @@
 //! Single-pass journal demux + Opus decode into aligned stereo WAV stems.
 
+use super::accumulator::{lost_marker_span_samples, PacketDisposition, UserPacketAccumulator};
 use super::manifest::LocalFinalizationManifest;
 use super::opus_decode::StereoOpusDecoder;
 use super::report::{RecoveryReportBuilder, SilenceInterval};
@@ -13,9 +14,6 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-
-const OPUS_FRAME_SAMPLES: u64 = 960;
-const REORDER_WINDOW: u16 = 32;
 
 #[derive(Debug, Error)]
 pub enum LocalProcessorError {
@@ -82,39 +80,56 @@ impl UserWriter {
         self.next_write_sample = end;
     }
 
-    fn decode_packet(&mut self, record: &JournalRecord) {
-        if record.opus_payload.is_empty() {
-            self.report.record_discarded_packet();
-            return;
-        }
-        let capture = record
-            .session_capture_offset_samples
-            .unwrap_or(self.next_write_sample);
-        if capture >= self.target_samples {
-            self.report.record_discarded_packet();
-            return;
-        }
-        self.pad_silence_to(capture, "timeline_gap");
-        let mut pcm_buf = [0i16; 960 * 2];
-        match self.decoder.decode_packet(record, &mut pcm_buf) {
-            Ok(samples) => {
-                let frame_samples = samples as u64;
-                let start = self.next_write_sample;
-                let end = (start + frame_samples).min(self.target_samples);
-                let write_samples = end - start;
-                let base = (start * 2) as usize;
-                let len = (write_samples * 2) as usize;
-                for i in 0..len {
-                    if base + i < self.pcm.len() {
-                        self.pcm[base + i] = pcm_buf[i];
+    fn apply_packet(
+        &mut self,
+        record: &JournalRecord,
+        disposition: PacketDisposition,
+        placement: u64,
+    ) {
+        match disposition {
+            PacketDisposition::DiscardedDuplicate
+            | PacketDisposition::DiscardedConflict
+            | PacketDisposition::DiscardedOutOfWindow => {
+                self.report.record_discarded_packet();
+            }
+            PacketDisposition::LostPlacement => {
+                let span = lost_marker_span_samples();
+                self.pad_silence_to(placement, "lost_marker");
+                let end = (placement + span).min(self.target_samples);
+                self.pad_silence_to(end, "lost_marker");
+            }
+            PacketDisposition::Decode => {
+                if record.opus_payload.is_empty() {
+                    self.report.record_discarded_packet();
+                    return;
+                }
+                if placement >= self.target_samples {
+                    self.report.record_discarded_packet();
+                    return;
+                }
+                self.pad_silence_to(placement, "timeline_gap");
+                let mut pcm_buf = [0i16; 960 * 2];
+                match self.decoder.decode_packet(record, &mut pcm_buf) {
+                    Ok(samples) => {
+                        let frame_samples = samples as u64;
+                        let start = self.next_write_sample;
+                        let end = (start + frame_samples).min(self.target_samples);
+                        let write_samples = end - start;
+                        let base = (start * 2) as usize;
+                        let len = (write_samples * 2) as usize;
+                        for i in 0..len {
+                            if base + i < self.pcm.len() {
+                                self.pcm[base + i] = pcm_buf[i];
+                            }
+                        }
+                        self.next_write_sample = end;
+                    }
+                    Err(_) => {
+                        self.report.record_discarded_packet();
+                        let end = (placement + lost_marker_span_samples()).min(self.target_samples);
+                        self.pad_silence_to(end, "opus_decode_failed");
                     }
                 }
-                self.next_write_sample = end;
-            }
-            Err(_) => {
-                self.report.record_discarded_packet();
-                let end = (capture + OPUS_FRAME_SAMPLES).min(self.target_samples);
-                self.pad_silence_to(end, "opus_decode_failed");
             }
         }
     }
@@ -136,52 +151,27 @@ impl UserWriter {
     }
 }
 
-struct BufferedPacket {
-    record: JournalRecord,
-    extended_seq: u32,
-}
-
 struct UserAccumulator {
     writer: UserWriter,
-    buffer: Vec<BufferedPacket>,
-    frontier_seq: Option<u32>,
-    epoch: u32,
+    packets: UserPacketAccumulator,
 }
 
 impl UserAccumulator {
-    fn flush_ready(&mut self) {
-        if self.buffer.is_empty() {
-            return;
-        }
-        self.buffer.sort_by_key(|p| p.extended_seq);
-        while let Some(idx) = self.buffer.iter().position(|p| {
-            self.frontier_seq
-                .map(|f| p.extended_seq <= f + REORDER_WINDOW as u32)
-                .unwrap_or(true)
-        }) {
-            let pkt = self.buffer.remove(idx);
-            if let Some(f) = self.frontier_seq {
-                if pkt.extended_seq <= f {
-                    continue;
-                }
-            }
-            self.frontier_seq = Some(pkt.extended_seq);
-            self.writer.decode_packet(&pkt.record);
+    fn ingest(&mut self, record: JournalRecord) {
+        let ready = self.packets.ingest(record);
+        for pkt in ready {
+            let placement = self.packets.placement_samples(&pkt.record);
+            self.writer
+                .apply_packet(&pkt.record, pkt.disposition, placement);
         }
     }
 
-    fn ingest(&mut self, record: JournalRecord) {
-        let extended_seq = (record.ssrc_epoch << 16) | u32::from(record.sequence);
-        if self.epoch != 0 && record.ssrc_epoch != self.epoch {
-            self.epoch = record.ssrc_epoch;
-        } else if self.epoch == 0 {
-            self.epoch = record.ssrc_epoch;
+    fn flush_ready(&mut self) {
+        for pkt in self.packets.flush_remaining() {
+            let placement = self.packets.placement_samples(&pkt.record);
+            self.writer
+                .apply_packet(&pkt.record, pkt.disposition, placement);
         }
-        self.buffer.push(BufferedPacket {
-            record,
-            extended_seq,
-        });
-        self.flush_ready();
     }
 }
 
@@ -200,9 +190,7 @@ pub fn process_verified_segments(
             user.discord_user_id.clone(),
             UserAccumulator {
                 writer,
-                buffer: Vec::new(),
-                frontier_seq: None,
-                epoch: 0,
+                packets: UserPacketAccumulator::default(),
             },
         );
     }
@@ -254,7 +242,6 @@ pub fn process_verified_segments(
                 user.path_nick, len, expected_bytes
             )));
         }
-        global_report.discarded_packet_count += report.discarded_packet_count;
         global_report.discarded_packet_count += report.discarded_packet_count;
         for interval in report.intervals_snapshot() {
             global_report.record_silence_interval(interval);

@@ -24,7 +24,9 @@ use crate::voice_delivery::recovery_report::RECOVERY_REPORT_CONTENT_TYPE;
 use crate::voice_delivery::recovery_report::RECOVERY_REPORT_RELATIVE_PATH;
 use std::io::Seek;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use thiserror::Error;
 
 const CHUNK: u64 = 8 * 1024 * 1024;
@@ -43,33 +45,62 @@ pub enum LocalOrchestratorError {
     Other(String),
 }
 
+/// Shared pause/cancel handles wired from the In-Sync worker and HTTP control plane.
+#[derive(Clone)]
+pub struct LocalFinalizationControls {
+    pub cancel: LocalFinalizationCancel,
+    pub paused: Arc<AtomicBool>,
+    /// When true, pause at segment boundaries releases the delivery lease instead of renewing.
+    pub release_lease_on_pause: Arc<AtomicBool>,
+}
+
+impl Default for LocalFinalizationControls {
+    fn default() -> Self {
+        Self {
+            cancel: LocalFinalizationCancel::new(),
+            paused: Arc::new(AtomicBool::new(false)),
+            release_lease_on_pause: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
 pub struct LocalFinalizationOrchestrator {
     parent: PathBuf,
     device_id: String,
     phase: Mutex<LocalFinalizationPhase>,
     events: Mutex<Vec<LocalFinalizationProgressEvent>>,
-    paused: Mutex<bool>,
-    cancel: LocalFinalizationCancel,
+    controls: LocalFinalizationControls,
 }
 
 impl LocalFinalizationOrchestrator {
     pub fn open(parent: &Path, device_id: impl Into<String>) -> Self {
+        Self::open_with_controls(parent, device_id, LocalFinalizationControls::default())
+    }
+
+    pub fn open_with_controls(
+        parent: &Path,
+        device_id: impl Into<String>,
+        controls: LocalFinalizationControls,
+    ) -> Self {
         Self {
             parent: parent.to_path_buf(),
             device_id: device_id.into(),
             phase: Mutex::new(LocalFinalizationPhase::Queued),
             events: Mutex::new(Vec::new()),
-            paused: Mutex::new(false),
-            cancel: LocalFinalizationCancel::new(),
+            controls,
         }
     }
 
+    pub fn controls(&self) -> &LocalFinalizationControls {
+        &self.controls
+    }
+
     pub fn cancellation(&self) -> LocalFinalizationCancel {
-        self.cancel.clone()
+        self.controls.cancel.clone()
     }
 
     pub fn set_paused(&self, paused: bool) {
-        *self.paused.lock().unwrap() = paused;
+        self.controls.paused.store(paused, Ordering::SeqCst);
         if paused {
             *self.phase.lock().unwrap() = LocalFinalizationPhase::Paused;
         }
@@ -94,13 +125,27 @@ impl LocalFinalizationOrchestrator {
         *self.phase.lock().unwrap() = phase;
     }
 
-    fn check_pause_cancel(&self) -> Result<(), LocalOrchestratorError> {
-        self.cancel
+    fn check_pause_cancel<C: LocalFinalizationClient>(
+        &self,
+        client: &C,
+        session_id: &str,
+    ) -> Result<(), LocalOrchestratorError> {
+        self.controls
+            .cancel
             .check()
             .map_err(|_| LocalOrchestratorError::Cancelled)?;
-        if *self.paused.lock().unwrap() {
+        while self.controls.paused.load(Ordering::SeqCst) {
             self.set_phase(LocalFinalizationPhase::Paused);
-            return Err(LocalOrchestratorError::Other("paused".into()));
+            if self.controls.release_lease_on_pause.load(Ordering::SeqCst) {
+                let _ = client.release_delivery(session_id, &self.device_id);
+            } else {
+                let _ = client.renew_lease(session_id, &self.device_id);
+            }
+            self.controls
+                .cancel
+                .check()
+                .map_err(|_| LocalOrchestratorError::Cancelled)?;
+            std::thread::sleep(Duration::from_millis(400));
         }
         Ok(())
     }
@@ -110,10 +155,16 @@ impl LocalFinalizationOrchestrator {
         client: &C,
         pending: &LocalPendingDelivery,
     ) -> Result<(), LocalOrchestratorError> {
-        self.set_phase(LocalFinalizationPhase::Claiming);
-        self.check_pause_cancel()?;
-        let _claim = client.claim_delivery(&pending.session_id, &self.device_id)?;
         let manifest = pending.manifest.clone();
+        let required = LocalJournalStore::disk_preflight_bytes(&manifest, 512 * 1024 * 1024);
+        if !LocalJournalStore::free_space_ok(&self.parent, required) {
+            return Err(LocalOrchestratorError::Other(
+                "insufficient disk space".into(),
+            ));
+        }
+        self.set_phase(LocalFinalizationPhase::Claiming);
+        self.check_pause_cancel(client, &pending.session_id)?;
+        let _claim = client.claim_delivery(&pending.session_id, &self.device_id)?;
         let store = LocalJournalStore::open(&self.parent, &manifest.session_id)
             .map_err(|e| LocalOrchestratorError::Store(e.to_string()))?;
         store
@@ -123,7 +174,7 @@ impl LocalFinalizationOrchestrator {
             session_id: manifest.session_id.clone(),
         });
         self.download_all(client, &store, &manifest)?;
-        self.check_pause_cancel()?;
+        self.check_pause_cancel(client, &manifest.session_id)?;
         self.set_phase(LocalFinalizationPhase::Processing);
         self.emit(LocalFinalizationProgressEvent::ProcessingStarted {
             session_id: manifest.session_id.clone(),
@@ -136,7 +187,13 @@ impl LocalFinalizationOrchestrator {
             .collect();
         let output = process_verified_segments(&manifest, &segment_paths, &staging)
             .map_err(|e| LocalOrchestratorError::Processor(e.to_string()))?;
-        self.publish_and_receipt(client, &manifest, &pending.manifest_digest, output)?;
+        self.publish_and_receipt(
+            client,
+            &manifest,
+            &pending.manifest_digest,
+            &pending.sealed_at,
+            output,
+        )?;
         self.set_phase(LocalFinalizationPhase::Complete);
         Ok(())
     }
@@ -170,7 +227,7 @@ impl LocalFinalizationOrchestrator {
                 .collect();
         }
         for seg in &manifest.segments {
-            self.check_pause_cancel()?;
+            self.check_pause_cancel(client, &manifest.session_id)?;
             let _ = client.renew_lease(&manifest.session_id, &self.device_id);
             if store
                 .verify_segment_complete(seg.segment_seq, seg.byte_length, &seg.sha256)
@@ -189,7 +246,7 @@ impl LocalFinalizationOrchestrator {
                 .map(|c| c.bytes_complete)
                 .unwrap_or(0);
             while offset < seg.byte_length {
-                self.check_pause_cancel()?;
+                self.check_pause_cancel(client, &manifest.session_id)?;
                 let chunk = (seg.byte_length - offset).min(CHUNK);
                 let mut file = store
                     .open_segment_writer(seg.segment_seq, offset > 0)
@@ -260,6 +317,7 @@ impl LocalFinalizationOrchestrator {
         client: &C,
         manifest: &LocalFinalizationManifest,
         manifest_digest: &str,
+        sealed_at: &str,
         output: super::processor::LocalProcessOutput,
     ) -> Result<(), LocalOrchestratorError> {
         self.set_phase(LocalFinalizationPhase::Publishing);
@@ -297,9 +355,15 @@ impl LocalFinalizationOrchestrator {
         let delivery = FinalizedVoiceDelivery::open_recording_parent(&self.parent)
             .map_err(|e| LocalOrchestratorError::Other(e.to_string()))?
             .with_device_id(self.device_id.clone());
-        // Publication via existing v2 orchestrator path is deferred in raw pass; stems remain in staging.
+        let published = delivery
+            .publish_local_decoded(&syndicate, &output_digest, sealed_at, &output)
+            .map_err(|e| LocalOrchestratorError::Other(e.to_string()))?;
         self.emit(LocalFinalizationProgressEvent::PublicationComplete {
             session_id: manifest.session_id.clone(),
+            final_session_dir: published.final_session_dir.to_string_lossy().to_string(),
+            recovery_report_path: published
+                .recovery_report_path
+                .map(|p| p.to_string_lossy().to_string()),
         });
         self.set_phase(LocalFinalizationPhase::Receipting);
         let receipt = LocalFinalizationReceipt {
@@ -342,8 +406,6 @@ impl LocalFinalizationOrchestrator {
         self.emit(LocalFinalizationProgressEvent::ReceiptAcknowledged {
             session_id: manifest.session_id.clone(),
         });
-        let _ = delivery;
-        let _ = LOCAL_PUBLICATION_STATE;
         let _ = ReceiptRequestBody {
             manifest_digest: manifest_digest.to_string(),
             device_id: self.device_id.clone(),

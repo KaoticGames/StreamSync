@@ -44,6 +44,9 @@ pub enum LocalFinalizationProgressEvent {
     },
     PublicationComplete {
         session_id: String,
+        final_session_dir: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery_report_path: Option<String>,
     },
     ReceiptAcknowledged {
         session_id: String,
