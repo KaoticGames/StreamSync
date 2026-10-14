@@ -94,7 +94,7 @@ jobs:
         run: node scripts/check-desktop-icons.js
 
       - name: NSIS installer
-        run: npx tauri build --bundles nsis --ci --no-sign --config tauri.ci.conf.json
+        run: cargo build -p stream-sync-desktop --features windows-vendored-opus --release && npx tauri build --bundles nsis --ci --no-sign --config tauri.ci.conf.json
         working-directory: crates/stream-sync-desktop
 
   signed-release:

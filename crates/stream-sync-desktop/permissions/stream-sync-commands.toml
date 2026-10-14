@@ -23,4 +23,6 @@ commands.allow = [
   "open_se_account_page",
   "export_backup",
   "restore_backup",
+  "reveal_in_sync_output",
+  "open_in_sync_recovery_report",
 ]

@@ -46,13 +46,38 @@ async function refreshInSyncRecordings() {
 
   const processBtn = document.getElementById("in-sync-process-now");
   if (processBtn) {
-    processBtn.disabled = false;
+    processBtn.disabled = !status.activeSessionId;
     processBtn.onclick = async function () {
       await inSyncPrivileged("/api/in-sync/process-now", {
         method: "POST",
         body: JSON.stringify({ sessionId: status.activeSessionId }),
       });
       await refreshInSyncRecordings();
+    };
+  }
+
+  const revealBtn = document.getElementById("in-sync-reveal");
+  const reportBtn = document.getElementById("in-sync-open-report");
+  const sid = status.activeSessionId;
+  const canOpen = Boolean(sid && status.publishedOutputDir);
+  if (revealBtn) {
+    revealBtn.disabled = !canOpen;
+    revealBtn.onclick = async function () {
+      if (window.__TAURI__ && window.__TAURI__.core) {
+        await window.__TAURI__.core.invoke("reveal_in_sync_output", {
+          sessionId: sid,
+        });
+      }
+    };
+  }
+  if (reportBtn) {
+    reportBtn.disabled = !canOpen || !status.recoveryReportPath;
+    reportBtn.onclick = async function () {
+      if (window.__TAURI__ && window.__TAURI__.core) {
+        await window.__TAURI__.core.invoke("open_in_sync_recovery_report", {
+          sessionId: sid,
+        });
+      }
     };
   }
 }
