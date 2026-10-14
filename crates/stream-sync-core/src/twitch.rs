@@ -2127,6 +2127,7 @@ async fn execute_delegated_teardown(
         // 3. Stop workers.
         stop_delegated_worker_handles(&services.refresh_handle, &services.watch_handle, None).await;
         crate::discord_voice::stop_ingest_worker_for_generation(&services, generation).await;
+        crate::in_sync::cancel_in_sync_work(state.clone()).await;
 
         // 4. Mode persist: do not skip based solely on was_active after memory already cleared.
         let mem_delegated = *state.active_mode.read().await == TwitchActiveMode::Delegated;

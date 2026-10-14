@@ -118,6 +118,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const viewMap = {
     chat: "views/chat.html",
     events: "views/events.html",
+    "in-sync": "views/in-sync.html",
     connections: "views/connections.html",
     help: "views/help.html",
     about: "views/about.html",
@@ -161,6 +162,9 @@ document.addEventListener("DOMContentLoaded", () => {
           break;
         case "connections":
           initConnectionsView();
+          break;
+        case "in-sync":
+          if (typeof wireInSyncRecordingsUi === "function") wireInSyncRecordingsUi();
           break;
         case "help":
           initHelpView();

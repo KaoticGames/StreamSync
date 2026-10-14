@@ -5,6 +5,8 @@ pub mod rename_buffer;
 
 pub mod storage_qualify;
 
+pub mod disk_space;
+
 #[cfg(windows)]
 mod win {
     use std::ffi::c_void;

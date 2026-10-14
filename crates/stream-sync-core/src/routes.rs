@@ -162,6 +162,14 @@ pub fn build_router(ctx: ServerContext) -> Router {
             "/api/discord/connect-key/redeem",
             post(post_discord_connect_key_mint),
         )
+        .route("/api/in-sync/status", get(get_in_sync_status))
+        .route("/api/in-sync/process-now", post(post_in_sync_process_now))
+        .route(
+            "/api/in-sync/processing-mode",
+            post(post_in_sync_processing_mode),
+        )
+        .route("/api/in-sync/pause", post(post_in_sync_pause))
+        .route("/api/in-sync/cancel", post(post_in_sync_cancel))
         .route("/api/twitch/use-connection", post(post_use_connection))
         .route(
             "/api/twitch/remove-connection",
@@ -526,6 +534,7 @@ async fn api_status(State(ctx): State<ServerContext>) -> Json<Value> {
             "personalSaved": personal_kick.is_linked(),
         },
         "discordVoice": discord_voice,
+        "inSync": crate::in_sync::status_json(&ctx.state).await,
         "streamelements": se_connected,
     }))
 }
@@ -1591,6 +1600,95 @@ async fn post_discord_recording_folder(
                     "error": "invalid_folder",
                     "message": e.to_string(),
                 })),
+            )
+        })?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn get_in_sync_status(State(ctx): State<ServerContext>) -> Json<Value> {
+    Json(crate::in_sync::status_json(&ctx.state).await)
+}
+
+async fn post_in_sync_process_now(
+    State(ctx): State<ServerContext>,
+    Json(body): Json<crate::in_sync::ProcessNowBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if ctx.state.readonly {
+        return Err(readonly_json());
+    }
+    crate::in_sync::enqueue_process_now(ctx.state.clone(), &body.session_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": e })),
+            )
+        })?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct InSyncProcessingModeBody {
+    mode: String,
+}
+
+async fn post_in_sync_processing_mode(
+    State(ctx): State<ServerContext>,
+    Json(body): Json<InSyncProcessingModeBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if ctx.state.readonly {
+        return Err(readonly_json());
+    }
+    let mode = match body.mode.as_str() {
+        "manual" => crate::config_types::LocalProcessingMode::Manual,
+        "automatic_after_seal" => crate::config_types::LocalProcessingMode::AutomaticAfterSeal,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": "invalid_mode" })),
+            ));
+        }
+    };
+    crate::in_sync::set_processing_mode(ctx.state.clone(), mode)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": e })),
+            )
+        })?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct InSyncPauseBody {
+    paused: bool,
+}
+
+async fn post_in_sync_pause(
+    State(ctx): State<ServerContext>,
+    Json(body): Json<InSyncPauseBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    crate::in_sync::set_paused(ctx.state.clone(), body.paused)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": e })),
+            )
+        })?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn post_in_sync_cancel(
+    State(ctx): State<ServerContext>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    crate::in_sync::request_cancel(ctx.state.clone())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": e })),
             )
         })?;
     Ok(Json(json!({ "ok": true })))

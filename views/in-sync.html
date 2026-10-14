@@ -1,0 +1,127 @@
+<div class="view-panel view-in-sync in-sync-view">
+  <div class="section-header">
+    <h2>In-Sync — Recordings</h2>
+    <p class="section-subtitle">
+      Local recording processor — finalize voice journals on your machine.
+    </p>
+  </div>
+
+  <div class="in-sync-workshop" id="in-sync-workshop">
+    <div
+      id="in-sync-workshop-placeholder"
+      class="in-sync-workshop-stage"
+      aria-hidden="true"
+    >
+      <div class="in-sync-workshop-circuit" aria-hidden="true"></div>
+      <p class="in-sync-workshop-caption">Workshop preview (placeholder)</p>
+    </div>
+
+    <aside
+      class="in-sync-workshop-hud"
+      role="region"
+      aria-label="Processing summary and controls"
+    >
+      <div class="in-sync-hud-summary">
+        <div class="in-sync-hud-stat">
+          <span class="field-label">Status</span>
+          <span id="in-sync-hud-status" class="in-sync-hud-value">Nothing processing</span>
+        </div>
+        <div class="in-sync-hud-stat">
+          <span class="field-label">Phase</span>
+          <span id="in-sync-hud-phase" class="in-sync-hud-value">—</span>
+        </div>
+        <div class="in-sync-hud-stat">
+          <span class="field-label">Session</span>
+          <span id="in-sync-hud-session" class="in-sync-hud-value">—</span>
+        </div>
+      </div>
+
+      <div class="config-section in-sync-hud-mode">
+        <label class="field-label" id="in-sync-mode-label">Processing mode</label>
+        <div
+          class="in-sync-mode-row"
+          role="group"
+          aria-labelledby="in-sync-mode-label"
+        >
+          <span class="in-sync-mode-side in-sync-mode-side--manual is-active" id="in-sync-mode-manual-label">
+            Manual
+          </span>
+          <button
+            type="button"
+            id="in-sync-processing-mode-toggle"
+            class="toggle-switch"
+            aria-pressed="false"
+            aria-label="Processing mode: manual or automatic"
+            title="Switch between manual and automatic processing"
+          >
+            <span class="toggle-thumb"></span>
+            <span class="toggle-label">Manual</span>
+          </button>
+          <span class="in-sync-mode-side in-sync-mode-side--automatic" id="in-sync-mode-automatic-label">
+            Automatic
+          </span>
+        </div>
+      </div>
+
+      <div class="in-sync-hud-actions">
+        <button type="button" class="btn btn-primary" id="in-sync-process-now" disabled>
+          Process now
+        </button>
+        <button type="button" class="btn btn-secondary" id="in-sync-pause">Pause</button>
+        <button type="button" class="btn btn-secondary" id="in-sync-resume">Resume</button>
+        <button type="button" class="btn btn-secondary" id="in-sync-retry">Retry</button>
+        <button type="button" class="btn btn-secondary" id="in-sync-refresh">Refresh</button>
+      </div>
+    </aside>
+  </div>
+
+  <div class="in-sync-status-row" aria-label="Summary">
+    <div class="card in-sync-stat-card">
+      <div class="card-title">Ready queue</div>
+      <p id="in-sync-card-queue" class="in-sync-stat-body">No recordings ready</p>
+    </div>
+    <div class="card in-sync-stat-card">
+      <div class="card-title">Processing</div>
+      <p id="in-sync-card-processing" class="in-sync-stat-body">Nothing processing</p>
+    </div>
+    <div class="card in-sync-stat-card">
+      <div class="card-title">Mode</div>
+      <p id="in-sync-card-mode" class="in-sync-stat-body">Manual</p>
+    </div>
+    <div class="card in-sync-stat-card">
+      <div class="card-title">Published</div>
+      <p id="in-sync-card-published" class="in-sync-stat-body">None yet</p>
+    </div>
+  </div>
+
+  <div class="card-grid in-sync-details-grid">
+    <div class="card in-sync-detail-card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">Session details</div>
+          <div class="card-subtitle">Active local finalization session</div>
+        </div>
+      </div>
+      <p id="in-sync-empty" class="in-sync-empty-state">No active session</p>
+      <dl id="in-sync-session-fields" class="in-sync-fields" hidden></dl>
+      <div class="in-sync-output-actions">
+        <button type="button" class="btn btn-secondary" id="in-sync-reveal" disabled>
+          Reveal output
+        </button>
+        <button type="button" class="btn btn-secondary" id="in-sync-open-report" disabled>
+          Open recovery report
+        </button>
+      </div>
+    </div>
+
+    <div class="card in-sync-detail-card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">Progress log</div>
+          <div class="card-subtitle">Recent processor events</div>
+        </div>
+      </div>
+      <pre id="in-sync-progress-log" class="in-sync-progress-log">No events yet</pre>
+    </div>
+  </div>
+</div>

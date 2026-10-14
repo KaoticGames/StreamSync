@@ -220,6 +220,8 @@ pub fn run() {
             commands::open_se_account_page,
             commands::export_backup,
             commands::restore_backup,
+            commands::reveal_in_sync_output,
+            commands::open_in_sync_recovery_report,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Stream Sync desktop");

@@ -79,6 +79,10 @@ pub struct FinalizedVoiceDelivery {
 }
 
 impl FinalizedVoiceDelivery {
+    pub fn recording_parent(&self) -> &Path {
+        &self.parent
+    }
+
     pub fn open_recording_parent(parent: &Path) -> Result<Self, OrchestratorError> {
         let _probe = DestRoot::open(parent).map_err(|e| OrchestratorError::Other(e.to_string()))?;
         Ok(Self {
@@ -185,7 +189,7 @@ impl FinalizedVoiceDelivery {
         Ok(())
     }
 
-    fn open_session_for_delivery(
+    pub(crate) fn open_session_for_delivery(
         &self,
         root: DestRoot,
         identity: DeliveryImmutableIdentity,

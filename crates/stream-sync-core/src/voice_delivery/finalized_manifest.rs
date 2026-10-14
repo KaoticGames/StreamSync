@@ -121,7 +121,7 @@ fn require_bigint_string(v: &Value, field: &str) -> Result<String, FinalizedMani
     Ok(s)
 }
 
-fn validate_sha256_hex(s: &str, field: &str) -> Result<String, FinalizedManifestError> {
+pub(crate) fn validate_sha256_hex(s: &str, field: &str) -> Result<String, FinalizedManifestError> {
     if s.len() != 64
         || !s
             .bytes()
@@ -132,7 +132,10 @@ fn validate_sha256_hex(s: &str, field: &str) -> Result<String, FinalizedManifest
     Ok(s.to_string())
 }
 
-fn validate_discord_snowflake(v: &str, field: &str) -> Result<String, FinalizedManifestError> {
+pub(crate) fn validate_discord_snowflake(
+    v: &str,
+    field: &str,
+) -> Result<String, FinalizedManifestError> {
     if !v.bytes().all(|b| b.is_ascii_digit()) {
         return Err(fail(format!("{field} must be numeric snowflake")));
     }
@@ -181,7 +184,7 @@ pub fn expected_wav_file_bytes(target_sample_count: u64) -> u64 {
     WAV_HEADER_BYTES + target_sample_count * STEREO_PCM_FRAME_BYTES
 }
 
-fn compare_ascii(a: &str, b: &str) -> std::cmp::Ordering {
+pub(crate) fn compare_ascii_for_digest(a: &str, b: &str) -> std::cmp::Ordering {
     let len = a.len().min(b.len());
     for i in 0..len {
         let ca = a.as_bytes()[i];
@@ -236,7 +239,7 @@ fn canonicalize_finalized_manifest_base_for_digest(
         })
         .collect();
     stems.sort_by(|a, b| {
-        compare_ascii(
+        compare_ascii_for_digest(
             a.get("pathNick").and_then(|v| v.as_str()).unwrap_or(""),
             b.get("pathNick").and_then(|v| v.as_str()).unwrap_or(""),
         )

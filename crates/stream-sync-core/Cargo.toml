@@ -33,6 +33,13 @@ urlencoding.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate"] }
 fs2 = "0.4"
 sha2 = "0.10"
+audiopus = { version = "0.3.0-rc.0", default-features = false, features = ["decoder"], optional = true }
+audiopus_sys = { version = "0.2.2", optional = true }
+
+[features]
+default = []
+local-opus-native = ["audiopus", "audiopus_sys"]
+local-opus-vendored = ["local-opus-native", "audiopus_sys/static"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
