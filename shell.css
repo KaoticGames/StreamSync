@@ -1676,6 +1676,7 @@ input[type="range"]::-ms-thumb {
     right: 16px;
     bottom: 16px;
     width: min(400px, 36%);
+    overflow: visible;
   }
 }
 
@@ -1684,6 +1685,7 @@ input[type="range"]::-ms-thumb {
     left: 12px;
     right: 12px;
     bottom: 12px;
+    overflow: visible;
   }
 }
 

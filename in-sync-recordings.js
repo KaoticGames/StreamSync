@@ -14,7 +14,9 @@ function mountInSyncSyndicateSelect(rootEl, items, selectedId, onChange) {
   var menu = rootEl.querySelector(".ss-select__menu");
   if (!btn || !menu) return null;
 
-  var activeIndex = -1;
+  function setExpanded(open) {
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+  }
 
   function render() {
     var selected = items.find(function (i) {
@@ -23,93 +25,54 @@ function mountInSyncSyndicateSelect(rootEl, items, selectedId, onChange) {
     if (!selected && items.length) selected = items[0];
     btn.textContent = selected ? selected.name : "Select…";
     rootEl.dataset.selected = selectedId || "";
-    btn.setAttribute("aria-expanded", menu.classList.contains("open") ? "true" : "false");
+    setExpanded(menu.classList.contains("open"));
 
     menu.innerHTML = "";
-    items.forEach(function (it, idx) {
+    items.forEach(function (it) {
       var div = document.createElement("div");
       div.className =
         "ss-select__item" + (it.id === selectedId ? " selected" : "");
       div.textContent = it.name;
       div.dataset.id = it.id;
       div.setAttribute("role", "option");
-      div.setAttribute("aria-selected", it.id === selectedId ? "true" : "false");
-      div.tabIndex = -1;
       div.addEventListener("click", function () {
-        selectItem(it.id);
+        selectedId = it.id;
+        menu.classList.remove("open");
+        render();
+        if (typeof onChange === "function") onChange(it.id);
       });
       menu.appendChild(div);
     });
   }
 
-  function selectItem(id) {
-    selectedId = id;
-    menu.classList.remove("open");
-    render();
-    if (typeof onChange === "function") onChange(id);
-  }
-
-  function openMenu() {
-    menu.classList.add("open");
-    btn.setAttribute("aria-expanded", "true");
-    var itemsEl = menu.querySelectorAll(".ss-select__item");
-    activeIndex = Math.max(
-      0,
-      items.findIndex(function (i) {
-        return i.id === selectedId;
-      })
-    );
-    if (itemsEl[activeIndex]) itemsEl[activeIndex].focus();
-  }
-
   function closeMenu() {
     menu.classList.remove("open");
-    btn.setAttribute("aria-expanded", "false");
-    btn.focus();
+    setExpanded(false);
+  }
+
+  function onOutsidePointer(e) {
+    if (!rootEl.contains(e.target)) closeMenu();
   }
 
   btn.addEventListener("click", function (e) {
     e.preventDefault();
-    if (menu.classList.contains("open")) closeMenu();
-    else openMenu();
+    e.stopPropagation();
+    menu.classList.toggle("open");
+    setExpanded(menu.classList.contains("open"));
   });
 
   btn.addEventListener("keydown", function (e) {
-    if (e.key === "ArrowDown" || e.key === "Enter" || e.key === " ") {
+    if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      if (!menu.classList.contains("open")) openMenu();
+      e.stopPropagation();
+      menu.classList.toggle("open");
+      setExpanded(menu.classList.contains("open"));
     }
     if (e.key === "Escape") closeMenu();
   });
 
-  menu.addEventListener("keydown", function (e) {
-    var itemsEl = menu.querySelectorAll(".ss-select__item");
-    if (!itemsEl.length) return;
-    if (e.key === "Escape") {
-      e.preventDefault();
-      closeMenu();
-      return;
-    }
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      activeIndex = Math.min(activeIndex + 1, itemsEl.length - 1);
-      itemsEl[activeIndex].focus();
-    }
-    if (e.key === "ArrowUp") {
-      e.preventDefault();
-      activeIndex = Math.max(activeIndex - 1, 0);
-      itemsEl[activeIndex].focus();
-    }
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      var id = itemsEl[activeIndex] && itemsEl[activeIndex].dataset.id;
-      if (id) selectItem(id);
-    }
-  });
-
-  document.addEventListener("click", function (e) {
-    if (!rootEl.contains(e.target)) menu.classList.remove("open");
-  });
+  document.addEventListener("mousedown", onOutsidePointer);
+  document.addEventListener("click", onOutsidePointer);
 
   render();
 
@@ -121,8 +84,30 @@ function mountInSyncSyndicateSelect(rootEl, items, selectedId, onChange) {
     getSelected: function () {
       return selectedId;
     },
+    destroy: function () {
+      document.removeEventListener("mousedown", onOutsidePointer);
+      document.removeEventListener("click", onOutsidePointer);
+    },
   };
 }
+
+(function initInSyncProcessingModeClickFallback() {
+  if (window.__inSyncProcessingModeClickFallback) return;
+  window.__inSyncProcessingModeClickFallback = true;
+
+  document.addEventListener("click", function (e) {
+    var btn = e.target.closest("#in-sync-processing-mode .ss-select__btn");
+    if (!btn) return;
+    var root = document.getElementById("in-sync-processing-mode");
+    if (!root || root.dataset.bound === "1") return;
+    e.preventDefault();
+    e.stopPropagation();
+    var menu = root.querySelector(".ss-select__menu");
+    if (!menu) return;
+    menu.classList.toggle("open");
+    btn.setAttribute("aria-expanded", menu.classList.contains("open") ? "true" : "false");
+  });
+})();
 
 async function inSyncPrivileged(path, options) {
   if (!window.streamSyncControlApi || !window.streamSyncControlApi.privilegedFetch) {
@@ -325,8 +310,11 @@ async function refreshInSyncRecordings() {
 
 function wireInSyncRecordingsUi() {
   var selectRoot = document.getElementById("in-sync-processing-mode");
-  if (selectRoot && selectRoot.dataset.bound !== "1") {
-    selectRoot.dataset.bound = "1";
+  if (selectRoot) {
+    if (selectRoot.__ssWidget && selectRoot.__ssWidget.destroy) {
+      selectRoot.__ssWidget.destroy();
+    }
+    delete selectRoot.dataset.bound;
     var initial = selectRoot.dataset.selected || "manual";
     selectRoot.__ssWidget = mountInSyncSyndicateSelect(
       selectRoot,
@@ -345,6 +333,7 @@ function wireInSyncRecordingsUi() {
         }
       }
     );
+    if (selectRoot.__ssWidget) selectRoot.dataset.bound = "1";
   }
 
   var refreshBtn = document.getElementById("in-sync-refresh");
