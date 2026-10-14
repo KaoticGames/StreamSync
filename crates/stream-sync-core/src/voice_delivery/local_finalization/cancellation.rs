@@ -1,4 +1,7 @@
 //! Subscription-expiry / authority cancellation seam for local finalization work.
+//!
+//! Production callers should use [`crate::in_sync::cancel_in_sync_work`] (also invoked from
+//! delegated subscription teardown) rather than ad-hoc flags.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

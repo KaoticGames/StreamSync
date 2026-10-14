@@ -504,6 +504,8 @@ pub struct DiscordVoiceRuntime {
 pub struct InSyncRuntime {
     pub phase: Option<crate::voice_delivery::LocalFinalizationPhase>,
     pub active_session_id: Option<String>,
+    pub published_output_dir: Option<String>,
+    pub recovery_report_path: Option<String>,
 }
 
 /// Deterministic failure injection for durable delegated-store operations (tests).
@@ -575,7 +577,7 @@ pub struct AppState {
     pub in_sync_runtime: RwLock<InSyncRuntime>,
     pub in_sync_manual_queue: RwLock<Vec<String>>,
     pub in_sync_progress_events: RwLock<Vec<crate::voice_delivery::LocalFinalizationProgressEvent>>,
-    pub in_sync_cancel: RwLock<bool>,
+    pub in_sync_worker: RwLock<crate::in_sync::InSyncWorkerState>,
     /// Per-installation localhost control capability (privileged routes + control socket).
     control_token: String,
     /// One-time OAuth completion nonces (never the master capability).
@@ -840,7 +842,7 @@ impl AppState {
             in_sync_runtime: RwLock::new(InSyncRuntime::default()),
             in_sync_manual_queue: RwLock::new(Vec::new()),
             in_sync_progress_events: RwLock::new(Vec::new()),
-            in_sync_cancel: RwLock::new(false),
+            in_sync_worker: RwLock::new(crate::in_sync::InSyncWorkerState::default()),
             control_token,
             pending_logins: crate::oauth_pending::PendingLoginStore::new(),
             dock_credentials,

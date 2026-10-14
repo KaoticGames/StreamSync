@@ -88,6 +88,9 @@ pub use storage::{
     write_identity_rollback_pending, write_json, INJECT_COMMITTING_REMOVE_FAILURE,
 };
 pub use store_lock::{try_acquire_instance_lock, InstanceLockError};
+pub use voice_delivery::local_finalization::{
+    resolve_canonical_session_paths, validate_path_under_parent, PublishedSessionPaths,
+};
 
 /// Integration-test hooks for durable apply rollback (not a public API surface).
 #[doc(hidden)]

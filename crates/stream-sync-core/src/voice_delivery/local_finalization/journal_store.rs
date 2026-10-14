@@ -156,14 +156,29 @@ impl LocalJournalStore {
     }
 
     pub fn free_space_ok(recording_parent: &Path, required: u64) -> bool {
-        let _probe = DestRoot::open(recording_parent);
+        if DestRoot::open(recording_parent).is_err() {
+            return false;
+        }
         if let Ok(meta) = std::fs::metadata(recording_parent) {
-            // Best-effort: if we cannot query space, allow and fail later on write.
             if !meta.is_dir() {
                 return false;
             }
         }
-        true
+        #[cfg(windows)]
+        {
+            if let Some(free) =
+                stream_sync_windows_fs::disk_space::available_bytes_for_path(recording_parent)
+            {
+                return free >= required;
+            }
+            return false;
+        }
+        #[cfg(not(windows))]
+        {
+            // Non-Windows: documented best-effort fallback (writes fail closed on ENOSPC).
+            let _ = required;
+            true
+        }
     }
 }
 
