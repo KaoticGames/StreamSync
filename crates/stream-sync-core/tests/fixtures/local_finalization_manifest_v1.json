@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "finalizerAlgorithmVersion": "syndicate-local-opus-finalizer-v1",
+  "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+  "guildId": "123456789012345678",
+  "channelId": "234567890123456789",
+  "sessionStartWallMs": 1700000000000,
+  "sessionStartMonotonicNs": "1000000000",
+  "sealedStopWallMs": 1700000360000,
+  "sealedStopMonotonicNs": "4600000000000",
+  "targetSampleCount48k": 17280000,
+  "journalSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "recordingManifest": {
+    "key": "voice-delivery-v2/123456789012345678/550e8400-e29b-41d4-a716-446655440000/manifest/recording.manifest.json",
+    "byteLength": 4096,
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "sealedIndex": {
+    "key": "voice-delivery-v2/123456789012345678/550e8400-e29b-41d4-a716-446655440000/journal/index.sealed.json",
+    "byteLength": 512,
+    "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "segments": [
+    {
+      "segmentSeq": 0,
+      "key": "voice-delivery-v2/123456789012345678/550e8400-e29b-41d4-a716-446655440000/journal/00000000.synj",
+      "byteLength": 1048576,
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    {
+      "segmentSeq": 1,
+      "key": "voice-delivery-v2/123456789012345678/550e8400-e29b-41d4-a716-446655440000/journal/00000001.synj",
+      "byteLength": 2097152,
+      "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+  ],
+  "users": [
+    {
+      "discordUserId": "123456789012345678",
+      "pathNick": "alpha",
+      "opaqueStemId": "b78071bf7e74d0219cd67584775500d8"
+    },
+    {
+      "discordUserId": "234567890123456789",
+      "pathNick": "zeta",
+      "opaqueStemId": "5b3e08050185f3d96174af88c89cf844"
+    }
+  ],
+  "output": {
+    "wavFormat": "pcm_s16le_stereo_48000",
+    "recoveryReportRelativePath": "Syndicate Audio Recovery Report.txt"
+  }
+}
