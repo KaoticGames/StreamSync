@@ -249,9 +249,11 @@ fn blocking_supervisor_cycle(state: &AppState) -> Result<Duration, String> {
             }
             Err(LocalOrchestratorError::Cancelled) => {
                 info!("in-sync supervisor: session {session_id} cancelled");
+                let mut q = state.in_sync_manual_queue.blocking_write();
+                q.retain(|id| id != &session_id);
                 update_local_runtime_blocking(
                     state,
-                    LocalFinalizationPhase::FailedRetryable,
+                    LocalFinalizationPhase::Cancelled,
                     Some(session_id),
                     None,
                     None,
