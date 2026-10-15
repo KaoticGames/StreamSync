@@ -220,37 +220,58 @@ fn expected_sealed_index_key(guild_id: &str, session_id: &str) -> String {
     )
 }
 
-fn is_valid_recording_manifest_key(key: &str, guild_id: &str, session_id: &str) -> bool {
-    let prefix = session_prefix(guild_id, session_id);
-    if key == format!("{prefix}/manifest/recording.manifest.json") {
-        return true;
-    }
-    let pattern = format!(
-        r"^{}/manifest/recording/[a-f0-9]{{64}}\.manifest\.json$",
-        prefix.replace('/', "\\/")
-    );
-    regex_simple_match(&pattern, key)
+fn legacy_recording_manifest_key(guild_id: &str, session_id: &str) -> String {
+    format!(
+        "{}/manifest/recording.manifest.json",
+        session_prefix(guild_id, session_id)
+    )
 }
 
-fn regex_simple_match(pattern: &str, text: &str) -> bool {
-    // Minimal matcher for the single recording manifest digest-key pattern.
-    let prefix = pattern
-        .strip_prefix('^')
-        .and_then(|p| p.strip_suffix('$'))
-        .unwrap_or(pattern);
-    if !prefix.contains("[a-f0-9]{64}") {
-        return false;
-    }
-    let parts: Vec<&str> = prefix.split("[a-f0-9]{64}").collect();
-    if parts.len() != 2 {
-        return false;
-    }
-    text.starts_with(parts[0])
-        && text.ends_with(parts[1])
-        && text.len() == parts[0].len() + 64 + parts[1].len()
-        && text[parts[0].len()..text.len() - parts[1].len()]
+fn recording_manifest_embedded_sha256_from_key<'a>(
+    key: &'a str,
+    guild_id: &str,
+    session_id: &str,
+) -> Option<&'a str> {
+    let dir = format!(
+        "{}/manifest/recording/",
+        session_prefix(guild_id, session_id)
+    );
+    let rest = key.strip_prefix(&dir)?;
+    let embedded = rest.strip_suffix(".manifest.json")?;
+    if embedded.len() != 64
+        || !embedded
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    Some(embedded)
+}
+
+fn is_valid_recording_manifest_key(key: &str, guild_id: &str, session_id: &str) -> bool {
+    if key == legacy_recording_manifest_key(guild_id, session_id) {
+        return true;
+    }
+    recording_manifest_embedded_sha256_from_key(key, guild_id, session_id).is_some()
+}
+
+fn assert_recording_manifest_key_matches_sha256(
+    key: &str,
+    sha256: &str,
+    guild_id: &str,
+    session_id: &str,
+) -> Result<(), LocalFinalizationManifestError> {
+    if key == legacy_recording_manifest_key(guild_id, session_id) {
+        return Ok(());
+    }
+    let embedded = recording_manifest_embedded_sha256_from_key(key, guild_id, session_id)
+        .ok_or_else(|| fail("local finalization manifest recordingManifest.key invalid"))?;
+    if embedded != sha256 {
+        return Err(fail(
+            "local finalization manifest recordingManifest.key sha256 mismatch",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_object_ref(
@@ -363,6 +384,12 @@ pub fn parse_local_finalization_manifest(
                 Ok(())
             }
         },
+    )?;
+    assert_recording_manifest_key_matches_sha256(
+        &recording_manifest.key,
+        &recording_manifest.sha256,
+        &guild_id,
+        &session_id,
     )?;
     let sealed_index = parse_object_ref(
         &obj["sealedIndex"],
