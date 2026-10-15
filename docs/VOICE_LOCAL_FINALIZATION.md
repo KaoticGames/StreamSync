@@ -50,4 +50,6 @@ Top-level **In-Sync** tab → Recordings functional panel (`views/in-sync.html`,
 
 ## Protocol
 
+`recordingManifest.key` is either legacy `…/manifest/recording.manifest.json` or content-addressed `…/manifest/recording/<64 lowercase hex>.manifest.json`; for the latter, the path digest must equal `recordingManifest.sha256`.
+
 Shared manifest fixture digest: `fc0c603e00b6656fcbf4e921bf118b941dd1a9433d5e17b0cd24b5fe05740023` (`crates/stream-sync-core/tests/fixtures/local_finalization_manifest_v1.json`).
