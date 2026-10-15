@@ -38,6 +38,73 @@ function formatPhase(phase) {
     .replace(/_/g, " ");
 }
 
+function shortSessionId(id) {
+  if (!id) return "—";
+  return id.length > 24 ? id.slice(0, 10) + "…" + id.slice(-8) : id;
+}
+
+function formatDuration(secs) {
+  if (secs == null || !isFinite(secs)) return "—";
+  var m = Math.floor(secs / 60);
+  var s = Math.floor(secs % 60);
+  return m > 0 ? m + "m " + s + "s" : s + "s";
+}
+
+function renderInSyncPendingList(pending, primarySessionId) {
+  var listEl = document.getElementById("in-sync-pending-list");
+  if (!listEl) return;
+  if (!pending.length) {
+    listEl.hidden = true;
+    listEl.innerHTML = "";
+    return;
+  }
+  listEl.hidden = false;
+  listEl.innerHTML = pending
+    .map(function (item, idx) {
+      var sid = item.sessionId || "";
+      var isPrimary = sid && sid === primarySessionId;
+      return (
+        '<div class="in-sync-pending-card' +
+        (isPrimary ? " is-primary" : "") +
+        '">' +
+        '<div class="in-sync-pending-card-title">Ready: ' +
+        shortSessionId(sid) +
+        (isPrimary ? " (next)" : "") +
+        "</div>" +
+        '<div class="in-sync-pending-card-meta">' +
+        "Guild " +
+        (item.guildId || "—") +
+        " · Channel " +
+        (item.channelId || "—") +
+        "<br>Segments " +
+        (item.segmentCount != null ? item.segmentCount : "—") +
+        " · ~" +
+        formatDuration(item.targetDurationSecs) +
+        "<br>Digest " +
+        (item.manifestDigest
+          ? item.manifestDigest.slice(0, 12) + "…"
+          : "—") +
+        "</div></div>"
+      );
+    })
+    .join("");
+}
+
+function renderInSyncDiscovery(discovery) {
+  var el = document.getElementById("in-sync-discovery-status");
+  if (!el) return;
+  var status = discovery && discovery.status ? discovery.status : "";
+  var msg = discovery && discovery.message ? discovery.message : "";
+  if (status === "ok" || (!status && !msg)) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  el.hidden = false;
+  var label = status === "blocked" ? "Discovery blocked" : "Discovery error";
+  el.textContent = msg ? label + ": " + msg : label;
+}
+
 function applyInSyncEmptyUi() {
   var hudStatus = document.getElementById("in-sync-hud-status");
   var hudPhase = document.getElementById("in-sync-hud-phase");
@@ -57,6 +124,8 @@ function applyInSyncEmptyUi() {
   if (hudPhase) hudPhase.textContent = "—";
   if (hudSession) hudSession.textContent = "—";
   if (cardQueue) cardQueue.textContent = "No recordings ready";
+  renderInSyncPendingList([], "");
+  renderInSyncDiscovery(null);
   if (cardProcessing) cardProcessing.textContent = "Nothing processing";
   if (cardMode) cardMode.textContent = "Manual";
   if (cardPublished) cardPublished.textContent = "None yet";
@@ -79,6 +148,9 @@ function applyInSyncStatus(status) {
   var mode = status.localProcessingMode || "manual";
   var modeLabel = inSyncModeLabel(mode);
   var queue = status.manualQueue || [];
+  var pending = status.pendingSessions || [];
+  var primaryPendingId =
+    pending.length && pending[0].sessionId ? pending[0].sessionId : "";
   var activeId = status.activeSessionId || "";
   var phase = status.phase || "";
   var published = status.publishedSessions || [];
@@ -102,10 +174,20 @@ function applyInSyncStatus(status) {
 
   if (cardMode) cardMode.textContent = modeLabel;
 
+  renderInSyncPendingList(pending, primaryPendingId);
+  renderInSyncDiscovery(status.discovery);
+
   if (cardQueue) {
-    cardQueue.textContent = queue.length
-      ? queue.length + " in queue: " + queue.join(", ")
-      : "No recordings ready";
+    if (pending.length) {
+      cardQueue.textContent =
+        pending.length +
+        " ready in cloud" +
+        (queue.length ? " · " + queue.length + " queued locally" : "");
+    } else if (queue.length) {
+      cardQueue.textContent = queue.length + " in local queue: " + queue.join(", ");
+    } else {
+      cardQueue.textContent = "No recordings ready";
+    }
   }
 
   var processingLabel = "Nothing processing";
@@ -137,8 +219,10 @@ function applyInSyncStatus(status) {
 
   if (!activeId) {
     if (empty) {
-      empty.hidden = false;
-      empty.textContent = "No active session";
+      empty.hidden = pending.length > 0;
+      empty.textContent = pending.length
+        ? "Select Process now to finalize the next ready session"
+        : "No active session";
     }
     if (fields) {
       fields.hidden = true;
@@ -162,13 +246,20 @@ function applyInSyncStatus(status) {
   }
 
   var canOpen = Boolean(activeId && status.publishedOutputDir);
-  if (processBtn) processBtn.disabled = !activeId;
+  if (processBtn) {
+    processBtn.disabled = !primaryPendingId || Boolean(activeId);
+  }
   if (revealBtn) revealBtn.disabled = !canOpen;
   if (reportBtn) {
     reportBtn.disabled = !canOpen || !status.recoveryReportPath;
   }
 
-  return { activeId: activeId, status: status, canOpen: canOpen };
+  return {
+    activeId: activeId,
+    primaryPendingId: primaryPendingId,
+    status: status,
+    canOpen: canOpen,
+  };
 }
 
 async function refreshInSyncRecordings() {
@@ -179,9 +270,10 @@ async function refreshInSyncRecordings() {
     var processBtn = document.getElementById("in-sync-process-now");
     if (processBtn) {
       processBtn.onclick = async function () {
+        if (!ctx.primaryPendingId) return;
         await inSyncPrivileged("/api/in-sync/process-now", {
           method: "POST",
-          body: JSON.stringify({ sessionId: ctx.activeId }),
+          body: JSON.stringify({ sessionId: ctx.primaryPendingId }),
         });
         await refreshInSyncRecordings();
       };
