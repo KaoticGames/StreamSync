@@ -66,6 +66,7 @@ pub enum LocalFinalizationPhase {
     Publishing,
     Receipting,
     Complete,
+    Cancelled,
     FailedRetryable,
     Quarantined,
 }

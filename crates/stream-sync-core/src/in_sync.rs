@@ -203,7 +203,7 @@ pub async fn record_published_paths(
         .insert(session_id.to_string(), paths);
 }
 
-/// Central cancellation entry for entitlement teardown and the HTTP cancel route.
+/// Signal cancellation for the active in-sync finalization job (shared worker controls + orchestrator).
 pub async fn cancel_in_sync_work(state: Arc<AppState>) {
     let slot = state.in_sync_worker.read().await;
     slot.controls.cancel.cancel();
@@ -270,6 +270,10 @@ pub async fn enqueue_process_now(state: Arc<AppState>, session_id: &str) -> Resu
     if !in_sync_session_is_pending(&state, id).await {
         return Err("session is not in the cloud pending list; refresh and try again".into());
     }
+    {
+        let worker = state.in_sync_worker.write().await;
+        worker.controls.cancel.reset();
+    }
     let mut q = state.in_sync_manual_queue.write().await;
     if !q.iter().any(|s| s == id) {
         q.push(id.to_string());
@@ -306,7 +310,16 @@ pub async fn set_paused(state: Arc<AppState>, paused: bool) -> Result<(), String
 }
 
 pub async fn request_cancel(state: Arc<AppState>) -> Result<(), String> {
+    let active_session = state.in_sync_runtime.read().await.active_session_id.clone();
     cancel_in_sync_work(state.clone()).await;
+    {
+        let mut q = state.in_sync_manual_queue.write().await;
+        if let Some(id) = active_session {
+            q.retain(|s| s != &id);
+        } else {
+            q.clear();
+        }
+    }
     crate::in_sync_supervisor::wake_in_sync_supervisor(&state).await;
     Ok(())
 }
