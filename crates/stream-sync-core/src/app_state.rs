@@ -506,6 +506,9 @@ pub struct InSyncRuntime {
     pub active_session_id: Option<String>,
     pub published_output_dir: Option<String>,
     pub recovery_report_path: Option<String>,
+    /// Last deterministic storage preflight failure (bounded; no path secrets).
+    pub storage_blocked: Option<crate::voice_delivery::StoragePreflightFailure>,
+    pub storage_blocked_session_id: Option<String>,
 }
 
 /// Deterministic failure injection for durable delegated-store operations (tests).
@@ -577,6 +580,8 @@ pub struct AppState {
     pub in_sync_runtime: RwLock<InSyncRuntime>,
     pub in_sync_pending: RwLock<crate::in_sync::InSyncPendingState>,
     pub in_sync_manual_queue: RwLock<Vec<String>>,
+    /// Sessions deferred after storage preflight failure until explicit Process now.
+    pub in_sync_storage_deferred: RwLock<std::collections::HashSet<String>>,
     pub in_sync_progress_events: RwLock<Vec<crate::voice_delivery::LocalFinalizationProgressEvent>>,
     pub in_sync_worker: RwLock<crate::in_sync::InSyncWorkerState>,
     pub in_sync_wake: Arc<tokio::sync::Notify>,
@@ -845,6 +850,7 @@ impl AppState {
             in_sync_runtime: RwLock::new(InSyncRuntime::default()),
             in_sync_pending: RwLock::new(crate::in_sync::InSyncPendingState::default()),
             in_sync_manual_queue: RwLock::new(Vec::new()),
+            in_sync_storage_deferred: RwLock::new(std::collections::HashSet::new()),
             in_sync_progress_events: RwLock::new(Vec::new()),
             in_sync_worker: RwLock::new(crate::in_sync::InSyncWorkerState::default()),
             in_sync_wake: crate::in_sync::new_in_sync_wake(),

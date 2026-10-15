@@ -15,6 +15,7 @@ mod processor;
 mod progress;
 mod receipt;
 mod report;
+mod storage_preflight;
 mod synj;
 
 pub use cancellation::{LocalFinalizationCancel, LocalFinalizationCancelled};
@@ -44,3 +45,4 @@ pub use receipt::{
     assert_local_finalization_receipt_matches_manifest, parse_local_finalization_receipt,
     LocalFinalizationReceipt,
 };
+pub use storage_preflight::{bytes_to_gib, StoragePreflightFailure};

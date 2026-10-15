@@ -248,6 +248,8 @@ pub async fn status_json(state: &AppState) -> Value {
         "publishedSessions": published_ids,
         "publishedOutputDir": runtime.published_output_dir,
         "recoveryReportPath": runtime.recovery_report_path,
+        "storageBlocked": runtime.storage_blocked,
+        "storageBlockedSessionId": runtime.storage_blocked_session_id,
         "supervisorStatus": supervisor_status,
         "supervisorLastAttemptAtMs": supervisor.last_attempt_at_ms,
         "supervisorLastSuccessAtMs": supervisor.last_success_at_ms,
@@ -278,6 +280,7 @@ pub async fn enqueue_process_now(state: Arc<AppState>, session_id: &str) -> Resu
     if !q.iter().any(|s| s == id) {
         q.push(id.to_string());
     }
+    state.in_sync_storage_deferred.write().await.remove(id);
     crate::in_sync_supervisor::wake_in_sync_supervisor(&state).await;
     Ok(())
 }

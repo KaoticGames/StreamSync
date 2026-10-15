@@ -193,7 +193,11 @@ fn blocking_supervisor_cycle(state: &AppState) -> Result<Duration, String> {
     ));
     set_active_orchestrator_blocking(state, Some(orch.clone()));
 
+    let deferred = state.in_sync_storage_deferred.blocking_read().clone();
     for item in pending {
+        if deferred.contains(&item.session_id) {
+            continue;
+        }
         if let Some(manual) = manual_queue.as_ref() {
             if !manual.contains(&item.session_id) {
                 continue;
@@ -210,6 +214,11 @@ fn blocking_supervisor_cycle(state: &AppState) -> Result<Duration, String> {
         match orch.process_pending(&client, &item) {
             Ok(()) => {
                 info!("in-sync supervisor: session {session_id} complete");
+                state
+                    .in_sync_storage_deferred
+                    .blocking_write()
+                    .remove(&session_id);
+                clear_runtime_storage_blocked_blocking(state);
                 let events = orch.drain_events();
                 let (out_dir, report) = published_paths_from_events(&events, &session_id);
                 if !events.is_empty() {
@@ -257,6 +266,27 @@ fn blocking_supervisor_cycle(state: &AppState) -> Result<Duration, String> {
                     Some(session_id),
                     None,
                     None,
+                );
+                break;
+            }
+            Err(LocalOrchestratorError::StoragePreflight(pref)) => {
+                warn!("in-sync supervisor: session {session_id} storage blocked: {pref}");
+                let events = orch.drain_events();
+                if !events.is_empty() {
+                    let mut sink = state.in_sync_progress_events.blocking_write();
+                    sink.extend(events);
+                }
+                let mut q = state.in_sync_manual_queue.blocking_write();
+                q.retain(|id| id != &session_id);
+                state
+                    .in_sync_storage_deferred
+                    .blocking_write()
+                    .insert(session_id.clone());
+                update_local_runtime_storage_blocked_blocking(
+                    state,
+                    &session_id,
+                    LocalFinalizationPhase::FailedBlocked,
+                    pref,
                 );
                 break;
             }
@@ -321,6 +351,25 @@ fn update_local_runtime_blocking(
     if recovery_report_path.is_some() {
         runtime.recovery_report_path = recovery_report_path;
     }
+}
+
+fn clear_runtime_storage_blocked_blocking(state: &AppState) {
+    let mut runtime = state.in_sync_runtime.blocking_write();
+    runtime.storage_blocked = None;
+    runtime.storage_blocked_session_id = None;
+}
+
+fn update_local_runtime_storage_blocked_blocking(
+    state: &AppState,
+    session_id: &str,
+    phase: LocalFinalizationPhase,
+    failure: crate::voice_delivery::StoragePreflightFailure,
+) {
+    let mut runtime = state.in_sync_runtime.blocking_write();
+    runtime.phase = Some(phase);
+    runtime.active_session_id = Some(session_id.to_string());
+    runtime.storage_blocked = Some(failure);
+    runtime.storage_blocked_session_id = Some(session_id.to_string());
 }
 
 fn set_active_orchestrator_blocking(

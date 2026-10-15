@@ -1,4 +1,4 @@
-//! Phase 0C destination-root storage qualification (local fixed NTFS only).
+//! Destination-root storage qualification: local fixed NTFS or canonical UNC SMB share paths.
 
 use std::io;
 use std::path::Path;
@@ -22,28 +22,57 @@ const ERROR_FILENAME_EXCED_RANGE: i32 = 206;
 const VOLUME_PATH_BUFFER_CEILING: usize = 32_768;
 const WIN32_MAX_PATH: usize = 260;
 
+/// How a destination root was qualified (drives open-time guarantees).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestRootQualification {
+    /// Local volume: `GetDriveTypeW` reports fixed disk and `GetVolumeInformationW` reports NTFS.
+    LocalFixedNtfs,
+    /// Canonical `\\server\share\...` UNC: structure validated lexically; directory open + reparse
+    /// checks happen in `DestRoot::open` via `CreateFileW`. Remote filesystem type is **not**
+    /// verified (SMB shares may be ext4, btrfs, etc. on the NAS).
+    UncCanonicalShare,
+}
+
 #[derive(Debug)]
 pub enum StorageQualifyError {
-    UncPath,
-    UnsupportedDriveType { drive_type: u32 },
-    UnsupportedFilesystem { filesystem: String },
+    /// Path begins with `\\` but is not a supported canonical UNC share path.
+    InvalidUncPath {
+        detail: String,
+    },
+    /// `\\?\` or `\\.\` device-namespace paths are not supported.
+    DeviceNamespacePath,
+    /// Disallowed `.` / `..` or empty share path component in a UNC path.
+    UnsafeUncPath {
+        detail: String,
+    },
+    UnsupportedDriveType {
+        drive_type: u32,
+    },
+    UnsupportedFilesystem {
+        filesystem: String,
+    },
     Io(io::Error),
 }
 
 impl std::fmt::Display for StorageQualifyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UncPath => write!(f, "UNC paths are not supported for Phase 0C"),
+            Self::InvalidUncPath { detail } => write!(f, "invalid UNC path: {detail}"),
+            Self::DeviceNamespacePath => write!(
+                f,
+                "device-namespace paths (\\\\?\\ or \\\\.\\) are not supported"
+            ),
+            Self::UnsafeUncPath { detail } => write!(f, "unsafe UNC path: {detail}"),
             Self::UnsupportedDriveType { drive_type } => {
                 write!(
                     f,
-                    "unsupported drive type {drive_type} (local fixed disk required)"
+                    "unsupported drive type {drive_type} (local fixed disk required; mapped network drives are not supported)"
                 )
             }
             Self::UnsupportedFilesystem { filesystem } => {
                 write!(
                     f,
-                    "unsupported filesystem {filesystem:?} (NTFS required for Phase 0C baseline)"
+                    "unsupported filesystem {filesystem:?} (NTFS required for local fixed destinations)"
                 )
             }
             Self::Io(e) => write!(f, "{e}"),
@@ -53,13 +82,126 @@ impl std::fmt::Display for StorageQualifyError {
 
 impl std::error::Error for StorageQualifyError {}
 
-/// Lexical UNC rejection before Win32 volume queries (deterministic, no I/O).
-pub fn reject_lexical_unc(path: &Path) -> Result<(), StorageQualifyError> {
+/// Lexical destination-root shape (no I/O). Drives routing in [`qualify_dest_root`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LexicalDestRoot {
+    /// `\\?\` or `\\.\` Win32 device-namespace prefix.
+    DeviceNamespace,
+    /// Forward-slash `//server/share` (not supported).
+    InvalidForwardSlashUnc,
+    /// Backslash `\\server\share\...` candidate for canonical UNC validation.
+    CanonicalUncShare,
+    /// Local path candidate (drive-relative, rooted, or relative).
+    LocalCandidate,
+}
+
+/// Pure cross-platform lexical classifier for destination-root qualification routing.
+pub fn classify_lexical_dest_root(path: &Path) -> LexicalDestRoot {
     let s = path.to_string_lossy();
+    if s.starts_with(r"\\?\") || s.starts_with(r"\\.\") {
+        return LexicalDestRoot::DeviceNamespace;
+    }
+    if s.starts_with("//") {
+        return LexicalDestRoot::InvalidForwardSlashUnc;
+    }
     if s.starts_with(r"\\") {
-        return Err(StorageQualifyError::UncPath);
+        return LexicalDestRoot::CanonicalUncShare;
+    }
+    LexicalDestRoot::LocalCandidate
+}
+
+/// Returns true when `path` uses the canonical UNC share prefix `\\` (not device namespace).
+pub fn path_looks_like_unc(path: &Path) -> bool {
+    classify_lexical_dest_root(path) == LexicalDestRoot::CanonicalUncShare
+}
+
+fn ensure_local_lexical_dest_candidate(path: &Path) -> Result<(), StorageQualifyError> {
+    match classify_lexical_dest_root(path) {
+        LexicalDestRoot::DeviceNamespace => Err(StorageQualifyError::DeviceNamespacePath),
+        LexicalDestRoot::InvalidForwardSlashUnc => Err(StorageQualifyError::InvalidUncPath {
+            detail: "forward-slash UNC is not supported; use \\\\server\\share\\...".into(),
+        }),
+        LexicalDestRoot::CanonicalUncShare => Err(StorageQualifyError::InvalidUncPath {
+            detail: "use qualify_dest_root for UNC paths".into(),
+        }),
+        LexicalDestRoot::LocalCandidate => Ok(()),
+    }
+}
+
+fn qualify_dest_root_from_lexical(
+    path: &Path,
+) -> Result<DestRootQualification, StorageQualifyError> {
+    match classify_lexical_dest_root(path) {
+        LexicalDestRoot::DeviceNamespace => Err(StorageQualifyError::DeviceNamespacePath),
+        LexicalDestRoot::InvalidForwardSlashUnc => Err(StorageQualifyError::InvalidUncPath {
+            detail: "forward-slash UNC is not supported; use \\\\server\\share\\...".into(),
+        }),
+        LexicalDestRoot::CanonicalUncShare => {
+            validate_canonical_unc_share_path(path)?;
+            Ok(DestRootQualification::UncCanonicalShare)
+        }
+        LexicalDestRoot::LocalCandidate => {
+            qualify_local_ntfs_dest_root(path)?;
+            Ok(DestRootQualification::LocalFixedNtfs)
+        }
+    }
+}
+
+/// Pure lexical validation for canonical UNC share paths `\\server\share\...` (no I/O).
+///
+/// Rejects device namespaces, missing server/share, `.` / `..` components, and empty interior
+/// segments. Does not contact the SMB server.
+pub fn validate_canonical_unc_share_path(path: &Path) -> Result<(), StorageQualifyError> {
+    let s = path.to_string_lossy();
+    if !s.starts_with(r"\\") {
+        return Err(StorageQualifyError::InvalidUncPath {
+            detail: "path does not begin with \\\\".into(),
+        });
+    }
+    if s.starts_with(r"\\?\") || s.starts_with(r"\\.\") {
+        return Err(StorageQualifyError::DeviceNamespacePath);
+    }
+    if s.starts_with("//") {
+        return Err(StorageQualifyError::InvalidUncPath {
+            detail: "forward-slash UNC is not supported; use \\\\server\\share\\...".into(),
+        });
+    }
+    let rest = s.trim_end_matches('\\');
+    let body = rest.strip_prefix(r"\\").unwrap_or("");
+    if body.is_empty() {
+        return Err(StorageQualifyError::InvalidUncPath {
+            detail: "missing server and share".into(),
+        });
+    }
+    let parts: Vec<&str> = body.split('\\').collect();
+    if parts.len() < 2 {
+        return Err(StorageQualifyError::InvalidUncPath {
+            detail: "UNC path must include \\\\server\\share".into(),
+        });
+    }
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            return Err(StorageQualifyError::InvalidUncPath {
+                detail: format!("empty path component at index {i}"),
+            });
+        }
+        if *part == "." || *part == ".." {
+            return Err(StorageQualifyError::UnsafeUncPath {
+                detail: format!("disallowed component {:?}", part),
+            });
+        }
     }
     Ok(())
+}
+
+/// Classify whether a path is a supported canonical UNC share root (lexical only).
+pub fn classify_canonical_unc(path: &Path) -> Result<(), StorageQualifyError> {
+    if classify_lexical_dest_root(path) != LexicalDestRoot::CanonicalUncShare {
+        return Err(StorageQualifyError::InvalidUncPath {
+            detail: "not a canonical UNC share path".into(),
+        });
+    }
+    validate_canonical_unc_share_path(path)
 }
 
 /// Pure classification helpers (unit-tested without creating mapped/network volumes).
@@ -214,9 +356,9 @@ fn get_volume_path_root(path: &Path) -> Result<Vec<u16>, io::Error> {
                     }
                     None => {
                         return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "GetVolumePathNameW result missing trailing backslash before NUL (buffer truncation at ceiling)",
-                    ));
+                            io::ErrorKind::InvalidData,
+                            "GetVolumePathNameW result missing trailing backslash before NUL (buffer truncation at ceiling)",
+                        ));
                     }
                 }
             }
@@ -224,10 +366,10 @@ fn get_volume_path_root(path: &Path) -> Result<Vec<u16>, io::Error> {
     }
 }
 
-/// Fail closed unless `path` resolves to a local fixed NTFS volume root.
+/// Fail closed unless `path` resolves to a local fixed NTFS volume root (not UNC, not mapped remote).
 #[cfg(windows)]
 pub fn qualify_local_ntfs_dest_root(path: &Path) -> Result<(), StorageQualifyError> {
-    reject_lexical_unc(path)?;
+    ensure_local_lexical_dest_candidate(path)?;
     let volume_root = get_volume_path_root(path).map_err(StorageQualifyError::Io)?;
     let drive_type = unsafe { GetDriveTypeW(volume_root.as_ptr()) };
     classify_drive_type(drive_type)?;
@@ -256,14 +398,128 @@ pub fn qualify_local_ntfs_dest_root(path: &Path) -> Result<(), StorageQualifyErr
     classify_filesystem_name(&name)
 }
 
+/// Qualify a destination root: canonical UNC share (lexical) or local fixed NTFS (Win32 volume query).
+#[cfg(windows)]
+pub fn qualify_dest_root(path: &Path) -> Result<DestRootQualification, StorageQualifyError> {
+    qualify_dest_root_from_lexical(path)
+}
+
+#[cfg(not(windows))]
+pub fn qualify_local_ntfs_dest_root(path: &Path) -> Result<(), StorageQualifyError> {
+    ensure_local_lexical_dest_candidate(path)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn qualify_dest_root(path: &Path) -> Result<DestRootQualification, StorageQualifyError> {
+    qualify_dest_root_from_lexical(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn lexical_unc_rejected_without_io() {
-        let err = reject_lexical_unc(Path::new(r"\\server\share\dest"));
-        assert!(matches!(err, Err(StorageQualifyError::UncPath)));
+    fn canonical_unc_accepted_without_io() {
+        assert!(validate_canonical_unc_share_path(Path::new(r"\\server\share")).is_ok());
+        assert!(validate_canonical_unc_share_path(Path::new(r"\\server\share\dest\sub")).is_ok());
+        assert!(validate_canonical_unc_share_path(Path::new(r"\\Hades\nas\DnD_Things")).is_ok());
+        assert!(classify_canonical_unc(Path::new(r"\\server\share\root")).is_ok());
+    }
+
+    #[test]
+    fn device_namespace_unc_rejected() {
+        assert!(matches!(
+            validate_canonical_unc_share_path(Path::new(r"\\?\UNC\server\share")),
+            Err(StorageQualifyError::DeviceNamespacePath)
+        ));
+        assert!(matches!(
+            validate_canonical_unc_share_path(Path::new(r"\\.\pipe\foo")),
+            Err(StorageQualifyError::DeviceNamespacePath)
+        ));
+    }
+
+    #[test]
+    fn lexical_dest_root_classifier() {
+        assert_eq!(
+            classify_lexical_dest_root(Path::new(r"\\?\UNC\server\share")),
+            LexicalDestRoot::DeviceNamespace
+        );
+        assert_eq!(
+            classify_lexical_dest_root(Path::new(r"\\.\pipe\foo")),
+            LexicalDestRoot::DeviceNamespace
+        );
+        assert_eq!(
+            classify_lexical_dest_root(Path::new("//server/share")),
+            LexicalDestRoot::InvalidForwardSlashUnc
+        );
+        assert_eq!(
+            classify_lexical_dest_root(Path::new(r"\\server\share")),
+            LexicalDestRoot::CanonicalUncShare
+        );
+        assert_eq!(
+            classify_lexical_dest_root(Path::new("/tmp/dest")),
+            LexicalDestRoot::LocalCandidate
+        );
+    }
+
+    #[test]
+    fn qualify_dest_root_lexical_routing() {
+        assert_eq!(
+            qualify_dest_root(Path::new(r"\\server\share\dest")).unwrap(),
+            DestRootQualification::UncCanonicalShare
+        );
+        assert!(matches!(
+            qualify_dest_root(Path::new(r"\\?\C:\temp")),
+            Err(StorageQualifyError::DeviceNamespacePath)
+        ));
+        assert!(matches!(
+            qualify_dest_root(Path::new(r"\\.\pipe\foo")),
+            Err(StorageQualifyError::DeviceNamespacePath)
+        ));
+        assert!(matches!(
+            qualify_dest_root(Path::new("//server/share")),
+            Err(StorageQualifyError::InvalidUncPath { .. })
+        ));
+        #[cfg(not(windows))]
+        assert_eq!(
+            qualify_dest_root(Path::new("/tmp/local-dest")).unwrap(),
+            DestRootQualification::LocalFixedNtfs
+        );
+    }
+
+    #[test]
+    fn qualify_local_ntfs_rejects_non_local_lexical_shapes() {
+        assert!(matches!(
+            qualify_local_ntfs_dest_root(Path::new(r"\\?\UNC\server\share")),
+            Err(StorageQualifyError::DeviceNamespacePath)
+        ));
+        assert!(matches!(
+            qualify_local_ntfs_dest_root(Path::new(r"\\server\share")),
+            Err(StorageQualifyError::InvalidUncPath { .. })
+        ));
+        assert!(matches!(
+            qualify_local_ntfs_dest_root(Path::new("//server/share")),
+            Err(StorageQualifyError::InvalidUncPath { .. })
+        ));
+        #[cfg(not(windows))]
+        qualify_local_ntfs_dest_root(Path::new("/tmp/local-dest")).unwrap();
+    }
+
+    #[test]
+    fn malformed_unc_rejected() {
+        assert!(matches!(
+            validate_canonical_unc_share_path(Path::new(r"\\server")),
+            Err(StorageQualifyError::InvalidUncPath { .. })
+        ));
+        assert!(matches!(
+            validate_canonical_unc_share_path(Path::new(r"\\server\share\..")),
+            Err(StorageQualifyError::UnsafeUncPath { .. })
+        ));
+        assert!(matches!(
+            validate_canonical_unc_share_path(Path::new(r"//server/share")),
+            Err(StorageQualifyError::InvalidUncPath { .. })
+        ));
     }
 
     #[test]

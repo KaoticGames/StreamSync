@@ -89,6 +89,47 @@ function formatDuration(secs) {
   return m > 0 ? m + "m " + s + "s" : s + "s";
 }
 
+function formatGiB(bytes) {
+  if (bytes == null || !isFinite(bytes)) return "—";
+  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GiB";
+}
+
+function renderInSyncStorageBlocked(status) {
+  var el = document.getElementById("in-sync-storage-blocked");
+  if (!el) return;
+  var failure = status.storageBlocked;
+  var sid = status.storageBlockedSessionId || "";
+  if (!failure || !sid) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  el.hidden = false;
+  var parts = [
+    "Storage blocked for " + shortSessionId(sid) + ":",
+  ];
+  if (failure.kind === "insufficient_space") {
+    parts.push(
+      "need " +
+        formatGiB(failure.required_bytes) +
+        ", available " +
+        formatGiB(failure.available_bytes)
+    );
+  } else if (failure.kind === "destination_unsupported") {
+    parts.push(failure.message || "destination unsupported");
+  } else if (failure.kind === "destination_inaccessible") {
+    parts.push(failure.message || "destination inaccessible");
+  } else if (failure.kind === "free_space_query_failed") {
+    parts.push(failure.message || "could not query free space");
+  } else if (failure.kind === "required_bytes_overflow") {
+    parts.push("session size estimate overflow");
+  } else {
+    parts.push(JSON.stringify(failure));
+  }
+  parts.push("Use Process now after correcting the recording folder or freeing space.");
+  el.textContent = parts.join(" ");
+}
+
 function renderInSyncPendingList(pending, primarySessionId) {
   var listEl = document.getElementById("in-sync-pending-list");
   if (!listEl) return;
@@ -238,6 +279,7 @@ function applyInSyncStatus(status) {
     status: status.supervisorStatus,
     lastError: status.supervisorLastError,
   });
+  renderInSyncStorageBlocked(status);
 
   if (cardQueue) {
     if (pending.length) {
@@ -256,6 +298,9 @@ function applyInSyncStatus(status) {
   var processingLabel = "Nothing processing";
   if (activeId) {
     processingLabel = formatPhase(phase) || "Active";
+    if (phase === "failed_blocked" && status.storageBlocked) {
+      processingLabel = "Blocked (storage)";
+    }
   }
   if (cardProcessing) cardProcessing.textContent = processingLabel;
 
@@ -265,7 +310,10 @@ function applyInSyncStatus(status) {
   else if (sup === "blocked") hudLabel = "Blocked";
   else if (sup === "error") hudLabel = "Error";
   else if (sup === "starting") hudLabel = "Starting";
-  if (hudStatus) hudStatus.textContent = hudLabel;
+  if (hudStatus) {
+    hudStatus.textContent =
+      phase === "failed_blocked" ? "Blocked" : hudLabel;
+  }
   if (hudPhase) hudPhase.textContent = activeId ? formatPhase(phase) : "—";
   if (hudSession) {
     hudSession.textContent = activeId
