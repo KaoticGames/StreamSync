@@ -1824,6 +1824,13 @@ input[type="range"]::-ms-thumb {
   margin-bottom: 0.75rem;
 }
 
+.in-sync-storage-blocked {
+  font-size: 0.85rem;
+  color: var(--danger, #e86d6d);
+  margin-bottom: 0.75rem;
+  line-height: 1.45;
+}
+
 .in-sync-empty-state {
   margin: 0 0 10px;
   font-size: 13px;

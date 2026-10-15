@@ -208,7 +208,9 @@ impl DirHandle {
 
 /// Configured publication root opened without following symlinks/reparse points.
 ///
-/// On Windows, `open` rejects UNC paths, mapped/network drives, and non-NTFS volumes (local fixed NTFS only).
+/// On Windows, `open` accepts canonical `\\server\share\...` UNC paths (directory handle + reparse
+/// validation; remote FS type not checked) or local fixed NTFS volumes. Mapped network drive letters
+/// (`DRIVE_REMOTE`) and non-NTFS local volumes are rejected.
 pub struct DestRoot {
     handle: DirHandle,
 }

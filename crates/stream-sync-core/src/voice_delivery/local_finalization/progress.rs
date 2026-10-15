@@ -68,5 +68,7 @@ pub enum LocalFinalizationPhase {
     Complete,
     Cancelled,
     FailedRetryable,
+    /// Storage/configuration preflight failed; requires user correction and explicit Process now.
+    FailedBlocked,
     Quarantined,
 }

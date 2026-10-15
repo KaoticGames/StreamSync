@@ -15,6 +15,7 @@ use super::receipt::{
     assert_local_finalization_receipt_matches_manifest, LocalFinalizationReceipt,
     LocalFinalizationReceiptRecoveryReport, LocalFinalizationReceiptStem,
 };
+use super::storage_preflight::StoragePreflightFailure;
 use crate::voice_delivery::client::ReceiptRequestBody;
 use crate::voice_delivery::client::VoiceV2ClientError;
 use crate::voice_delivery::finalized_manifest::{
@@ -46,6 +47,8 @@ pub enum LocalOrchestratorError {
     Processor(String),
     #[error("orchestrator: {0}")]
     Other(String),
+    #[error("storage preflight: {0}")]
+    StoragePreflight(StoragePreflightFailure),
 }
 
 /// Shared pause/cancel handles wired from the In-Sync worker and HTTP control plane.
@@ -196,11 +199,10 @@ impl LocalFinalizationOrchestrator {
                 ));
             }
 
-            let required = LocalJournalStore::disk_preflight_bytes(&manifest, 512 * 1024 * 1024);
-            if !LocalJournalStore::free_space_ok(&self.parent, required) {
-                return Err(LocalOrchestratorError::Other(
-                    "insufficient disk space".into(),
-                ));
+            if let Err(pref) =
+                LocalJournalStore::run_storage_preflight(&self.parent, &manifest, 512 * 1024 * 1024)
+            {
+                return Err(LocalOrchestratorError::StoragePreflight(pref));
             }
 
             let store = LocalJournalStore::open(&self.parent, &manifest.session_id)
@@ -264,11 +266,10 @@ impl LocalFinalizationOrchestrator {
         lease: &mut LeaseSession<C>,
     ) -> Result<(), LocalOrchestratorError> {
         self.set_phase(LocalFinalizationPhase::Downloading);
-        let required = LocalJournalStore::disk_preflight_bytes(manifest, 512 * 1024 * 1024);
-        if !LocalJournalStore::free_space_ok(&self.parent, required) {
-            return Err(LocalOrchestratorError::Other(
-                "insufficient disk space".into(),
-            ));
+        if let Err(pref) =
+            LocalJournalStore::run_storage_preflight(&self.parent, manifest, 512 * 1024 * 1024)
+        {
+            return Err(LocalOrchestratorError::StoragePreflight(pref));
         }
         let mut checkpoint = store
             .load_checkpoint()

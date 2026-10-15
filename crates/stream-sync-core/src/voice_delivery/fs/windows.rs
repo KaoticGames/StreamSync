@@ -262,7 +262,7 @@ fn is_reparse_point(handle: HANDLE) -> Result<bool, FsError> {
 
 pub(crate) fn open_root_dir(path: &Path) -> Result<OwnedDirHandle, FsError> {
     let abs = validated_absolute_path(path)?;
-    stream_sync_windows_fs::storage_qualify::qualify_local_ntfs_dest_root(&abs)
+    stream_sync_windows_fs::storage_qualify::qualify_dest_root(&abs)
         .map_err(map_storage_qualify_err)?;
     let not_directory_label = abs
         .file_name()
@@ -735,17 +735,18 @@ mod probe_child_dir_tests {
 
 #[cfg(test)]
 mod dest_root_storage_qualify {
-    use super::*;
     use crate::voice_delivery::fs::DestRoot;
-    use stream_sync_windows_fs::storage_qualify::reject_lexical_unc;
+    use stream_sync_windows_fs::storage_qualify::validate_canonical_unc_share_path;
 
     #[test]
-    fn unc_lexical_fixture_rejected_at_open() {
+    fn unc_lexical_fixture_accepted_before_io() {
+        assert!(
+            validate_canonical_unc_share_path(std::path::Path::new(r"\\server\share\root")).is_ok()
+        );
         match DestRoot::open(std::path::Path::new(r"\\server\share\root")) {
-            Ok(_) => panic!("expected unsupported storage, got Ok DestRoot"),
-            Err(FsError::UnsupportedStorage(_)) => {}
-            Err(other) => panic!("expected unsupported storage, got {other:?}"),
+            Ok(_) => panic!("expected Io/inaccessible for offline UNC, got Ok DestRoot"),
+            Err(FsError::Io(_)) | Err(FsError::UnsupportedStorage(_)) => {}
+            Err(other) => panic!("expected Io or unsupported storage, got {other:?}"),
         }
-        assert!(reject_lexical_unc(std::path::Path::new(r"\\server\share\root")).is_err());
     }
 }
