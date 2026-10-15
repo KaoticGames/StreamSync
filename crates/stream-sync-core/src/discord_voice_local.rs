@@ -2,7 +2,11 @@
 
 use crate::app_state::AppState;
 use crate::config_types::LocalProcessingMode;
-use crate::in_sync::{ensure_in_sync_native_opus, record_published_paths, set_active_orchestrator};
+use crate::in_sync::{
+    bound_client_error, ensure_in_sync_native_opus, record_published_paths,
+    set_active_orchestrator, set_in_sync_discovery_blocked, set_in_sync_pending_deliveries,
+    set_in_sync_pending_fetch_error,
+};
 use crate::voice_delivery::local_finalization::PublishedSessionPaths;
 use crate::voice_delivery::{
     HttpLocalFinalizationClient, LocalFinalizationClient, LocalFinalizationOrchestrator,
@@ -19,21 +23,17 @@ const LOCAL_DEFAULT_WAIT: Duration = Duration::from_secs(3);
 pub async fn local_poll_once(state: &AppState) -> Duration {
     if let Err(e) = ensure_in_sync_native_opus() {
         warn!("in-sync disabled: {e}");
+        set_in_sync_discovery_blocked(state, e).await;
         return LOCAL_DEFAULT_WAIT;
     }
     let cfg = state.discord_voice_config.read().await.clone();
-    if cfg.local_processing_mode == LocalProcessingMode::Manual {
-        let manual = state.in_sync_manual_queue.read().await.clone();
-        if manual.is_empty() {
-            return LOCAL_DEFAULT_WAIT;
-        }
-    }
     let key = cfg
         .host_token
         .clone()
         .filter(|v| v.starts_with("sdk_"))
         .unwrap_or_default();
     if key.is_empty() {
+        set_in_sync_discovery_blocked(state, "host SDK token (sdk_…) not configured").await;
         return LOCAL_DEFAULT_WAIT;
     }
     let parent = cfg
@@ -41,6 +41,7 @@ pub async fn local_poll_once(state: &AppState) -> Duration {
         .clone()
         .filter(|v| !v.trim().is_empty());
     if parent.is_none() {
+        set_in_sync_discovery_blocked(state, "recording parent folder not configured").await;
         return LOCAL_DEFAULT_WAIT;
     }
     let parent = parent.unwrap();
@@ -59,23 +60,34 @@ pub async fn local_poll_once(state: &AppState) -> Duration {
         Err(VoiceV2ClientError::RetryAfter(d)) => return d,
         Err(e) => {
             warn!("local finalization pending error: {e}");
+            set_in_sync_pending_fetch_error(state, bound_client_error(&e)).await;
             set_active_orchestrator(state, None).await;
             return LOCAL_DEFAULT_WAIT;
         }
     };
+    set_in_sync_pending_deliveries(state, &pending).await;
     if pending.is_empty() {
         update_local_runtime(state, LocalFinalizationPhase::Queued, None, None, None).await;
         set_active_orchestrator(state, None).await;
         return LOCAL_DEFAULT_WAIT;
     }
+    let manual_queue = if cfg.local_processing_mode == LocalProcessingMode::Manual {
+        Some(state.in_sync_manual_queue.read().await.clone())
+    } else {
+        None
+    };
+    if manual_queue.is_some() {
+        let allowed_any = pending
+            .iter()
+            .any(|item| manual_queue.as_ref().unwrap().contains(&item.session_id));
+        if !allowed_any {
+            set_active_orchestrator(state, None).await;
+            return LOCAL_DEFAULT_WAIT;
+        }
+    }
     for item in pending {
-        if cfg.local_processing_mode == LocalProcessingMode::Manual {
-            let allowed = state
-                .in_sync_manual_queue
-                .read()
-                .await
-                .contains(&item.session_id);
-            if !allowed {
+        if let Some(manual) = manual_queue.as_ref() {
+            if !manual.contains(&item.session_id) {
                 continue;
             }
         }

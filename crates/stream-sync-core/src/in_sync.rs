@@ -6,10 +6,106 @@ use crate::voice_delivery::local_finalization::{
     assert_local_opus_available, LocalFinalizationControls, LocalFinalizationOrchestrator,
     PublishedSessionPaths,
 };
+use crate::voice_delivery::{LocalPendingDelivery, VoiceV2ClientError};
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+const IN_SYNC_DISCOVERY_MESSAGE_MAX: usize = 240;
+
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InSyncDiscoverySnapshot {
+    /// `ok` | `blocked` | `error`
+    pub status: String,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InSyncPendingSessionSummary {
+    pub session_id: String,
+    pub guild_id: String,
+    pub channel_id: String,
+    pub manifest_digest: String,
+    pub sealed_at: String,
+    pub segment_count: u32,
+    pub target_duration_secs: Option<f64>,
+}
+
+#[derive(Clone, Default)]
+pub struct InSyncPendingState {
+    pub sessions: Vec<InSyncPendingSessionSummary>,
+    pub discovery: InSyncDiscoverySnapshot,
+}
+
+pub fn pending_summary_from_delivery(item: &LocalPendingDelivery) -> InSyncPendingSessionSummary {
+    let duration_secs = (item.manifest.target_sample_count_48k as f64) / 48_000.0;
+    InSyncPendingSessionSummary {
+        session_id: item.session_id.clone(),
+        guild_id: item.manifest.guild_id.clone(),
+        channel_id: item.manifest.channel_id.clone(),
+        manifest_digest: item.manifest_digest.clone(),
+        sealed_at: item.sealed_at.clone(),
+        segment_count: item.manifest.segments.len() as u32,
+        target_duration_secs: Some(duration_secs),
+    }
+}
+
+fn bound_discovery_message(message: impl AsRef<str>) -> String {
+    let s = message.as_ref();
+    if s.len() <= IN_SYNC_DISCOVERY_MESSAGE_MAX {
+        return s.to_string();
+    }
+    format!(
+        "{}…",
+        s.chars()
+            .take(IN_SYNC_DISCOVERY_MESSAGE_MAX)
+            .collect::<String>()
+    )
+}
+
+pub fn bound_client_error(err: &VoiceV2ClientError) -> String {
+    bound_discovery_message(err.to_string())
+}
+
+pub async fn set_in_sync_discovery_blocked(state: &AppState, message: impl Into<String>) {
+    let mut slot = state.in_sync_pending.write().await;
+    slot.sessions.clear();
+    slot.discovery = InSyncDiscoverySnapshot {
+        status: "blocked".into(),
+        message: Some(bound_discovery_message(message.into())),
+    };
+}
+
+pub async fn set_in_sync_pending_fetch_error(state: &AppState, message: impl Into<String>) {
+    let mut slot = state.in_sync_pending.write().await;
+    slot.sessions.clear();
+    slot.discovery = InSyncDiscoverySnapshot {
+        status: "error".into(),
+        message: Some(bound_discovery_message(message.into())),
+    };
+}
+
+pub async fn set_in_sync_pending_deliveries(state: &AppState, deliveries: &[LocalPendingDelivery]) {
+    let sessions = deliveries
+        .iter()
+        .map(pending_summary_from_delivery)
+        .collect();
+    let mut slot = state.in_sync_pending.write().await;
+    slot.sessions = sessions;
+    slot.discovery = InSyncDiscoverySnapshot {
+        status: "ok".into(),
+        message: None,
+    };
+}
+
+pub async fn in_sync_session_is_pending(state: &AppState, session_id: &str) -> bool {
+    let slot = state.in_sync_pending.read().await;
+    slot.sessions.iter().any(|s| s.session_id == session_id)
+}
 
 #[derive(Clone, Default)]
 pub struct InSyncWorkerState {
@@ -67,11 +163,14 @@ pub async fn status_json(state: &AppState) -> Value {
         .published_by_session
         .clone();
     let published_ids: Vec<String> = published.keys().cloned().collect();
+    let pending = state.in_sync_pending.read().await.clone();
     json!({
         "localProcessingMode": cfg.local_processing_mode,
         "phase": runtime.phase,
         "activeSessionId": runtime.active_session_id,
         "manualQueue": queue,
+        "pendingSessions": pending.sessions,
+        "discovery": pending.discovery,
         "progressEvents": events,
         "publishedSessions": published_ids,
         "publishedOutputDir": runtime.published_output_dir,
@@ -89,6 +188,9 @@ pub async fn enqueue_process_now(state: Arc<AppState>, session_id: &str) -> Resu
     let id = session_id.trim();
     if id.is_empty() {
         return Err("session_id required".into());
+    }
+    if !in_sync_session_is_pending(&state, id).await {
+        return Err("session is not in the cloud pending list; refresh and try again".into());
     }
     let mut q = state.in_sync_manual_queue.write().await;
     if !q.iter().any(|s| s == id) {
