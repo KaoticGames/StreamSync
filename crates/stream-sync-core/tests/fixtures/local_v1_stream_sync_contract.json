@@ -1,0 +1,42 @@
+{
+  "contractVersion": 1,
+  "description": "Canonical StreamSync local-v1 cloud contract (pending/claim/lease bodies and lease proof headers).",
+  "leaseProofHeaders": {
+    "generation": "X-Voice-Lease-Generation",
+    "token": "X-Voice-Lease-Token",
+    "generationWireShape": "decimal positive safe integer (HTTP header string)",
+    "tokenWireShape": "16-256 character opaque string (never logged server-side)"
+  },
+  "pendingResponse": {
+    "ok": true,
+    "deliveries": [
+      {
+        "sessionId": "fd6bbbee-040a-4892-86ff-2c4fdf30ce2c",
+        "manifestDigest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "sealedAtMs": 1704067200000
+      }
+    ]
+  },
+  "claimResponse": {
+    "ok": true,
+    "sessionId": "fd6bbbee-040a-4892-86ff-2c4fdf30ce2c",
+    "manifestDigest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "leaseGeneration": 1,
+    "leaseToken": "cafebabecafebabecafebabecafebabe",
+    "leaseExpiresAtMs": 1704069000000
+  },
+  "renewRequest": {
+    "deviceId": "stream-sync-device-fixture-01",
+    "leaseGeneration": 1,
+    "leaseToken": "cafebabecafebabecafebabecafebabe"
+  },
+  "releaseRequest": {
+    "deviceId": "stream-sync-device-fixture-01",
+    "leaseGeneration": 1,
+    "leaseToken": "cafebabecafebabecafebabecafebabe"
+  },
+  "leaseProofHeaderExample": {
+    "X-Voice-Lease-Generation": "1",
+    "X-Voice-Lease-Token": "cafebabecafebabecafebabecafebabe"
+  }
+}

@@ -12,11 +12,11 @@ mod delegated_refresh_observability;
 mod delegated_secrets;
 mod diagnostics;
 mod discord_voice;
-mod discord_voice_local;
 mod discord_voice_v2;
 mod dock_capability;
 mod export;
 mod in_sync;
+mod in_sync_supervisor;
 mod kick;
 mod oauth_pending;
 mod route_manifest;
@@ -238,6 +238,7 @@ impl OverlayServer {
         twitch::maybe_autostart(state.clone(), twitch.clone()).await;
         kick::maybe_autostart(state.clone()).await;
         discord_voice::maybe_autostart(state.clone(), twitch).await;
+        in_sync_supervisor::ensure_in_sync_supervisor(state.clone());
         let studio = state.overlay_server_dir.join("events-studio.html");
         info!(
             "stream-sync-core listening on http://localhost:{port} (readonly={}, twitch_redirect={}, repo_root={}, overlay_server={}, events_studio_exists={})",

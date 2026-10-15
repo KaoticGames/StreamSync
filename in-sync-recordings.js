@@ -1,5 +1,8 @@
 // In-Sync Recordings functional UI (local finalization queue)
 
+var inSyncInitState = "idle";
+var inSyncLastRefreshAt = null;
+
 function inSyncModeLabel(mode) {
   return mode === "automatic_after_seal" ? "Automatic" : "Manual";
 }
@@ -19,6 +22,28 @@ function setInSyncModeToggle(mode) {
   if (autoSide) autoSide.classList.toggle("is-active", isAutomatic);
 }
 
+function showInSyncPanelError(message) {
+  var el = document.getElementById("in-sync-init-error");
+  if (!el) return;
+  el.hidden = false;
+  el.textContent = message || "In-Sync initialization failed";
+}
+
+function clearInSyncPanelError() {
+  var el = document.getElementById("in-sync-init-error");
+  if (!el) return;
+  el.hidden = true;
+  el.textContent = "";
+}
+
+function setInSyncBusy(busy, label) {
+  var refreshBtn = document.getElementById("in-sync-refresh");
+  if (refreshBtn) {
+    refreshBtn.disabled = !!busy;
+    if (busy && label) refreshBtn.dataset.busyLabel = label;
+  }
+}
+
 async function inSyncPrivileged(path, options) {
   if (!window.streamSyncControlApi || !window.streamSyncControlApi.privilegedFetch) {
     throw new Error("control API unavailable");
@@ -36,6 +61,20 @@ function formatPhase(phase) {
   return String(phase)
     .replace(/([a-z])([A-Z])/g, "$1 $2")
     .replace(/_/g, " ");
+}
+
+function formatSupervisorStatus(status) {
+  if (!status || typeof status !== "string") return "starting";
+  return status;
+}
+
+function formatTimestampMs(ms) {
+  if (ms == null || !isFinite(ms)) return "—";
+  try {
+    return new Date(ms).toLocaleString();
+  } catch (e) {
+    return String(ms);
+  }
 }
 
 function shortSessionId(id) {
@@ -60,7 +99,7 @@ function renderInSyncPendingList(pending, primarySessionId) {
   }
   listEl.hidden = false;
   listEl.innerHTML = pending
-    .map(function (item, idx) {
+    .map(function (item) {
       var sid = item.sessionId || "";
       var isPrimary = sid && sid === primarySessionId;
       return (
@@ -72,29 +111,35 @@ function renderInSyncPendingList(pending, primarySessionId) {
         (isPrimary ? " (next)" : "") +
         "</div>" +
         '<div class="in-sync-pending-card-meta">' +
-        "Guild " +
-        (item.guildId || "—") +
-        " · Channel " +
-        (item.channelId || "—") +
-        "<br>Segments " +
-        (item.segmentCount != null ? item.segmentCount : "—") +
-        " · ~" +
-        formatDuration(item.targetDurationSecs) +
+        "Sealed " +
+        formatTimestampMs(item.sealedAtMs) +
         "<br>Digest " +
         (item.manifestDigest
           ? item.manifestDigest.slice(0, 12) + "…"
           : "—") +
+        (item.segmentCount != null
+          ? "<br>Segments " + item.segmentCount + " · ~" + formatDuration(item.targetDurationSecs)
+          : "") +
         "</div></div>"
       );
     })
     .join("");
 }
 
-function renderInSyncDiscovery(discovery) {
+function renderInSyncDiscovery(discovery, supervisor) {
   var el = document.getElementById("in-sync-discovery-status");
   if (!el) return;
   var status = discovery && discovery.status ? discovery.status : "";
   var msg = discovery && discovery.message ? discovery.message : "";
+  var sup = formatSupervisorStatus(supervisor && supervisor.status);
+  if (sup === "blocked" || sup === "error") {
+    el.hidden = false;
+    var supErr = supervisor && supervisor.lastError ? supervisor.lastError : "";
+    el.textContent = sup === "blocked"
+      ? "Supervisor blocked" + (supErr ? ": " + supErr : "")
+      : "Supervisor error" + (supErr ? ": " + supErr : "");
+    return;
+  }
   if (status === "ok" || (!status && !msg)) {
     el.hidden = true;
     el.textContent = "";
@@ -103,6 +148,19 @@ function renderInSyncDiscovery(discovery) {
   el.hidden = false;
   var label = status === "blocked" ? "Discovery blocked" : "Discovery error";
   el.textContent = msg ? label + ": " + msg : label;
+}
+
+function renderInSyncSupervisorMeta(status) {
+  var el = document.getElementById("in-sync-supervisor-meta");
+  if (!el) return;
+  var sup = formatSupervisorStatus(status.supervisorStatus);
+  var parts = ["Supervisor: " + sup];
+  parts.push("Pending: " + (status.supervisorPendingCount != null ? status.supervisorPendingCount : "—"));
+  parts.push("Last poll: " + formatTimestampMs(status.supervisorLastAttemptAtMs));
+  if (status.supervisorLastError) {
+    parts.push("Error: " + status.supervisorLastError);
+  }
+  el.textContent = parts.join(" · ");
 }
 
 function applyInSyncEmptyUi() {
@@ -120,12 +178,12 @@ function applyInSyncEmptyUi() {
   var revealBtn = document.getElementById("in-sync-reveal");
   var reportBtn = document.getElementById("in-sync-open-report");
 
-  if (hudStatus) hudStatus.textContent = "Nothing processing";
+  if (hudStatus) hudStatus.textContent = "Idle";
   if (hudPhase) hudPhase.textContent = "—";
   if (hudSession) hudSession.textContent = "—";
   if (cardQueue) cardQueue.textContent = "No recordings ready";
   renderInSyncPendingList([], "");
-  renderInSyncDiscovery(null);
+  renderInSyncDiscovery(null, null);
   if (cardProcessing) cardProcessing.textContent = "Nothing processing";
   if (cardMode) cardMode.textContent = "Manual";
   if (cardPublished) cardPublished.textContent = "None yet";
@@ -157,6 +215,7 @@ function applyInSyncStatus(status) {
   var events = status.progressEvents || [];
 
   setInSyncModeToggle(mode === "automatic_after_seal" ? "automatic_after_seal" : "manual");
+  renderInSyncSupervisorMeta(status);
 
   var hudStatus = document.getElementById("in-sync-hud-status");
   var hudPhase = document.getElementById("in-sync-hud-phase");
@@ -175,7 +234,10 @@ function applyInSyncStatus(status) {
   if (cardMode) cardMode.textContent = modeLabel;
 
   renderInSyncPendingList(pending, primaryPendingId);
-  renderInSyncDiscovery(status.discovery);
+  renderInSyncDiscovery(status.discovery, {
+    status: status.supervisorStatus,
+    lastError: status.supervisorLastError,
+  });
 
   if (cardQueue) {
     if (pending.length) {
@@ -190,12 +252,20 @@ function applyInSyncStatus(status) {
     }
   }
 
+  var sup = formatSupervisorStatus(status.supervisorStatus);
   var processingLabel = "Nothing processing";
   if (activeId) {
     processingLabel = formatPhase(phase) || "Active";
   }
   if (cardProcessing) cardProcessing.textContent = processingLabel;
-  if (hudStatus) hudStatus.textContent = activeId ? "Processing" : "Idle";
+
+  var hudLabel = "Idle";
+  if (activeId) hudLabel = "Processing";
+  else if (sup === "polling") hudLabel = "Polling";
+  else if (sup === "blocked") hudLabel = "Blocked";
+  else if (sup === "error") hudLabel = "Error";
+  else if (sup === "starting") hudLabel = "Starting";
+  if (hudStatus) hudStatus.textContent = hudLabel;
   if (hudPhase) hudPhase.textContent = activeId ? formatPhase(phase) : "—";
   if (hudSession) {
     hudSession.textContent = activeId
@@ -263,19 +333,33 @@ function applyInSyncStatus(status) {
 }
 
 async function refreshInSyncRecordings() {
+  setInSyncBusy(true, "Refreshing…");
   try {
     var status = await inSyncPrivileged("/api/in-sync/status");
+    inSyncInitState = "ready";
+    inSyncLastRefreshAt = Date.now();
+    clearInSyncPanelError();
     var ctx = applyInSyncStatus(status);
 
     var processBtn = document.getElementById("in-sync-process-now");
-    if (processBtn) {
+    if (processBtn && !processBtn.dataset.boundClick) {
+      processBtn.dataset.boundClick = "1";
       processBtn.onclick = async function () {
         if (!ctx.primaryPendingId) return;
-        await inSyncPrivileged("/api/in-sync/process-now", {
-          method: "POST",
-          body: JSON.stringify({ sessionId: ctx.primaryPendingId }),
-        });
-        await refreshInSyncRecordings();
+        processBtn.disabled = true;
+        processBtn.textContent = "Queuing…";
+        try {
+          await inSyncPrivileged("/api/in-sync/process-now", {
+            method: "POST",
+            body: JSON.stringify({ sessionId: ctx.primaryPendingId }),
+          });
+          processBtn.textContent = "Queued";
+          await refreshInSyncRecordings();
+        } catch (e) {
+          showInSyncPanelError(e && e.message ? e.message : "Process now failed");
+        } finally {
+          processBtn.textContent = "Process now";
+        }
       };
     }
 
@@ -302,11 +386,22 @@ async function refreshInSyncRecordings() {
     }
   } catch (err) {
     console.error("In-Sync status refresh failed:", err);
-    applyInSyncEmptyUi();
+    inSyncInitState = "error";
+    showInSyncPanelError(
+      err && err.message ? err.message : "Could not load In-Sync status"
+    );
+  } finally {
+    setInSyncBusy(false);
   }
 }
 
 function wireInSyncRecordingsUi() {
+  if (!window.streamSyncControlApi || !window.streamSyncControlApi.privilegedFetch) {
+    inSyncInitState = "error";
+    showInSyncPanelError("Control API unavailable — restart Stream Sync");
+    return;
+  }
+
   var modeToggle = document.getElementById("in-sync-processing-mode-toggle");
   if (modeToggle && !modeToggle.dataset.bound) {
     modeToggle.dataset.bound = "1";
@@ -327,9 +422,11 @@ function wireInSyncRecordingsUi() {
         setInSyncModeToggle(nextMode);
         var cardMode = document.getElementById("in-sync-card-mode");
         if (cardMode) cardMode.textContent = inSyncModeLabel(nextMode);
+        clearInSyncPanelError();
       } catch (e) {
         console.error(e);
         setInSyncModeToggle(previousMode);
+        showInSyncPanelError(e && e.message ? e.message : "Mode change failed");
       } finally {
         modeToggle.disabled = false;
       }
@@ -337,30 +434,40 @@ function wireInSyncRecordingsUi() {
   }
 
   var refreshBtn = document.getElementById("in-sync-refresh");
-  if (refreshBtn) {
+  if (refreshBtn && !refreshBtn.dataset.bound) {
+    refreshBtn.dataset.bound = "1";
     refreshBtn.addEventListener("click", function () {
       refreshInSyncRecordings().catch(console.error);
     });
   }
 
   document.getElementById("in-sync-pause")?.addEventListener("click", async function () {
-    await inSyncPrivileged("/api/in-sync/pause", {
-      method: "POST",
-      body: JSON.stringify({ paused: true }),
-    });
-    await refreshInSyncRecordings();
+    try {
+      await inSyncPrivileged("/api/in-sync/pause", {
+        method: "POST",
+        body: JSON.stringify({ paused: true }),
+      });
+      await refreshInSyncRecordings();
+    } catch (e) {
+      showInSyncPanelError(e && e.message ? e.message : "Pause failed");
+    }
   });
   document.getElementById("in-sync-resume")?.addEventListener("click", async function () {
-    await inSyncPrivileged("/api/in-sync/pause", {
-      method: "POST",
-      body: JSON.stringify({ paused: false }),
-    });
-    await refreshInSyncRecordings();
+    try {
+      await inSyncPrivileged("/api/in-sync/pause", {
+        method: "POST",
+        body: JSON.stringify({ paused: false }),
+      });
+      await refreshInSyncRecordings();
+    } catch (e) {
+      showInSyncPanelError(e && e.message ? e.message : "Resume failed");
+    }
   });
   document.getElementById("in-sync-retry")?.addEventListener("click", function () {
     refreshInSyncRecordings().catch(console.error);
   });
 
+  inSyncInitState = "starting";
   applyInSyncEmptyUi();
   refreshInSyncRecordings().catch(console.error);
 }

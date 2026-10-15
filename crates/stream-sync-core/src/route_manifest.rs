@@ -77,6 +77,15 @@ pub const ROUTE_MANIFEST: &[(&str, &str, RoutePolicy)] = &[
         "/api/discord/connect-key/redeem",
         RoutePolicy::Privileged,
     ),
+    ("GET", "/api/in-sync/status", RoutePolicy::Privileged),
+    ("POST", "/api/in-sync/process-now", RoutePolicy::Privileged),
+    (
+        "POST",
+        "/api/in-sync/processing-mode",
+        RoutePolicy::Privileged,
+    ),
+    ("POST", "/api/in-sync/pause", RoutePolicy::Privileged),
+    ("POST", "/api/in-sync/cancel", RoutePolicy::Privileged),
     (
         "POST",
         "/api/twitch/use-connection",

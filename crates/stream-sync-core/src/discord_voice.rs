@@ -276,9 +276,7 @@ async fn run_ingest_iteration(
             return crate::discord_voice_v2::v2_poll_and_deliver_once_with_mock(state, client)
                 .await;
         }
-        let v2_wait = crate::discord_voice_v2::v2_poll_and_deliver_once(state).await;
-        let local_wait = crate::discord_voice_local::local_poll_once(state).await;
-        v2_wait.min(local_wait)
+        crate::discord_voice_v2::v2_poll_and_deliver_once(state).await
     } else if let Some(parent) = parent_folder {
         match poll_pending_chunk(key).await {
             Ok(pending) => {
