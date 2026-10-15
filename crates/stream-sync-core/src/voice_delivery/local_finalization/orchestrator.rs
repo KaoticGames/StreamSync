@@ -184,38 +184,34 @@ impl LocalFinalizationOrchestrator {
         }
 
         let mut lease = LeaseSession::new(client.clone(), grant, &self.device_id);
-        let manifest = client
-            .fetch_manifest(&pending.session_id, lease.proof())
-            .map_err(|e| {
-                lease.release_best_effort(client, &self.device_id);
-                LocalOrchestratorError::Client(e)
-            })?;
-        let computed = compute_local_finalization_manifest_digest(&manifest);
-        if computed != pending.manifest_digest || manifest.session_id != pending.session_id {
-            lease.release_best_effort(client, &self.device_id);
-            return Err(LocalOrchestratorError::Client(
-                VoiceV2ClientError::IdentityConflict,
-            ));
-        }
-
-        let required = LocalJournalStore::disk_preflight_bytes(&manifest, 512 * 1024 * 1024);
-        if !LocalJournalStore::free_space_ok(&self.parent, required) {
-            lease.release_best_effort(client, &self.device_id);
-            return Err(LocalOrchestratorError::Other(
-                "insufficient disk space".into(),
-            ));
-        }
-
-        let store = LocalJournalStore::open(&self.parent, &manifest.session_id)
-            .map_err(|e| LocalOrchestratorError::Store(e.to_string()))?;
-        store
-            .persist_manifest(&manifest)
-            .map_err(|e| LocalOrchestratorError::Store(e.to_string()))?;
-        self.emit(LocalFinalizationProgressEvent::JournalReady {
-            session_id: manifest.session_id.clone(),
-        });
 
         let run_result = (|| {
+            let manifest = client
+                .fetch_manifest(&pending.session_id, lease.proof())
+                .map_err(LocalOrchestratorError::Client)?;
+            let computed = compute_local_finalization_manifest_digest(&manifest);
+            if computed != pending.manifest_digest || manifest.session_id != pending.session_id {
+                return Err(LocalOrchestratorError::Client(
+                    VoiceV2ClientError::IdentityConflict,
+                ));
+            }
+
+            let required = LocalJournalStore::disk_preflight_bytes(&manifest, 512 * 1024 * 1024);
+            if !LocalJournalStore::free_space_ok(&self.parent, required) {
+                return Err(LocalOrchestratorError::Other(
+                    "insufficient disk space".into(),
+                ));
+            }
+
+            let store = LocalJournalStore::open(&self.parent, &manifest.session_id)
+                .map_err(|e| LocalOrchestratorError::Store(e.to_string()))?;
+            store
+                .persist_manifest(&manifest)
+                .map_err(|e| LocalOrchestratorError::Store(e.to_string()))?;
+            self.emit(LocalFinalizationProgressEvent::JournalReady {
+                session_id: manifest.session_id.clone(),
+            });
+
             self.check_pause_cancel(client, &pending.session_id, &mut lease)?;
             self.ensure_lease_alive(&lease)?;
             self.download_all(client, &store, &manifest, &mut lease)?;
