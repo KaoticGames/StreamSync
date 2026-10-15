@@ -1,9 +1,10 @@
 //! HTTP client for `/api/stream-sync/voice/local-v1/*`.
 
-use super::manifest::{
-    compute_local_finalization_manifest_digest, parse_local_finalization_manifest,
-    LocalFinalizationManifest,
+use super::contract::{
+    parse_local_claim_response, parse_local_manifest_response, parse_local_pending_response,
+    LeaseGrant, LeaseProof, LEASE_GENERATION_HEADER, LEASE_TOKEN_HEADER,
 };
+use super::manifest::LocalFinalizationManifest;
 use super::receipt::LocalFinalizationReceipt;
 use crate::voice_delivery::client::{
     bind_opaque_object_etag, map_http_status, parse_error_code, parse_retry_after,
@@ -20,25 +21,26 @@ use std::io::Write;
 
 pub const LOCAL_PENDING_PATH: &str = "/api/stream-sync/voice/local-v1/deliveries/pending";
 
-#[derive(Debug, Clone)]
-pub struct LocalPendingDelivery {
-    pub session_id: String,
-    pub manifest_digest: String,
-    pub sealed_at: String,
-    pub manifest: LocalFinalizationManifest,
-}
+pub use super::contract::{parse_local_pending_item, LocalPendingItem};
 
 pub trait LocalFinalizationClient: Send + Sync {
-    fn fetch_pending(&self, limit: u32) -> Result<Vec<LocalPendingDelivery>, VoiceV2ClientError>;
+    fn fetch_pending(&self, limit: u32) -> Result<Vec<LocalPendingItem>, VoiceV2ClientError>;
     fn claim_delivery(
         &self,
         session_id: &str,
         device_id: &str,
-    ) -> Result<Value, VoiceV2ClientError>;
-    fn renew_lease(&self, session_id: &str, device_id: &str) -> Result<(), VoiceV2ClientError>;
+    ) -> Result<LeaseGrant, VoiceV2ClientError>;
+    /// Returns updated lease expiry when the cloud provides one.
+    fn renew_lease(
+        &self,
+        session_id: &str,
+        device_id: &str,
+        proof: &LeaseProof,
+    ) -> Result<Option<i64>, VoiceV2ClientError>;
     fn fetch_manifest(
         &self,
         session_id: &str,
+        proof: &LeaseProof,
     ) -> Result<LocalFinalizationManifest, VoiceV2ClientError>;
     fn fetch_segment_range(
         &self,
@@ -46,17 +48,24 @@ pub trait LocalFinalizationClient: Send + Sync {
         segment_seq: u32,
         offset: u64,
         length: u64,
+        proof: &LeaseProof,
         writer: &mut dyn Write,
     ) -> Result<StemRangeMeta, VoiceV2ClientError>;
     fn post_receipt(
         &self,
         session_id: &str,
         receipt: &LocalFinalizationReceipt,
+        proof: &LeaseProof,
     ) -> Result<(), VoiceV2ClientError>;
-    fn release_delivery(&self, session_id: &str, device_id: &str)
-        -> Result<(), VoiceV2ClientError>;
+    fn release_delivery(
+        &self,
+        session_id: &str,
+        device_id: &str,
+        proof: &LeaseProof,
+    ) -> Result<(), VoiceV2ClientError>;
 }
 
+#[derive(Clone)]
 pub struct HttpLocalFinalizationClient {
     base_url: String,
     bearer: String,
@@ -86,11 +95,34 @@ impl HttpLocalFinalizationClient {
         crate::delegated_lifecycle::connection_key_authorization(&self.bearer)
     }
 
+    fn lease_headers(&self, proof: &LeaseProof) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            LEASE_GENERATION_HEADER,
+            reqwest::header::HeaderValue::from_str(&proof.generation_header_value())
+                .expect("lease generation header"),
+        );
+        headers.insert(
+            LEASE_TOKEN_HEADER,
+            reqwest::header::HeaderValue::from_str(&proof.token).expect("lease token header"),
+        );
+        headers
+    }
+
+    fn lease_body(device_id: &str, proof: &LeaseProof) -> Value {
+        serde_json::json!({
+            "deviceId": device_id,
+            "leaseGeneration": proof.generation,
+            "leaseToken": proof.token,
+        })
+    }
+
     fn fetch_ranged(
         &self,
         url: &str,
         offset: u64,
         length: u64,
+        proof: &LeaseProof,
         writer: &mut dyn Write,
     ) -> Result<StemRangeMeta, VoiceV2ClientError> {
         if length == 0 || length > VOICE_V2_MAX_CHUNK_BYTES {
@@ -110,6 +142,7 @@ impl HttpLocalFinalizationClient {
                 .http
                 .get(url)
                 .header("Authorization", self.auth_header())
+                .headers(self.lease_headers(proof))
                 .header(reqwest::header::RANGE, &range)
                 .send()
                 .map_err(network_from_reqwest)?;
@@ -260,65 +293,8 @@ impl HttpLocalFinalizationClient {
     }
 }
 
-pub fn parse_local_pending_response(
-    body: &Value,
-) -> Result<Vec<LocalPendingDelivery>, VoiceV2ClientError> {
-    if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        return Err(VoiceV2ClientError::Parse("ok:false".into()));
-    }
-    let deliveries = body
-        .get("deliveries")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| VoiceV2ClientError::Parse("deliveries array missing".into()))?;
-    let mut out = Vec::with_capacity(deliveries.len());
-    for (i, item) in deliveries.iter().enumerate() {
-        let obj = item
-            .as_object()
-            .ok_or_else(|| VoiceV2ClientError::Parse(format!("deliveries[{i}] not object")))?;
-        let session_id = obj
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| VoiceV2ClientError::Parse("sessionId".into()))?
-            .to_string();
-        let manifest_digest = obj
-            .get("manifestDigest")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| VoiceV2ClientError::Parse("manifestDigest".into()))?
-            .to_string();
-        let sealed_at = obj
-            .get("sealedAt")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| VoiceV2ClientError::Parse("sealedAt".into()))?
-            .to_string();
-        let manifest_raw = obj
-            .get("manifest")
-            .ok_or_else(|| VoiceV2ClientError::Parse("manifest required".into()))?;
-        let manifest = parse_local_finalization_manifest(manifest_raw)
-            .map_err(|e| VoiceV2ClientError::Parse(e.to_string()))?;
-        if manifest.session_id != session_id {
-            return Err(VoiceV2ClientError::IdentityConflict);
-        }
-        let computed = compute_local_finalization_manifest_digest(&manifest);
-        if computed != manifest_digest {
-            return Err(VoiceV2ClientError::IdentityConflict);
-        }
-        out.push(LocalPendingDelivery {
-            session_id,
-            manifest_digest,
-            sealed_at,
-            manifest,
-        });
-    }
-    out.sort_by(|a, b| {
-        a.sealed_at
-            .cmp(&b.sealed_at)
-            .then(a.session_id.cmp(&b.session_id))
-    });
-    Ok(out)
-}
-
 impl LocalFinalizationClient for HttpLocalFinalizationClient {
-    fn fetch_pending(&self, limit: u32) -> Result<Vec<LocalPendingDelivery>, VoiceV2ClientError> {
+    fn fetch_pending(&self, limit: u32) -> Result<Vec<LocalPendingItem>, VoiceV2ClientError> {
         let url = format!("{}{}?limit={}", self.base_url, LOCAL_PENDING_PATH, limit);
         let res = self
             .http
@@ -348,7 +324,7 @@ impl LocalFinalizationClient for HttpLocalFinalizationClient {
         &self,
         session_id: &str,
         device_id: &str,
-    ) -> Result<Value, VoiceV2ClientError> {
+    ) -> Result<LeaseGrant, VoiceV2ClientError> {
         let url = format!(
             "{}/api/stream-sync/voice/local-v1/deliveries/{}/claim",
             self.base_url, session_id
@@ -370,10 +346,15 @@ impl LocalFinalizationClient for HttpLocalFinalizationClient {
                 parse_retry_after(&headers),
             ));
         }
-        Ok(body)
+        parse_local_claim_response(&body)
     }
 
-    fn renew_lease(&self, session_id: &str, device_id: &str) -> Result<(), VoiceV2ClientError> {
+    fn renew_lease(
+        &self,
+        session_id: &str,
+        device_id: &str,
+        proof: &LeaseProof,
+    ) -> Result<Option<i64>, VoiceV2ClientError> {
         let url = format!(
             "{}/api/stream-sync/voice/local-v1/deliveries/{}/lease/renew",
             self.base_url, session_id
@@ -382,34 +363,7 @@ impl LocalFinalizationClient for HttpLocalFinalizationClient {
             .http
             .post(url)
             .header("Authorization", self.auth_header())
-            .json(&serde_json::json!({ "deviceId": device_id }))
-            .send()
-            .map_err(network_from_reqwest)?;
-        let status = res.status();
-        let headers = res.headers().clone();
-        if !status.is_success() {
-            let body: Value = res.json().unwrap_or(Value::Null);
-            return Err(map_http_status(
-                status.as_u16(),
-                parse_error_code(&body).as_deref(),
-                parse_retry_after(&headers),
-            ));
-        }
-        Ok(())
-    }
-
-    fn fetch_manifest(
-        &self,
-        session_id: &str,
-    ) -> Result<LocalFinalizationManifest, VoiceV2ClientError> {
-        let url = format!(
-            "{}/api/stream-sync/voice/local-v1/deliveries/{}/manifest",
-            self.base_url, session_id
-        );
-        let res = self
-            .http
-            .get(url)
-            .header("Authorization", self.auth_header())
+            .json(&Self::lease_body(device_id, proof))
             .send()
             .map_err(network_from_reqwest)?;
         let status = res.status();
@@ -422,11 +376,39 @@ impl LocalFinalizationClient for HttpLocalFinalizationClient {
                 parse_retry_after(&headers),
             ));
         }
-        let manifest_raw = body
-            .get("manifest")
-            .ok_or_else(|| VoiceV2ClientError::Parse("manifest missing".into()))?;
-        parse_local_finalization_manifest(manifest_raw)
-            .map_err(|e| VoiceV2ClientError::Parse(e.to_string()))
+        Ok(body
+            .get("leaseExpiresAtMs")
+            .and_then(|v| v.as_i64())
+            .filter(|n| *n >= 0))
+    }
+
+    fn fetch_manifest(
+        &self,
+        session_id: &str,
+        proof: &LeaseProof,
+    ) -> Result<LocalFinalizationManifest, VoiceV2ClientError> {
+        let url = format!(
+            "{}/api/stream-sync/voice/local-v1/deliveries/{}/manifest",
+            self.base_url, session_id
+        );
+        let res = self
+            .http
+            .get(url)
+            .header("Authorization", self.auth_header())
+            .headers(self.lease_headers(proof))
+            .send()
+            .map_err(network_from_reqwest)?;
+        let status = res.status();
+        let headers = res.headers().clone();
+        let body: Value = res.json().unwrap_or(Value::Null);
+        if !status.is_success() {
+            return Err(map_http_status(
+                status.as_u16(),
+                parse_error_code(&body).as_deref(),
+                parse_retry_after(&headers),
+            ));
+        }
+        parse_local_manifest_response(&body).map(|(m, _)| m)
     }
 
     fn fetch_segment_range(
@@ -435,13 +417,14 @@ impl LocalFinalizationClient for HttpLocalFinalizationClient {
         segment_seq: u32,
         offset: u64,
         length: u64,
+        proof: &LeaseProof,
         writer: &mut dyn Write,
     ) -> Result<StemRangeMeta, VoiceV2ClientError> {
         let url = format!(
             "{}/api/stream-sync/voice/local-v1/deliveries/{}/segments/{}",
             self.base_url, session_id, segment_seq
         );
-        let meta = self.fetch_ranged(&url, offset, length, writer)?;
+        let meta = self.fetch_ranged(&url, offset, length, proof, writer)?;
         validate_stem_range_meta(&meta, offset, meta.total_length, length)?;
         Ok(meta)
     }
@@ -450,6 +433,7 @@ impl LocalFinalizationClient for HttpLocalFinalizationClient {
         &self,
         session_id: &str,
         receipt: &LocalFinalizationReceipt,
+        proof: &LeaseProof,
     ) -> Result<(), VoiceV2ClientError> {
         let url = format!(
             "{}/api/stream-sync/voice/local-v1/deliveries/{}/receipt",
@@ -481,6 +465,7 @@ impl LocalFinalizationClient for HttpLocalFinalizationClient {
             .http
             .post(url)
             .header("Authorization", self.auth_header())
+            .headers(self.lease_headers(proof))
             .json(&body)
             .send()
             .map_err(network_from_reqwest)?;
@@ -501,6 +486,7 @@ impl LocalFinalizationClient for HttpLocalFinalizationClient {
         &self,
         session_id: &str,
         device_id: &str,
+        proof: &LeaseProof,
     ) -> Result<(), VoiceV2ClientError> {
         let url = format!(
             "{}/api/stream-sync/voice/local-v1/deliveries/{}/release",
@@ -510,7 +496,7 @@ impl LocalFinalizationClient for HttpLocalFinalizationClient {
             .http
             .post(url)
             .header("Authorization", self.auth_header())
-            .json(&serde_json::json!({ "deviceId": device_id }))
+            .json(&Self::lease_body(device_id, proof))
             .send()
             .map_err(network_from_reqwest)?;
         let status = res.status();

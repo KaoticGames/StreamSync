@@ -39,9 +39,9 @@ pub use finalized_manifest::{
 pub use ingest::{PartialError, PartialRecoveryReportWriter, PartialStemWriter};
 pub use local_finalization::{
     compute_local_finalization_manifest_digest, parse_local_finalization_manifest,
-    HttpLocalFinalizationClient, LocalFinalizationClient, LocalFinalizationOrchestrator,
-    LocalFinalizationPhase, LocalFinalizationProgressEvent, LocalPendingDelivery,
-    LOCAL_PENDING_PATH,
+    parse_local_pending_response, HttpLocalFinalizationClient, LocalFinalizationClient,
+    LocalFinalizationOrchestrator, LocalFinalizationPhase, LocalFinalizationProgressEvent,
+    LocalPendingItem, LOCAL_PENDING_PATH,
 };
 pub use orchestrator::{DeliveryPhase, FinalizedVoiceDelivery, OrchestratorError};
 pub use recovery_report::{

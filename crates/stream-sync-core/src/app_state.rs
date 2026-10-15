@@ -579,6 +579,8 @@ pub struct AppState {
     pub in_sync_manual_queue: RwLock<Vec<String>>,
     pub in_sync_progress_events: RwLock<Vec<crate::voice_delivery::LocalFinalizationProgressEvent>>,
     pub in_sync_worker: RwLock<crate::in_sync::InSyncWorkerState>,
+    pub in_sync_wake: Arc<tokio::sync::Notify>,
+    pub in_sync_supervisor: RwLock<crate::in_sync::InSyncSupervisorSnapshot>,
     /// Per-installation localhost control capability (privileged routes + control socket).
     control_token: String,
     /// One-time OAuth completion nonces (never the master capability).
@@ -845,6 +847,10 @@ impl AppState {
             in_sync_manual_queue: RwLock::new(Vec::new()),
             in_sync_progress_events: RwLock::new(Vec::new()),
             in_sync_worker: RwLock::new(crate::in_sync::InSyncWorkerState::default()),
+            in_sync_wake: crate::in_sync::new_in_sync_wake(),
+            in_sync_supervisor: RwLock::new(crate::in_sync::InSyncSupervisorSnapshot::from_status(
+                crate::in_sync::InSyncSupervisorStatus::Starting,
+            )),
             control_token,
             pending_logins: crate::oauth_pending::PendingLoginStore::new(),
             dock_credentials,

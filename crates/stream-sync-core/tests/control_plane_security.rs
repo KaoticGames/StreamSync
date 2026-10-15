@@ -972,6 +972,44 @@ fn build_router_source_must_match_route_id_list() {
 }
 
 #[test]
+fn in_sync_overlay_proxy_routes_match_router_manifest() {
+    const IN_SYNC_ROUTES: &[(&str, &str)] = &[
+        ("GET", "/api/in-sync/status"),
+        ("POST", "/api/in-sync/process-now"),
+        ("POST", "/api/in-sync/processing-mode"),
+        ("POST", "/api/in-sync/pause"),
+        ("POST", "/api/in-sync/cancel"),
+    ];
+    let router: std::collections::BTreeSet<_> = BUILD_ROUTER_ROUTE_IDS.iter().copied().collect();
+    let manifest: std::collections::BTreeSet<_> = route_inventory()
+        .iter()
+        .map(|(method, path, _)| (*method, *path))
+        .collect();
+    for route in IN_SYNC_ROUTES {
+        assert!(
+            router.contains(route),
+            "missing from BUILD_ROUTER_ROUTE_IDS: {:?}",
+            route
+        );
+        assert!(
+            manifest.contains(route),
+            "missing from ROUTE_MANIFEST: {:?}",
+            route
+        );
+    }
+    let proxy_src =
+        std::fs::read_to_string("../stream-sync-desktop/src/overlay_proxy.rs").expect("proxy");
+    for (method, path) in IN_SYNC_ROUTES {
+        let needle = format!("(\"{}\", \"{}\")", method, path);
+        assert!(
+            proxy_src.contains(&needle),
+            "missing from OVERLAY_API_ALLOWLIST: {}",
+            needle
+        );
+    }
+}
+
+#[test]
 fn frontend_dock_and_login_wiring_is_scoped() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

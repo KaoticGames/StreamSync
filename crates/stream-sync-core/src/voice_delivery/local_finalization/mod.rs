@@ -3,7 +3,9 @@
 mod accumulator;
 mod cancellation;
 mod client;
+mod contract;
 mod journal_store;
+mod lease_keeper;
 mod local_publication;
 mod manifest;
 mod opus_decode;
@@ -17,8 +19,11 @@ mod synj;
 
 pub use cancellation::{LocalFinalizationCancel, LocalFinalizationCancelled};
 pub use client::{
-    parse_local_pending_response, HttpLocalFinalizationClient, LocalFinalizationClient,
-    LocalPendingDelivery, LOCAL_PENDING_PATH,
+    HttpLocalFinalizationClient, LocalFinalizationClient, LocalPendingItem, LOCAL_PENDING_PATH,
+};
+pub use contract::{
+    parse_lease_renew_release_body, parse_local_claim_response, parse_local_pending_response,
+    LeaseGrant, LeaseProof, LEASE_GENERATION_HEADER, LEASE_TOKEN_HEADER,
 };
 pub use journal_store::LocalJournalStore;
 pub use local_publication::{resolve_published_paths, PublishedLocalOutput};

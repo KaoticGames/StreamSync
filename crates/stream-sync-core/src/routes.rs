@@ -111,6 +111,11 @@ pub const BUILD_ROUTER_ROUTE_IDS: &[(&str, &str)] = &[
     ("GET", "/events-media/*"),
     ("POST", "/api/chat/upload-font"),
     ("POST", "/api/events/upload-media"),
+    ("GET", "/api/in-sync/status"),
+    ("POST", "/api/in-sync/process-now"),
+    ("POST", "/api/in-sync/processing-mode"),
+    ("POST", "/api/in-sync/pause"),
+    ("POST", "/api/in-sync/cancel"),
 ];
 
 pub fn build_router(ctx: ServerContext) -> Router {

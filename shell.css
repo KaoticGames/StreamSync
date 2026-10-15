@@ -1564,6 +1564,21 @@ input[type="range"]::-ms-thumb {
   font-size: 14px;
 }
 
+.view-in-sync .in-sync-init-error {
+  margin: 0.5rem 0 0;
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  background: rgba(248, 113, 113, 0.12);
+  color: #fecaca;
+  font-size: 0.9rem;
+}
+
+.view-in-sync .in-sync-supervisor-meta {
+  margin: 0.35rem 0 0;
+  font-size: 0.82rem;
+  color: var(--text-muted, #9ca3af);
+}
+
 .view-in-sync .section-header h2 {
   font-size: 20px;
 }
