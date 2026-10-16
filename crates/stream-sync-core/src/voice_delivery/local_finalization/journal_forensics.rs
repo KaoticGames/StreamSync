@@ -71,6 +71,7 @@ pub struct AccumulatorDispositionCounts {
     pub discarded_duplicate: u64,
     pub discarded_conflict: u64,
     pub discarded_out_of_window: u64,
+    pub accumulator_errors: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,6 +100,7 @@ pub struct UserJournalForensics {
     pub journal_capture_max_after_first_epoch_transition: Option<u64>,
     pub emitted_capture_max_after_first_epoch_transition: Option<u64>,
     pub diagnostics: Vec<String>,
+    pub forensics_certified_clean: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -171,11 +173,7 @@ fn journal_record_from_meta(meta: &JournalRecordMeta) -> JournalRecord {
         opus_payload: if payload_len == 0 {
             Vec::new()
         } else {
-            let mut p = vec![0x08, 0x01];
-            if payload_len > 2 {
-                p.resize(payload_len, 0x01);
-            }
-            p
+            vec![0x08, 0x01]
         },
     }
 }
@@ -456,6 +454,7 @@ fn analyze_user(
         discarded_duplicate: 0,
         discarded_conflict: 0,
         discarded_out_of_window: 0,
+        accumulator_errors: 0,
     };
     let mut first_emitted: Option<u64> = None;
     let mut last_emitted_end: Option<u64> = None;
@@ -463,14 +462,21 @@ fn analyze_user(
     let first_epoch = epochs.keys().next().copied();
     let mut emitted_capture_max_after_transition: Option<u64> = None;
     let mut emitted_in_later_epochs = 0u64;
+    let mut diagnostics = Vec::new();
 
     for rec in rows {
         let jr = journal_record_from_meta(&rec.meta);
-        let ready = acc.ingest_timeline(jr).unwrap_or_else(|_| Vec::new());
+        let ready = match acc.ingest_timeline(jr) {
+            Ok(v) => v,
+            Err(e) => {
+                counts.accumulator_errors += 1;
+                diagnostics.push(format!("ACCUMULATOR_INGEST_ERROR: {e:?}"));
+                Vec::new()
+            }
+        };
         for pkt in ready {
             track_emitted(
                 &pkt,
-                &mut acc,
                 &mut counts,
                 &mut first_emitted,
                 &mut last_emitted_end,
@@ -481,18 +487,25 @@ fn analyze_user(
             );
         }
     }
-    for pkt in acc.flush_remaining() {
-        track_emitted(
-            &pkt,
-            &mut acc,
-            &mut counts,
-            &mut first_emitted,
-            &mut last_emitted_end,
-            first_transition_index,
-            first_epoch,
-            &mut emitted_capture_max_after_transition,
-            &mut emitted_in_later_epochs,
-        );
+    match acc.flush_remaining() {
+        Ok(flushed) => {
+            for pkt in flushed {
+                track_emitted(
+                    &pkt,
+                    &mut counts,
+                    &mut first_emitted,
+                    &mut last_emitted_end,
+                    first_transition_index,
+                    first_epoch,
+                    &mut emitted_capture_max_after_transition,
+                    &mut emitted_in_later_epochs,
+                );
+            }
+        }
+        Err(e) => {
+            counts.accumulator_errors += 1;
+            diagnostics.push(format!("ACCUMULATOR_FLUSH_ERROR: {e:?}"));
+        }
     }
 
     let mut journal_capture_max_after_transition: Option<u64> = None;
@@ -517,13 +530,14 @@ fn analyze_user(
     };
 
     let mut local_epoch_frontier_stall = false;
-    let mut diagnostics = Vec::new();
     if !epoch_transitions.is_empty() && later_epoch_nonempty > 0 && emitted_in_later_epochs == 0 {
         local_epoch_frontier_stall = true;
         diagnostics.push("LOCAL_EPOCH_FRONTIER_STALL".into());
     }
 
     let wav_relative_path = format!("{path_nick}.wav");
+    let forensics_certified_clean =
+        counts.accumulator_errors == 0 && !local_epoch_frontier_stall && diagnostics.is_empty();
     UserJournalForensics {
         discord_user_id,
         path_nick,
@@ -548,12 +562,12 @@ fn analyze_user(
         journal_capture_max_after_first_epoch_transition: journal_capture_max_after_transition,
         emitted_capture_max_after_first_epoch_transition: emitted_capture_max_after_transition,
         diagnostics,
+        forensics_certified_clean,
     }
 }
 
 fn track_emitted(
     pkt: &super::accumulator::ReadyPacket,
-    acc: &mut UserPacketAccumulator,
     counts: &mut AccumulatorDispositionCounts,
     first_emitted: &mut Option<u64>,
     last_emitted_end: &mut Option<u64>,
@@ -562,15 +576,16 @@ fn track_emitted(
     emitted_capture_max_after_transition: &mut Option<u64>,
     emitted_in_later_epochs: &mut u64,
 ) {
-    let placement = pkt
-        .timeline_sample_start
-        .unwrap_or_else(|| acc.placement_samples(&pkt.record));
-    let end = placement + span_for_disposition(pkt.disposition);
+    bump_disposition(counts, pkt.disposition);
+    let placement = match pkt.timeline_sample_start {
+        Some(p) => p,
+        None => return,
+    };
+    let end = placement + span_for_packet(pkt);
     if first_emitted.is_none() {
         *first_emitted = Some(placement);
     }
     *last_emitted_end = Some(last_emitted_end.map_or(end, |e| e.max(end)));
-    bump_disposition(counts, pkt.disposition);
 
     if first_transition_index.is_some() && Some(pkt.record.ssrc_epoch) != first_epoch {
         if matches!(
@@ -584,10 +599,11 @@ fn track_emitted(
     }
 }
 
-fn span_for_disposition(d: PacketDisposition) -> u64 {
-    match d {
-        PacketDisposition::Decode => OPUS_FRAME_SAMPLES,
-        PacketDisposition::LostPlacement => lost_marker_span_samples(),
+fn span_for_packet(pkt: &super::accumulator::ReadyPacket) -> u64 {
+    match pkt.disposition {
+        PacketDisposition::Decode | PacketDisposition::LostPlacement => {
+            pkt.span_samples.unwrap_or(0)
+        }
         PacketDisposition::DiscardedDuplicate
         | PacketDisposition::DiscardedConflict
         | PacketDisposition::DiscardedOutOfWindow => 0,

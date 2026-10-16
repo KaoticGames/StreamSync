@@ -1,6 +1,6 @@
 //! Per-user journal packet accumulator (parity with ChatBot `userJournalPacketAccumulator.ts`).
 
-use super::opus_packet_duration::opus_packet_duration_samples;
+use super::opus_journal_timeline::validate_opus_packet_for_journal_timeline;
 use super::rtp_generation_inference::{
     decide_rtp_timestamp_discontinuity, discontinuity_decision_to_action, rtp_forward_delta,
     InferredRtpGenerationBoundary, RtpCandidatePacket, RtpDiscontinuityAction,
@@ -30,9 +30,11 @@ pub enum PacketDisposition {
 pub struct ReadyPacket {
     pub record: JournalRecord,
     pub disposition: PacketDisposition,
-    pub extended_sequence: u64,
+    pub extended_sequence: i64,
     pub effective_epoch: u32,
     pub timeline_sample_start: Option<u64>,
+    /// Known Opus span in 48 kHz samples when framing validates; loss markers may be `None`.
+    pub span_samples: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -64,7 +66,7 @@ struct MutablePacket {
 
 struct BufferedPacket {
     record: JournalRecord,
-    extended_sequence: u64,
+    extended_sequence: i64,
     framing_skip: bool,
 }
 
@@ -79,11 +81,11 @@ pub struct UserPacketAccumulator {
     user_id: String,
     target_sample_count: u64,
     placement_overlap_tolerant: bool,
-    frontier_extended: Option<u64>,
-    buffer: std::collections::BTreeMap<u64, BufferedPacket>,
-    dedupe_by_extended: std::collections::BTreeMap<u64, MutablePacket>,
-    emitted_by_extended: std::collections::BTreeMap<u64, EmittedDedupeSnapshot>,
-    next_emit_extended: Option<u64>,
+    frontier_extended: Option<i64>,
+    buffer: std::collections::BTreeMap<i64, BufferedPacket>,
+    dedupe_by_extended: std::collections::BTreeMap<i64, MutablePacket>,
+    emitted_by_extended: std::collections::BTreeMap<i64, EmittedDedupeSnapshot>,
+    next_emit_extended: Option<i64>,
     prev_raw_timestamp: Option<u32>,
     prev_sample_start: u64,
     prev_end: u64,
@@ -98,7 +100,7 @@ pub struct UserPacketAccumulator {
     total_inferred_boundary_count: u32,
     inferred_boundaries_truncated: bool,
     last_emitted_raw_sequence: u16,
-    last_emitted_extended_sequence: u64,
+    last_emitted_extended_sequence: i64,
     last_emitted_capture_offset: u64,
     last_emitted_arrived_at_ns: u64,
     inferred_generation_boundaries: Vec<InferredRtpGenerationBoundary>,
@@ -180,19 +182,15 @@ impl UserPacketAccumulator {
         Ok(out)
     }
 
-    pub fn flush_remaining(&mut self) -> Vec<ReadyPacket> {
+    pub fn flush_remaining(&mut self) -> Result<Vec<ReadyPacket>, AccumulatorError> {
         let mut out = Vec::new();
         if self.timeline_active {
-            if let Ok(flushed) = self.end_epoch_sync(self.epoch_anchor_capture) {
-                out.extend(flushed);
-            }
+            out.extend(self.end_epoch_sync(self.epoch_anchor_capture)?);
             self.timeline_active = false;
             self.active_journal_epoch = None;
         }
-        if let Ok(flushed) = self.flush_buffer_hard_sync() {
-            out.extend(flushed);
-        }
-        out
+        out.extend(self.flush_buffer_hard_sync()?);
+        Ok(out)
     }
 
     pub fn placement_samples(&self, record: &JournalRecord) -> u64 {
@@ -268,11 +266,13 @@ impl UserPacketAccumulator {
             out.extend(self.ingest_framing_skip_record(record, journal_epoch)?);
             return Ok(out);
         }
-        if opus_packet_duration_samples(&record.opus_payload).is_err() {
+        if validate_opus_packet_for_journal_timeline(&record.opus_payload).is_err() {
             out.extend(self.ingest_framing_skip_record(record, journal_epoch)?);
             return Ok(out);
         }
-        match self.ingest_record_core(&record, journal_epoch)? {
+        let (prefix, core) = self.ingest_record_core(&record, journal_epoch)?;
+        out.extend(prefix);
+        match core {
             IngestCoreResult::Buffered => {
                 out.extend(self.drain_emittable_sync()?);
             }
@@ -283,6 +283,7 @@ impl UserPacketAccumulator {
                     extended_sequence: 0,
                     effective_epoch: self.effective_epoch,
                     timeline_sample_start: None,
+                    span_samples: None,
                 });
             }
             IngestCoreResult::OutOfWindow => {
@@ -292,6 +293,7 @@ impl UserPacketAccumulator {
                     extended_sequence: 0,
                     effective_epoch: self.effective_epoch,
                     timeline_sample_start: None,
+                    span_samples: None,
                 });
             }
         }
@@ -305,10 +307,11 @@ impl UserPacketAccumulator {
     ) -> Result<Vec<ReadyPacket>, AccumulatorError> {
         let pkt = self.record_to_packet(&record)?;
         let mut extended = self.extend_one(&pkt)?;
+        let mut boundary_flush = Vec::new();
         if extended.is_none() {
             let ctx = self.classify_implicit_boundary_from_sequence(&pkt)?;
             if ctx.is_some() {
-                self.apply_implicit_boundary_sync(&pkt, &ctx.unwrap())?;
+                boundary_flush = self.apply_implicit_boundary_sync(&pkt, &ctx.unwrap())?;
                 extended = self.extend_one(&pkt)?;
             }
         }
@@ -319,35 +322,38 @@ impl UserPacketAccumulator {
             ))
         })?;
         if !self.buffer_ingested_packet(journal_epoch, extended, &record, &pkt, true)? {
-            return Ok(Vec::new());
+            return Ok(boundary_flush);
         }
-        self.drain_emittable_sync()
+        let drained = self.drain_emittable_sync()?;
+        boundary_flush.extend(drained);
+        Ok(boundary_flush)
     }
 
     fn ingest_record_core(
         &mut self,
         record: &JournalRecord,
         journal_epoch: u32,
-    ) -> Result<IngestCoreResult, AccumulatorError> {
+    ) -> Result<(Vec<ReadyPacket>, IngestCoreResult), AccumulatorError> {
         let pkt = self.record_to_packet(record)?;
+        let mut prefix = Vec::new();
         let mut extended = self.extend_one(&pkt)?;
         if extended.is_none() {
             if let Some(ctx) = self.classify_implicit_boundary_from_sequence(&pkt)? {
-                self.apply_implicit_boundary_sync(&pkt, &ctx)?;
+                prefix = self.apply_implicit_boundary_sync(&pkt, &ctx)?;
                 extended = self.extend_one(&pkt)?;
             }
         }
         let extended = match extended {
             Some(e) => e,
-            None => return Ok(IngestCoreResult::OutOfWindow),
+            None => return Ok((prefix, IngestCoreResult::OutOfWindow)),
         };
         if self.is_exact_replay(extended, &pkt) {
-            return Ok(IngestCoreResult::ExactReplay);
+            return Ok((prefix, IngestCoreResult::ExactReplay));
         }
         if self.buffer_ingested_packet(journal_epoch, extended, record, &pkt, false)? {
-            Ok(IngestCoreResult::Buffered)
+            Ok((prefix, IngestCoreResult::Buffered))
         } else {
-            Ok(IngestCoreResult::ExactReplay)
+            Ok((prefix, IngestCoreResult::ExactReplay))
         }
     }
 
@@ -369,7 +375,7 @@ impl UserPacketAccumulator {
     fn buffer_ingested_packet(
         &mut self,
         _epoch: u32,
-        extended: u64,
+        extended: i64,
         record: &JournalRecord,
         pkt: &MutablePacket,
         framing_skip: bool,
@@ -436,7 +442,7 @@ impl UserPacketAccumulator {
             return Ok(None);
         }
         let raw = seq16(pkt.sequence);
-        let frontier_raw = seq16_u64(self.frontier_extended.unwrap());
+        let frontier_raw = seq16_i64(self.frontier_extended.unwrap());
         let behind = (frontier_raw.wrapping_sub(raw)) & 0xffff;
         if behind == 0 || behind <= REORDER_WINDOW_PACKETS {
             return Ok(None);
@@ -448,7 +454,7 @@ impl UserPacketAccumulator {
             &ctx,
             &RtpCandidatePacket {
                 raw_sequence: pkt.sequence,
-                extended_sequence: u64::from(raw),
+                extended_sequence: i64::from(raw),
                 rtp_timestamp: pkt.rtp_timestamp,
                 capture_offset_samples: pkt.capture_offset_samples,
                 arrived_at_ns: pkt.arrived_at_ns,
@@ -486,10 +492,10 @@ impl UserPacketAccumulator {
         &mut self,
         pkt: &MutablePacket,
         ctx: &RtpPlacementContext,
-    ) -> Result<(), AccumulatorError> {
-        self.flush_buffer_hard_sync()?;
+    ) -> Result<Vec<ReadyPacket>, AccumulatorError> {
+        let flushed = self.flush_buffer_hard_sync()?;
         self.commit_implicit_boundary_state(pkt, ctx);
-        Ok(())
+        Ok(flushed)
     }
 
     fn commit_implicit_boundary_state(&mut self, pkt: &MutablePacket, ctx: &RtpPlacementContext) {
@@ -529,15 +535,16 @@ impl UserPacketAccumulator {
         self.inferred_generation_boundaries.push(entry);
     }
 
-    fn extend_one(&mut self, pkt: &MutablePacket) -> Result<Option<u64>, AccumulatorError> {
+    fn extend_one(&mut self, pkt: &MutablePacket) -> Result<Option<i64>, AccumulatorError> {
         let raw = seq16(pkt.sequence);
         if self.frontier_extended.is_none() {
-            self.frontier_extended = Some(u64::from(raw));
-            self.next_emit_extended = Some(u64::from(raw));
-            return Ok(Some(u64::from(raw)));
+            let ext = i64::from(raw);
+            self.frontier_extended = Some(ext);
+            self.next_emit_extended = Some(ext);
+            return Ok(Some(ext));
         }
         let frontier = self.frontier_extended.unwrap();
-        let frontier_raw = seq16_u64(frontier);
+        let frontier_raw = seq16_i64(frontier);
         let behind = (frontier_raw.wrapping_sub(raw)) & 0xffff;
         if behind == HALF_RANGE as u16 {
             return Err(AccumulatorError::SequenceAmbiguity(format!(
@@ -546,7 +553,7 @@ impl UserPacketAccumulator {
             )));
         }
         if behind != 0 && behind <= REORDER_WINDOW_PACKETS && seq_before(raw, frontier_raw) {
-            return Ok(Some(frontier.saturating_sub(u64::from(behind))));
+            return Ok(Some(frontier - i64::from(behind)));
         }
         let ahead = (raw.wrapping_sub(frontier_raw)) & 0xffff;
         let behind_alt = (frontier_raw.wrapping_sub(raw)) & 0xffff;
@@ -557,10 +564,10 @@ impl UserPacketAccumulator {
         }
         let mut candidates = Vec::new();
         if ahead != 0 && ahead < HALF_RANGE as u16 {
-            candidates.push(frontier + u64::from(ahead));
+            candidates.push(frontier + i64::from(ahead));
         }
         if behind_alt != 0 && behind_alt < HALF_RANGE as u16 {
-            candidates.push(frontier.saturating_sub(u64::from(behind_alt)));
+            candidates.push(frontier - i64::from(behind_alt));
         }
         if candidates.is_empty() {
             if behind == 0 && ahead == 0 {
@@ -578,14 +585,14 @@ impl UserPacketAccumulator {
         candidates.dedup();
         if candidates.len() > 1 {
             let span = candidates.last().unwrap() - candidates.first().unwrap();
-            if span >= HALF_RANGE as u64 {
+            if span >= HALF_RANGE as i64 {
                 return Err(AccumulatorError::SequenceAmbiguity(
                     "sequence unwrap spans ambiguous half-range".into(),
                 ));
             }
         }
         let ext = candidates[0];
-        if ext < frontier.saturating_sub(u64::from(REORDER_WINDOW_PACKETS)) {
+        if ext < frontier - i64::from(REORDER_WINDOW_PACKETS) {
             return Ok(None);
         }
         if ext > frontier {
@@ -594,7 +601,7 @@ impl UserPacketAccumulator {
         Ok(Some(ext))
     }
 
-    fn is_conflicting_replay(&self, extended: u64, pkt: &MutablePacket) -> bool {
+    fn is_conflicting_replay(&self, extended: i64, pkt: &MutablePacket) -> bool {
         if self.next_emit_extended.is_none() || extended >= self.next_emit_extended.unwrap() {
             return false;
         }
@@ -603,18 +610,21 @@ impl UserPacketAccumulator {
             .is_some_and(|snap| !packets_equivalent_snapshot(snap, pkt))
     }
 
-    fn is_exact_replay(&self, extended: u64, pkt: &MutablePacket) -> bool {
+    fn is_exact_replay(&self, extended: i64, pkt: &MutablePacket) -> bool {
         if self.next_emit_extended.is_none() || extended >= self.next_emit_extended.unwrap() {
             return false;
         }
         if let Some(snap) = self.emitted_by_extended.get(&extended) {
             return packets_equivalent_snapshot(snap, pkt);
         }
+        if extended < 0 {
+            return false;
+        }
         true
     }
 
-    fn evict_retained_before(&mut self, min_extended: u64) {
-        if min_extended == 0 {
+    fn evict_retained_before(&mut self, min_extended: i64) {
+        if min_extended == i64::MIN {
             return;
         }
         self.dedupe_by_extended.retain(|k, _| *k >= min_extended);
@@ -633,7 +643,7 @@ impl UserPacketAccumulator {
                 opus_payload: pkt.record.opus_payload.clone(),
             },
         );
-        let min = extended.saturating_sub(DEDUPE_RETENTION_PACKETS);
+        let min = extended - i64::try_from(DEDUPE_RETENTION_PACKETS).unwrap_or(i64::MAX);
         self.evict_retained_before(min);
     }
 
@@ -642,16 +652,11 @@ impl UserPacketAccumulator {
         if self.frontier_extended.is_none() || self.next_emit_extended.is_none() {
             return Ok(out);
         }
-        let stale_before = self
-            .frontier_extended
-            .unwrap()
-            .saturating_sub(u64::from(REORDER_WINDOW_PACKETS));
+        let stale_before = self.frontier_extended.unwrap() - i64::from(REORDER_WINDOW_PACKETS);
         while !self.buffer.is_empty() {
             let next = self.next_emit_extended.unwrap();
             if let Some(direct) = self.buffer.remove(&next) {
-                if let Some(ready) = self.emit_buffered_sync(direct)? {
-                    out.push(ready);
-                }
+                out.extend(self.emit_buffered_sync(direct)?);
                 self.next_emit_extended = Some(next + 1);
                 continue;
             }
@@ -661,9 +666,7 @@ impl UserPacketAccumulator {
                 if self.next_emit_extended.is_none() || min_key < self.next_emit_extended.unwrap() {
                     self.next_emit_extended = Some(min_key + 1);
                 }
-                if let Some(ready) = self.emit_buffered_sync(pkt)? {
-                    out.push(ready);
-                }
+                out.extend(self.emit_buffered_sync(pkt)?);
                 continue;
             }
             break;
@@ -676,12 +679,10 @@ impl UserPacketAccumulator {
         if self.buffer.is_empty() {
             return Ok(out);
         }
-        let keys: Vec<u64> = self.buffer.keys().copied().collect();
+        let keys: Vec<i64> = self.buffer.keys().copied().collect();
         for key in keys {
             let pkt = self.buffer.remove(&key).unwrap();
-            if let Some(ready) = self.emit_buffered_sync(pkt)? {
-                out.push(ready);
-            }
+            out.extend(self.emit_buffered_sync(pkt)?);
         }
         self.next_emit_extended = None;
         Ok(out)
@@ -690,9 +691,9 @@ impl UserPacketAccumulator {
     fn emit_buffered_sync(
         &mut self,
         pkt: BufferedPacket,
-    ) -> Result<Option<ReadyPacket>, AccumulatorError> {
+    ) -> Result<Vec<ReadyPacket>, AccumulatorError> {
         if pkt.framing_skip {
-            return Ok(Some(self.emit_framing_skip(pkt)));
+            return Ok(vec![self.emit_framing_skip(pkt)]);
         }
         self.place_buffered_packet(pkt)
     }
@@ -737,29 +738,34 @@ impl UserPacketAccumulator {
         {
             self.next_emit_extended = Some(pkt.extended_sequence + 1);
         }
+        let span_samples = if pkt.record.opus_payload.is_empty() {
+            None
+        } else {
+            validate_opus_packet_for_journal_timeline(&pkt.record.opus_payload).ok()
+        };
         ReadyPacket {
             record: pkt.record,
             disposition: PacketDisposition::LostPlacement,
             extended_sequence: pkt.extended_sequence,
             effective_epoch: self.effective_epoch,
             timeline_sample_start: Some(sample_start),
+            span_samples,
         }
     }
 
     fn place_buffered_packet(
         &mut self,
         pkt: BufferedPacket,
-    ) -> Result<Option<ReadyPacket>, AccumulatorError> {
-        let frame_samples = opus_packet_duration_samples(&pkt.record.opus_payload).unwrap_or(0);
-        let sample_start = self.resolve_sample_start(&pkt)?;
-        self.finalize_placed_packet(pkt, frame_samples, sample_start)
-    }
-
-    fn resolve_sample_start(&mut self, pkt: &BufferedPacket) -> Result<u64, AccumulatorError> {
+    ) -> Result<Vec<ReadyPacket>, AccumulatorError> {
+        let frame_samples = validate_opus_packet_for_journal_timeline(&pkt.record.opus_payload)
+            .map_err(|e| AccumulatorError::Pathological(format!("invalid opus framing: {e}")))?;
         if self.prev_raw_timestamp.is_none() {
-            return Ok(self.epoch_anchor);
+            return Ok(self
+                .finalize_placed_packet(pkt, frame_samples, self.epoch_anchor)?
+                .into_iter()
+                .collect());
         }
-        let action = self.classify_placement_action(pkt);
+        let action = self.classify_placement_action(&pkt);
         match action {
             RtpDiscontinuityAction::ImplicitBoundary => {
                 let ctx = self.placement_context().unwrap();
@@ -770,15 +776,19 @@ impl UserPacketAccumulator {
                     arrived_at_ns: pkt.record.arrived_at_ns,
                     opus_payload: pkt.record.opus_payload.clone(),
                 };
-                self.apply_implicit_boundary_sync(&mp, &ctx)?;
-                Ok(self.epoch_anchor)
+                let mut out = self.apply_implicit_boundary_sync(&mp, &ctx)?;
+                out.extend(
+                    self.finalize_placed_packet(pkt, frame_samples, self.epoch_anchor)?
+                        .into_iter(),
+                );
+                Ok(out)
             }
             RtpDiscontinuityAction::Gap { sample_start }
-            | RtpDiscontinuityAction::Normal { sample_start } => Ok(sample_start),
+            | RtpDiscontinuityAction::Normal { sample_start } => Ok(self
+                .finalize_placed_packet(pkt, frame_samples, sample_start)?
+                .into_iter()
+                .collect()),
             RtpDiscontinuityAction::Refuse { reason } => {
-                if self.placement_overlap_tolerant {
-                    return Err(AccumulatorError::Pathological(reason));
-                }
                 Err(AccumulatorError::Pathological(reason))
             }
         }
@@ -811,21 +821,19 @@ impl UserPacketAccumulator {
         if sample_end > self.max_emitted_sample_end {
             self.max_emitted_sample_end = sample_end;
         }
+        if sample_end > self.target_sample_count {
+            self.note_irrevocably_emitted(&pkt);
+            return Ok(None);
+        }
         self.note_irrevocably_emitted(&pkt);
-
-        let disposition = PacketDisposition::Decode;
-        let timeline = if sample_end > self.target_sample_count {
-            None
-        } else {
-            Some(sample_start)
-        };
 
         Ok(Some(ReadyPacket {
             record: pkt.record,
-            disposition,
+            disposition: PacketDisposition::Decode,
             extended_sequence: pkt.extended_sequence,
             effective_epoch: self.effective_epoch,
-            timeline_sample_start: timeline,
+            timeline_sample_start: Some(sample_start),
+            span_samples: Some(frame_samples),
         }))
     }
 }
@@ -840,8 +848,8 @@ fn seq16(n: u16) -> u16 {
     n
 }
 
-fn seq16_u64(n: u64) -> u16 {
-    (n & 0xffff) as u16
+fn seq16_i64(n: i64) -> u16 {
+    n as u16
 }
 
 fn seq_before(a: u16, b: u16) -> bool {

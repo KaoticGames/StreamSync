@@ -28,17 +28,13 @@ fn sample_record(
         discord_user_id: user.into(),
         ssrc_epoch: epoch,
         sequence: seq,
-        rtp_timestamp: (capture as u32) * 960,
+        rtp_timestamp: capture as u32,
         arrived_at_ns: u64::from(seq) * 1_000_000,
         session_capture_offset_samples: Some(capture),
         opus_payload: if payload_len == 0 {
             Vec::new()
         } else {
-            let mut p = vec![0x08, 0x01];
-            if payload_len > 2 {
-                p.resize(payload_len, 0x01);
-            }
-            p
+            vec![0x08, 0x01]
         },
     }
 }
@@ -179,6 +175,50 @@ fn json_output_has_no_payload_bytes() {
     assert!(!json.contains("FE")); // fixture payload byte pattern
     assert!(json.contains("wavRelativePath"));
     assert!(json.contains("clean.wav"));
+}
+
+#[test]
+fn pathological_overlap_fixture_not_certified_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = "123456789012345678";
+    let records = vec![
+        JournalRecord {
+            discord_user_id: user.into(),
+            ssrc_epoch: 1,
+            sequence: 0,
+            rtp_timestamp: 0,
+            arrived_at_ns: 1,
+            session_capture_offset_samples: Some(0),
+            opus_payload: vec![0x08, 0x01],
+        },
+        JournalRecord {
+            discord_user_id: user.into(),
+            ssrc_epoch: 1,
+            sequence: 5,
+            rtp_timestamp: 480,
+            arrived_at_ns: 5,
+            session_capture_offset_samples: Some(0),
+            opus_payload: vec![0x08, 0x01],
+        },
+    ];
+    write_session(
+        dir.path(),
+        "550e8400-e29b-41d4-a716-446655440099",
+        &[("123456789012345678", "pathological")],
+        &records,
+    );
+    let report = analyze_local_journal_session(dir.path()).unwrap();
+    let u = report
+        .users
+        .iter()
+        .find(|u| u.path_nick == "pathological")
+        .unwrap();
+    assert!(!u.forensics_certified_clean);
+    assert!(u.accumulator.accumulator_errors > 0);
+    assert!(u
+        .diagnostics
+        .iter()
+        .any(|d| d.contains("ACCUMULATOR_FLUSH_ERROR")));
 }
 
 #[test]

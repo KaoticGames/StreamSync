@@ -43,7 +43,7 @@ fn rec(
 struct EmittedRow {
     sequence: u16,
     disposition: PacketDisposition,
-    extended_sequence: u64,
+    extended_sequence: i64,
     timeline_sample_start: Option<u64>,
 }
 
@@ -60,7 +60,7 @@ fn ingest_all(acc: &mut UserPacketAccumulator, records: &[JournalRecord]) -> Vec
             });
         }
     }
-    for p in acc.flush_remaining() {
+    for p in acc.flush_remaining().expect("flush") {
         out.push(EmittedRow {
             sequence: p.record.sequence,
             disposition: p.disposition,
@@ -313,6 +313,134 @@ fn payload_for_kind(kind: &str) -> Vec<u8> {
         "framingSkip" => payload_framing_skip(),
         other => panic!("unknown payload kind {}", other),
     }
+}
+
+#[test]
+fn parity_implicit_boundary_flush_emits_buffered_before_new_generation() {
+    let prior_end = 100 * FRAME;
+    let records = vec![
+        rec(0, 0, 0, 0, 1, payload_toc_20ms()),
+        rec(0, 100, 100 * 960, prior_end, 100, payload_toc_20ms()),
+        rec(
+            0,
+            50,
+            40_000_000,
+            prior_end + FRAME,
+            2_020_000_000,
+            payload_toc_20ms(),
+        ),
+    ];
+    let mut acc = UserPacketAccumulator::new(USER, TARGET);
+    let got = ingest_all(&mut acc, &records);
+    assert_emitted_sequences(&got, &[0, 100, 50]);
+    assert_eq!(got[0].extended_sequence, 0);
+    assert_eq!(got[1].extended_sequence, 100);
+    assert_eq!(got[2].extended_sequence, 50);
+}
+
+#[test]
+fn parity_reverse_late_65535_after_seq0_extended_negative_one() {
+    let records = vec![
+        rec(0, 0, 0, 0, 1, payload_toc_20ms()),
+        rec(0, 65535, 960, 65535 * FRAME, 2, payload_toc_20ms()),
+    ];
+    let mut acc = UserPacketAccumulator::new(USER, TARGET);
+    let got = ingest_all(&mut acc, &records);
+    assert_emitted_sequences(&got, &[0, 65535]);
+    assert_eq!(got[1].extended_sequence, -1);
+}
+
+#[test]
+fn parity_drops_decode_past_target_sample_count() {
+    let small_target = 1000u64;
+    let records = vec![rec(0, 0, 0, 900, 1, payload_toc_20ms())];
+    let mut acc = UserPacketAccumulator::new(USER, small_target);
+    let got = ingest_all(&mut acc, &records);
+    assert!(
+        got.iter()
+            .all(|r| r.disposition != PacketDisposition::Decode),
+        "out-of-target packet must not surface as Decode: {:?}",
+        got
+    );
+}
+
+#[test]
+fn flush_remaining_returns_overlap_error_fail_closed() {
+    let mut acc = UserPacketAccumulator::new(USER, TARGET);
+    acc.ingest_timeline(rec(0, 0, 0, 0, 1, payload_toc_20ms()))
+        .expect("first");
+    acc.ingest_timeline(rec(0, 5, 480, 0, 5, payload_toc_20ms()))
+        .expect("buffer seq 5");
+    let flush_err = acc.flush_remaining().unwrap_err();
+    assert!(flush_err.is_overlap());
+}
+
+#[test]
+fn parity_eight_packet_wrap_near_u16_rollover() {
+    let mut records = Vec::new();
+    let mut seq = 65530u16;
+    let mut capture = 0u64;
+    for i in 0..8u64 {
+        records.push(rec(
+            1,
+            seq,
+            (capture as u32) * 960,
+            capture,
+            i + 1,
+            payload_toc_20ms(),
+        ));
+        capture += FRAME;
+        seq = seq.wrapping_add(1);
+    }
+    let mut acc = UserPacketAccumulator::new(USER, TARGET);
+    let got = ingest_all(&mut acc, &records);
+    let decodes = got
+        .iter()
+        .filter(|r| r.disposition == PacketDisposition::Decode)
+        .count();
+    assert_eq!(decodes, 8, "got {:?}", got);
+}
+
+#[test]
+fn parity_wrap_epoch_transition_emits_epoch_two() {
+    let mut records = Vec::new();
+    let mut seq = 65530u16;
+    let mut capture = 0u64;
+    for i in 0..8u64 {
+        records.push(rec(
+            1,
+            seq,
+            (capture as u32) * 960,
+            capture,
+            i + 1,
+            payload_toc_20ms(),
+        ));
+        capture += FRAME;
+        seq = seq.wrapping_add(1);
+    }
+    records.push(rec(
+        2,
+        0,
+        (capture as u32) * 960,
+        capture,
+        9,
+        payload_toc_20ms(),
+    ));
+    records.push(rec(
+        2,
+        1,
+        ((capture + FRAME) as u32) * 960,
+        capture + FRAME,
+        10,
+        payload_toc_20ms(),
+    ));
+    let mut acc = UserPacketAccumulator::new(USER, TARGET);
+    let got = ingest_all(&mut acc, &records);
+    let decodes = got
+        .iter()
+        .filter(|r| r.disposition == PacketDisposition::Decode)
+        .count();
+    assert_eq!(decodes, 10, "got {:?}", got);
 }
 
 #[test]

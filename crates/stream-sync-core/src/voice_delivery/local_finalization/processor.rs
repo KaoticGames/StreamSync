@@ -4,7 +4,7 @@
 //! with a 1 MiB [`std::io::BufWriter`] and incremental SHA-256 over the exact on-disk bytes.
 //! Memory is bounded by per-writer buffers and the packet reorder window, not session duration.
 
-use super::accumulator::{lost_marker_span_samples, PacketDisposition, UserPacketAccumulator};
+use super::accumulator::{PacketDisposition, UserPacketAccumulator};
 use super::cancellation::{LocalFinalizationCancel, LocalFinalizationCancelled};
 use super::manifest::LocalFinalizationManifest;
 use super::opus_decode::StereoOpusDecoder;
@@ -206,6 +206,7 @@ impl UserWriter {
         record: &JournalRecord,
         disposition: PacketDisposition,
         placement: u64,
+        span_samples: Option<u64>,
     ) -> Result<(), LocalProcessorError> {
         match disposition {
             PacketDisposition::DiscardedDuplicate => {
@@ -218,10 +219,14 @@ impl UserWriter {
                 self.report.record_discarded(DiscardReason::OutOfWindow);
             }
             PacketDisposition::LostPlacement => {
-                let span = lost_marker_span_samples();
                 self.pad_silence_to(placement, StemSilenceReason::TimelineGap, 0)?;
-                let end = (placement + span).min(self.target_samples);
-                self.pad_silence_to(end, StemSilenceReason::JournalLossMarker, 1)?;
+                if let Some(span) = span_samples {
+                    let end = (placement + span).min(self.target_samples);
+                    self.pad_silence_to(end, StemSilenceReason::JournalLossMarker, 1)?;
+                } else {
+                    let end = (placement + 1).min(self.target_samples);
+                    self.pad_silence_to(end, StemSilenceReason::JournalLossMarker, 1)?;
+                }
             }
             PacketDisposition::Decode => {
                 if record.opus_payload.is_empty() {
@@ -233,7 +238,7 @@ impl UserWriter {
                     return Ok(());
                 }
                 self.pad_silence_to(placement, StemSilenceReason::TimelineGap, 0)?;
-                let mut pcm_buf = [0i16; 960 * 2];
+                let mut pcm_buf = [0i16; 5760 * 2];
                 match self.decoder.decode_packet(record, &mut pcm_buf) {
                     Ok(samples) => {
                         let frame_samples = samples as u64;
@@ -250,8 +255,11 @@ impl UserWriter {
                     }
                     Err(_) => {
                         self.report.record_discarded(DiscardReason::Other);
-                        let end = (placement + lost_marker_span_samples()).min(self.target_samples);
-                        self.pad_silence_to(end, StemSilenceReason::OpusDecodeFailed, 1)?;
+                        let recovery_span = span_samples.unwrap_or(0);
+                        if recovery_span > 0 {
+                            let end = (placement + recovery_span).min(self.target_samples);
+                            self.pad_silence_to(end, StemSilenceReason::OpusDecodeFailed, 1)?;
+                        }
                     }
                 }
             }
@@ -311,22 +319,31 @@ impl UserAccumulator {
             .ingest_timeline(record)
             .map_err(|e| LocalProcessorError::Fatal(format!("accumulator: {e:?}")))?;
         for pkt in ready {
-            let placement = pkt
-                .timeline_sample_start
-                .unwrap_or_else(|| self.packets.placement_samples(&pkt.record));
-            self.writer
-                .apply_packet(&pkt.record, pkt.disposition, placement)?;
+            self.apply_ready_packet(&pkt)?;
         }
         Ok(())
     }
 
+    fn apply_ready_packet(
+        &mut self,
+        pkt: &super::accumulator::ReadyPacket,
+    ) -> Result<(), LocalProcessorError> {
+        let placement = match pkt.timeline_sample_start {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        self.writer
+            .apply_packet(&pkt.record, pkt.disposition, placement, pkt.span_samples)?;
+        Ok(())
+    }
+
     fn flush_ready(&mut self) -> Result<(), LocalProcessorError> {
-        for pkt in self.packets.flush_remaining() {
-            let placement = pkt
-                .timeline_sample_start
-                .unwrap_or_else(|| self.packets.placement_samples(&pkt.record));
-            self.writer
-                .apply_packet(&pkt.record, pkt.disposition, placement)?;
+        let remaining = self
+            .packets
+            .flush_remaining()
+            .map_err(|e| LocalProcessorError::Fatal(format!("accumulator: {e:?}")))?;
+        for pkt in remaining {
+            self.apply_ready_packet(&pkt)?;
         }
         Ok(())
     }
@@ -730,12 +747,10 @@ mod tests {
         .unwrap();
         let staging = dir.path().join("staging");
         let out = process_verified_segments(&manifest, &[seg_path], &staging).unwrap();
-        assert_eq!(out.silence_range_count, 1);
         let report_text = std::fs::read_to_string(out.report_path.unwrap()).unwrap();
-        assert!(report_text.contains("normalTimelineSilenceSamples=4800"));
         assert!(report_text.contains("badPacketCount=1"));
-        assert!(report_text.contains("samples=4800-5760"));
-        assert!(!report_text.contains("samples=0-4800"));
+        assert!(report_text.contains("samples=4800-4801"));
+        assert!(report_text.contains("tail_padding"));
     }
 
     #[test]
@@ -765,10 +780,11 @@ mod tests {
         .unwrap();
         let staging = dir.path().join("staging");
         let out = process_verified_segments(&manifest, &[seg_path], &staging).unwrap();
-        assert_eq!(out.silence_range_count, 1);
+        assert_eq!(out.silence_range_count, 2);
         let report_text = std::fs::read_to_string(out.report_path.unwrap()).unwrap();
         assert!(report_text.contains("badPacketCount=2"));
-        assert!(report_text.contains("samples=0-1920"));
+        assert!(report_text.contains("samples=0-1"));
+        assert!(report_text.contains("samples=960-961"));
     }
 
     #[test]

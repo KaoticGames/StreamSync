@@ -11,7 +11,7 @@ pub const RTP_CAPTURE_GAP_TOLERANCE_SAMPLES: u64 = OPUS_FRAME_SAMPLES * 4;
 #[derive(Debug, Clone)]
 pub struct RtpPlacementContext {
     pub prior_raw_sequence: u16,
-    pub prior_extended_sequence: u64,
+    pub prior_extended_sequence: i64,
     pub prior_raw_rtp_timestamp: u32,
     pub prior_capture_offset_samples: u64,
     pub prior_arrived_at_ns: u64,
@@ -21,7 +21,7 @@ pub struct RtpPlacementContext {
 #[derive(Debug, Clone)]
 pub struct RtpCandidatePacket {
     pub raw_sequence: u16,
-    pub extended_sequence: u64,
+    pub extended_sequence: i64,
     pub rtp_timestamp: u32,
     pub capture_offset_samples: u64,
     pub arrived_at_ns: u64,
@@ -37,6 +37,7 @@ pub struct InferredRtpGenerationBoundary {
     pub capture_offset_samples: u64,
 }
 
+#[derive(Debug)]
 pub enum RtpDiscontinuityDecision {
     Gap { rtp_delta_samples: u64 },
     ImplicitGeneration,
@@ -81,7 +82,8 @@ pub fn arrival_ns_to_capture_samples(delta_ns: u64) -> u64 {
     if delta_ns == 0 {
         return 0;
     }
-    (delta_ns * RTP_CLOCK_HZ) / 1_000_000_000
+    let product = u128::from(delta_ns) * u128::from(RTP_CLOCK_HZ);
+    (product / 1_000_000_000) as u64
 }
 
 pub fn capture_and_arrival_coherent(capture_delta_samples: u64, arrival_delta_ns: u64) -> bool {
@@ -124,8 +126,8 @@ pub fn is_likely_rtp_timestamp_wrap_forward(
 pub fn has_sequence_discontinuity_evidence(
     prior_raw_sequence: u16,
     current_raw_sequence: u16,
-    prior_extended_sequence: u64,
-    current_extended_sequence: u64,
+    prior_extended_sequence: i64,
+    current_extended_sequence: i64,
 ) -> bool {
     let prior_raw = seq16(prior_raw_sequence);
     let raw = seq16(current_raw_sequence);
@@ -143,11 +145,12 @@ pub fn has_sequence_discontinuity_evidence(
     if ahead != 0 && ahead < 0x8000 && ahead <= REORDER_WINDOW_PACKETS {
         return false;
     }
-    let extended_behind = prior_extended_sequence - current_extended_sequence;
-    if extended_behind > u64::from(REORDER_WINDOW_PACKETS) {
+    let window = i64::from(REORDER_WINDOW_PACKETS);
+    let extended_delta = current_extended_sequence - prior_extended_sequence;
+    if extended_delta > window {
         return true;
     }
-    if current_extended_sequence > prior_extended_sequence + u64::from(REORDER_WINDOW_PACKETS) {
+    if extended_delta < -window {
         return true;
     }
     false
@@ -158,7 +161,17 @@ pub fn decide_rtp_timestamp_discontinuity(
     pkt: &RtpCandidatePacket,
 ) -> RtpDiscontinuityDecision {
     let rtp_delta = rtp_forward_delta(ctx.prior_raw_rtp_timestamp, pkt.rtp_timestamp);
-    let capture_delta = pkt.capture_offset_samples - ctx.prior_capture_offset_samples;
+    let capture_delta = match pkt
+        .capture_offset_samples
+        .checked_sub(ctx.prior_capture_offset_samples)
+    {
+        Some(d) => d,
+        None => {
+            return RtpDiscontinuityDecision::Refuse {
+                reason: "capture offset regressed across discontinuity".into(),
+            };
+        }
+    };
     let arrival_delta_ns = pkt.arrived_at_ns.saturating_sub(ctx.prior_arrived_at_ns);
 
     if is_likely_rtp_timestamp_wrap_forward(
@@ -217,12 +230,6 @@ pub fn decide_rtp_timestamp_discontinuity(
             };
         }
 
-        if use_capture_clocks && pkt.capture_offset_samples < ctx.prior_capture_offset_samples {
-            return RtpDiscontinuityDecision::Refuse {
-                reason: "capture offset regressed across inferred generation boundary".into(),
-            };
-        }
-
         let anchor = pkt
             .capture_offset_samples
             .max(ctx.prior_timeline_sample_end);
@@ -243,5 +250,50 @@ pub fn decide_rtp_timestamp_discontinuity(
 
     RtpDiscontinuityDecision::Gap {
         rtp_delta_samples: rtp_delta,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_regression_refused_before_unsigned_wrap() {
+        let ctx = RtpPlacementContext {
+            prior_raw_sequence: 10,
+            prior_extended_sequence: 10,
+            prior_raw_rtp_timestamp: 0,
+            prior_capture_offset_samples: 10_000,
+            prior_arrived_at_ns: 1_000_000,
+            prior_timeline_sample_end: 10_000,
+        };
+        let pkt = RtpCandidatePacket {
+            raw_sequence: 11,
+            extended_sequence: 11,
+            rtp_timestamp: 0,
+            capture_offset_samples: 5_000,
+            arrived_at_ns: 2_000_000,
+        };
+        let decision = decide_rtp_timestamp_discontinuity(&ctx, &pkt);
+        assert!(
+            matches!(decision, RtpDiscontinuityDecision::Refuse { .. }),
+            "expected refuse on capture regression, got {:?}",
+            decision
+        );
+    }
+
+    #[test]
+    fn extended_sequence_ahead_gap_is_discontinuity_evidence() {
+        assert!(has_sequence_discontinuity_evidence(0, 40, 0, 40));
+    }
+
+    #[test]
+    fn extended_sequence_behind_gap_is_discontinuity_evidence() {
+        assert!(has_sequence_discontinuity_evidence(100, 50, 100, 50));
+    }
+
+    #[test]
+    fn extended_sequence_negative_within_window_is_not_extended_discontinuity() {
+        assert!(!has_sequence_discontinuity_evidence(0, 65535, 0, -1));
     }
 }
