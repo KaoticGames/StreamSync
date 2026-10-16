@@ -102,6 +102,28 @@ impl LocalJournalStore {
         Ok(())
     }
 
+    pub fn segment_bytes_on_disk(&self, segment_seq: u32) -> Result<u64, JournalStoreError> {
+        let path = self.segment_path(segment_seq);
+        if !path.exists() {
+            return Ok(0);
+        }
+        Ok(std::fs::metadata(&path)?.len())
+    }
+
+    /// Resume offset for an in-progress segment: durable on-disk byte length (≤ expected).
+    /// Checkpoint values may lag or run ahead after a crash; only the file prefix is resumed.
+    pub fn reconcile_segment_resume_bytes(
+        &self,
+        segment_seq: u32,
+        expected_len: u64,
+    ) -> Result<u64, JournalStoreError> {
+        let actual = self.segment_bytes_on_disk(segment_seq)?;
+        if actual > expected_len {
+            return Err(JournalStoreError::Conflict);
+        }
+        Ok(actual)
+    }
+
     pub fn verify_segment_complete(
         &self,
         segment_seq: u32,
@@ -113,7 +135,11 @@ impl LocalJournalStore {
             return Ok(false);
         }
         let meta = std::fs::metadata(&path)?;
-        if meta.len() != expected_len {
+        let len = meta.len();
+        if len < expected_len {
+            return Ok(false);
+        }
+        if len > expected_len {
             return Err(JournalStoreError::Conflict);
         }
         let file = File::open(&path)?;
@@ -244,6 +270,100 @@ mod preflight_tests {
                 recovery_report_relative_path: crate::voice_delivery::recovery_report::RECOVERY_REPORT_RELATIVE_PATH.into(),
             },
         }
+    }
+
+    fn open_test_store(dir: &Path) -> LocalJournalStore {
+        LocalJournalStore::open(dir, "test-session").expect("open store")
+    }
+
+    fn write_segment(store: &LocalJournalStore, seq: u32, bytes: &[u8]) {
+        let path = store.segment_path(seq);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn zero_byte_segment_is_incomplete_not_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        write_segment(&store, 0, &[]);
+        assert!(!store
+            .verify_segment_complete(0, 100, &"a".repeat(64))
+            .unwrap());
+        assert_eq!(store.reconcile_segment_resume_bytes(0, 100).unwrap(), 0);
+    }
+
+    #[test]
+    fn partial_segment_resumes_from_file_length() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let partial = vec![0u8; 50];
+        write_segment(&store, 0, &partial);
+        assert!(!store
+            .verify_segment_complete(0, 100, &"a".repeat(64))
+            .unwrap());
+        assert_eq!(store.reconcile_segment_resume_bytes(0, 100).unwrap(), 50);
+    }
+
+    #[test]
+    fn stale_checkpoint_reconciles_to_shorter_on_disk_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        write_segment(&store, 0, &[1, 2, 3]);
+        let cp = DownloadCheckpoint {
+            segments: vec![SegmentCheckpoint {
+                segment_seq: 0,
+                bytes_complete: 9_999,
+                sha256: None,
+                complete: false,
+            }],
+        };
+        store.save_checkpoint(&cp).unwrap();
+        assert_eq!(store.reconcile_segment_resume_bytes(0, 100).unwrap(), 3);
+    }
+
+    #[test]
+    fn overlength_segment_is_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        write_segment(&store, 0, &[0; 101]);
+        assert!(matches!(
+            store.verify_segment_complete(0, 100, &"a".repeat(64)),
+            Err(JournalStoreError::Conflict)
+        ));
+        assert!(matches!(
+            store.reconcile_segment_resume_bytes(0, 100),
+            Err(JournalStoreError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn exact_length_wrong_hash_is_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let body = b"hello segment";
+        write_segment(&store, 0, body);
+        let sha = sha256_hex_reader(std::io::Cursor::new(body), DEFAULT_STREAM_CHUNK).unwrap();
+        assert!(matches!(
+            store.verify_segment_complete(0, body.len() as u64, &"0".repeat(64)),
+            Err(JournalStoreError::Conflict)
+        ));
+        assert!(store
+            .verify_segment_complete(0, body.len() as u64, &sha)
+            .unwrap());
+    }
+
+    #[test]
+    fn open_segment_writer_clears_zero_byte_file_on_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let _ = store.open_segment_writer(0, false).unwrap();
+        assert_eq!(store.segment_bytes_on_disk(0).unwrap(), 0);
+        let _ = store.open_segment_writer(0, false).unwrap();
+        assert!(!store.segment_path(0).exists() || store.segment_bytes_on_disk(0).unwrap() == 0);
+        assert!(!store
+            .verify_segment_complete(0, 10, &"a".repeat(64))
+            .unwrap());
     }
 
     #[test]

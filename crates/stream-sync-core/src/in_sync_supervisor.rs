@@ -290,6 +290,30 @@ fn blocking_supervisor_cycle(state: &AppState) -> Result<Duration, String> {
                 );
                 break;
             }
+            Err(LocalOrchestratorError::StoreConflict) => {
+                warn!(
+                    "in-sync supervisor: session {session_id} journal store conflict; deferred until Process now"
+                );
+                let events = orch.drain_events();
+                if !events.is_empty() {
+                    let mut sink = state.in_sync_progress_events.blocking_write();
+                    sink.extend(events);
+                }
+                let mut q = state.in_sync_manual_queue.blocking_write();
+                q.retain(|id| id != &session_id);
+                state
+                    .in_sync_storage_deferred
+                    .blocking_write()
+                    .insert(session_id.clone());
+                update_local_runtime_blocking(
+                    state,
+                    LocalFinalizationPhase::Quarantined,
+                    Some(session_id),
+                    None,
+                    None,
+                );
+                break;
+            }
             Err(e) => {
                 warn!("in-sync supervisor: session {session_id} failed: {e}");
                 let events = orch.drain_events();
