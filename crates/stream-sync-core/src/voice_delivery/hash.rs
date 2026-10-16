@@ -66,6 +66,10 @@ impl LiveSha256 {
     pub fn prefix_digest_hex(&self) -> String {
         hex_digest(&self.hasher.clone().finalize())
     }
+
+    pub fn finish_hex(self) -> String {
+        hex_digest(&self.hasher.finalize())
+    }
 }
 
 impl Default for LiveSha256 {

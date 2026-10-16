@@ -9,7 +9,10 @@ use super::manifest::{
     compute_local_finalization_manifest_digest, local_manifest_to_syndicate_finalized,
     LocalFinalizationManifest,
 };
-use super::processor::process_verified_segments;
+use super::processor::{
+    process_verified_segments_with_options, LocalProcessorError, LocalProcessorOptions,
+    LocalProcessorProgress,
+};
 use super::progress::{LocalFinalizationPhase, LocalFinalizationProgressEvent};
 use super::receipt::{
     assert_local_finalization_receipt_matches_manifest, LocalFinalizationReceipt,
@@ -76,7 +79,7 @@ pub struct LocalFinalizationOrchestrator {
     parent: PathBuf,
     device_id: String,
     phase: Mutex<LocalFinalizationPhase>,
-    events: Mutex<Vec<LocalFinalizationProgressEvent>>,
+    events: Arc<Mutex<Vec<LocalFinalizationProgressEvent>>>,
     controls: LocalFinalizationControls,
 }
 
@@ -94,7 +97,7 @@ impl LocalFinalizationOrchestrator {
             parent: parent.to_path_buf(),
             device_id: device_id.into(),
             phase: Mutex::new(LocalFinalizationPhase::Queued),
-            events: Mutex::new(Vec::new()),
+            events: Arc::new(Mutex::new(Vec::new())),
             controls,
         }
     }
@@ -232,8 +235,31 @@ impl LocalFinalizationOrchestrator {
                 .map(|s| store.segment_path(s.segment_seq))
                 .collect();
             self.ensure_lease_alive(&lease)?;
-            let output = process_verified_segments(&manifest, &segment_paths, &staging)
-                .map_err(|e| LocalOrchestratorError::Processor(e.to_string()))?;
+            let session_id = manifest.session_id.clone();
+            let orch_events = Arc::clone(&self.events);
+            let progress_sink = Arc::new(move |p: LocalProcessorProgress| {
+                if p.processed_segments == 0 {
+                    return;
+                }
+                orch_events.lock().unwrap().push(
+                    LocalFinalizationProgressEvent::TimelineProgress {
+                        session_id: session_id.clone(),
+                        processed_segments: p.processed_segments,
+                        total_segments: p.total_segments,
+                    },
+                );
+            });
+            let output = process_verified_segments_with_options(
+                &manifest,
+                &segment_paths,
+                &staging,
+                LocalProcessorOptions {
+                    cancel: Some(self.controls.cancel.clone()),
+                    paused: Some(self.controls.paused.clone()),
+                    progress: Some(progress_sink),
+                },
+            )
+            .map_err(map_processor_err)?;
             self.ensure_lease_alive(&lease)?;
             self.publish_and_receipt(
                 client,
@@ -250,6 +276,10 @@ impl LocalFinalizationOrchestrator {
 
         if matches!(&run_result, Err(LocalOrchestratorError::Paused)) {
             lease.stop_keeper();
+            if self.controls.release_lease_on_pause.load(Ordering::SeqCst) {
+                let _ =
+                    client.release_delivery(&pending.session_id, &self.device_id, lease.proof());
+            }
             return run_result;
         }
         if run_result.is_err() && !lease.receipt_posted {
@@ -494,6 +524,14 @@ impl LocalFinalizationOrchestrator {
 impl From<LocalFinalizationCancelled> for LocalOrchestratorError {
     fn from(_: LocalFinalizationCancelled) -> Self {
         LocalOrchestratorError::Cancelled
+    }
+}
+
+fn map_processor_err(e: LocalProcessorError) -> LocalOrchestratorError {
+    match e {
+        LocalProcessorError::Cancelled => LocalOrchestratorError::Cancelled,
+        LocalProcessorError::Paused => LocalOrchestratorError::Paused,
+        other => LocalOrchestratorError::Processor(other.to_string()),
     }
 }
 
