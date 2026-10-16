@@ -63,3 +63,7 @@ serde_json.workspace = true
 [[example]]
 name = "host_embed"
 path = "examples/host_embed.rs"
+
+[[example]]
+name = "local_journal_forensics"
+path = "examples/local_journal_forensics.rs"

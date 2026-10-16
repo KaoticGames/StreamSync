@@ -4,6 +4,7 @@ mod accumulator;
 mod cancellation;
 mod client;
 mod contract;
+mod journal_forensics;
 mod journal_store;
 mod lease_keeper;
 mod local_publication;
@@ -26,6 +27,10 @@ pub use contract::{
     parse_lease_renew_release_body, parse_local_claim_response, parse_local_pending_response,
     LeaseGrant, LeaseProof, LEASE_GENERATION_HEADER, LEASE_TOKEN_HEADER,
 };
+pub use journal_forensics::{
+    analyze_local_journal_session, build_minimal_manifest_json, forensics_report_to_json,
+    render_forensics_table, LocalJournalForensicsReport,
+};
 pub use journal_store::LocalJournalStore;
 pub use local_publication::{resolve_published_paths, PublishedLocalOutput};
 pub use manifest::{
@@ -46,3 +51,6 @@ pub use receipt::{
     LocalFinalizationReceipt,
 };
 pub use storage_preflight::{bytes_to_gib, StoragePreflightFailure};
+pub use synj::{
+    encode_journal_file, encode_journal_record, JournalRecord, JOURNAL_FORMAT_VERSION_V2,
+};
