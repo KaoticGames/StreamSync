@@ -3,7 +3,7 @@
 use super::cancellation::{LocalFinalizationCancel, LocalFinalizationCancelled};
 use super::client::{LocalFinalizationClient, LocalPendingItem};
 use super::contract::{sealed_at_rfc3339_from_ms, LeaseGrant, LeaseProof};
-use super::journal_store::{DownloadCheckpoint, LocalJournalStore, SegmentCheckpoint};
+use super::journal_store::{JournalStoreError, LocalJournalStore, SegmentCheckpoint};
 use super::lease_keeper::LeaseKeeper;
 use super::manifest::{
     compute_local_finalization_manifest_digest, local_manifest_to_syndicate_finalized,
@@ -43,6 +43,8 @@ pub enum LocalOrchestratorError {
     Client(#[from] VoiceV2ClientError),
     #[error("store: {0}")]
     Store(String),
+    #[error("journal store conflict")]
+    StoreConflict,
     #[error("processor: {0}")]
     Processor(String),
     #[error("orchestrator: {0}")]
@@ -206,10 +208,10 @@ impl LocalFinalizationOrchestrator {
             }
 
             let store = LocalJournalStore::open(&self.parent, &manifest.session_id)
-                .map_err(|e| LocalOrchestratorError::Store(e.to_string()))?;
+                .map_err(map_journal_store_err)?;
             store
                 .persist_manifest(&manifest)
-                .map_err(|e| LocalOrchestratorError::Store(e.to_string()))?;
+                .map_err(map_journal_store_err)?;
             self.emit(LocalFinalizationProgressEvent::JournalReady {
                 session_id: manifest.session_id.clone(),
             });
@@ -271,9 +273,7 @@ impl LocalFinalizationOrchestrator {
         {
             return Err(LocalOrchestratorError::StoragePreflight(pref));
         }
-        let mut checkpoint = store
-            .load_checkpoint()
-            .map_err(|e| LocalOrchestratorError::Store(e.to_string()))?;
+        let mut checkpoint = store.load_checkpoint().map_err(map_journal_store_err)?;
         if checkpoint.segments.is_empty() {
             checkpoint.segments = manifest
                 .segments
@@ -291,7 +291,7 @@ impl LocalFinalizationOrchestrator {
             self.ensure_lease_alive(lease)?;
             if store
                 .verify_segment_complete(seg.segment_seq, seg.byte_length, &seg.sha256)
-                .map_err(|e| LocalOrchestratorError::Store(e.to_string()))?
+                .map_err(map_journal_store_err)?
             {
                 self.emit(LocalFinalizationProgressEvent::SegmentVerified {
                     session_id: manifest.session_id.clone(),
@@ -299,19 +299,28 @@ impl LocalFinalizationOrchestrator {
                 });
                 continue;
             }
-            let mut offset = checkpoint
+            let mut offset = store
+                .reconcile_segment_resume_bytes(seg.segment_seq, seg.byte_length)
+                .map_err(map_journal_store_err)?;
+            if let Some(entry) = checkpoint
                 .segments
-                .iter()
+                .iter_mut()
                 .find(|c| c.segment_seq == seg.segment_seq)
-                .map(|c| c.bytes_complete)
-                .unwrap_or(0);
+            {
+                if entry.bytes_complete != offset {
+                    entry.bytes_complete = offset;
+                    store
+                        .save_checkpoint(&checkpoint)
+                        .map_err(map_journal_store_err)?;
+                }
+            }
             while offset < seg.byte_length {
                 self.check_pause_cancel(client, &manifest.session_id, lease)?;
                 self.ensure_lease_alive(lease)?;
                 let chunk = (seg.byte_length - offset).min(CHUNK);
                 let mut file = store
                     .open_segment_writer(seg.segment_seq, offset > 0)
-                    .map_err(|e| LocalOrchestratorError::Store(e.to_string()))?;
+                    .map_err(map_journal_store_err)?;
                 if offset > 0 {
                     file.seek(std::io::SeekFrom::End(0))
                         .map_err(|e| LocalOrchestratorError::Store(e.to_string()))?;
@@ -344,15 +353,13 @@ impl LocalFinalizationOrchestrator {
                 }
                 store
                     .save_checkpoint(&checkpoint)
-                    .map_err(|e| LocalOrchestratorError::Store(e.to_string()))?;
+                    .map_err(map_journal_store_err)?;
             }
             if !store
                 .verify_segment_complete(seg.segment_seq, seg.byte_length, &seg.sha256)
-                .map_err(|e| LocalOrchestratorError::Store(e.to_string()))?
+                .map_err(map_journal_store_err)?
             {
-                return Err(LocalOrchestratorError::Store(
-                    "segment hash mismatch".into(),
-                ));
+                return Err(LocalOrchestratorError::StoreConflict);
             }
             if let Some(entry) = checkpoint
                 .segments
@@ -364,7 +371,7 @@ impl LocalFinalizationOrchestrator {
             }
             store
                 .save_checkpoint(&checkpoint)
-                .map_err(|e| LocalOrchestratorError::Store(e.to_string()))?;
+                .map_err(map_journal_store_err)?;
             self.emit(LocalFinalizationProgressEvent::SegmentVerified {
                 session_id: manifest.session_id.clone(),
                 segment_seq: seg.segment_seq,
@@ -483,6 +490,13 @@ impl LocalFinalizationOrchestrator {
 impl From<LocalFinalizationCancelled> for LocalOrchestratorError {
     fn from(_: LocalFinalizationCancelled) -> Self {
         LocalOrchestratorError::Cancelled
+    }
+}
+
+fn map_journal_store_err(e: JournalStoreError) -> LocalOrchestratorError {
+    match e {
+        JournalStoreError::Conflict => LocalOrchestratorError::StoreConflict,
+        other => LocalOrchestratorError::Store(other.to_string()),
     }
 }
 

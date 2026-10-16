@@ -15,16 +15,22 @@ const R2_HOST_SUFFIX: &str = ".r2.cloudflarestorage.com";
 pub const STRIPPED_ON_STEM_REDIRECT: &[&str] =
     &["authorization", "cookie", "x-stream-sync-control-token"];
 
+fn is_valid_r2_dns_label(label: &str) -> bool {
+    !label.is_empty()
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// True for `*.r2.cloudflarestorage.com` with one or more valid DNS labels before the suffix
+/// (e.g. virtual-hosted `bucket.account.r2.cloudflarestorage.com`).
 pub fn is_allowed_r2_host(host: &str) -> bool {
     let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
     if !h.ends_with(R2_HOST_SUFFIX) {
         return false;
     }
-    let account = h.strip_suffix(R2_HOST_SUFFIX).unwrap_or("");
-    !account.is_empty()
-        && account
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    let prefix = h.strip_suffix(R2_HOST_SUFFIX).unwrap_or("");
+    !prefix.is_empty() && prefix.split('.').all(is_valid_r2_dns_label)
 }
 
 fn allowlist_permits_host_port(allowlist: &[String], host: &str, port: u16) -> bool {
@@ -109,8 +115,35 @@ mod redirect_unit_tests {
     #[test]
     fn r2_host_pattern_accepts_account_subdomain() {
         assert!(is_allowed_r2_host("abc123.r2.cloudflarestorage.com"));
+        assert!(is_allowed_r2_host(
+            "my-bucket.a1b2c3d4.r2.cloudflarestorage.com"
+        ));
         assert!(!is_allowed_r2_host("evil.com"));
         assert!(!is_allowed_r2_host(".r2.cloudflarestorage.com"));
+        assert!(!is_allowed_r2_host("r2.cloudflarestorage.com"));
+        assert!(!is_allowed_r2_host("-bad.r2.cloudflarestorage.com"));
+        assert!(!is_allowed_r2_host("bad-.r2.cloudflarestorage.com"));
+        assert!(!is_allowed_r2_host(
+            "bucket..account.r2.cloudflarestorage.com"
+        ));
+        assert!(!is_allowed_r2_host(
+            "evil.r2.cloudflarestorage.com.attacker.example"
+        ));
+    }
+
+    #[test]
+    fn r2_virtual_host_bucket_account_accepted_in_redirect() {
+        let url = validate_stem_redirect_location(
+            "https://mybucket.myaccountid.r2.cloudflarestorage.com/stem/key",
+            "https://api.example.com",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            url.host_str(),
+            Some("mybucket.myaccountid.r2.cloudflarestorage.com")
+        );
     }
 
     #[test]
