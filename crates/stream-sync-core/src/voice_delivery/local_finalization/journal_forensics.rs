@@ -171,7 +171,11 @@ fn journal_record_from_meta(meta: &JournalRecordMeta) -> JournalRecord {
         opus_payload: if payload_len == 0 {
             Vec::new()
         } else {
-            vec![0xAB; payload_len]
+            let mut p = vec![0x08, 0x01];
+            if payload_len > 2 {
+                p.resize(payload_len, 0x01);
+            }
+            p
         },
     }
 }
@@ -445,7 +449,7 @@ fn analyze_user(
         last_seq_by_epoch.insert(rec.meta.ssrc_epoch, rec.meta.sequence);
     }
 
-    let mut acc = UserPacketAccumulator::default();
+    let mut acc = UserPacketAccumulator::new(&discord_user_id, target_samples);
     let mut counts = AccumulatorDispositionCounts {
         decode: 0,
         lost_placement: 0,
@@ -462,7 +466,7 @@ fn analyze_user(
 
     for rec in rows {
         let jr = journal_record_from_meta(&rec.meta);
-        let ready = acc.ingest(jr);
+        let ready = acc.ingest_timeline(jr).unwrap_or_else(|_| Vec::new());
         for pkt in ready {
             track_emitted(
                 &pkt,
@@ -558,7 +562,9 @@ fn track_emitted(
     emitted_capture_max_after_transition: &mut Option<u64>,
     emitted_in_later_epochs: &mut u64,
 ) {
-    let placement = acc.placement_samples(&pkt.record);
+    let placement = pkt
+        .timeline_sample_start
+        .unwrap_or_else(|| acc.placement_samples(&pkt.record));
     let end = placement + span_for_disposition(pkt.disposition);
     if first_emitted.is_none() {
         *first_emitted = Some(placement);

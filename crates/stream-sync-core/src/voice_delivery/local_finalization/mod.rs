@@ -10,15 +10,21 @@ mod lease_keeper;
 mod local_publication;
 mod manifest;
 mod opus_decode;
+mod opus_packet_duration;
 mod orchestrator;
 mod paths;
 mod processor;
 mod progress;
 mod receipt;
 mod report;
+mod rtp_generation_inference;
 mod storage_preflight;
 mod synj;
 
+pub use accumulator::{
+    lost_marker_span_samples, AccumulatorError, PacketDisposition, ReadyPacket,
+    UserPacketAccumulator,
+};
 pub use cancellation::{LocalFinalizationCancel, LocalFinalizationCancelled};
 pub use client::{
     HttpLocalFinalizationClient, LocalFinalizationClient, LocalPendingItem, LOCAL_PENDING_PATH,

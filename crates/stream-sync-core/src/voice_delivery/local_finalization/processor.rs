@@ -306,9 +306,14 @@ struct UserAccumulator {
 
 impl UserAccumulator {
     fn ingest(&mut self, record: JournalRecord) -> Result<(), LocalProcessorError> {
-        let ready = self.packets.ingest(record);
+        let ready = self
+            .packets
+            .ingest_timeline(record)
+            .map_err(|e| LocalProcessorError::Fatal(format!("accumulator: {e:?}")))?;
         for pkt in ready {
-            let placement = self.packets.placement_samples(&pkt.record);
+            let placement = pkt
+                .timeline_sample_start
+                .unwrap_or_else(|| self.packets.placement_samples(&pkt.record));
             self.writer
                 .apply_packet(&pkt.record, pkt.disposition, placement)?;
         }
@@ -317,7 +322,9 @@ impl UserAccumulator {
 
     fn flush_ready(&mut self) -> Result<(), LocalProcessorError> {
         for pkt in self.packets.flush_remaining() {
-            let placement = self.packets.placement_samples(&pkt.record);
+            let placement = pkt
+                .timeline_sample_start
+                .unwrap_or_else(|| self.packets.placement_samples(&pkt.record));
             self.writer
                 .apply_packet(&pkt.record, pkt.disposition, placement)?;
         }
@@ -360,7 +367,7 @@ pub fn process_verified_segments_with_options(
             user.discord_user_id.clone(),
             UserAccumulator {
                 writer,
-                packets: UserPacketAccumulator::default(),
+                packets: UserPacketAccumulator::new(&user.discord_user_id, target),
             },
         );
     }
@@ -693,8 +700,8 @@ mod tests {
             discord_user_id: user_id.into(),
             ssrc_epoch: 1,
             sequence,
-            rtp_timestamp: 0,
-            arrived_at_ns: 0,
+            rtp_timestamp: u32::from(sequence) * 960,
+            arrived_at_ns: u64::from(sequence) * 20_000_000,
             session_capture_offset_samples: Some(placement),
             opus_payload: vec![],
         }

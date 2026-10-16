@@ -34,13 +34,17 @@ fn sample_record(
         opus_payload: if payload_len == 0 {
             Vec::new()
         } else {
-            vec![0xFE; payload_len]
+            let mut p = vec![0x08, 0x01];
+            if payload_len > 2 {
+                p.resize(payload_len, 0x01);
+            }
+            p
         },
     }
 }
 
 #[test]
-fn two_epochs_trigger_local_epoch_frontier_stall() {
+fn two_epochs_do_not_stall_after_accumulator_parity() {
     let dir = tempfile::tempdir().unwrap();
     let user = "123456789012345678";
     let records = vec![
@@ -61,13 +65,47 @@ fn two_epochs_trigger_local_epoch_frontier_stall() {
         .iter()
         .find(|u| u.path_nick == "player")
         .unwrap();
-    assert!(u.local_epoch_frontier_stall);
-    assert!(u
-        .diagnostics
-        .iter()
-        .any(|d| d == "LOCAL_EPOCH_FRONTIER_STALL"));
+    assert!(!u.local_epoch_frontier_stall);
     assert_eq!(u.distinct_ssrc_epochs, 2);
-    assert_eq!(u.accumulator.discarded_duplicate, 0);
+    assert_eq!(u.accumulator.decode, 4);
+    assert_eq!(u.accumulator.discarded_out_of_window, 0);
+}
+
+#[test]
+fn production_shaped_multi_wrap_epoch_fixture_no_mass_discard() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = "123456789012345678";
+    let mut records = Vec::new();
+    let mut seq = 65530u16;
+    let mut capture = 0u64;
+    for _ in 0..8 {
+        records.push(sample_record(user, 1, seq, capture, 120));
+        capture += 960;
+        seq = seq.wrapping_add(1);
+    }
+    records.push(sample_record(user, 2, 0, capture, 120));
+    records.push(sample_record(user, 2, 1, capture + 960, 120));
+    records.push(sample_record(user, 2, 2, capture + 1920, 120));
+    write_session(
+        dir.path(),
+        "550e8400-e29b-41d4-a716-446655440005",
+        &[("123456789012345678", "wrap_epoch")],
+        &records,
+    );
+    let report = analyze_local_journal_session(dir.path()).unwrap();
+    let u = report
+        .users
+        .iter()
+        .find(|u| u.path_nick == "wrap_epoch")
+        .unwrap();
+    assert!(!u.local_epoch_frontier_stall);
+    let total_nonempty = u.nonempty_payload_records;
+    let emitted = u.accumulator.decode + u.accumulator.lost_placement;
+    assert_eq!(emitted, total_nonempty);
+    let drops = u.accumulator.discarded_duplicate
+        + u.accumulator.discarded_conflict
+        + u.accumulator.discarded_out_of_window;
+    assert_eq!(drops, 0);
 }
 
 #[test]

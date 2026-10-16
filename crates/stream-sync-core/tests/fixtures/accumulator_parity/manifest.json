@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "description": "Deterministic accumulator parity scenarios (synthetic payloads only; no production bytes).",
+  "payloadToc20ms": [8, 1],
+  "payloadFramingSkip": [11, 0]
+}
