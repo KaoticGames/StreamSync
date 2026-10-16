@@ -10,6 +10,9 @@ use thiserror::Error;
 
 pub const IN_SYNC_DIR: &str = ".in-sync";
 const CHECKPOINT_FILE: &str = "download-checkpoint.json";
+const CHECKPOINT_BAK_FILE: &str = "download-checkpoint.json.bak";
+/// Legacy fixed temp from immutable `write_atomic` (`download-checkpoint.json` → `.tmp` extension).
+const CHECKPOINT_LEGACY_TMP: &str = "download-checkpoint.tmp";
 const MANIFEST_FILE: &str = "manifest.json";
 const SEGMENTS_DIR: &str = "journal/segments";
 
@@ -81,24 +84,85 @@ impl LocalJournalStore {
     }
 
     pub fn load_checkpoint(&self) -> Result<DownloadCheckpoint, JournalStoreError> {
-        let path = self.session_root.join(CHECKPOINT_FILE);
-        if !path.exists() {
-            return Ok(DownloadCheckpoint {
-                segments: Vec::new(),
-            });
+        let primary = self.session_root.join(CHECKPOINT_FILE);
+        let backup = self.session_root.join(CHECKPOINT_BAK_FILE);
+
+        if primary.exists() {
+            if let Ok(cp) = parse_checkpoint_file(&primary) {
+                cleanup_legacy_checkpoint_tmp(&self.session_root)?;
+                return Ok(cp);
+            }
         }
-        let raw = std::fs::read_to_string(&path)?;
-        serde_json::from_str(&raw).map_err(|e| JournalStoreError::Other(e.to_string()))
+
+        if backup.exists() {
+            match parse_checkpoint_file(&backup) {
+                Ok(cp) => {
+                    if primary.exists() {
+                        std::fs::remove_file(&primary)?;
+                    }
+                    std::fs::rename(&backup, &primary)?;
+                    sync_dir(&self.session_root)?;
+                    cleanup_legacy_checkpoint_tmp(&self.session_root)?;
+                    return Ok(cp);
+                }
+                Err(_) if primary.exists() => return Err(JournalStoreError::Conflict),
+                Err(e) => return Err(e),
+            }
+        }
+
+        if primary.exists() {
+            return Err(JournalStoreError::Conflict);
+        }
+
+        cleanup_legacy_checkpoint_tmp(&self.session_root)?;
+        Ok(DownloadCheckpoint {
+            segments: Vec::new(),
+        })
     }
 
     pub fn save_checkpoint(
         &self,
         checkpoint: &DownloadCheckpoint,
     ) -> Result<(), JournalStoreError> {
-        let path = self.session_root.join(CHECKPOINT_FILE);
         let json = serde_json::to_string_pretty(checkpoint)
             .map_err(|e| JournalStoreError::Other(e.to_string()))?;
-        write_atomic(&path, json.as_bytes())?;
+        let unique_tmp = self
+            .session_root
+            .join(format!("download-checkpoint.{}.tmp", uuid::Uuid::new_v4()));
+        {
+            let mut f = File::create(&unique_tmp)?;
+            f.write_all(json.as_bytes())?;
+            f.sync_all()?;
+        }
+        checkpoint_commit_replace(&self.session_root, &unique_tmp)?;
+        Ok(())
+    }
+
+    /// Bounded checkpoint shape vs manifest: unique known segment seqs, bytes ≤ expected.
+    /// On-disk segment length and full-file SHA remain authoritative at resume/verify time.
+    pub fn validate_checkpoint_against_manifest(
+        checkpoint: &DownloadCheckpoint,
+        manifest: &LocalFinalizationManifest,
+    ) -> Result<(), JournalStoreError> {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for entry in &checkpoint.segments {
+            if !seen.insert(entry.segment_seq) {
+                return Err(JournalStoreError::Conflict);
+            }
+            let expected = manifest
+                .segments
+                .iter()
+                .find(|s| s.segment_seq == entry.segment_seq);
+            match expected {
+                None => return Err(JournalStoreError::Conflict),
+                Some(seg) => {
+                    if entry.bytes_complete > seg.byte_length {
+                        return Err(JournalStoreError::Conflict);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -203,6 +267,56 @@ impl LocalJournalStore {
     ) -> Result<(), StoragePreflightFailure> {
         let required = Self::disk_preflight_bytes(manifest, reserve)?;
         storage_preflight(recording_parent, required)
+    }
+}
+
+fn parse_checkpoint_file(path: &Path) -> Result<DownloadCheckpoint, JournalStoreError> {
+    let raw = std::fs::read_to_string(path)?;
+    serde_json::from_str(&raw).map_err(|e| JournalStoreError::Other(e.to_string()))
+}
+
+fn cleanup_legacy_checkpoint_tmp(session_root: &Path) -> Result<(), JournalStoreError> {
+    let legacy = session_root.join(CHECKPOINT_LEGACY_TMP);
+    if legacy.exists() {
+        std::fs::remove_file(&legacy)?;
+    }
+    Ok(())
+}
+
+/// Durable checkpoint replacement: unique temp → primary, prior primary → `.bak`.
+/// On commit failure restores `.bak` to primary when primary is absent.
+fn checkpoint_commit_replace(
+    session_root: &Path,
+    unique_tmp: &Path,
+) -> Result<(), JournalStoreError> {
+    let primary = session_root.join(CHECKPOINT_FILE);
+    let backup = session_root.join(CHECKPOINT_BAK_FILE);
+
+    if backup.exists() {
+        std::fs::remove_file(&backup)?;
+    }
+
+    let rotated_primary_to_bak = if primary.exists() {
+        std::fs::rename(&primary, &backup)?;
+        true
+    } else {
+        false
+    };
+
+    match std::fs::rename(unique_tmp, &primary) {
+        Ok(()) => {
+            sync_dir(session_root)?;
+            let _ = std::fs::remove_file(unique_tmp);
+            Ok(())
+        }
+        Err(e) => {
+            if rotated_primary_to_bak && !primary.exists() && backup.exists() {
+                let _ = std::fs::rename(&backup, &primary);
+                let _ = sync_dir(session_root);
+            }
+            let _ = std::fs::remove_file(unique_tmp);
+            Err(JournalStoreError::Io(e))
+        }
     }
 }
 
@@ -364,6 +478,161 @@ mod preflight_tests {
         assert!(!store
             .verify_segment_complete(0, 10, &"a".repeat(64))
             .unwrap());
+    }
+
+    fn sample_checkpoint(bytes_complete: u64) -> DownloadCheckpoint {
+        DownloadCheckpoint {
+            segments: vec![SegmentCheckpoint {
+                segment_seq: 0,
+                bytes_complete,
+                sha256: None,
+                complete: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn checkpoint_first_save_and_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let cp = sample_checkpoint(12);
+        store.save_checkpoint(&cp).unwrap();
+        let loaded = store.load_checkpoint().unwrap();
+        assert_eq!(loaded.segments[0].bytes_complete, 12);
+        assert!(store.session_root().join(CHECKPOINT_FILE).exists());
+    }
+
+    #[test]
+    fn checkpoint_second_save_replaces_without_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        store.save_checkpoint(&sample_checkpoint(1)).unwrap();
+        store.save_checkpoint(&sample_checkpoint(99)).unwrap();
+        let loaded = store.load_checkpoint().unwrap();
+        assert_eq!(loaded.segments[0].bytes_complete, 99);
+        assert!(store.session_root().join(CHECKPOINT_BAK_FILE).exists());
+    }
+
+    #[test]
+    fn checkpoint_stale_legacy_tmp_ignored_when_primary_valid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        store.save_checkpoint(&sample_checkpoint(5)).unwrap();
+        let legacy = store.session_root().join(CHECKPOINT_LEGACY_TMP);
+        std::fs::write(&legacy, b"not authoritative").unwrap();
+        let loaded = store.load_checkpoint().unwrap();
+        assert_eq!(loaded.segments[0].bytes_complete, 5);
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn checkpoint_load_promotes_valid_bak_when_primary_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let root = store.session_root();
+        let json = serde_json::to_string_pretty(&sample_checkpoint(42)).unwrap();
+        std::fs::write(root.join(CHECKPOINT_BAK_FILE), json).unwrap();
+        let loaded = store.load_checkpoint().unwrap();
+        assert_eq!(loaded.segments[0].bytes_complete, 42);
+        assert!(root.join(CHECKPOINT_FILE).exists());
+        assert!(!root.join(CHECKPOINT_BAK_FILE).exists());
+    }
+
+    #[test]
+    fn checkpoint_load_promotes_valid_bak_when_primary_corrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let root = store.session_root();
+        std::fs::write(root.join(CHECKPOINT_FILE), b"{not json").unwrap();
+        let json = serde_json::to_string_pretty(&sample_checkpoint(7)).unwrap();
+        std::fs::write(root.join(CHECKPOINT_BAK_FILE), json).unwrap();
+        let loaded = store.load_checkpoint().unwrap();
+        assert_eq!(loaded.segments[0].bytes_complete, 7);
+    }
+
+    #[test]
+    fn checkpoint_load_fails_when_primary_and_bak_invalid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let root = store.session_root();
+        std::fs::write(root.join(CHECKPOINT_FILE), b"{bad").unwrap();
+        std::fs::write(root.join(CHECKPOINT_BAK_FILE), b"{also bad").unwrap();
+        assert!(matches!(
+            store.load_checkpoint(),
+            Err(JournalStoreError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_commit_failure_restores_primary_from_bak() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let root = store.session_root();
+        let v1 = serde_json::to_string_pretty(&sample_checkpoint(11)).unwrap();
+        std::fs::write(root.join(CHECKPOINT_FILE), v1).unwrap();
+        let missing_tmp = root.join("download-checkpoint.nope.tmp");
+        let err = checkpoint_commit_replace(root, &missing_tmp);
+        assert!(err.is_err());
+        assert!(root.join(CHECKPOINT_FILE).exists());
+        let loaded = store.load_checkpoint().unwrap();
+        assert_eq!(loaded.segments[0].bytes_complete, 11);
+    }
+
+    #[test]
+    fn validate_checkpoint_rejects_unknown_segment_and_duplicate_seq() {
+        let manifest = minimal_manifest(
+            vec![LocalFinalizationSegment {
+                segment_seq: 0,
+                key: "k".into(),
+                byte_length: 100,
+                sha256: "s".into(),
+            }],
+            1,
+        );
+        let dup = DownloadCheckpoint {
+            segments: vec![
+                SegmentCheckpoint {
+                    segment_seq: 0,
+                    bytes_complete: 1,
+                    sha256: None,
+                    complete: false,
+                },
+                SegmentCheckpoint {
+                    segment_seq: 0,
+                    bytes_complete: 2,
+                    sha256: None,
+                    complete: false,
+                },
+            ],
+        };
+        assert!(matches!(
+            LocalJournalStore::validate_checkpoint_against_manifest(&dup, &manifest),
+            Err(JournalStoreError::Conflict)
+        ));
+        let unknown = DownloadCheckpoint {
+            segments: vec![SegmentCheckpoint {
+                segment_seq: 9,
+                bytes_complete: 1,
+                sha256: None,
+                complete: false,
+            }],
+        };
+        assert!(matches!(
+            LocalJournalStore::validate_checkpoint_against_manifest(&unknown, &manifest),
+            Err(JournalStoreError::Conflict)
+        ));
+        let over = DownloadCheckpoint {
+            segments: vec![SegmentCheckpoint {
+                segment_seq: 0,
+                bytes_complete: 101,
+                sha256: None,
+                complete: false,
+            }],
+        };
+        assert!(matches!(
+            LocalJournalStore::validate_checkpoint_against_manifest(&over, &manifest),
+            Err(JournalStoreError::Conflict)
+        ));
     }
 
     #[test]

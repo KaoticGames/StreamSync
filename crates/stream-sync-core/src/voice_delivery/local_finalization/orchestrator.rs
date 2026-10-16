@@ -274,6 +274,10 @@ impl LocalFinalizationOrchestrator {
             return Err(LocalOrchestratorError::StoragePreflight(pref));
         }
         let mut checkpoint = store.load_checkpoint().map_err(map_journal_store_err)?;
+        if !checkpoint.segments.is_empty() {
+            LocalJournalStore::validate_checkpoint_against_manifest(&checkpoint, manifest)
+                .map_err(map_journal_store_err)?;
+        }
         if checkpoint.segments.is_empty() {
             checkpoint.segments = manifest
                 .segments
