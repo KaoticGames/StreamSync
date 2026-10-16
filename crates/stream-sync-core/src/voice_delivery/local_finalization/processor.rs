@@ -8,7 +8,9 @@ use super::accumulator::{lost_marker_span_samples, PacketDisposition, UserPacket
 use super::cancellation::{LocalFinalizationCancel, LocalFinalizationCancelled};
 use super::manifest::LocalFinalizationManifest;
 use super::opus_decode::StereoOpusDecoder;
-use super::report::{RecoveryReportBuilder, SilenceInterval};
+use super::report::{
+    DiscardReason, SessionRecoveryReportBuilder, StemRecoveryReportBuilder, StemSilenceReason,
+};
 use super::synj::{decode_journal_record, read_file_header, JournalFramingError, JournalRecord};
 use crate::voice_delivery::bounds::STEREO_PCM_FRAME_BYTES;
 use crate::voice_delivery::finalized_manifest::expected_wav_file_bytes;
@@ -114,12 +116,13 @@ struct UserWriter {
     decoder: StereoOpusDecoder,
     next_write_sample: u64,
     pcm_bytes_written: u64,
-    report: RecoveryReportBuilder,
+    report: StemRecoveryReportBuilder,
 }
 
 impl UserWriter {
     fn new(
         path_nick: String,
+        discord_user_id: String,
         out_dir: &Path,
         target_samples: u64,
     ) -> Result<Self, LocalProcessorError> {
@@ -140,6 +143,7 @@ impl UserWriter {
             .map_err(|_| LocalProcessorError::Fatal("opus decoder init failed".into()))?;
         let silence_len = SILENCE_WRITE_CHUNK_BYTES.div_ceil(STEREO_PCM_FRAME_BYTES as usize)
             * STEREO_PCM_FRAME_BYTES as usize;
+        let report = StemRecoveryReportBuilder::new(path_nick.clone(), discord_user_id);
         Ok(Self {
             path_nick,
             path,
@@ -152,7 +156,7 @@ impl UserWriter {
             decoder,
             next_write_sample: 0,
             pcm_bytes_written: 0,
-            report: RecoveryReportBuilder::default(),
+            report,
         })
     }
 
@@ -176,19 +180,20 @@ impl UserWriter {
         Ok(())
     }
 
-    fn pad_silence_to(&mut self, sample: u64, reason: &str) -> Result<(), LocalProcessorError> {
+    fn pad_silence_to(
+        &mut self,
+        sample: u64,
+        reason: StemSilenceReason,
+        bad_packet_count: u64,
+    ) -> Result<(), LocalProcessorError> {
         if sample <= self.next_write_sample {
             return Ok(());
         }
         let start = self.next_write_sample;
         let end = sample.min(self.target_samples);
         if end > start {
-            self.report.record_silence_interval(SilenceInterval {
-                start_sample: start,
-                end_sample: end,
-                packet_count: 1,
-                reason_code: reason.to_string(),
-            });
+            self.report
+                .record_silence_span(start, end, reason, bad_packet_count);
             let frames = end - start;
             self.write_zero_pcm_bytes(frames * STEREO_PCM_FRAME_BYTES)?;
             self.next_write_sample = end;
@@ -203,27 +208,31 @@ impl UserWriter {
         placement: u64,
     ) -> Result<(), LocalProcessorError> {
         match disposition {
-            PacketDisposition::DiscardedDuplicate
-            | PacketDisposition::DiscardedConflict
-            | PacketDisposition::DiscardedOutOfWindow => {
-                self.report.record_discarded_packet();
+            PacketDisposition::DiscardedDuplicate => {
+                self.report.record_discarded(DiscardReason::Duplicate);
+            }
+            PacketDisposition::DiscardedConflict => {
+                self.report.record_discarded(DiscardReason::Conflict);
+            }
+            PacketDisposition::DiscardedOutOfWindow => {
+                self.report.record_discarded(DiscardReason::OutOfWindow);
             }
             PacketDisposition::LostPlacement => {
                 let span = lost_marker_span_samples();
-                self.pad_silence_to(placement, "lost_marker")?;
+                self.pad_silence_to(placement, StemSilenceReason::TimelineGap, 0)?;
                 let end = (placement + span).min(self.target_samples);
-                self.pad_silence_to(end, "lost_marker")?;
+                self.pad_silence_to(end, StemSilenceReason::JournalLossMarker, 1)?;
             }
             PacketDisposition::Decode => {
                 if record.opus_payload.is_empty() {
-                    self.report.record_discarded_packet();
+                    self.report.record_discarded(DiscardReason::Other);
                     return Ok(());
                 }
                 if placement >= self.target_samples {
-                    self.report.record_discarded_packet();
+                    self.report.record_discarded(DiscardReason::Other);
                     return Ok(());
                 }
-                self.pad_silence_to(placement, "timeline_gap")?;
+                self.pad_silence_to(placement, StemSilenceReason::TimelineGap, 0)?;
                 let mut pcm_buf = [0i16; 960 * 2];
                 match self.decoder.decode_packet(record, &mut pcm_buf) {
                     Ok(samples) => {
@@ -240,9 +249,9 @@ impl UserWriter {
                         self.next_write_sample = end;
                     }
                     Err(_) => {
-                        self.report.record_discarded_packet();
+                        self.report.record_discarded(DiscardReason::Other);
                         let end = (placement + lost_marker_span_samples()).min(self.target_samples);
-                        self.pad_silence_to(end, "opus_decode_failed")?;
+                        self.pad_silence_to(end, StemSilenceReason::OpusDecodeFailed, 1)?;
                     }
                 }
             }
@@ -250,8 +259,10 @@ impl UserWriter {
         Ok(())
     }
 
-    fn finalize(mut self) -> Result<(PathBuf, String, RecoveryReportBuilder), LocalProcessorError> {
-        self.pad_silence_to(self.target_samples, "tail_padding")?;
+    fn finalize(
+        mut self,
+    ) -> Result<(PathBuf, String, StemRecoveryReportBuilder), LocalProcessorError> {
+        self.pad_silence_to(self.target_samples, StemSilenceReason::TailPadding, 0)?;
         self.file.flush()?;
         self.file
             .get_mut()
@@ -339,7 +350,12 @@ pub fn process_verified_segments_with_options(
     let expected_bytes = expected_wav_file_bytes(target);
     let mut users: HashMap<String, UserAccumulator> = HashMap::new();
     for user in &manifest.users {
-        let writer = UserWriter::new(user.path_nick.clone(), staging_dir, target)?;
+        let writer = UserWriter::new(
+            user.path_nick.clone(),
+            user.discord_user_id.clone(),
+            staging_dir,
+            target,
+        )?;
         users.insert(
             user.discord_user_id.clone(),
             UserAccumulator {
@@ -348,7 +364,7 @@ pub fn process_verified_segments_with_options(
             },
         );
     }
-    let mut global_report = RecoveryReportBuilder::default();
+    let mut session_report = SessionRecoveryReportBuilder::default();
     let total_segments = segment_paths.len() as u32;
 
     for (seg_idx, seg_path) in segment_paths.iter().enumerate() {
@@ -376,12 +392,12 @@ pub fn process_verified_segments_with_options(
                     if let Some(acc) = users.get_mut(&record.discord_user_id) {
                         acc.ingest(record)?;
                     } else {
-                        global_report.record_discarded_packet();
+                        session_report.record_session_discarded_other();
                     }
                 }
                 Err(JournalFramingError::Fatal(e)) => return Err(LocalProcessorError::Fatal(e)),
                 Err(JournalFramingError::Recoverable(_)) => {
-                    global_report.record_discarded_packet();
+                    session_report.record_session_discarded_other();
                     break;
                 }
             }
@@ -404,15 +420,12 @@ pub fn process_verified_segments_with_options(
                 user.path_nick, len, expected_bytes
             )));
         }
-        global_report.discarded_packet_count += report.discarded_packet_count;
-        for interval in report.intervals_snapshot() {
-            global_report.record_silence_interval(interval);
-        }
+        session_report.push_stem(report);
         stem_paths.insert(user.discord_user_id.clone(), path);
         stem_sha256.insert(user.discord_user_id.clone(), sha);
     }
 
-    let report_text = global_report.render(
+    let report_text = session_report.render(
         &manifest.session_id,
         &manifest.guild_id,
         &manifest.channel_id,
@@ -429,8 +442,8 @@ pub fn process_verified_segments_with_options(
         report_path: Some(report_path),
         report_sha256: Some(report_sha),
         report_bytes: Some(report_bytes),
-        discarded_packet_count: global_report.discarded_packet_count,
-        silence_range_count: global_report.silence_range_count(),
+        discarded_packet_count: session_report.discarded_packet_count(),
+        silence_range_count: session_report.silence_range_count(),
     })
 }
 
@@ -469,7 +482,7 @@ mod tests {
         LOCAL_FINALIZATION_FINALIZER_ALGORITHM_VERSION,
     };
     use crate::voice_delivery::local_finalization::synj::{
-        encode_journal_file, encode_journal_record, JOURNAL_FORMAT_VERSION_V2,
+        encode_journal_file, encode_journal_record, JournalRecord, JOURNAL_FORMAT_VERSION_V2,
     };
     use crate::voice_delivery::wav::validate_canonical_pcm_wav_header;
     use std::fs::File;
@@ -569,7 +582,7 @@ mod tests {
     #[test]
     fn user_writer_does_not_hold_target_pcm_vec() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = UserWriter::new("x".into(), dir.path(), 48_000).unwrap();
+        let writer = UserWriter::new("x".into(), "1".into(), dir.path(), 48_000).unwrap();
         assert_eq!(writer.silence_chunk.len(), SILENCE_WRITE_CHUNK_BYTES);
         assert!(writer.pcm_byte_scratch.capacity() < 16 * 1024);
         // A duration-sized buffer would be ~192 KiB for this target alone (48k * 4), not a few KiB scratch.
@@ -673,6 +686,82 @@ mod tests {
         let events = progress.lock().unwrap();
         assert!(events.len() <= 4);
         assert_eq!(events.last().unwrap().processed_segments, 10);
+    }
+
+    fn loss_marker_record(user_id: &str, sequence: u16, placement: u64) -> JournalRecord {
+        JournalRecord {
+            discord_user_id: user_id.into(),
+            ssrc_epoch: 1,
+            sequence,
+            rtp_timestamp: 0,
+            arrived_at_ns: 0,
+            session_capture_offset_samples: Some(placement),
+            opus_payload: vec![],
+        }
+    }
+
+    #[test]
+    fn lost_placement_pads_timeline_gap_then_marker_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_id = "123456789012345678";
+        let target = 5760u64;
+        let users = vec![LocalFinalizationUser {
+            discord_user_id: user_id.into(),
+            path_nick: "alice".into(),
+            opaque_stem_id: "a".repeat(32),
+        }];
+        let manifest = test_manifest(target, users);
+        let record = encode_journal_record(
+            JOURNAL_FORMAT_VERSION_V2,
+            &loss_marker_record(user_id, 0, 4800),
+        );
+        let seg_path = dir.path().join("seg.synj");
+        std::fs::write(
+            &seg_path,
+            encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &[record]),
+        )
+        .unwrap();
+        let staging = dir.path().join("staging");
+        let out = process_verified_segments(&manifest, &[seg_path], &staging).unwrap();
+        assert_eq!(out.silence_range_count, 1);
+        let report_text = std::fs::read_to_string(out.report_path.unwrap()).unwrap();
+        assert!(report_text.contains("normalTimelineSilenceSamples=4800"));
+        assert!(report_text.contains("badPacketCount=1"));
+        assert!(report_text.contains("samples=4800-5760"));
+        assert!(!report_text.contains("samples=0-4800"));
+    }
+
+    #[test]
+    fn adjacent_loss_markers_in_journal_count_one_bad_packet_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_id = "123456789012345678";
+        let target = 3840u64;
+        let users = vec![LocalFinalizationUser {
+            discord_user_id: user_id.into(),
+            path_nick: "alice".into(),
+            opaque_stem_id: "a".repeat(32),
+        }];
+        let manifest = test_manifest(target, users);
+        let r0 = encode_journal_record(
+            JOURNAL_FORMAT_VERSION_V2,
+            &loss_marker_record(user_id, 0, 0),
+        );
+        let r1 = encode_journal_record(
+            JOURNAL_FORMAT_VERSION_V2,
+            &loss_marker_record(user_id, 1, 960),
+        );
+        let seg_path = dir.path().join("seg.synj");
+        std::fs::write(
+            &seg_path,
+            encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &[r0, r1]),
+        )
+        .unwrap();
+        let staging = dir.path().join("staging");
+        let out = process_verified_segments(&manifest, &[seg_path], &staging).unwrap();
+        assert_eq!(out.silence_range_count, 1);
+        let report_text = std::fs::read_to_string(out.report_path.unwrap()).unwrap();
+        assert!(report_text.contains("badPacketCount=2"));
+        assert!(report_text.contains("samples=0-1920"));
     }
 
     #[test]
