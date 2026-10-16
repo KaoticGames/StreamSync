@@ -8,9 +8,14 @@ pub enum OpusDecodeError {
     Unavailable,
 }
 
+#[cfg(all(not(feature = "local-opus-native"), test))]
+struct TestOpusStub;
+
 pub struct StereoOpusDecoder {
     #[cfg(feature = "local-opus-native")]
     inner: audiopus::coder::Decoder,
+    #[cfg(all(not(feature = "local-opus-native"), test))]
+    _test_stub: TestOpusStub,
 }
 
 impl StereoOpusDecoder {
@@ -22,7 +27,13 @@ impl StereoOpusDecoder {
                 .map_err(|_| OpusDecodeError::Failed)?;
             return Ok(Self { inner });
         }
-        #[cfg(not(feature = "local-opus-native"))]
+        #[cfg(all(not(feature = "local-opus-native"), test))]
+        {
+            return Ok(Self {
+                _test_stub: TestOpusStub,
+            });
+        }
+        #[cfg(all(not(feature = "local-opus-native"), not(test)))]
         {
             Err(OpusDecodeError::Unavailable)
         }

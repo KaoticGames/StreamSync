@@ -166,3 +166,54 @@ pub fn decode_journal_record(
         offset + record_size,
     ))
 }
+
+/// Encode a single journal record (including size prefix and CRC) for tests and fixtures.
+pub fn encode_journal_record(format_version: u32, record: &JournalRecord) -> Vec<u8> {
+    let user_bytes = record.discord_user_id.as_bytes();
+    assert!(!user_bytes.is_empty() && user_bytes.len() <= MAX_USER_ID_BYTES);
+    let payload_len = record.opus_payload.len();
+    assert!(payload_len <= MAX_OPUS_PAYLOAD_BYTES);
+    let body_len = 2
+        + user_bytes.len()
+        + 4
+        + 2
+        + 4
+        + 8
+        + if format_version == JOURNAL_FORMAT_VERSION_V2 {
+            8
+        } else {
+            0
+        }
+        + 2
+        + payload_len
+        + 4;
+    let record_size = 4 + body_len;
+    let mut out = Vec::with_capacity(record_size);
+    out.extend_from_slice(&(record_size as u32).to_be_bytes());
+    out.extend_from_slice(&(user_bytes.len() as u16).to_be_bytes());
+    out.extend_from_slice(user_bytes);
+    out.extend_from_slice(&record.ssrc_epoch.to_be_bytes());
+    out.extend_from_slice(&record.sequence.to_be_bytes());
+    out.extend_from_slice(&record.rtp_timestamp.to_be_bytes());
+    out.extend_from_slice(&record.arrived_at_ns.to_be_bytes());
+    if format_version == JOURNAL_FORMAT_VERSION_V2 {
+        let capture = record.session_capture_offset_samples.unwrap_or(0);
+        out.extend_from_slice(&capture.to_be_bytes());
+    }
+    out.extend_from_slice(&(payload_len as u16).to_be_bytes());
+    out.extend_from_slice(&record.opus_payload);
+    let crc = crc32_buffer(&out);
+    out.extend_from_slice(&crc.to_be_bytes());
+    out
+}
+
+/// Minimal `.synj` file bytes containing zero or more encoded records.
+pub fn encode_journal_file(format_version: u32, records: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&JOURNAL_MAGIC);
+    out.extend_from_slice(&format_version.to_be_bytes());
+    for record in records {
+        out.extend_from_slice(record);
+    }
+    out
+}
