@@ -15,6 +15,7 @@ mod opus_decode;
 mod opus_journal_timeline;
 mod opus_packet_duration;
 mod orchestrator;
+mod packet_loss_policy;
 mod paths;
 mod processor;
 mod progress;
@@ -25,8 +26,8 @@ mod storage_preflight;
 mod synj;
 
 pub use accumulator::{
-    lost_marker_span_samples, AccumulatorError, PacketDisposition, ReadyPacket,
-    UserPacketAccumulator,
+    lost_marker_span_samples, AccumulatorError, AccumulatorPlacementPolicy, PacketDisposition,
+    ReadyPacket, UserPacketAccumulator,
 };
 pub use cancellation::{LocalFinalizationCancel, LocalFinalizationCancelled};
 pub use client::{
@@ -37,9 +38,10 @@ pub use contract::{
     LeaseGrant, LeaseProof, LEASE_GENERATION_HEADER, LEASE_TOKEN_HEADER,
 };
 pub use journal_forensics::{
-    analyze_local_journal_session, build_minimal_manifest_json, forensics_report_to_json,
-    local_journal_forensics_exit_code, render_forensics_table, session_forensics_certified_clean,
-    LocalJournalForensicsReport,
+    analyze_local_journal_session, analyze_local_journal_session_with_options,
+    build_minimal_manifest_json, forensics_report_to_json, local_journal_forensics_exit_code,
+    offline_journal_forensics_options, render_forensics_table, session_forensics_certified_clean,
+    LocalJournalForensicsOptions, LocalJournalForensicsReport,
 };
 pub use journal_store::LocalJournalStore;
 pub use local_publication::{resolve_published_paths, PublishedLocalOutput};
@@ -58,9 +60,14 @@ pub use opus_decode::assert_local_opus_available;
 pub use orchestrator::{
     LocalFinalizationControls, LocalFinalizationOrchestrator, LocalOrchestratorError,
 };
+pub use packet_loss_policy::{
+    BoundedPacketLossError, BoundedPacketLossTracker, LocalPacketLossPolicySummary,
+    PacketLossSource, LOCAL_PACKET_LOSS_MAX_SKIPPED, LOCAL_PACKET_LOSS_POLICY_VERSION,
+};
 pub use paths::{
     resolve_canonical_session_paths, validate_path_under_parent, PublishedSessionPaths,
 };
+pub use processor::LocalProcessorError;
 pub use progress::{LocalFinalizationPhase, LocalFinalizationProgressEvent};
 pub use receipt::{
     assert_local_finalization_receipt_matches_manifest, parse_local_finalization_receipt,
