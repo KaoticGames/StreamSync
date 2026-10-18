@@ -1,6 +1,9 @@
 //! Offline, read-only local journal recovery render (no cloud / API / receipt mutation).
 
-use super::journal_forensics::{analyze_local_journal_session, session_forensics_certified_clean};
+use super::journal_forensics::{
+    analyze_local_journal_session_with_options, offline_journal_forensics_options,
+    session_forensics_certified_clean,
+};
 use super::journal_store::LocalJournalStore;
 use super::manifest::{
     parse_local_finalization_manifest, LocalFinalizationManifest,
@@ -86,8 +89,11 @@ pub struct OfflineJournalRerenderOptions {
     pub _private: (),
 }
 
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct OfflineJournalRerenderTestHooks {
+    /// Opt-in for module tests: use the `cfg(test)` Opus decoder stub without `local-opus-native`.
+    pub allow_test_opus_decoder_stub: bool,
     pub fail_after_staging: bool,
     pub post_snapshot: Option<Box<dyn Fn(&Path) + Send + Sync>>,
 }
@@ -112,6 +118,21 @@ pub struct OfflineRecoveryReportRef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OfflineRecoveryPacketLossPolicy {
+    pub version: String,
+    pub total_journal_records: u64,
+    pub max_skipped: u64,
+    pub skipped_count: u64,
+    pub framing_or_lost_placement: u64,
+    pub decode_failure: u64,
+    pub placement_overlap: u64,
+    pub out_of_window: u64,
+    pub consecutive_loss_detected: bool,
+    pub within_policy: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OfflineRecoveryManifest {
     pub schema_version: u32,
     pub recovery_algorithm_version: String,
@@ -132,6 +153,7 @@ pub struct OfflineRecoveryManifest {
     pub recovery_report: OfflineRecoveryReportRef,
     pub discarded_packet_count: u64,
     pub silence_range_count: u64,
+    pub packet_loss_policy: OfflineRecoveryPacketLossPolicy,
     pub tool_package_version: String,
     pub tool_build_git_sha: String,
     pub staging_directory_namespace_durability: NamespaceDurability,
@@ -170,9 +192,15 @@ pub fn run_offline_journal_rerender(
     output_dir: &Path,
     _options: OfflineJournalRerenderOptions,
 ) -> Result<OfflineJournalRerenderOutcome, OfflineJournalRerenderError> {
-    run_offline_journal_rerender_inner(session_root, output_dir, None)
+    run_offline_journal_rerender_inner(
+        session_root,
+        output_dir,
+        #[cfg(test)]
+        None,
+    )
 }
 
+#[cfg(test)]
 pub(crate) fn run_offline_journal_rerender_with_hooks(
     session_root: &Path,
     output_dir: &Path,
@@ -184,7 +212,7 @@ pub(crate) fn run_offline_journal_rerender_with_hooks(
 fn run_offline_journal_rerender_inner(
     session_root: &Path,
     output_dir: &Path,
-    hooks: Option<OfflineJournalRerenderTestHooks>,
+    #[cfg(test)] hooks: Option<OfflineJournalRerenderTestHooks>,
 ) -> Result<OfflineJournalRerenderOutcome, OfflineJournalRerenderError> {
     if output_dir.as_os_str().is_empty() {
         return Err(OfflineJournalRerenderError::OutputPathRequired);
@@ -202,8 +230,11 @@ fn run_offline_journal_rerender_inner(
     validate_session_root_identity(session_root, &manifest)?;
     enumerate_journal_segments_exact(session_root, &manifest)?;
 
-    let source_forensics = analyze_local_journal_session(session_root)
-        .map_err(|e| OfflineJournalRerenderError::Other(e.to_string()))?;
+    let source_forensics = analyze_local_journal_session_with_options(
+        session_root,
+        offline_journal_forensics_options(),
+    )
+    .map_err(|e| OfflineJournalRerenderError::Other(e.to_string()))?;
     if !session_forensics_certified_clean(&source_forensics) {
         return Err(OfflineJournalRerenderError::ForensicsNotCertified);
     }
@@ -241,7 +272,17 @@ fn run_offline_journal_rerender_inner(
         }
     }
 
-    if assert_local_opus_available().is_err() {
+    let opus_unavailable = assert_local_opus_available().is_err();
+    #[cfg(test)]
+    let opus_unavailable = if hooks
+        .as_ref()
+        .is_some_and(|h| h.allow_test_opus_decoder_stub)
+    {
+        false
+    } else {
+        opus_unavailable
+    };
+    if opus_unavailable {
         return Err(OfflineJournalRerenderError::OpusUnavailable);
     }
 
@@ -251,6 +292,7 @@ fn run_offline_journal_rerender_inner(
         .map_err(|e| OfflineJournalRerenderError::Publish(e.to_string()))?;
     let staging_path = dest_parent.join(&stage_token);
 
+    #[cfg(test)]
     if hooks.as_ref().is_some_and(|h| h.fail_after_staging) {
         eprintln!(
             "offline_journal_rerender: staging preserved at {}",
@@ -270,6 +312,7 @@ fn run_offline_journal_rerender_inner(
             &manifest_bytes,
         )?;
 
+        #[cfg(test)]
         if let Some(hooks) = &hooks {
             if let Some(cb) = &hooks.post_snapshot {
                 cb(session_root);
@@ -282,8 +325,11 @@ fn run_offline_journal_rerender_inner(
             ));
         }
 
-        let forensics = analyze_local_journal_session(&snapshot_root)
-            .map_err(|e| OfflineJournalRerenderError::Other(e.to_string()))?;
+        let forensics = analyze_local_journal_session_with_options(
+            &snapshot_root,
+            offline_journal_forensics_options(),
+        )
+        .map_err(|e| OfflineJournalRerenderError::Other(e.to_string()))?;
         if !session_forensics_certified_clean(&forensics) {
             return Err(OfflineJournalRerenderError::ForensicsNotCertified);
         }
@@ -535,6 +581,21 @@ fn build_recovery_manifest(
         },
         discarded_packet_count: output.discarded_packet_count,
         silence_range_count: output.silence_range_count,
+        packet_loss_policy: OfflineRecoveryPacketLossPolicy {
+            version: output.packet_loss_policy.version.clone(),
+            total_journal_records: output.packet_loss_policy.total_journal_records,
+            max_skipped: output.packet_loss_policy.max_skipped,
+            skipped_count: output.packet_loss_policy.skipped_count,
+            framing_or_lost_placement: output
+                .packet_loss_policy
+                .source_counts
+                .framing_or_lost_placement,
+            decode_failure: output.packet_loss_policy.source_counts.decode_failure,
+            placement_overlap: output.packet_loss_policy.source_counts.placement_overlap,
+            out_of_window: output.packet_loss_policy.source_counts.out_of_window,
+            consecutive_loss_detected: output.packet_loss_policy.consecutive_loss_detected,
+            within_policy: output.packet_loss_policy.within_policy,
+        },
         tool_package_version: env!("CARGO_PKG_VERSION").into(),
         tool_build_git_sha: tool_build_git_sha.into(),
         staging_directory_namespace_durability: staging_namespace,
@@ -697,6 +758,10 @@ fn map_fs_err(e: FsError) -> OfflineJournalRerenderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::voice_delivery::local_finalization::journal_forensics::{
+        analyze_local_journal_session_with_options, offline_journal_forensics_options,
+        session_forensics_certified_clean,
+    };
     use crate::voice_delivery::local_finalization::manifest::{
         LocalFinalizationManifest, LocalFinalizationObjectRef, LocalFinalizationOutputPolicy,
         LocalFinalizationSegment, LocalFinalizationUser, LOCAL_FINALIZATION_WAV_FORMAT,
@@ -807,7 +872,11 @@ mod tests {
         }];
         let manifest = manifest_with_segments(session_id, users, vec![(0, body.clone())]);
         write_verified_session(&session_root, &manifest, &[body]);
-        let report = analyze_local_journal_session(&session_root).unwrap();
+        let report = analyze_local_journal_session_with_options(
+            &session_root,
+            offline_journal_forensics_options(),
+        )
+        .unwrap();
         assert!(session_forensics_certified_clean(&report));
         (session_root, manifest)
     }
@@ -821,7 +890,10 @@ mod tests {
         run_offline_journal_rerender_with_hooks(
             session_root,
             &out,
-            OfflineJournalRerenderTestHooks::default(),
+            OfflineJournalRerenderTestHooks {
+                allow_test_opus_decoder_stub: true,
+                ..Default::default()
+            },
         )
         .unwrap()
     }
@@ -965,6 +1037,7 @@ mod tests {
             &session_root,
             &out,
             OfflineJournalRerenderTestHooks {
+                allow_test_opus_decoder_stub: true,
                 fail_after_staging: true,
                 post_snapshot: None,
             },
@@ -1004,6 +1077,7 @@ mod tests {
             &session_root,
             &out,
             OfflineJournalRerenderTestHooks {
+                allow_test_opus_decoder_stub: true,
                 fail_after_staging: false,
                 post_snapshot: Some(Box::new(move |_| {
                     let mut bytes = std::fs::read(&seg).unwrap();
@@ -1022,6 +1096,154 @@ mod tests {
         assert!(!out.exists());
         assert!(std::fs::read(&session_root.join("manifest.json")).is_ok());
         let _ = manifest;
+    }
+
+    fn overlap_triplet(user: &str, base_seq: u16) -> [JournalRecord; 3] {
+        let prev_start = u64::from(base_seq) * 960;
+        let rtp_first = u32::from(base_seq) * 960;
+        let payload = vec![0x08, 0x01];
+        [
+            JournalRecord {
+                discord_user_id: user.into(),
+                ssrc_epoch: 1,
+                sequence: base_seq,
+                rtp_timestamp: rtp_first,
+                arrived_at_ns: 1,
+                session_capture_offset_samples: Some(prev_start),
+                opus_payload: payload.clone(),
+            },
+            JournalRecord {
+                discord_user_id: user.into(),
+                ssrc_epoch: 1,
+                sequence: base_seq + 1,
+                rtp_timestamp: rtp_first + 480,
+                arrived_at_ns: 2,
+                session_capture_offset_samples: Some(prev_start),
+                opus_payload: payload,
+            },
+            JournalRecord {
+                discord_user_id: user.into(),
+                ssrc_epoch: 1,
+                sequence: base_seq + 2,
+                rtp_timestamp: rtp_first + 960,
+                arrived_at_ns: 3,
+                session_capture_offset_samples: Some(prev_start + 960),
+                opus_payload: vec![0x08, 0x01],
+            },
+        ]
+    }
+
+    #[test]
+    fn tolerant_preflight_certifies_overlap_and_reaches_processor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user = "123456789012345678";
+        let session_id = "550e8400-e29b-41d4-a716-446655440022";
+        let session_root = tmp.path().join(session_id);
+        let mut records = Vec::new();
+        for seq in 0..10_000u16 {
+            records.push(sample_record(user, seq, u64::from(seq) * 960));
+        }
+        records.extend(overlap_triplet(user, 10_000));
+        let encoded: Vec<_> = records
+            .iter()
+            .map(|r| encode_journal_record(JOURNAL_FORMAT_VERSION_V2, r))
+            .collect();
+        let body = encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &encoded);
+        let users = vec![LocalFinalizationUser {
+            discord_user_id: user.into(),
+            path_nick: "overlap_preflight".into(),
+            opaque_stem_id:
+                crate::voice_delivery::local_finalization::derive_voice_v2_opaque_stem_id(
+                    session_id,
+                    "123456789012345678",
+                    user,
+                    "overlap_preflight",
+                ),
+        }];
+        let manifest = manifest_with_segments(session_id, users, vec![(0, body.clone())]);
+        write_verified_session(&session_root, &manifest, &[body]);
+        let report = analyze_local_journal_session_with_options(
+            &session_root,
+            offline_journal_forensics_options(),
+        )
+        .unwrap();
+        assert!(session_forensics_certified_clean(&report));
+        assert_eq!(
+            report
+                .packet_loss_preflight
+                .as_ref()
+                .unwrap()
+                .source_counts
+                .placement_overlap,
+            1
+        );
+        let out = tmp.path().join("dest").join("recovered-overlap");
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        let outcome = run_offline_journal_rerender_with_hooks(
+            &session_root,
+            &out,
+            OfflineJournalRerenderTestHooks {
+                allow_test_opus_decoder_stub: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(outcome.final_dir.join("overlap_preflight.wav").is_file());
+    }
+
+    #[test]
+    fn excessive_overlap_preflight_refuses_before_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user = "123456789012345678";
+        let session_id = "550e8400-e29b-41d4-a716-446655440023";
+        let session_root = tmp.path().join(session_id);
+        let mut records = Vec::new();
+        for seq in 0..500u16 {
+            records.push(sample_record(user, seq, u64::from(seq) * 960));
+        }
+        for block in 0..33u16 {
+            records.extend(overlap_triplet(user, 1_000 + block * 4));
+        }
+        let encoded: Vec<_> = records
+            .iter()
+            .map(|r| encode_journal_record(JOURNAL_FORMAT_VERSION_V2, r))
+            .collect();
+        let body = encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &encoded);
+        let users = vec![LocalFinalizationUser {
+            discord_user_id: user.into(),
+            path_nick: "overlap_excess".into(),
+            opaque_stem_id:
+                crate::voice_delivery::local_finalization::derive_voice_v2_opaque_stem_id(
+                    session_id,
+                    "123456789012345678",
+                    user,
+                    "overlap_excess",
+                ),
+        }];
+        let manifest = manifest_with_segments(session_id, users, vec![(0, body.clone())]);
+        write_verified_session(&session_root, &manifest, &[body]);
+        let report = analyze_local_journal_session_with_options(
+            &session_root,
+            offline_journal_forensics_options(),
+        )
+        .unwrap();
+        assert!(!session_forensics_certified_clean(&report));
+        let out = tmp.path().join("dest").join("recovered-excess");
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        let err = run_offline_journal_rerender_with_hooks(
+            &session_root,
+            &out,
+            OfflineJournalRerenderTestHooks {
+                allow_test_opus_decoder_stub: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            OfflineJournalRerenderError::ForensicsNotCertified
+        ));
+        assert!(!out.exists());
     }
 
     #[test]

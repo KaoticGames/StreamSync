@@ -4,7 +4,8 @@ use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 use stream_sync_core::voice_delivery::local_finalization::{
-    AccumulatorError, JournalRecord, PacketDisposition, UserPacketAccumulator,
+    AccumulatorError, AccumulatorPlacementPolicy, JournalRecord, PacketDisposition,
+    UserPacketAccumulator,
 };
 
 const USER: &str = "123456789012345678";
@@ -281,6 +282,80 @@ fn parity_overlap_placement_refused() {
     acc.ingest_timeline(records[0].clone()).expect("first");
     let err = acc.ingest_timeline(records[1].clone()).unwrap_err();
     assert!(err.is_overlap());
+}
+
+#[test]
+fn tolerant_overlap_emits_discarded_overlap_without_advancing_timeline() {
+    let records = vec![
+        rec(0, 1, 0, 0, 1, payload_toc_20ms()),
+        rec(0, 2, 480, 0, 2, payload_toc_20ms()),
+    ];
+    let mut acc = UserPacketAccumulator::new_with_placement_policy(
+        USER,
+        TARGET,
+        AccumulatorPlacementPolicy::PlacementOverlapTolerant,
+    );
+    let first = acc.ingest_timeline(records[0].clone()).expect("first");
+    assert_eq!(first[0].disposition, PacketDisposition::Decode);
+    let second = acc.ingest_timeline(records[1].clone()).expect("overlap");
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].disposition, PacketDisposition::DiscardedOverlap);
+    assert_eq!(second[0].timeline_sample_start, Some(480));
+    assert_eq!(second[0].span_samples, Some(FRAME));
+    let third = rec(0, 3, 960, 0, 3, payload_toc_20ms());
+    let after = acc.ingest_timeline(third).expect("continues");
+    assert!(after
+        .iter()
+        .any(|p| p.disposition == PacketDisposition::Decode && p.record.sequence == 3));
+}
+
+#[test]
+fn tolerant_overlap_updates_last_emitted_before_next_discontinuity() {
+    let prev_start = 10_000u64 * FRAME;
+    let base_seq = 100u16;
+    let rtp_first = u32::try_from(prev_start).expect("rtp fits u32");
+    let first = rec(0, base_seq, rtp_first, prev_start, 1, payload_toc_20ms());
+    let overlap = rec(
+        0,
+        base_seq + 1,
+        rtp_first + 480,
+        prev_start + 480,
+        2,
+        payload_toc_20ms(),
+    );
+    // Same RTP step as production overlap recovery (+960): discontinuity consults
+    // last-emitted capture/sequence after the overlap packet was dropped.
+    let next = rec(
+        0,
+        base_seq + 2,
+        rtp_first + 960,
+        prev_start + FRAME,
+        NS_PER_FRAME * 3,
+        payload_toc_20ms(),
+    );
+    let mut acc = UserPacketAccumulator::new_with_placement_policy(
+        USER,
+        TARGET,
+        AccumulatorPlacementPolicy::PlacementOverlapTolerant,
+    );
+    let r1 = acc.ingest_timeline(first).expect("first");
+    assert_eq!(r1[0].disposition, PacketDisposition::Decode);
+    assert_eq!(r1[0].timeline_sample_start, Some(prev_start));
+    let r2 = acc.ingest_timeline(overlap).expect("overlap");
+    assert_eq!(r2.len(), 1);
+    assert_eq!(r2[0].disposition, PacketDisposition::DiscardedOverlap);
+    let r3 = acc.ingest_timeline(next).expect("after overlap identity");
+    let decoded = r3
+        .iter()
+        .find(|p| p.record.sequence == base_seq + 2)
+        .expect("next packet emitted");
+    assert_eq!(decoded.disposition, PacketDisposition::Decode);
+    assert_eq!(decoded.timeline_sample_start, Some(prev_start + FRAME));
+    assert!(
+        !r3.iter()
+            .any(|p| p.disposition == PacketDisposition::DiscardedOverlap),
+        "overlap drop must not cascade silence via a second overlap discard"
+    );
 }
 
 #[derive(Deserialize)]
