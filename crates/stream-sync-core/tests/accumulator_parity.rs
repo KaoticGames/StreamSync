@@ -444,7 +444,6 @@ fn parity_wrap_epoch_transition_emits_epoch_two() {
 }
 
 #[test]
-#[test]
 fn sample_start_plus_frame_span_overflow_pathological() {
     let target = u64::MAX;
     let start = u64::MAX - 400;

@@ -146,7 +146,10 @@ pub fn has_sequence_discontinuity_evidence(
         return false;
     }
     let window = i64::from(REORDER_WINDOW_PACKETS);
-    let extended_delta = current_extended_sequence - prior_extended_sequence;
+    let extended_delta = match current_extended_sequence.checked_sub(prior_extended_sequence) {
+        Some(d) => d,
+        None => return true,
+    };
     if extended_delta > window {
         return true;
     }

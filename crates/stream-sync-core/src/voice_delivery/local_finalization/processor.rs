@@ -221,10 +221,20 @@ impl UserWriter {
             PacketDisposition::LostPlacement => {
                 self.pad_silence_to(placement, StemSilenceReason::TimelineGap, 0)?;
                 if let Some(span) = span_samples {
-                    let end = (placement + span).min(self.target_samples);
+                    let end = placement
+                        .checked_add(span)
+                        .ok_or_else(|| {
+                            LocalProcessorError::Fatal("journal placement span overflow".into())
+                        })?
+                        .min(self.target_samples);
                     self.pad_silence_to(end, StemSilenceReason::JournalLossMarker, 1)?;
                 } else {
-                    let end = (placement + 1).min(self.target_samples);
+                    let end = placement
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            LocalProcessorError::Fatal("journal placement span overflow".into())
+                        })?
+                        .min(self.target_samples);
                     self.pad_silence_to(end, StemSilenceReason::JournalLossMarker, 1)?;
                 }
             }
@@ -257,7 +267,14 @@ impl UserWriter {
                         self.report.record_discarded(DiscardReason::Other);
                         let recovery_span = span_samples.unwrap_or(0);
                         if recovery_span > 0 {
-                            let end = (placement + recovery_span).min(self.target_samples);
+                            let end = placement
+                                .checked_add(recovery_span)
+                                .ok_or_else(|| {
+                                    LocalProcessorError::Fatal(
+                                        "journal placement recovery span overflow".into(),
+                                    )
+                                })?
+                                .min(self.target_samples);
                             self.pad_silence_to(end, StemSilenceReason::OpusDecodeFailed, 1)?;
                         }
                     }
@@ -265,6 +282,17 @@ impl UserWriter {
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn apply_packet_for_test(
+        &mut self,
+        record: &JournalRecord,
+        disposition: PacketDisposition,
+        placement: u64,
+        span_samples: Option<u64>,
+    ) -> Result<(), LocalProcessorError> {
+        self.apply_packet(record, disposition, placement, span_samples)
     }
 
     fn finalize(
@@ -881,6 +909,52 @@ mod tests {
             report_text.contains("out_of_window=1"),
             "report must count out-of-window discard: {}",
             report_text
+        );
+    }
+
+    #[test]
+    fn lost_placement_at_u64_max_placement_returns_fatal_not_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = UserWriter::new("x".into(), "1".into(), dir.path(), 1_000_000).unwrap();
+        let record = JournalRecord {
+            discord_user_id: "1".into(),
+            ssrc_epoch: 1,
+            sequence: 0,
+            rtp_timestamp: 0,
+            arrived_at_ns: 0,
+            session_capture_offset_samples: Some(u64::MAX),
+            opus_payload: vec![],
+        };
+        let err = writer
+            .apply_packet_for_test(&record, PacketDisposition::LostPlacement, u64::MAX, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, LocalProcessorError::Fatal(_)),
+            "expected fatal on placement+1 overflow, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn decode_failed_recovery_span_at_u64_max_returns_fatal_not_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = UserWriter::new("x".into(), "1".into(), dir.path(), 1_000_000).unwrap();
+        let record = JournalRecord {
+            discord_user_id: "1".into(),
+            ssrc_epoch: 1,
+            sequence: 0,
+            rtp_timestamp: 0,
+            arrived_at_ns: 0,
+            session_capture_offset_samples: Some(0),
+            opus_payload: vec![0xff, 0xff],
+        };
+        let err = writer
+            .apply_packet_for_test(&record, PacketDisposition::Decode, 100, Some(u64::MAX - 50))
+            .unwrap_err();
+        assert!(
+            matches!(err, LocalProcessorError::Fatal(_)),
+            "expected fatal on placement+recovery_span overflow, got {:?}",
+            err
         );
     }
 
