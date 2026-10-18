@@ -16,7 +16,6 @@ impl FinalParentPublication {
     }
 
     /// Create `.streamsync-stage-<random128>` as a direct child of the final-parent handle.
-    #[cfg(test)]
     pub fn create_stage_dir(&self) -> Result<String, FsError> {
         use crate::voice_delivery::ids::new_opaque_stage_basename;
         let name = new_opaque_stage_basename();
