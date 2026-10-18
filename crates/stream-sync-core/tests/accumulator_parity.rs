@@ -4,7 +4,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 use stream_sync_core::voice_delivery::local_finalization::{
-    JournalRecord, PacketDisposition, UserPacketAccumulator,
+    AccumulatorError, JournalRecord, PacketDisposition, UserPacketAccumulator,
 };
 
 const USER: &str = "123456789012345678";
@@ -441,6 +441,39 @@ fn parity_wrap_epoch_transition_emits_epoch_two() {
         .filter(|r| r.disposition == PacketDisposition::Decode)
         .count();
     assert_eq!(decodes, 10, "got {:?}", got);
+}
+
+#[test]
+#[test]
+fn sample_start_plus_frame_span_overflow_pathological() {
+    let target = u64::MAX;
+    let start = u64::MAX - 400;
+    let mut acc = UserPacketAccumulator::new(USER, target);
+    let err = acc
+        .ingest_timeline(rec(0, 0, 0, start, 1, payload_toc_20ms()))
+        .unwrap_err();
+    assert!(
+        matches!(err, AccumulatorError::Pathological(_)),
+        "expected pathological overflow, got {:?}",
+        err
+    );
+}
+
+#[test]
+fn prev_timeline_plus_rtp_delta_overflow_pathological() {
+    let target = u64::MAX;
+    let anchor = u64::MAX - 5000;
+    let mut acc = UserPacketAccumulator::new(USER, target);
+    acc.ingest_timeline(rec(0, 0, 0, anchor, 1, payload_toc_20ms()))
+        .expect("anchor packet");
+    let err = acc
+        .ingest_timeline(rec(0, 1, 6000, anchor, 2, payload_toc_20ms()))
+        .unwrap_err();
+    assert!(
+        matches!(err, AccumulatorError::Pathological(_)),
+        "expected pathological timeline overflow, got {:?}",
+        err
+    );
 }
 
 #[test]

@@ -328,12 +328,29 @@ impl UserAccumulator {
         &mut self,
         pkt: &super::accumulator::ReadyPacket,
     ) -> Result<(), LocalProcessorError> {
-        let placement = match pkt.timeline_sample_start {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-        self.writer
-            .apply_packet(&pkt.record, pkt.disposition, placement, pkt.span_samples)?;
+        use super::accumulator::PacketDisposition;
+        match pkt.disposition {
+            PacketDisposition::DiscardedDuplicate
+            | PacketDisposition::DiscardedConflict
+            | PacketDisposition::DiscardedOutOfWindow => {
+                self.writer
+                    .apply_packet(&pkt.record, pkt.disposition, 0, None)?;
+            }
+            PacketDisposition::Decode | PacketDisposition::LostPlacement => {
+                let placement = pkt.timeline_sample_start.ok_or_else(|| {
+                    LocalProcessorError::Fatal(format!(
+                        "ready packet {:?} missing authoritative timeline",
+                        pkt.disposition
+                    ))
+                })?;
+                self.writer.apply_packet(
+                    &pkt.record,
+                    pkt.disposition,
+                    placement,
+                    pkt.span_samples,
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -785,6 +802,86 @@ mod tests {
         assert!(report_text.contains("badPacketCount=2"));
         assert!(report_text.contains("samples=0-1"));
         assert!(report_text.contains("samples=960-961"));
+    }
+
+    #[test]
+    fn recovery_report_counts_discarded_duplicate_without_timeline_placement() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_id = "123456789012345678";
+        let target = 4800u64;
+        let users = vec![LocalFinalizationUser {
+            discord_user_id: user_id.into(),
+            path_nick: "dup".into(),
+            opaque_stem_id: "a".repeat(32),
+        }];
+        let manifest = test_manifest(target, users);
+        let base = JournalRecord {
+            discord_user_id: user_id.into(),
+            ssrc_epoch: 1,
+            sequence: 0,
+            rtp_timestamp: 0,
+            arrived_at_ns: 0,
+            session_capture_offset_samples: Some(0),
+            opus_payload: vec![0x08, 0x01],
+        };
+        let dup = base.clone();
+        let r0 = encode_journal_record(JOURNAL_FORMAT_VERSION_V2, &base);
+        let r1 = encode_journal_record(JOURNAL_FORMAT_VERSION_V2, &dup);
+        let seg_path = dir.path().join("seg.synj");
+        std::fs::write(
+            &seg_path,
+            encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &[r0, r1]),
+        )
+        .unwrap();
+        let staging = dir.path().join("staging");
+        let out = process_verified_segments(&manifest, &[seg_path], &staging).unwrap();
+        let report_text = std::fs::read_to_string(out.report_path.unwrap()).unwrap();
+        assert!(
+            report_text.contains("discarded duplicate=1"),
+            "report must count duplicate discard: {}",
+            report_text
+        );
+    }
+
+    #[test]
+    fn recovery_report_counts_out_of_window_discard() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_id = "123456789012345678";
+        let target = 200_000u64;
+        let users = vec![LocalFinalizationUser {
+            discord_user_id: user_id.into(),
+            path_nick: "oow".into(),
+            opaque_stem_id: "a".repeat(32),
+        }];
+        let manifest = test_manifest(target, users);
+        let mk = |seq: u16, capture: u64| JournalRecord {
+            discord_user_id: user_id.into(),
+            ssrc_epoch: 1,
+            sequence: seq,
+            rtp_timestamp: u32::from(seq) * 960,
+            arrived_at_ns: u64::from(seq) * 20_000_000,
+            session_capture_offset_samples: Some(capture),
+            opus_payload: vec![0x08, 0x01],
+        };
+        let records = [mk(0, 0), mk(100, 100 * 960), mk(50, 50 * 960)];
+        let encoded: Vec<_> = records
+            .iter()
+            .map(|r| encode_journal_record(JOURNAL_FORMAT_VERSION_V2, r))
+            .collect();
+        let seg_path = dir.path().join("seg.synj");
+        std::fs::write(
+            &seg_path,
+            encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &encoded),
+        )
+        .unwrap();
+        let staging = dir.path().join("staging");
+        let out = process_verified_segments(&manifest, &[seg_path], &staging).unwrap();
+        let report_text = std::fs::read_to_string(out.report_path.unwrap()).unwrap();
+        assert!(
+            report_text.contains("out_of_window=1"),
+            "report must count out-of-window discard: {}",
+            report_text
+        );
     }
 
     #[test]

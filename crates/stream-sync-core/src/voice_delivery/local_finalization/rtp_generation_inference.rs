@@ -94,7 +94,7 @@ pub fn capture_and_arrival_coherent(capture_delta_samples: u64, arrival_delta_ns
     if from_arrival == 0 && capture_delta_samples >= OPUS_FRAME_SAMPLES {
         return false;
     }
-    let slip = (capture_delta_samples as i64 - from_arrival as i64).unsigned_abs();
+    let slip = capture_delta_samples.abs_diff(from_arrival);
     slip <= CAPTURE_ARRIVAL_TOLERANCE_SAMPLES
 }
 
@@ -102,7 +102,7 @@ pub fn rtp_delta_matches_capture_gap(rtp_delta_samples: u64, capture_delta_sampl
     if capture_delta_samples == 0 {
         return false;
     }
-    let slip = (rtp_delta_samples as i64 - capture_delta_samples as i64).unsigned_abs();
+    let slip = rtp_delta_samples.abs_diff(capture_delta_samples);
     slip <= RTP_CAPTURE_GAP_TOLERANCE_SAMPLES
 }
 
@@ -295,5 +295,19 @@ mod tests {
     #[test]
     fn extended_sequence_negative_within_window_is_not_extended_discontinuity() {
         assert!(!has_sequence_discontinuity_evidence(0, 65535, 0, -1));
+    }
+
+    #[test]
+    fn huge_capture_delta_not_falsely_coherent_via_i64_wrap() {
+        assert!(!capture_and_arrival_coherent(u64::MAX, 20_000_000));
+        let huge = i64::MAX as u64 + 50_000;
+        assert!(!capture_and_arrival_coherent(huge, 20_000_000));
+    }
+
+    #[test]
+    fn huge_rtp_capture_gap_not_falsely_matched_via_i64_wrap() {
+        assert!(!rtp_delta_matches_capture_gap(u64::MAX, 960));
+        let huge = i64::MAX as u64 + 960;
+        assert!(!rtp_delta_matches_capture_gap(huge, 960));
     }
 }

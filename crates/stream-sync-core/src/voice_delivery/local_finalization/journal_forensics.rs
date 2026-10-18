@@ -125,6 +125,7 @@ pub struct LocalJournalForensicsReport {
     pub users: Vec<UserJournalForensics>,
     pub session_framing_fatal_count: u32,
     pub session_framing_recoverable_count: u32,
+    pub session_forensics_certified_clean: bool,
     pub silence_cause_ranking: Vec<SilenceCauseEntry>,
 }
 
@@ -349,7 +350,7 @@ pub fn analyze_local_journal_session(
 
     let silence_cause_ranking = rank_silence_causes(&users_out);
 
-    Ok(LocalJournalForensicsReport {
+    let mut report = LocalJournalForensicsReport {
         session_root: session_root.display().to_string(),
         session_id: manifest.session_id.clone(),
         guild_id: manifest.guild_id.clone(),
@@ -361,8 +362,49 @@ pub fn analyze_local_journal_session(
         users: users_out,
         session_framing_fatal_count: session_fatal,
         session_framing_recoverable_count: session_recoverable,
+        session_forensics_certified_clean: false,
         silence_cause_ranking,
-    })
+    };
+    report.session_forensics_certified_clean = session_forensics_certified_clean(&report);
+    Ok(report)
+}
+
+pub fn session_forensics_certified_clean(report: &LocalJournalForensicsReport) -> bool {
+    if !report.manifest_warnings.is_empty() {
+        return false;
+    }
+    if report.session_framing_fatal_count > 0 || report.session_framing_recoverable_count > 0 {
+        return false;
+    }
+    for seg in &report.segments {
+        if !seg.present {
+            return false;
+        }
+        if !seg.fatal_framing.is_empty() || !seg.recoverable_framing.is_empty() {
+            return false;
+        }
+    }
+    for u in &report.users {
+        if !u.forensics_certified_clean {
+            return false;
+        }
+        if u.accumulator.accumulator_errors > 0 {
+            return false;
+        }
+        if u.local_epoch_frontier_stall || !u.diagnostics.is_empty() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Process exit code for the forensics CLI: 0 certified clean, 2 uncertified (outputs still written).
+pub fn local_journal_forensics_exit_code(report: &LocalJournalForensicsReport) -> i32 {
+    if report.session_forensics_certified_clean {
+        0
+    } else {
+        2
+    }
 }
 
 fn analyze_user(
@@ -581,7 +623,10 @@ fn track_emitted(
         Some(p) => p,
         None => return,
     };
-    let end = placement + span_for_packet(pkt);
+    let end = match placement.checked_add(span_for_packet(pkt)) {
+        Some(e) => e,
+        None => return,
+    };
     if first_emitted.is_none() {
         *first_emitted = Some(placement);
     }
@@ -698,6 +743,16 @@ pub fn render_forensics_table(report: &LocalJournalForensicsReport) -> String {
         "Session {} ({})\n",
         report.session_id, report.session_root
     ));
+    let session_cert = if report.session_forensics_certified_clean {
+        "CERTIFIED CLEAN"
+    } else {
+        "NOT CLEAN"
+    };
+    out.push_str(&format!(
+        "Session forensics: {} | Manifest warnings: {}\n",
+        session_cert,
+        report.manifest_warnings.len()
+    ));
     out.push_str(&format!(
         "Target samples: {} | Segments: {} | Framing fatal/recoverable: {}/{}\n\n",
         report.target_sample_count_48k,
@@ -706,11 +761,11 @@ pub fn render_forensics_table(report: &LocalJournalForensicsReport) -> String {
         report.session_framing_recoverable_count
     ));
     out.push_str(
-        "pathNick          records  epochs  stall  acc(decode/lost/dup/conf/oow)  trailSilence\n",
+        "pathNick          records  epochs  stall  accErr  acc(decode/lost/dup/conf/oow)  trailSilence\n",
     );
     for u in &report.users {
         out.push_str(&format!(
-            "{:<16}  {:7}  {:6}  {:5}  {:>6}/{:>4}/{:>3}/{:>4}/{:>3}  {:>12}\n",
+            "{:<16}  {:7}  {:6}  {:5}  {:>6}  {:>6}/{:>4}/{:>3}/{:>4}/{:>3}  {:>12}\n",
             u.path_nick,
             u.total_records,
             u.distinct_ssrc_epochs,
@@ -719,6 +774,7 @@ pub fn render_forensics_table(report: &LocalJournalForensicsReport) -> String {
             } else {
                 "no"
             },
+            u.accumulator.accumulator_errors,
             u.accumulator.decode,
             u.accumulator.lost_placement,
             u.accumulator.discarded_duplicate,
@@ -726,6 +782,9 @@ pub fn render_forensics_table(report: &LocalJournalForensicsReport) -> String {
             u.accumulator.discarded_out_of_window,
             u.predicted_trailing_silence_samples,
         ));
+        for diag in &u.diagnostics {
+            out.push_str(&format!("  diagnostic [{}]: {}\n", u.path_nick, diag));
+        }
     }
     if !report.silence_cause_ranking.is_empty() {
         out.push_str("\nSilence cause ranking (weight):\n");

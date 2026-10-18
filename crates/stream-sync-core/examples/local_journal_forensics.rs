@@ -8,21 +8,25 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use stream_sync_core::voice_delivery::local_finalization::{
-    analyze_local_journal_session, forensics_report_to_json, render_forensics_table,
+    analyze_local_journal_session, forensics_report_to_json, local_journal_forensics_exit_code,
+    render_forensics_table,
 };
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("local_journal_forensics: {e}");
-        std::process::exit(1);
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("local_journal_forensics: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<i32, String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         eprintln!("usage: local_journal_forensics <session-root> [--json <output-path>]");
-        return Ok(());
+        return Ok(0);
     }
     let session_root = PathBuf::from(&args[0]);
     let mut json_path: Option<PathBuf> = None;
@@ -47,5 +51,5 @@ fn run() -> Result<(), String> {
         fs::write(&path, json).map_err(|e| e.to_string())?;
         eprintln!("wrote {}", path.display());
     }
-    Ok(())
+    Ok(local_journal_forensics_exit_code(&report))
 }

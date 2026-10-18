@@ -36,7 +36,8 @@ pub use contract::{
 };
 pub use journal_forensics::{
     analyze_local_journal_session, build_minimal_manifest_json, forensics_report_to_json,
-    render_forensics_table, LocalJournalForensicsReport,
+    local_journal_forensics_exit_code, render_forensics_table, session_forensics_certified_clean,
+    LocalJournalForensicsReport,
 };
 pub use journal_store::LocalJournalStore;
 pub use local_publication::{resolve_published_paths, PublishedLocalOutput};

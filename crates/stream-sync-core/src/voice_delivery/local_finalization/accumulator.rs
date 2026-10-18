@@ -2,10 +2,9 @@
 
 use super::opus_journal_timeline::validate_opus_packet_for_journal_timeline;
 use super::rtp_generation_inference::{
-    decide_rtp_timestamp_discontinuity, discontinuity_decision_to_action, rtp_forward_delta,
-    InferredRtpGenerationBoundary, RtpCandidatePacket, RtpDiscontinuityAction,
-    RtpDiscontinuityDecision, RtpPlacementContext, MAX_RTP_GAP_SAMPLES, OPUS_FRAME_SAMPLES,
-    REORDER_WINDOW_PACKETS,
+    decide_rtp_timestamp_discontinuity, rtp_forward_delta, InferredRtpGenerationBoundary,
+    RtpCandidatePacket, RtpDiscontinuityAction, RtpDiscontinuityDecision, RtpPlacementContext,
+    MAX_RTP_GAP_SAMPLES, OPUS_FRAME_SAMPLES, REORDER_WINDOW_PACKETS,
 };
 use super::synj::JournalRecord;
 
@@ -204,7 +203,10 @@ impl UserPacketAccumulator {
             return self.epoch_anchor;
         }
         let anchor = self.prev_raw_timestamp.unwrap();
-        self.prev_sample_start + rtp_forward_delta(anchor, record.rtp_timestamp)
+        let delta = rtp_forward_delta(anchor, record.rtp_timestamp);
+        self.prev_sample_start
+            .checked_add(delta)
+            .unwrap_or(u64::MAX)
     }
 
     fn capture_anchor_samples(&self) -> u64 {
@@ -466,13 +468,20 @@ impl UserPacketAccumulator {
         Ok(Some(ctx))
     }
 
+    fn timeline_after_rtp_delta(&self, rtp_delta: u64) -> RtpDiscontinuityAction {
+        match self.prev_sample_start.checked_add(rtp_delta) {
+            Some(sample_start) => RtpDiscontinuityAction::Normal { sample_start },
+            None => RtpDiscontinuityAction::Refuse {
+                reason: "timeline sample index overflow".into(),
+            },
+        }
+    }
+
     fn classify_placement_action(&self, pkt: &BufferedPacket) -> RtpDiscontinuityAction {
         let ctx = self.placement_context().expect("placement ctx");
         let delta = rtp_forward_delta(ctx.prior_raw_rtp_timestamp, pkt.record.rtp_timestamp);
         if delta != 0 && delta <= MAX_RTP_GAP_SAMPLES {
-            return RtpDiscontinuityAction::Normal {
-                sample_start: self.prev_sample_start + delta,
-            };
+            return self.timeline_after_rtp_delta(delta);
         }
         let capture = pkt.record.session_capture_offset_samples.unwrap_or(0);
         let decision = decide_rtp_timestamp_discontinuity(
@@ -485,7 +494,22 @@ impl UserPacketAccumulator {
                 arrived_at_ns: pkt.record.arrived_at_ns,
             },
         );
-        discontinuity_decision_to_action(decision, |rtp_delta| self.prev_sample_start + rtp_delta)
+        match decision {
+            RtpDiscontinuityDecision::Gap { rtp_delta_samples } => {
+                match self.prev_sample_start.checked_add(rtp_delta_samples) {
+                    Some(sample_start) => RtpDiscontinuityAction::Gap { sample_start },
+                    None => RtpDiscontinuityAction::Refuse {
+                        reason: "timeline sample index overflow".into(),
+                    },
+                }
+            }
+            RtpDiscontinuityDecision::ImplicitGeneration => {
+                RtpDiscontinuityAction::ImplicitBoundary
+            }
+            RtpDiscontinuityDecision::Refuse { reason } => {
+                RtpDiscontinuityAction::Refuse { reason }
+            }
+        }
     }
 
     fn apply_implicit_boundary_sync(
@@ -800,7 +824,9 @@ impl UserPacketAccumulator {
         frame_samples: u64,
         sample_start: u64,
     ) -> Result<Option<ReadyPacket>, AccumulatorError> {
-        let sample_end = sample_start + frame_samples;
+        let sample_end = sample_start
+            .checked_add(frame_samples)
+            .ok_or_else(|| AccumulatorError::Pathological("timeline sample end overflow".into()))?;
         if self.prev_raw_timestamp.is_some() && sample_start < self.prev_end {
             if self.placement_overlap_tolerant {
                 self.note_irrevocably_emitted(&pkt);
