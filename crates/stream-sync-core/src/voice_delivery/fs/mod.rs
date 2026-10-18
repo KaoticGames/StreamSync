@@ -2,6 +2,7 @@
 
 mod dir;
 pub(crate) mod durability;
+pub(crate) mod durable_payload;
 mod error;
 pub(crate) mod file;
 mod geometry;

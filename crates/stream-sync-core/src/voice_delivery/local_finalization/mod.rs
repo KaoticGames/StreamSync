@@ -10,6 +10,7 @@ mod lease_keeper;
 mod local_publication;
 mod manifest;
 mod offline_journal_rerender;
+mod offline_source_snapshot;
 mod opus_decode;
 mod opus_journal_timeline;
 mod opus_packet_duration;

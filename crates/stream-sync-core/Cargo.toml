@@ -10,6 +10,8 @@ authors.workspace = true
 name = "stream_sync_core"
 path = "src/lib.rs"
 
+build = "build.rs"
+
 [dependencies]
 axum.workspace = true
 tokio.workspace = true
@@ -71,3 +73,4 @@ path = "examples/local_journal_forensics.rs"
 [[example]]
 name = "local_journal_rerender"
 path = "examples/local_journal_rerender.rs"
+required-features = ["local-opus-native"]

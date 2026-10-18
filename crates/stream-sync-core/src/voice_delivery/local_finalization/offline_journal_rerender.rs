@@ -6,6 +6,10 @@ use super::manifest::{
     parse_local_finalization_manifest, LocalFinalizationManifest,
     LOCAL_FINALIZATION_FINALIZER_ALGORITHM_VERSION,
 };
+use super::offline_source_snapshot::{
+    enumerate_journal_segments_exact, materialize_verified_source_snapshot,
+    observe_journal_segments, remove_source_snapshot, OFFLINE_SOURCE_SNAPSHOT_BASENAME,
+};
 use super::opus_decode::assert_local_opus_available;
 use super::processor::{
     process_verified_segments_with_options, LocalProcessorOptions, LocalProcessorProgress,
@@ -13,14 +17,15 @@ use super::processor::{
 };
 use super::storage_preflight::{storage_preflight, StoragePreflightFailure};
 use crate::voice_delivery::finalized_manifest::expected_wav_file_bytes;
-use crate::voice_delivery::fs::durability::sync_dir_exact;
+use crate::voice_delivery::fs::durability::{sync_dir_exact, NamespaceDurability};
+use crate::voice_delivery::fs::durable_payload::write_durable_payload_create_new;
 use crate::voice_delivery::fs::{
     ChildDirProbe, DestRoot, FinalParentPublication, FsError, ValidatedFinalName,
 };
 use crate::voice_delivery::hash::{hex_digest, sha256_hex_reader, DEFAULT_STREAM_CHUNK};
 use crate::voice_delivery::records::record_digest_hex;
 use crate::voice_delivery::recovery_report::RECOVERY_REPORT_RELATIVE_PATH;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io;
@@ -71,19 +76,23 @@ pub struct OfflineJournalRerenderOutcome {
     pub final_dir: PathBuf,
     pub recovery_manifest_path: PathBuf,
     pub completion_marker_path: PathBuf,
+    pub staging_directory_namespace_durability: NamespaceDurability,
+    pub final_parent_namespace_durability: NamespaceDurability,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct OfflineJournalRerenderOptions {
-    /// When true (tests only), skip native Opus availability check.
     #[doc(hidden)]
-    pub skip_native_opus_check: bool,
-    /// When true (tests only), fail immediately after staging directory creation.
-    #[doc(hidden)]
-    pub test_fail_after_staging: bool,
+    pub _private: (),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Default)]
+pub(crate) struct OfflineJournalRerenderTestHooks {
+    pub fail_after_staging: bool,
+    pub post_snapshot: Option<Box<dyn Fn(&Path) + Send + Sync>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OfflineRecoveryManifestStem {
     pub discord_user_id: String,
@@ -93,7 +102,7 @@ pub struct OfflineRecoveryManifestStem {
     pub sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OfflineRecoveryReportRef {
     pub relative_path: String,
@@ -101,7 +110,7 @@ pub struct OfflineRecoveryReportRef {
     pub sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OfflineRecoveryManifest {
     pub schema_version: u32,
@@ -124,11 +133,11 @@ pub struct OfflineRecoveryManifest {
     pub discarded_packet_count: u64,
     pub silence_range_count: u64,
     pub tool_package_version: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_git_identifier: Option<String>,
+    pub tool_build_git_sha: String,
+    pub staging_directory_namespace_durability: NamespaceDurability,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OfflineRecoveryCompleteMarker {
     pub schema_version: u32,
@@ -138,6 +147,8 @@ pub struct OfflineRecoveryCompleteMarker {
     pub source_session_root: String,
     pub recovery_manifest_relative_path: String,
     pub recovery_manifest_sha256: String,
+    pub tool_build_git_sha: String,
+    pub staging_directory_namespace_durability: NamespaceDurability,
     pub record_digest: String,
 }
 
@@ -157,11 +168,29 @@ pub fn run_offline_journal_rerender(
     _network_seal: OfflineJournalRerenderNetworkSeal,
     session_root: &Path,
     output_dir: &Path,
-    options: OfflineJournalRerenderOptions,
+    _options: OfflineJournalRerenderOptions,
+) -> Result<OfflineJournalRerenderOutcome, OfflineJournalRerenderError> {
+    run_offline_journal_rerender_inner(session_root, output_dir, None)
+}
+
+pub(crate) fn run_offline_journal_rerender_with_hooks(
+    session_root: &Path,
+    output_dir: &Path,
+    hooks: OfflineJournalRerenderTestHooks,
+) -> Result<OfflineJournalRerenderOutcome, OfflineJournalRerenderError> {
+    run_offline_journal_rerender_inner(session_root, output_dir, Some(hooks))
+}
+
+fn run_offline_journal_rerender_inner(
+    session_root: &Path,
+    output_dir: &Path,
+    hooks: Option<OfflineJournalRerenderTestHooks>,
 ) -> Result<OfflineJournalRerenderOutcome, OfflineJournalRerenderError> {
     if output_dir.as_os_str().is_empty() {
         return Err(OfflineJournalRerenderError::OutputPathRequired);
     }
+
+    let tool_build_git_sha = required_tool_build_git_sha()?;
 
     let manifest_path = session_root.join("manifest.json");
     let manifest_bytes = std::fs::read(&manifest_path)?;
@@ -171,14 +200,13 @@ pub fn run_offline_journal_rerender(
         .map_err(|e| OfflineJournalRerenderError::Other(e.to_string()))?;
 
     validate_session_root_identity(session_root, &manifest)?;
+    enumerate_journal_segments_exact(session_root, &manifest)?;
 
-    let forensics = analyze_local_journal_session(session_root)
+    let source_forensics = analyze_local_journal_session(session_root)
         .map_err(|e| OfflineJournalRerenderError::Other(e.to_string()))?;
-    if !session_forensics_certified_clean(&forensics) {
+    if !session_forensics_certified_clean(&source_forensics) {
         return Err(OfflineJournalRerenderError::ForensicsNotCertified);
     }
-
-    let segment_paths = verify_all_segments(session_root, &manifest)?;
 
     let dest_parent =
         output_dir
@@ -199,12 +227,6 @@ pub fn run_offline_journal_rerender(
     storage_preflight(dest_parent, required_bytes)
         .map_err(OfflineJournalRerenderError::StoragePreflight)?;
 
-    if !options.skip_native_opus_check {
-        if assert_local_opus_available().is_err() {
-            return Err(OfflineJournalRerenderError::OpusUnavailable);
-        }
-    }
-
     let dest_root = DestRoot::open(dest_parent).map_err(map_fs_err)?;
     let final_parent = dest_root.handle().clone_handle().map_err(map_fs_err)?;
     match final_parent.probe_child_dir(validated_final.as_str()) {
@@ -219,23 +241,53 @@ pub fn run_offline_journal_rerender(
         }
     }
 
+    if assert_local_opus_available().is_err() {
+        return Err(OfflineJournalRerenderError::OpusUnavailable);
+    }
+
     let publication = FinalParentPublication::new(final_parent.clone_handle().map_err(map_fs_err)?);
     let stage_token = publication
         .create_stage_dir()
         .map_err(|e| OfflineJournalRerenderError::Publish(e.to_string()))?;
     let staging_path = dest_parent.join(&stage_token);
 
-    if options.test_fail_after_staging {
+    if hooks.as_ref().is_some_and(|h| h.fail_after_staging) {
         eprintln!(
             "offline_journal_rerender: staging preserved at {}",
             staging_path.display()
         );
         return Err(OfflineJournalRerenderError::Other(
-            "test_fail_after_staging".into(),
+            "offline rerender test hook: fail after staging".into(),
         ));
     }
 
     let run_result = (|| {
+        let source_observation_before = observe_journal_segments(session_root, &manifest)?;
+        let (snapshot_root, segment_paths) = materialize_verified_source_snapshot(
+            &staging_path,
+            session_root,
+            &manifest,
+            &manifest_bytes,
+        )?;
+
+        if let Some(hooks) = &hooks {
+            if let Some(cb) = &hooks.post_snapshot {
+                cb(session_root);
+            }
+        }
+        let source_observation_after = observe_journal_segments(session_root, &manifest)?;
+        if source_observation_before != source_observation_after {
+            return Err(OfflineJournalRerenderError::SegmentVerification(
+                "source journal/segments changed after verified snapshot".into(),
+            ));
+        }
+
+        let forensics = analyze_local_journal_session(&snapshot_root)
+            .map_err(|e| OfflineJournalRerenderError::Other(e.to_string()))?;
+        if !session_forensics_certified_clean(&forensics) {
+            return Err(OfflineJournalRerenderError::ForensicsNotCertified);
+        }
+
         let progress = |p: LocalProcessorProgress| {
             if p.total_segments == 0 {
                 return;
@@ -264,16 +316,34 @@ pub fn run_offline_journal_rerender(
         )
         .map_err(|e| OfflineJournalRerenderError::Processor(e.to_string()))?;
 
+        remove_source_snapshot(&staging_path, &manifest.session_id)?;
+
         let source_manifest_sha256 = hex_digest(&Sha256::digest(&manifest_bytes));
-        let recovery_manifest =
-            build_recovery_manifest(session_root, &manifest, &source_manifest_sha256, &output)?;
+        let staging_handle = final_parent
+            .open_child_dir(&stage_token)
+            .map_err(|e| OfflineJournalRerenderError::Publish(e.to_string()))?;
+        let staging_namespace = sync_dir_exact(&staging_handle)
+            .map_err(|e| OfflineJournalRerenderError::Publish(e.to_string()))?;
+        warn_namespace_unavailable("staging directory", staging_namespace);
+
+        let recovery_manifest = build_recovery_manifest(
+            session_root,
+            &manifest,
+            &source_manifest_sha256,
+            &output,
+            tool_build_git_sha,
+            staging_namespace,
+        )?;
         let recovery_manifest_json = serde_json::to_string_pretty(&recovery_manifest)
             .map_err(|e| OfflineJournalRerenderError::Other(e.to_string()))?;
-        let recovery_manifest_path = staging_path.join(OFFLINE_RECOVERY_MANIFEST_FILENAME);
-        std::fs::write(&recovery_manifest_path, recovery_manifest_json.as_bytes())?;
-
+        write_durable_recovery_file(
+            &staging_handle,
+            OFFLINE_RECOVERY_MANIFEST_FILENAME,
+            recovery_manifest_json.as_bytes(),
+        )?;
         let recovery_manifest_sha256 =
             hex_digest(&Sha256::digest(recovery_manifest_json.as_bytes()));
+
         let marker = OfflineRecoveryCompleteMarker {
             schema_version: OFFLINE_RECOVERY_SCHEMA_VERSION,
             offline_recovery: true,
@@ -282,29 +352,44 @@ pub fn run_offline_journal_rerender(
             source_session_root: session_root.to_string_lossy().into_owned(),
             recovery_manifest_relative_path: OFFLINE_RECOVERY_MANIFEST_FILENAME.into(),
             recovery_manifest_sha256: recovery_manifest_sha256.clone(),
+            tool_build_git_sha: tool_build_git_sha.into(),
+            staging_directory_namespace_durability: staging_namespace,
             record_digest: String::new(),
         };
         let marker_bytes = marker.serialize_bytes()?;
-        let marker_path = staging_path.join(OFFLINE_RECOVERY_COMPLETE_MARKER);
-        std::fs::write(&marker_path, &marker_bytes)?;
+        write_durable_recovery_file(
+            &staging_handle,
+            OFFLINE_RECOVERY_COMPLETE_MARKER,
+            &marker_bytes,
+        )?;
 
-        verify_staging_outputs(&staging_path, &manifest, &output, &recovery_manifest_sha256)?;
-
-        let staging_handle = final_parent
-            .open_child_dir(&stage_token)
-            .map_err(|e| OfflineJournalRerenderError::Publish(e.to_string()))?;
-        sync_dir_exact(&staging_handle)
-            .map_err(|e| OfflineJournalRerenderError::Publish(e.to_string()))?;
+        verify_staging_outputs(
+            &staging_path,
+            &staging_handle,
+            session_root,
+            &manifest,
+            &output,
+            &recovery_manifest_sha256,
+            tool_build_git_sha,
+            staging_namespace,
+        )?;
 
         publication
             .rename_stage_to_final(&stage_token, &validated_final)
             .map_err(|e| OfflineJournalRerenderError::Publish(e.to_string()))?;
+
+        let final_parent_handle = final_parent.clone_handle().map_err(map_fs_err)?;
+        let final_parent_namespace = sync_dir_exact(&final_parent_handle)
+            .map_err(|e| OfflineJournalRerenderError::Publish(e.to_string()))?;
+        warn_namespace_unavailable("final parent directory", final_parent_namespace);
 
         let final_dir = dest_parent.join(validated_final.as_str());
         Ok(OfflineJournalRerenderOutcome {
             final_dir: final_dir.clone(),
             recovery_manifest_path: final_dir.join(OFFLINE_RECOVERY_MANIFEST_FILENAME),
             completion_marker_path: final_dir.join(OFFLINE_RECOVERY_COMPLETE_MARKER),
+            staging_directory_namespace_durability: staging_namespace,
+            final_parent_namespace_durability: final_parent_namespace,
         })
     })();
 
@@ -315,6 +400,45 @@ pub fn run_offline_journal_rerender(
         );
     }
     run_result
+}
+
+fn required_tool_build_git_sha() -> Result<&'static str, OfflineJournalRerenderError> {
+    match option_env!("STREAMSYNC_GIT_SHA") {
+        Some(s) if is_valid_git_sha(s) => Ok(s),
+        _ => Err(OfflineJournalRerenderError::Other(
+            "tool build git SHA unavailable; rebuild from a git checkout".into(),
+        )),
+    }
+}
+
+fn is_valid_git_sha(s: &str) -> bool {
+    s.len() == 40
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn is_valid_sha256_hex(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn warn_namespace_unavailable(label: &str, durability: NamespaceDurability) {
+    if durability == NamespaceDurability::Unavailable {
+        eprintln!(
+            "offline_journal_rerender: warning: {label} namespace durability unavailable on this platform (file sync/hash/readback succeeded)"
+        );
+    }
+}
+
+fn write_durable_recovery_file(
+    staging: &crate::voice_delivery::fs::DirHandle,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), OfflineJournalRerenderError> {
+    write_durable_payload_create_new(staging, name, bytes)
+        .map_err(|e| OfflineJournalRerenderError::Publish(e.to_string()))?;
+    Ok(())
 }
 
 fn validate_session_root_identity(
@@ -338,51 +462,6 @@ fn validate_session_root_identity(
     Ok(())
 }
 
-fn verify_all_segments(
-    session_root: &Path,
-    manifest: &LocalFinalizationManifest,
-) -> Result<Vec<PathBuf>, OfflineJournalRerenderError> {
-    let mut paths = Vec::with_capacity(manifest.segments.len());
-    let mut last_seq: Option<u32> = None;
-    for seg in &manifest.segments {
-        if last_seq.is_some_and(|prev| seg.segment_seq <= prev) {
-            return Err(OfflineJournalRerenderError::SegmentVerification(
-                "manifest segments must be strictly increasing by segmentSeq".into(),
-            ));
-        }
-        last_seq = Some(seg.segment_seq);
-        let path = session_root
-            .join("journal/segments")
-            .join(format!("{:08}.synj", seg.segment_seq));
-        if !path.is_file() {
-            return Err(OfflineJournalRerenderError::SegmentVerification(format!(
-                "missing segment file for seq {}",
-                seg.segment_seq
-            )));
-        }
-        let meta = std::fs::metadata(&path)?;
-        if meta.len() != seg.byte_length {
-            return Err(OfflineJournalRerenderError::SegmentVerification(format!(
-                "segment {} byte length {} != manifest {}",
-                seg.segment_seq,
-                meta.len(),
-                seg.byte_length
-            )));
-        }
-        let file = File::open(&path)?;
-        let sha = sha256_hex_reader(file, DEFAULT_STREAM_CHUNK)
-            .map_err(|e| OfflineJournalRerenderError::SegmentVerification(e.to_string()))?;
-        if sha != seg.sha256 {
-            return Err(OfflineJournalRerenderError::SegmentVerification(format!(
-                "segment {} sha256 mismatch",
-                seg.segment_seq
-            )));
-        }
-        paths.push(path);
-    }
-    Ok(paths)
-}
-
 pub(crate) fn offline_recovery_required_bytes(
     manifest: &LocalFinalizationManifest,
 ) -> Result<u64, StoragePreflightFailure> {
@@ -396,6 +475,8 @@ fn build_recovery_manifest(
     manifest: &LocalFinalizationManifest,
     source_manifest_sha256: &str,
     output: &super::processor::LocalProcessOutput,
+    tool_build_git_sha: &str,
+    staging_namespace: NamespaceDurability,
 ) -> Result<OfflineRecoveryManifest, OfflineJournalRerenderError> {
     let verified_total_bytes = manifest
         .segments
@@ -455,15 +536,78 @@ fn build_recovery_manifest(
         discarded_packet_count: output.discarded_packet_count,
         silence_range_count: output.silence_range_count,
         tool_package_version: env!("CARGO_PKG_VERSION").into(),
-        tool_git_identifier: option_env!("STREAMSYNC_GIT_SHA").map(|s| s.to_string()),
+        tool_build_git_sha: tool_build_git_sha.into(),
+        staging_directory_namespace_durability: staging_namespace,
     })
+}
+
+pub(crate) fn parse_offline_recovery_complete_marker_strict(
+    bytes: &[u8],
+) -> Result<OfflineRecoveryCompleteMarker, OfflineJournalRerenderError> {
+    let marker: OfflineRecoveryCompleteMarker = serde_json::from_slice(bytes)
+        .map_err(|_| OfflineJournalRerenderError::Other("completion marker json".into()))?;
+    if marker.schema_version != OFFLINE_RECOVERY_SCHEMA_VERSION {
+        return Err(OfflineJournalRerenderError::Other(
+            "completion marker schema".into(),
+        ));
+    }
+    if !marker.offline_recovery {
+        return Err(OfflineJournalRerenderError::Other(
+            "completion marker offlineRecovery".into(),
+        ));
+    }
+    if marker.cloud_receipt_posted {
+        return Err(OfflineJournalRerenderError::Other(
+            "completion marker cloudReceiptPosted".into(),
+        ));
+    }
+    if marker.source_session_id.is_empty() || marker.source_session_root.is_empty() {
+        return Err(OfflineJournalRerenderError::Other(
+            "completion marker source identity".into(),
+        ));
+    }
+    if marker.recovery_manifest_relative_path != OFFLINE_RECOVERY_MANIFEST_FILENAME {
+        return Err(OfflineJournalRerenderError::Other(
+            "completion marker manifest path".into(),
+        ));
+    }
+    if !is_valid_sha256_hex(&marker.recovery_manifest_sha256) {
+        return Err(OfflineJournalRerenderError::Other(
+            "completion marker manifest digest".into(),
+        ));
+    }
+    if !is_valid_git_sha(&marker.tool_build_git_sha) {
+        return Err(OfflineJournalRerenderError::Other(
+            "completion marker tool build git sha".into(),
+        ));
+    }
+    if !is_valid_sha256_hex(&marker.record_digest) {
+        return Err(OfflineJournalRerenderError::Other(
+            "completion marker record digest".into(),
+        ));
+    }
+    let mut tmp = marker.clone();
+    let expected = tmp.record_digest.clone();
+    tmp.record_digest = String::new();
+    let payload =
+        serde_json::to_vec(&tmp).map_err(|e| OfflineJournalRerenderError::Other(e.to_string()))?;
+    if record_digest_hex(&payload) != expected {
+        return Err(OfflineJournalRerenderError::Other(
+            "completion marker digest mismatch".into(),
+        ));
+    }
+    Ok(marker)
 }
 
 fn verify_staging_outputs(
     staging: &Path,
+    staging_handle: &crate::voice_delivery::fs::DirHandle,
+    session_root: &Path,
     manifest: &LocalFinalizationManifest,
     output: &super::processor::LocalProcessOutput,
     recovery_manifest_sha256: &str,
+    tool_build_git_sha: &str,
+    staging_namespace: NamespaceDurability,
 ) -> Result<(), OfflineJournalRerenderError> {
     for user in &manifest.users {
         let wav_name = format!("{}.wav", user.path_nick);
@@ -503,6 +647,46 @@ fn verify_staging_outputs(
             "recovery manifest digest mismatch".into(),
         ));
     }
+    let parsed_manifest: OfflineRecoveryManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| OfflineJournalRerenderError::Other(e.to_string()))?;
+    if parsed_manifest.schema_version != OFFLINE_RECOVERY_SCHEMA_VERSION
+        || !parsed_manifest.offline_recovery
+        || parsed_manifest.cloud_receipt_posted
+        || parsed_manifest.tool_build_git_sha != tool_build_git_sha
+    {
+        return Err(OfflineJournalRerenderError::Other(
+            "recovery manifest schema binding".into(),
+        ));
+    }
+
+    let marker_bytes = std::fs::read(staging.join(OFFLINE_RECOVERY_COMPLETE_MARKER))?;
+    let marker = parse_offline_recovery_complete_marker_strict(&marker_bytes)?;
+    if marker.source_session_id != manifest.session_id {
+        return Err(OfflineJournalRerenderError::Other(
+            "completion marker session id".into(),
+        ));
+    }
+    if marker.source_session_root != session_root.to_string_lossy() {
+        return Err(OfflineJournalRerenderError::Other(
+            "completion marker session root".into(),
+        ));
+    }
+    if marker.recovery_manifest_sha256 != recovery_manifest_sha256 {
+        return Err(OfflineJournalRerenderError::Other(
+            "completion marker manifest hash".into(),
+        ));
+    }
+    if marker.staging_directory_namespace_durability != staging_namespace {
+        return Err(OfflineJournalRerenderError::Other(
+            "completion marker namespace durability".into(),
+        ));
+    }
+    if staging.join(OFFLINE_SOURCE_SNAPSHOT_BASENAME).exists() {
+        return Err(OfflineJournalRerenderError::Other(
+            "source snapshot must be removed before publish".into(),
+        ));
+    }
+    let _ = staging_handle;
     Ok(())
 }
 
@@ -555,6 +739,7 @@ mod tests {
         users: Vec<LocalFinalizationUser>,
         segments: Vec<(u32, Vec<u8>)>,
     ) -> LocalFinalizationManifest {
+        let guild_id = "123456789012345678";
         let seg_entries: Vec<LocalFinalizationSegment> = segments
             .iter()
             .map(|(seq, body)| {
@@ -562,7 +747,10 @@ mod tests {
                     sha256_hex_reader(std::io::Cursor::new(body), DEFAULT_STREAM_CHUNK).unwrap();
                 LocalFinalizationSegment {
                     segment_seq: *seq,
-                    key: format!("seg-{seq}"),
+                    key: format!(
+                        "voice-delivery-v2/{guild_id}/{session_id}/journal/{:08}.synj",
+                        *seq
+                    ),
                     byte_length: body.len() as u64,
                     sha256: sha,
                 }
@@ -572,7 +760,7 @@ mod tests {
             version: 1,
             finalizer_algorithm_version: LOCAL_FINALIZATION_FINALIZER_ALGORITHM_VERSION.into(),
             session_id: session_id.into(),
-            guild_id: "123456789012345678".into(),
+            guild_id: guild_id.into(),
             channel_id: "234567890123456789".into(),
             session_start_wall_ms: 0,
             session_start_monotonic_ns: "0".into(),
@@ -581,14 +769,16 @@ mod tests {
             target_sample_count_48k: 960,
             journal_sha256: "a".repeat(64),
             recording_manifest: LocalFinalizationObjectRef {
-                key: "k".into(),
+                key: format!(
+                    "voice-delivery-v2/{guild_id}/{session_id}/manifest/recording.manifest.json"
+                ),
                 sha256: "b".repeat(64),
-                byte_length: 0,
+                byte_length: 4096,
             },
             sealed_index: LocalFinalizationObjectRef {
-                key: "k".into(),
+                key: format!("voice-delivery-v2/{guild_id}/{session_id}/journal/index.sealed.json"),
                 sha256: "c".repeat(64),
-                byte_length: 0,
+                byte_length: 512,
             },
             segments: seg_entries,
             users,
@@ -603,24 +793,41 @@ mod tests {
         let session_id = "550e8400-e29b-41d4-a716-446655440099";
         let session_root = tmp.join(session_id);
         let user = "123456789012345678";
-        let records = vec![sample_record(user, 0, 0), sample_record(user, 1, 960)];
-        let encoded: Vec<Vec<u8>> = records
-            .iter()
-            .map(|r| encode_journal_record(JOURNAL_FORMAT_VERSION_V2, r))
-            .collect();
-        let body = encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &encoded);
+        let body = encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &[]);
         let users = vec![LocalFinalizationUser {
             discord_user_id: user.into(),
-            path_nick: "player".into(),
-            opaque_stem_id: "a".repeat(32),
+            path_nick: "wrap_epoch".into(),
+            opaque_stem_id:
+                crate::voice_delivery::local_finalization::derive_voice_v2_opaque_stem_id(
+                    session_id,
+                    "123456789012345678",
+                    user,
+                    "wrap_epoch",
+                ),
         }];
         let manifest = manifest_with_segments(session_id, users, vec![(0, body.clone())]);
         write_verified_session(&session_root, &manifest, &[body]);
+        let report = analyze_local_journal_session(&session_root).unwrap();
+        assert!(session_forensics_certified_clean(&report));
         (session_root, manifest)
     }
 
+    fn run_success_outcome(
+        tmp: &tempfile::TempDir,
+        session_root: &Path,
+    ) -> OfflineJournalRerenderOutcome {
+        let out = tmp.path().join("dest").join("recovered");
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        run_offline_journal_rerender_with_hooks(
+            session_root,
+            &out,
+            OfflineJournalRerenderTestHooks::default(),
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn verify_segments_rejects_hash_and_missing() {
+    fn verify_segments_rejects_extra_and_missing_synj() {
         let session_id = "550e8400-e29b-41d4-a716-446655440020";
         let user = "123456789012345678";
         let body = encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &[]);
@@ -642,30 +849,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join(session_id);
         write_verified_session(&root, &manifest, &[body]);
-        assert!(verify_all_segments(&root, &manifest).is_ok());
+        assert!(enumerate_journal_segments_exact(&root, &manifest).is_ok());
         std::fs::remove_file(root.join("journal/segments/00000000.synj")).unwrap();
         assert!(matches!(
-            verify_all_segments(&root, &manifest),
+            enumerate_journal_segments_exact(&root, &manifest),
             Err(OfflineJournalRerenderError::SegmentVerification(_))
         ));
-        write_verified_session(
-            &root,
-            &manifest,
-            &[encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &[])],
-        );
-        let seg_path = root.join("journal/segments/00000000.synj");
-        let mut bytes = std::fs::read(&seg_path).unwrap();
-        let tail = bytes.len() - 1;
-        bytes[tail] ^= 0xff;
-        std::fs::write(seg_path, bytes).unwrap();
+        std::fs::write(root.join("journal/segments/00000001.synj"), b"extra").unwrap();
         assert!(matches!(
-            verify_all_segments(&root, &manifest),
+            enumerate_journal_segments_exact(&root, &manifest),
             Err(OfflineJournalRerenderError::SegmentVerification(_))
         ));
     }
 
     #[test]
-    fn segment_paths_follow_manifest_order() {
+    fn segment_paths_follow_manifest_order_in_snapshot() {
         let user = "123456789012345678";
         let b0 = encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &[]);
         let b1 = encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &[]);
@@ -681,7 +879,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join(&manifest.session_id);
         write_verified_session(&root, &manifest, &[b0, b1]);
-        let paths = verify_all_segments(&root, &manifest).unwrap();
+        let staging = tmp.path().join("stage");
+        std::fs::create_dir_all(&staging).unwrap();
+        let bytes = std::fs::read(root.join("manifest.json")).unwrap();
+        let (_, paths) =
+            materialize_verified_source_snapshot(&staging, &root, &manifest, &bytes).unwrap();
         assert_eq!(paths.len(), 2);
         assert!(paths[0].to_string_lossy().contains("00000000"));
         assert!(paths[1].to_string_lossy().contains("00000001"));
@@ -712,16 +914,133 @@ mod tests {
         let (session_root, manifest) = certified_single_user_session(tmp.path());
         let bytes = std::fs::read(session_root.join("manifest.json")).unwrap();
         let digest = hex_digest(&Sha256::digest(&bytes));
-        let out = super::super::processor::process_verified_segments(
+        let staging = tmp.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let (snap, seg_paths) =
+            materialize_verified_source_snapshot(&staging, &session_root, &manifest, &bytes)
+                .unwrap();
+        let out =
+            super::super::processor::process_verified_segments(&manifest, &seg_paths, &staging)
+                .unwrap();
+        let sha = required_tool_build_git_sha().unwrap();
+        let recovery = build_recovery_manifest(
+            &session_root,
             &manifest,
-            &[session_root.join("journal/segments").join("00000000.synj")],
-            &tmp.path().join("staging"),
+            &digest,
+            &out,
+            sha,
+            NamespaceDurability::Proven,
         )
         .unwrap();
-        let recovery = build_recovery_manifest(&session_root, &manifest, &digest, &out).unwrap();
         assert_eq!(recovery.source_manifest_sha256, digest);
-        assert_eq!(recovery.source_session_id, manifest.session_id);
+        assert_eq!(recovery.tool_build_git_sha, sha);
         assert!(recovery.offline_recovery);
         assert!(!recovery.cloud_receipt_posted);
+        let _ = snap;
+    }
+
+    #[test]
+    fn success_publishes_recovery_manifest_and_completion_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (session_root, manifest) = certified_single_user_session(tmp.path());
+        let outcome = run_success_outcome(&tmp, &session_root);
+        assert!(outcome.recovery_manifest_path.is_file());
+        assert!(outcome.completion_marker_path.is_file());
+        let recovery_json = std::fs::read_to_string(&outcome.recovery_manifest_path).unwrap();
+        assert!(recovery_json.contains("\"toolBuildGitSha\""));
+        assert!(recovery_json.contains("\"offlineRecovery\": true"));
+        let marker = std::fs::read(&outcome.completion_marker_path).unwrap();
+        parse_offline_recovery_complete_marker_strict(&marker).unwrap();
+        assert!(outcome.final_dir.join("wrap_epoch.wav").is_file());
+    }
+
+    #[test]
+    fn failure_preserves_source_and_leaves_staging_without_final() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (session_root, _) = certified_single_user_session(tmp.path());
+        let manifest_before = std::fs::read(session_root.join("manifest.json")).unwrap();
+        let out = tmp.path().join("dest").join("recovered-fail");
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        assert!(run_offline_journal_rerender_with_hooks(
+            &session_root,
+            &out,
+            OfflineJournalRerenderTestHooks {
+                fail_after_staging: true,
+                post_snapshot: None,
+            },
+        )
+        .is_err());
+        assert!(!out.exists());
+        assert_eq!(
+            std::fs::read(session_root.join("manifest.json")).unwrap(),
+            manifest_before
+        );
+        let parent = out.parent().unwrap();
+        assert!(parent.read_dir().unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".streamsync-stage-")));
+    }
+
+    #[test]
+    fn truncated_completion_marker_fails_strict_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (session_root, _) = certified_single_user_session(tmp.path());
+        let outcome = run_success_outcome(&tmp, &session_root);
+        let bytes = std::fs::read(&outcome.completion_marker_path).unwrap();
+        let truncated = &bytes[..bytes.len().saturating_sub(8)];
+        assert!(parse_offline_recovery_complete_marker_strict(truncated).is_err());
+    }
+
+    #[test]
+    fn source_mutation_after_snapshot_refuses_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (session_root, manifest) = certified_single_user_session(tmp.path());
+        let out = tmp.path().join("dest").join("recovered-mutate");
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        let seg = session_root.join("journal/segments/00000000.synj");
+        let err = run_offline_journal_rerender_with_hooks(
+            &session_root,
+            &out,
+            OfflineJournalRerenderTestHooks {
+                fail_after_staging: false,
+                post_snapshot: Some(Box::new(move |_| {
+                    let mut bytes = std::fs::read(&seg).unwrap();
+                    if !bytes.is_empty() {
+                        bytes[0] ^= 0x01;
+                    }
+                    std::fs::write(&seg, bytes).unwrap();
+                })),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            OfflineJournalRerenderError::SegmentVerification(_)
+        ));
+        assert!(!out.exists());
+        assert!(std::fs::read(&session_root.join("manifest.json")).is_ok());
+        let _ = manifest;
+    }
+
+    #[test]
+    fn marker_digest_mismatch_rejected_by_strict_parser() {
+        let marker = OfflineRecoveryCompleteMarker {
+            schema_version: OFFLINE_RECOVERY_SCHEMA_VERSION,
+            offline_recovery: true,
+            cloud_receipt_posted: false,
+            source_session_id: "s".into(),
+            source_session_root: "/tmp/s".into(),
+            recovery_manifest_relative_path: OFFLINE_RECOVERY_MANIFEST_FILENAME.into(),
+            recovery_manifest_sha256: "a".repeat(64),
+            tool_build_git_sha: "b".repeat(40),
+            staging_directory_namespace_durability: NamespaceDurability::Proven,
+            record_digest: "c".repeat(64),
+        };
+        let bytes = marker.serialize_bytes().unwrap();
+        let mut bad = bytes.clone();
+        bad[10] ^= 0x7;
+        assert!(parse_offline_recovery_complete_marker_strict(&bad).is_err());
     }
 }

@@ -25,7 +25,20 @@ fn main() {
     }
 }
 
+fn required_build_git_sha() -> Result<&'static str, String> {
+    match option_env!("STREAMSYNC_GIT_SHA") {
+        Some(s) if s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(s),
+        _ => Err(
+            "STREAMSYNC_GIT_SHA unavailable; build from a git checkout (build.rs sets provenance)"
+                .into(),
+        ),
+    }
+}
+
 fn run() -> Result<PathBuf, String> {
+    let build_sha = required_build_git_sha()?;
+    println!("offline_journal_rerender: tool_build_git_sha={}", build_sha);
+
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         eprintln!("usage: local_journal_rerender <session-root> --output <new-final-dir>");

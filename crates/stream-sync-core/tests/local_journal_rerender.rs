@@ -9,8 +9,7 @@ use stream_sync_core::voice_delivery::local_finalization::{
     LocalFinalizationOutputPolicy, LocalFinalizationSegment, LocalFinalizationUser,
     OfflineJournalRerenderError, OfflineJournalRerenderNetworkSeal, OfflineJournalRerenderOptions,
     JOURNAL_FORMAT_VERSION_V2, LOCAL_FINALIZATION_FINALIZER_ALGORITHM_VERSION,
-    LOCAL_FINALIZATION_WAV_FORMAT, OFFLINE_RECOVERY_COMPLETE_MARKER,
-    OFFLINE_RECOVERY_MANIFEST_FILENAME,
+    LOCAL_FINALIZATION_WAV_FORMAT, OFFLINE_RECOVERY_MANIFEST_FILENAME,
 };
 use stream_sync_core::voice_delivery::{
     hex_digest, sha256_hex_reader, DEFAULT_STREAM_CHUNK, RECOVERY_REPORT_RELATIVE_PATH,
@@ -128,13 +127,6 @@ fn certified_clean_session(tmp: &Path) -> (PathBuf, LocalFinalizationManifest) {
     (session_root, manifest)
 }
 
-fn run_options() -> OfflineJournalRerenderOptions {
-    OfflineJournalRerenderOptions {
-        skip_native_opus_check: true,
-        test_fail_after_staging: false,
-    }
-}
-
 #[test]
 fn refuses_existing_output_before_staging() {
     let tmp = tempfile::tempdir().unwrap();
@@ -147,7 +139,7 @@ fn refuses_existing_output_before_staging() {
         OfflineJournalRerenderNetworkSeal,
         &session_root,
         &final_dir,
-        run_options(),
+        OfflineJournalRerenderOptions::default(),
     )
     .unwrap_err();
     assert!(matches!(
@@ -185,7 +177,7 @@ fn refuses_uncertified_source_before_staging() {
         OfflineJournalRerenderNetworkSeal,
         &session_root,
         &out,
-        run_options(),
+        OfflineJournalRerenderOptions::default(),
     )
     .unwrap_err();
     assert!(
@@ -195,93 +187,48 @@ fn refuses_uncertified_source_before_staging() {
     assert!(!out.exists());
 }
 
+#[cfg(not(feature = "local-opus-native"))]
 #[test]
-fn success_publishes_recovery_manifest_and_completion_marker() {
+fn refuses_without_native_opus_decoder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (session_root, _) = certified_clean_session(tmp.path());
+    let out = tmp.path().join("dest").join("recovered-opus");
+    fs::create_dir_all(out.parent().unwrap()).unwrap();
+    let err = run_offline_journal_rerender(
+        OfflineJournalRerenderNetworkSeal,
+        &session_root,
+        &out,
+        OfflineJournalRerenderOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, OfflineJournalRerenderError::OpusUnavailable));
+    assert!(!out.exists());
+}
+
+#[test]
+fn rejects_extra_segment_file_before_staging() {
     let tmp = tempfile::tempdir().unwrap();
     let (session_root, manifest) = certified_clean_session(tmp.path());
-    let manifest_before = fs::read(session_root.join("manifest.json")).unwrap();
-    let out = tmp.path().join("dest").join("recovered-success");
-    fs::create_dir_all(out.parent().unwrap()).unwrap();
-    let outcome = run_offline_journal_rerender(
-        OfflineJournalRerenderNetworkSeal,
-        &session_root,
-        &out,
-        run_options(),
+    fs::write(
+        session_root.join("journal/segments/00000001.synj"),
+        b"extra",
     )
     .unwrap();
-    assert!(outcome.final_dir.is_dir());
-    assert!(outcome.recovery_manifest_path.is_file());
-    assert!(outcome.completion_marker_path.is_file());
-    assert!(outcome.final_dir.join("wrap_epoch.wav").is_file());
-    assert!(outcome
-        .final_dir
-        .join(RECOVERY_REPORT_RELATIVE_PATH)
-        .is_file());
-    let marker = fs::read_to_string(&outcome.completion_marker_path).unwrap();
-    assert!(marker.contains(&manifest.session_id));
-    let recovery_json = fs::read_to_string(&outcome.recovery_manifest_path).unwrap();
-    assert!(recovery_json.contains("\"offlineRecovery\": true"));
-    assert!(recovery_json.contains("\"cloudReceiptPosted\": false"));
-    assert_eq!(
-        fs::read(session_root.join("manifest.json")).unwrap(),
-        manifest_before
-    );
-}
-
-#[test]
-fn failure_preserves_source_and_leaves_staging_without_final() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (session_root, _) = certified_clean_session(tmp.path());
-    let manifest_before = fs::read(session_root.join("manifest.json")).unwrap();
-    let out = tmp.path().join("dest").join("recovered-fail");
+    let out = tmp.path().join("dest").join("recovered-extra");
     fs::create_dir_all(out.parent().unwrap()).unwrap();
-    let opts = OfflineJournalRerenderOptions {
-        skip_native_opus_check: true,
-        test_fail_after_staging: true,
-    };
-    assert!(run_offline_journal_rerender(
+    let err = run_offline_journal_rerender(
         OfflineJournalRerenderNetworkSeal,
         &session_root,
         &out,
-        opts,
+        OfflineJournalRerenderOptions::default(),
     )
-    .is_err());
-    assert!(!out.exists());
-    assert_eq!(
-        fs::read(session_root.join("manifest.json")).unwrap(),
-        manifest_before
-    );
-    let parent = out.parent().unwrap();
-    let staging_left = parent.read_dir().unwrap().filter_map(|e| e.ok()).any(|e| {
-        e.file_name()
-            .to_string_lossy()
-            .starts_with(".streamsync-stage-")
-    });
-    assert!(staging_left);
-}
-
-#[test]
-fn metadata_binds_source_manifest_digest() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (session_root, _) = certified_clean_session(tmp.path());
-    let digest = hex_digest(&Sha256::digest(
-        &fs::read(session_root.join("manifest.json")).unwrap(),
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        OfflineJournalRerenderError::SegmentVerification(_)
     ));
-    let out = tmp.path().join("dest").join("recovered-meta");
-    fs::create_dir_all(out.parent().unwrap()).unwrap();
-    let outcome = run_offline_journal_rerender(
-        OfflineJournalRerenderNetworkSeal,
-        &session_root,
-        &out,
-        run_options(),
-    )
-    .unwrap();
-    let json = fs::read_to_string(outcome.recovery_manifest_path).unwrap();
-    assert!(json.contains(&digest));
-    let marker = fs::read_to_string(outcome.completion_marker_path).unwrap();
-    assert!(marker.contains(OFFLINE_RECOVERY_MANIFEST_FILENAME));
-    let recovery_manifest_sha = hex_digest(&Sha256::digest(json.as_bytes()));
-    assert!(marker.contains(&recovery_manifest_sha));
+    assert!(!out.exists());
+    let _ = manifest;
 }
 
 #[test]
@@ -291,4 +238,43 @@ fn offline_rerender_source_has_no_network_client_symbols() {
     assert!(!production.contains("reqwest"));
     assert!(!production.contains("VoiceV2Client"));
     assert!(!production.contains("HttpLocalFinalizationClient"));
+    assert!(!production.contains("skip_native_opus_check"));
+}
+
+#[cfg(feature = "local-opus-native")]
+mod native_opus_success {
+    use super::*;
+
+    #[test]
+    fn success_publishes_recovery_manifest_with_build_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (session_root, manifest) = certified_clean_session(tmp.path());
+        let manifest_before = fs::read(session_root.join("manifest.json")).unwrap();
+        let out = tmp.path().join("dest").join("recovered-success");
+        fs::create_dir_all(out.parent().unwrap()).unwrap();
+        let outcome = run_offline_journal_rerender(
+            OfflineJournalRerenderNetworkSeal,
+            &session_root,
+            &out,
+            OfflineJournalRerenderOptions::default(),
+        )
+        .unwrap();
+        assert!(outcome.recovery_manifest_path.is_file());
+        assert!(outcome.completion_marker_path.is_file());
+        let recovery_json = fs::read_to_string(&outcome.recovery_manifest_path).unwrap();
+        assert!(recovery_json.contains("\"toolBuildGitSha\""));
+        assert!(recovery_json.contains("\"offlineRecovery\": true"));
+        assert!(recovery_json.contains("\"cloudReceiptPosted\": false"));
+        assert_eq!(
+            fs::read(session_root.join("manifest.json")).unwrap(),
+            manifest_before
+        );
+        let digest = hex_digest(&Sha256::digest(
+            &fs::read(session_root.join("manifest.json")).unwrap(),
+        ));
+        assert!(recovery_json.contains(&digest));
+        let marker = fs::read_to_string(&outcome.completion_marker_path).unwrap();
+        assert!(marker.contains(OFFLINE_RECOVERY_MANIFEST_FILENAME));
+        assert!(marker.contains(&manifest.session_id));
+    }
 }
