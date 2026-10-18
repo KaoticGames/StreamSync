@@ -138,7 +138,7 @@ impl BoundedPacketLossTracker {
         let stream_key = (discord_user_id.to_string(), effective_epoch);
         let cursor = self.stream_cursors.entry(stream_key).or_default();
         if let Some(prev) = cursor.last_loss_extended {
-            if prev + 1 == extended_sequence {
+            if prev.checked_add(1) == Some(extended_sequence) {
                 self.consecutive_loss_detected = true;
                 return Err(BoundedPacketLossError::ConsecutiveLoss {
                     path_nick,
@@ -280,6 +280,18 @@ mod tests {
             err,
             BoundedPacketLossError::MaxSkippedExceeded { max: 32, .. }
         ));
+    }
+
+    #[test]
+    fn consecutive_loss_i64_max_prior_does_not_wrap_to_adjacent() {
+        let mut t = tracker_with_user();
+        t.note_known_user_journal_record();
+        t.register_media_loss(USER, 0, 1, i64::MAX, PacketLossSource::DecodeFailure)
+            .expect("first loss at MAX");
+        t.register_media_loss(USER, 0, 2, i64::MIN, PacketLossSource::PlacementOverlap)
+            .expect("MIN must not look consecutive to MAX");
+        assert_eq!(t.skipped_count(), 2);
+        assert!(!t.summary(true).consecutive_loss_detected);
     }
 
     #[test]

@@ -894,6 +894,11 @@ impl UserPacketAccumulator {
             .ok_or_else(|| AccumulatorError::Pathological("timeline sample end overflow".into()))?;
         if self.prev_raw_timestamp.is_some() && sample_start < self.prev_end {
             if self.placement_overlap_tolerant {
+                self.last_emitted_raw_sequence = pkt.record.sequence;
+                self.last_emitted_extended_sequence = pkt.extended_sequence;
+                self.last_emitted_capture_offset =
+                    pkt.record.session_capture_offset_samples.unwrap_or(0);
+                self.last_emitted_arrived_at_ns = pkt.record.arrived_at_ns;
                 self.note_irrevocably_emitted(&pkt)?;
                 return Ok(Some(ReadyPacket {
                     record: pkt.record,
