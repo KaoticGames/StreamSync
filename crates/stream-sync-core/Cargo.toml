@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+build = "build.rs"
 
 [lib]
 name = "stream_sync_core"
@@ -67,3 +68,8 @@ path = "examples/host_embed.rs"
 [[example]]
 name = "local_journal_forensics"
 path = "examples/local_journal_forensics.rs"
+
+[[example]]
+name = "local_journal_rerender"
+path = "examples/local_journal_rerender.rs"
+required-features = ["local-opus-native"]

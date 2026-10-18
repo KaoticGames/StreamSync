@@ -36,6 +36,7 @@ pub use finalized_manifest::{
     canonicalize_finalized_manifest_for_digest, compute_finalized_manifest_digest,
     parse_syndicate_finalized_manifest, SyndicateFinalizedManifest,
 };
+pub use hash::{hex_digest, sha256_hex_reader, DEFAULT_STREAM_CHUNK};
 pub use ingest::{PartialError, PartialRecoveryReportWriter, PartialStemWriter};
 pub use local_finalization::{
     compute_local_finalization_manifest_digest, parse_local_finalization_manifest,

@@ -9,6 +9,8 @@ mod journal_store;
 mod lease_keeper;
 mod local_publication;
 mod manifest;
+mod offline_journal_rerender;
+mod offline_source_snapshot;
 mod opus_decode;
 mod opus_journal_timeline;
 mod opus_packet_duration;
@@ -43,8 +45,14 @@ pub use journal_store::LocalJournalStore;
 pub use local_publication::{resolve_published_paths, PublishedLocalOutput};
 pub use manifest::{
     compute_local_finalization_manifest_digest, derive_voice_v2_opaque_stem_id,
-    parse_local_finalization_manifest, LocalFinalizationManifest,
-    LOCAL_FINALIZATION_FINALIZER_ALGORITHM_VERSION,
+    parse_local_finalization_manifest, LocalFinalizationManifest, LocalFinalizationObjectRef,
+    LocalFinalizationOutputPolicy, LocalFinalizationSegment, LocalFinalizationUser,
+    LOCAL_FINALIZATION_FINALIZER_ALGORITHM_VERSION, LOCAL_FINALIZATION_WAV_FORMAT,
+};
+pub use offline_journal_rerender::{
+    run_offline_journal_rerender, OfflineJournalRerenderError, OfflineJournalRerenderNetworkSeal,
+    OfflineJournalRerenderOptions, OfflineJournalRerenderOutcome, OFFLINE_RECOVERY_COMPLETE_MARKER,
+    OFFLINE_RECOVERY_MANIFEST_FILENAME,
 };
 pub use opus_decode::assert_local_opus_available;
 pub use orchestrator::{

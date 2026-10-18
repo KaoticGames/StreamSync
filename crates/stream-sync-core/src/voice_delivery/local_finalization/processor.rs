@@ -14,6 +14,7 @@ use super::report::{
 use super::synj::{decode_journal_record, read_file_header, JournalFramingError, JournalRecord};
 use crate::voice_delivery::bounds::STEREO_PCM_FRAME_BYTES;
 use crate::voice_delivery::finalized_manifest::expected_wav_file_bytes;
+use crate::voice_delivery::fs::durable_payload::{ensure_parent, write_durable_payload_at_path};
 use crate::voice_delivery::hash::{hex_digest, LiveSha256};
 use crate::voice_delivery::wav::minimal_wav_header;
 use sha2::Digest;
@@ -503,7 +504,9 @@ pub fn process_verified_segments_with_options(
     let report_bytes = report_text.len() as u64;
     let report_path = staging_dir.join("Syndicate Audio Recovery Report.txt");
     let report_sha = hex_digest(&sha2::Sha256::digest(report_text.as_bytes()));
-    std::fs::write(&report_path, report_text)?;
+    ensure_parent(&report_path).map_err(LocalProcessorError::Io)?;
+    write_durable_payload_at_path(&report_path, report_text.as_bytes())
+        .map_err(LocalProcessorError::Io)?;
 
     Ok(LocalProcessOutput {
         stem_paths,
