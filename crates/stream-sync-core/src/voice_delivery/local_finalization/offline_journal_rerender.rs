@@ -86,8 +86,11 @@ pub struct OfflineJournalRerenderOptions {
     pub _private: (),
 }
 
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct OfflineJournalRerenderTestHooks {
+    /// Opt-in for module tests: use the `cfg(test)` Opus decoder stub without `local-opus-native`.
+    pub allow_test_opus_decoder_stub: bool,
     pub fail_after_staging: bool,
     pub post_snapshot: Option<Box<dyn Fn(&Path) + Send + Sync>>,
 }
@@ -186,9 +189,15 @@ pub fn run_offline_journal_rerender(
     output_dir: &Path,
     _options: OfflineJournalRerenderOptions,
 ) -> Result<OfflineJournalRerenderOutcome, OfflineJournalRerenderError> {
-    run_offline_journal_rerender_inner(session_root, output_dir, None)
+    run_offline_journal_rerender_inner(
+        session_root,
+        output_dir,
+        #[cfg(test)]
+        None,
+    )
 }
 
+#[cfg(test)]
 pub(crate) fn run_offline_journal_rerender_with_hooks(
     session_root: &Path,
     output_dir: &Path,
@@ -200,7 +209,7 @@ pub(crate) fn run_offline_journal_rerender_with_hooks(
 fn run_offline_journal_rerender_inner(
     session_root: &Path,
     output_dir: &Path,
-    hooks: Option<OfflineJournalRerenderTestHooks>,
+    #[cfg(test)] hooks: Option<OfflineJournalRerenderTestHooks>,
 ) -> Result<OfflineJournalRerenderOutcome, OfflineJournalRerenderError> {
     if output_dir.as_os_str().is_empty() {
         return Err(OfflineJournalRerenderError::OutputPathRequired);
@@ -257,7 +266,17 @@ fn run_offline_journal_rerender_inner(
         }
     }
 
-    if assert_local_opus_available().is_err() {
+    let opus_unavailable = assert_local_opus_available().is_err();
+    #[cfg(test)]
+    let opus_unavailable = if hooks
+        .as_ref()
+        .is_some_and(|h| h.allow_test_opus_decoder_stub)
+    {
+        false
+    } else {
+        opus_unavailable
+    };
+    if opus_unavailable {
         return Err(OfflineJournalRerenderError::OpusUnavailable);
     }
 
@@ -267,6 +286,7 @@ fn run_offline_journal_rerender_inner(
         .map_err(|e| OfflineJournalRerenderError::Publish(e.to_string()))?;
     let staging_path = dest_parent.join(&stage_token);
 
+    #[cfg(test)]
     if hooks.as_ref().is_some_and(|h| h.fail_after_staging) {
         eprintln!(
             "offline_journal_rerender: staging preserved at {}",
@@ -286,6 +306,7 @@ fn run_offline_journal_rerender_inner(
             &manifest_bytes,
         )?;
 
+        #[cfg(test)]
         if let Some(hooks) = &hooks {
             if let Some(cb) = &hooks.post_snapshot {
                 cb(session_root);
@@ -852,7 +873,10 @@ mod tests {
         run_offline_journal_rerender_with_hooks(
             session_root,
             &out,
-            OfflineJournalRerenderTestHooks::default(),
+            OfflineJournalRerenderTestHooks {
+                allow_test_opus_decoder_stub: true,
+                ..Default::default()
+            },
         )
         .unwrap()
     }
@@ -996,6 +1020,7 @@ mod tests {
             &session_root,
             &out,
             OfflineJournalRerenderTestHooks {
+                allow_test_opus_decoder_stub: true,
                 fail_after_staging: true,
                 post_snapshot: None,
             },
@@ -1035,6 +1060,7 @@ mod tests {
             &session_root,
             &out,
             OfflineJournalRerenderTestHooks {
+                allow_test_opus_decoder_stub: true,
                 fail_after_staging: false,
                 post_snapshot: Some(Box::new(move |_| {
                     let mut bytes = std::fs::read(&seg).unwrap();
