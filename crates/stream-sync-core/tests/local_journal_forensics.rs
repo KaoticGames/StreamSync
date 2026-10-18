@@ -2,7 +2,8 @@ use std::fs;
 use std::path::Path;
 use stream_sync_core::voice_delivery::local_finalization::{
     analyze_local_journal_session, build_minimal_manifest_json, encode_journal_file,
-    encode_journal_record, forensics_report_to_json, JournalRecord, JOURNAL_FORMAT_VERSION_V2,
+    encode_journal_record, forensics_report_to_json, local_journal_forensics_exit_code,
+    render_forensics_table, JournalRecord, JOURNAL_FORMAT_VERSION_V2,
 };
 
 fn write_session(root: &Path, session_id: &str, users: &[(&str, &str)], records: &[JournalRecord]) {
@@ -28,19 +29,19 @@ fn sample_record(
         discord_user_id: user.into(),
         ssrc_epoch: epoch,
         sequence: seq,
-        rtp_timestamp: (capture as u32) * 960,
+        rtp_timestamp: capture as u32,
         arrived_at_ns: u64::from(seq) * 1_000_000,
         session_capture_offset_samples: Some(capture),
         opus_payload: if payload_len == 0 {
             Vec::new()
         } else {
-            vec![0xFE; payload_len]
+            vec![0x08, 0x01]
         },
     }
 }
 
 #[test]
-fn two_epochs_trigger_local_epoch_frontier_stall() {
+fn two_epochs_do_not_stall_after_accumulator_parity() {
     let dir = tempfile::tempdir().unwrap();
     let user = "123456789012345678";
     let records = vec![
@@ -61,13 +62,47 @@ fn two_epochs_trigger_local_epoch_frontier_stall() {
         .iter()
         .find(|u| u.path_nick == "player")
         .unwrap();
-    assert!(u.local_epoch_frontier_stall);
-    assert!(u
-        .diagnostics
-        .iter()
-        .any(|d| d == "LOCAL_EPOCH_FRONTIER_STALL"));
+    assert!(!u.local_epoch_frontier_stall);
     assert_eq!(u.distinct_ssrc_epochs, 2);
-    assert_eq!(u.accumulator.discarded_duplicate, 0);
+    assert_eq!(u.accumulator.decode, 4);
+    assert_eq!(u.accumulator.discarded_out_of_window, 0);
+}
+
+#[test]
+fn production_shaped_multi_wrap_epoch_fixture_no_mass_discard() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = "123456789012345678";
+    let mut records = Vec::new();
+    let mut seq = 65530u16;
+    let mut capture = 0u64;
+    for _ in 0..8 {
+        records.push(sample_record(user, 1, seq, capture, 120));
+        capture += 960;
+        seq = seq.wrapping_add(1);
+    }
+    records.push(sample_record(user, 2, 0, capture, 120));
+    records.push(sample_record(user, 2, 1, capture + 960, 120));
+    records.push(sample_record(user, 2, 2, capture + 1920, 120));
+    write_session(
+        dir.path(),
+        "550e8400-e29b-41d4-a716-446655440005",
+        &[("123456789012345678", "wrap_epoch")],
+        &records,
+    );
+    let report = analyze_local_journal_session(dir.path()).unwrap();
+    let u = report
+        .users
+        .iter()
+        .find(|u| u.path_nick == "wrap_epoch")
+        .unwrap();
+    assert!(!u.local_epoch_frontier_stall);
+    let total_nonempty = u.nonempty_payload_records;
+    let emitted = u.accumulator.decode + u.accumulator.lost_placement;
+    assert_eq!(emitted, total_nonempty);
+    let drops = u.accumulator.discarded_duplicate
+        + u.accumulator.discarded_conflict
+        + u.accumulator.discarded_out_of_window;
+    assert_eq!(drops, 0);
 }
 
 #[test]
@@ -144,6 +179,50 @@ fn json_output_has_no_payload_bytes() {
 }
 
 #[test]
+fn pathological_overlap_fixture_not_certified_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = "123456789012345678";
+    let records = vec![
+        JournalRecord {
+            discord_user_id: user.into(),
+            ssrc_epoch: 1,
+            sequence: 0,
+            rtp_timestamp: 0,
+            arrived_at_ns: 1,
+            session_capture_offset_samples: Some(0),
+            opus_payload: vec![0x08, 0x01],
+        },
+        JournalRecord {
+            discord_user_id: user.into(),
+            ssrc_epoch: 1,
+            sequence: 5,
+            rtp_timestamp: 480,
+            arrived_at_ns: 5,
+            session_capture_offset_samples: Some(0),
+            opus_payload: vec![0x08, 0x01],
+        },
+    ];
+    write_session(
+        dir.path(),
+        "550e8400-e29b-41d4-a716-446655440099",
+        &[("123456789012345678", "pathological")],
+        &records,
+    );
+    let report = analyze_local_journal_session(dir.path()).unwrap();
+    let u = report
+        .users
+        .iter()
+        .find(|u| u.path_nick == "pathological")
+        .unwrap();
+    assert!(!u.forensics_certified_clean);
+    assert!(u.accumulator.accumulator_errors > 0);
+    assert!(u
+        .diagnostics
+        .iter()
+        .any(|d| d.contains("ACCUMULATOR_FLUSH_ERROR")));
+}
+
+#[test]
 fn single_clean_epoch_does_not_flag_stall() {
     let dir = tempfile::tempdir().unwrap();
     let user = "123456789012345678";
@@ -167,4 +246,140 @@ fn single_clean_epoch_does_not_flag_stall() {
     assert!(!u.local_epoch_frontier_stall);
     assert_eq!(u.distinct_ssrc_epochs, 1);
     assert_eq!(u.accumulator.decode, 3);
+}
+
+fn assert_session_not_certified(
+    report: &stream_sync_core::voice_delivery::local_finalization::LocalJournalForensicsReport,
+) {
+    assert!(!report.session_forensics_certified_clean);
+    let table = render_forensics_table(report);
+    assert!(
+        table.contains("NOT CLEAN"),
+        "human table must show NOT CLEAN: {}",
+        table
+    );
+    assert_ne!(local_journal_forensics_exit_code(report), 0);
+    let json = forensics_report_to_json(report).unwrap();
+    assert!(json.contains("\"sessionForensicsCertifiedClean\": false"));
+}
+
+#[test]
+fn production_shaped_fixture_session_certified_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = "123456789012345678";
+    let mut records = Vec::new();
+    let mut seq = 65530u16;
+    let mut capture = 0u64;
+    for _ in 0..8 {
+        records.push(sample_record(user, 1, seq, capture, 120));
+        capture += 960;
+        seq = seq.wrapping_add(1);
+    }
+    records.push(sample_record(user, 2, 0, capture, 120));
+    records.push(sample_record(user, 2, 1, capture + 960, 120));
+    let session_id = "550e8400-e29b-41d4-a716-446655440005";
+    let session_root = dir.path().join(session_id);
+    write_session(
+        &session_root,
+        session_id,
+        &[("123456789012345678", "wrap_epoch")],
+        &records,
+    );
+    let report = analyze_local_journal_session(&session_root).unwrap();
+    assert!(report.session_forensics_certified_clean);
+    assert_eq!(local_journal_forensics_exit_code(&report), 0);
+}
+
+#[test]
+fn missing_segment_session_not_certified() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("journal/segments")).unwrap();
+    let manifest = build_minimal_manifest_json(
+        "550e8400-e29b-41d4-a716-446655440010",
+        &[("123456789012345678", "player")],
+        48_000,
+    );
+    fs::write(dir.path().join("manifest.json"), manifest).unwrap();
+    let report = analyze_local_journal_session(dir.path()).unwrap();
+    assert_session_not_certified(&report);
+}
+
+#[test]
+fn fatal_header_session_not_certified() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("journal/segments")).unwrap();
+    let manifest = build_minimal_manifest_json(
+        "550e8400-e29b-41d4-a716-446655440011",
+        &[("123456789012345678", "player")],
+        48_000,
+    );
+    fs::write(dir.path().join("manifest.json"), manifest).unwrap();
+    fs::write(
+        dir.path().join("journal/segments/00000000.synj"),
+        b"BADJUNK!",
+    )
+    .unwrap();
+    let report = analyze_local_journal_session(dir.path()).unwrap();
+    assert_session_not_certified(&report);
+}
+
+#[test]
+fn recoverable_framing_session_not_certified() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = "123456789012345678";
+    let records = vec![sample_record(user, 1, 0, 0, 120)];
+    write_session(
+        dir.path(),
+        "550e8400-e29b-41d4-a716-446655440012",
+        &[("123456789012345678", "player")],
+        &records,
+    );
+    let seg_path = dir.path().join("journal/segments/00000000.synj");
+    let mut bytes = fs::read(&seg_path).unwrap();
+    if bytes.len() > 20 {
+        bytes[20] ^= 0xff;
+    }
+    fs::write(seg_path, bytes).unwrap();
+    let report = analyze_local_journal_session(dir.path()).unwrap();
+    assert_session_not_certified(&report);
+}
+
+#[test]
+fn accumulator_error_session_not_certified() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = "123456789012345678";
+    let records = vec![
+        JournalRecord {
+            discord_user_id: user.into(),
+            ssrc_epoch: 1,
+            sequence: 0,
+            rtp_timestamp: 0,
+            arrived_at_ns: 1,
+            session_capture_offset_samples: Some(0),
+            opus_payload: vec![0x08, 0x01],
+        },
+        JournalRecord {
+            discord_user_id: user.into(),
+            ssrc_epoch: 1,
+            sequence: 5,
+            rtp_timestamp: 480,
+            arrived_at_ns: 5,
+            session_capture_offset_samples: Some(0),
+            opus_payload: vec![0x08, 0x01],
+        },
+    ];
+    write_session(
+        dir.path(),
+        "550e8400-e29b-41d4-a716-446655440013",
+        &[("123456789012345678", "pathological")],
+        &records,
+    );
+    let report = analyze_local_journal_session(dir.path()).unwrap();
+    assert_session_not_certified(&report);
+    let u = report
+        .users
+        .iter()
+        .find(|u| u.path_nick == "pathological")
+        .unwrap();
+    assert!(u.accumulator.accumulator_errors > 0);
 }

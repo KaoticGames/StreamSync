@@ -1,0 +1,38 @@
+{
+  "scenario": "seq_wrap_65534_65535_0_1",
+  "want_emitted_sequences": [65534, 65535, 0, 1],
+  "records": [
+    {
+      "ssrc_epoch": 0,
+      "sequence": 65534,
+      "rtp_timestamp": 62914560,
+      "capture": 62914560,
+      "arrived_at_ns": 1,
+      "payload_kind": "toc20ms"
+    },
+    {
+      "ssrc_epoch": 0,
+      "sequence": 65535,
+      "rtp_timestamp": 62915520,
+      "capture": 62915520,
+      "arrived_at_ns": 2,
+      "payload_kind": "toc20ms"
+    },
+    {
+      "ssrc_epoch": 0,
+      "sequence": 0,
+      "rtp_timestamp": 62916480,
+      "capture": 62916480,
+      "arrived_at_ns": 3,
+      "payload_kind": "toc20ms"
+    },
+    {
+      "ssrc_epoch": 0,
+      "sequence": 1,
+      "rtp_timestamp": 62917440,
+      "capture": 62917440,
+      "arrived_at_ns": 4,
+      "payload_kind": "toc20ms"
+    }
+  ]
+}

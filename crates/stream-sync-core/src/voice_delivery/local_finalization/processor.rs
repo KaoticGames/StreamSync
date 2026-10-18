@@ -4,7 +4,7 @@
 //! with a 1 MiB [`std::io::BufWriter`] and incremental SHA-256 over the exact on-disk bytes.
 //! Memory is bounded by per-writer buffers and the packet reorder window, not session duration.
 
-use super::accumulator::{lost_marker_span_samples, PacketDisposition, UserPacketAccumulator};
+use super::accumulator::{PacketDisposition, UserPacketAccumulator};
 use super::cancellation::{LocalFinalizationCancel, LocalFinalizationCancelled};
 use super::manifest::LocalFinalizationManifest;
 use super::opus_decode::StereoOpusDecoder;
@@ -206,6 +206,7 @@ impl UserWriter {
         record: &JournalRecord,
         disposition: PacketDisposition,
         placement: u64,
+        span_samples: Option<u64>,
     ) -> Result<(), LocalProcessorError> {
         match disposition {
             PacketDisposition::DiscardedDuplicate => {
@@ -218,10 +219,24 @@ impl UserWriter {
                 self.report.record_discarded(DiscardReason::OutOfWindow);
             }
             PacketDisposition::LostPlacement => {
-                let span = lost_marker_span_samples();
                 self.pad_silence_to(placement, StemSilenceReason::TimelineGap, 0)?;
-                let end = (placement + span).min(self.target_samples);
-                self.pad_silence_to(end, StemSilenceReason::JournalLossMarker, 1)?;
+                if let Some(span) = span_samples {
+                    let end = placement
+                        .checked_add(span)
+                        .ok_or_else(|| {
+                            LocalProcessorError::Fatal("journal placement span overflow".into())
+                        })?
+                        .min(self.target_samples);
+                    self.pad_silence_to(end, StemSilenceReason::JournalLossMarker, 1)?;
+                } else {
+                    let end = placement
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            LocalProcessorError::Fatal("journal placement span overflow".into())
+                        })?
+                        .min(self.target_samples);
+                    self.pad_silence_to(end, StemSilenceReason::JournalLossMarker, 1)?;
+                }
             }
             PacketDisposition::Decode => {
                 if record.opus_payload.is_empty() {
@@ -233,7 +248,7 @@ impl UserWriter {
                     return Ok(());
                 }
                 self.pad_silence_to(placement, StemSilenceReason::TimelineGap, 0)?;
-                let mut pcm_buf = [0i16; 960 * 2];
+                let mut pcm_buf = [0i16; 5760 * 2];
                 match self.decoder.decode_packet(record, &mut pcm_buf) {
                     Ok(samples) => {
                         let frame_samples = samples as u64;
@@ -250,13 +265,34 @@ impl UserWriter {
                     }
                     Err(_) => {
                         self.report.record_discarded(DiscardReason::Other);
-                        let end = (placement + lost_marker_span_samples()).min(self.target_samples);
-                        self.pad_silence_to(end, StemSilenceReason::OpusDecodeFailed, 1)?;
+                        let recovery_span = span_samples.unwrap_or(0);
+                        if recovery_span > 0 {
+                            let end = placement
+                                .checked_add(recovery_span)
+                                .ok_or_else(|| {
+                                    LocalProcessorError::Fatal(
+                                        "journal placement recovery span overflow".into(),
+                                    )
+                                })?
+                                .min(self.target_samples);
+                            self.pad_silence_to(end, StemSilenceReason::OpusDecodeFailed, 1)?;
+                        }
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn apply_packet_for_test(
+        &mut self,
+        record: &JournalRecord,
+        disposition: PacketDisposition,
+        placement: u64,
+        span_samples: Option<u64>,
+    ) -> Result<(), LocalProcessorError> {
+        self.apply_packet(record, disposition, placement, span_samples)
     }
 
     fn finalize(
@@ -306,20 +342,53 @@ struct UserAccumulator {
 
 impl UserAccumulator {
     fn ingest(&mut self, record: JournalRecord) -> Result<(), LocalProcessorError> {
-        let ready = self.packets.ingest(record);
+        let ready = self
+            .packets
+            .ingest_timeline(record)
+            .map_err(|e| LocalProcessorError::Fatal(format!("accumulator: {e:?}")))?;
         for pkt in ready {
-            let placement = self.packets.placement_samples(&pkt.record);
-            self.writer
-                .apply_packet(&pkt.record, pkt.disposition, placement)?;
+            self.apply_ready_packet(&pkt)?;
+        }
+        Ok(())
+    }
+
+    fn apply_ready_packet(
+        &mut self,
+        pkt: &super::accumulator::ReadyPacket,
+    ) -> Result<(), LocalProcessorError> {
+        use super::accumulator::PacketDisposition;
+        match pkt.disposition {
+            PacketDisposition::DiscardedDuplicate
+            | PacketDisposition::DiscardedConflict
+            | PacketDisposition::DiscardedOutOfWindow => {
+                self.writer
+                    .apply_packet(&pkt.record, pkt.disposition, 0, None)?;
+            }
+            PacketDisposition::Decode | PacketDisposition::LostPlacement => {
+                let placement = pkt.timeline_sample_start.ok_or_else(|| {
+                    LocalProcessorError::Fatal(format!(
+                        "ready packet {:?} missing authoritative timeline",
+                        pkt.disposition
+                    ))
+                })?;
+                self.writer.apply_packet(
+                    &pkt.record,
+                    pkt.disposition,
+                    placement,
+                    pkt.span_samples,
+                )?;
+            }
         }
         Ok(())
     }
 
     fn flush_ready(&mut self) -> Result<(), LocalProcessorError> {
-        for pkt in self.packets.flush_remaining() {
-            let placement = self.packets.placement_samples(&pkt.record);
-            self.writer
-                .apply_packet(&pkt.record, pkt.disposition, placement)?;
+        let remaining = self
+            .packets
+            .flush_remaining()
+            .map_err(|e| LocalProcessorError::Fatal(format!("accumulator: {e:?}")))?;
+        for pkt in remaining {
+            self.apply_ready_packet(&pkt)?;
         }
         Ok(())
     }
@@ -360,7 +429,7 @@ pub fn process_verified_segments_with_options(
             user.discord_user_id.clone(),
             UserAccumulator {
                 writer,
-                packets: UserPacketAccumulator::default(),
+                packets: UserPacketAccumulator::new(&user.discord_user_id, target),
             },
         );
     }
@@ -693,8 +762,8 @@ mod tests {
             discord_user_id: user_id.into(),
             ssrc_epoch: 1,
             sequence,
-            rtp_timestamp: 0,
-            arrived_at_ns: 0,
+            rtp_timestamp: u32::from(sequence) * 960,
+            arrived_at_ns: u64::from(sequence) * 20_000_000,
             session_capture_offset_samples: Some(placement),
             opus_payload: vec![],
         }
@@ -723,12 +792,10 @@ mod tests {
         .unwrap();
         let staging = dir.path().join("staging");
         let out = process_verified_segments(&manifest, &[seg_path], &staging).unwrap();
-        assert_eq!(out.silence_range_count, 1);
         let report_text = std::fs::read_to_string(out.report_path.unwrap()).unwrap();
-        assert!(report_text.contains("normalTimelineSilenceSamples=4800"));
         assert!(report_text.contains("badPacketCount=1"));
-        assert!(report_text.contains("samples=4800-5760"));
-        assert!(!report_text.contains("samples=0-4800"));
+        assert!(report_text.contains("samples=4800-4801"));
+        assert!(report_text.contains("tail_padding"));
     }
 
     #[test]
@@ -758,10 +825,137 @@ mod tests {
         .unwrap();
         let staging = dir.path().join("staging");
         let out = process_verified_segments(&manifest, &[seg_path], &staging).unwrap();
-        assert_eq!(out.silence_range_count, 1);
+        assert_eq!(out.silence_range_count, 2);
         let report_text = std::fs::read_to_string(out.report_path.unwrap()).unwrap();
         assert!(report_text.contains("badPacketCount=2"));
-        assert!(report_text.contains("samples=0-1920"));
+        assert!(report_text.contains("samples=0-1"));
+        assert!(report_text.contains("samples=960-961"));
+    }
+
+    #[test]
+    fn recovery_report_counts_discarded_duplicate_without_timeline_placement() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_id = "123456789012345678";
+        let target = 4800u64;
+        let users = vec![LocalFinalizationUser {
+            discord_user_id: user_id.into(),
+            path_nick: "dup".into(),
+            opaque_stem_id: "a".repeat(32),
+        }];
+        let manifest = test_manifest(target, users);
+        let base = JournalRecord {
+            discord_user_id: user_id.into(),
+            ssrc_epoch: 1,
+            sequence: 0,
+            rtp_timestamp: 0,
+            arrived_at_ns: 0,
+            session_capture_offset_samples: Some(0),
+            opus_payload: vec![0x08, 0x01],
+        };
+        let dup = base.clone();
+        let r0 = encode_journal_record(JOURNAL_FORMAT_VERSION_V2, &base);
+        let r1 = encode_journal_record(JOURNAL_FORMAT_VERSION_V2, &dup);
+        let seg_path = dir.path().join("seg.synj");
+        std::fs::write(
+            &seg_path,
+            encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &[r0, r1]),
+        )
+        .unwrap();
+        let staging = dir.path().join("staging");
+        let out = process_verified_segments(&manifest, &[seg_path], &staging).unwrap();
+        let report_text = std::fs::read_to_string(out.report_path.unwrap()).unwrap();
+        assert!(
+            report_text.contains("discarded duplicate=1"),
+            "report must count duplicate discard: {}",
+            report_text
+        );
+    }
+
+    #[test]
+    fn recovery_report_counts_out_of_window_discard() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_id = "123456789012345678";
+        let target = 200_000u64;
+        let users = vec![LocalFinalizationUser {
+            discord_user_id: user_id.into(),
+            path_nick: "oow".into(),
+            opaque_stem_id: "a".repeat(32),
+        }];
+        let manifest = test_manifest(target, users);
+        let mk = |seq: u16, capture: u64| JournalRecord {
+            discord_user_id: user_id.into(),
+            ssrc_epoch: 1,
+            sequence: seq,
+            rtp_timestamp: u32::from(seq) * 960,
+            arrived_at_ns: u64::from(seq) * 20_000_000,
+            session_capture_offset_samples: Some(capture),
+            opus_payload: vec![0x08, 0x01],
+        };
+        let records = [mk(0, 0), mk(100, 100 * 960), mk(50, 50 * 960)];
+        let encoded: Vec<_> = records
+            .iter()
+            .map(|r| encode_journal_record(JOURNAL_FORMAT_VERSION_V2, r))
+            .collect();
+        let seg_path = dir.path().join("seg.synj");
+        std::fs::write(
+            &seg_path,
+            encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &encoded),
+        )
+        .unwrap();
+        let staging = dir.path().join("staging");
+        let out = process_verified_segments(&manifest, &[seg_path], &staging).unwrap();
+        let report_text = std::fs::read_to_string(out.report_path.unwrap()).unwrap();
+        assert!(
+            report_text.contains("out_of_window=1"),
+            "report must count out-of-window discard: {}",
+            report_text
+        );
+    }
+
+    #[test]
+    fn lost_placement_at_u64_max_placement_returns_fatal_not_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = UserWriter::new("x".into(), "1".into(), dir.path(), 1_000_000).unwrap();
+        let record = JournalRecord {
+            discord_user_id: "1".into(),
+            ssrc_epoch: 1,
+            sequence: 0,
+            rtp_timestamp: 0,
+            arrived_at_ns: 0,
+            session_capture_offset_samples: Some(u64::MAX),
+            opus_payload: vec![],
+        };
+        let err = writer
+            .apply_packet_for_test(&record, PacketDisposition::LostPlacement, u64::MAX, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, LocalProcessorError::Fatal(_)),
+            "expected fatal on placement+1 overflow, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn decode_failed_recovery_span_at_u64_max_returns_fatal_not_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = UserWriter::new("x".into(), "1".into(), dir.path(), 1_000_000).unwrap();
+        let record = JournalRecord {
+            discord_user_id: "1".into(),
+            ssrc_epoch: 1,
+            sequence: 0,
+            rtp_timestamp: 0,
+            arrived_at_ns: 0,
+            session_capture_offset_samples: Some(0),
+            opus_payload: vec![0xff, 0xff],
+        };
+        let err = writer
+            .apply_packet_for_test(&record, PacketDisposition::Decode, 100, Some(u64::MAX - 50))
+            .unwrap_err();
+        assert!(
+            matches!(err, LocalProcessorError::Fatal(_)),
+            "expected fatal on placement+recovery_span overflow, got {:?}",
+            err
+        );
     }
 
     #[test]

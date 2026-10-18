@@ -71,6 +71,7 @@ pub struct AccumulatorDispositionCounts {
     pub discarded_duplicate: u64,
     pub discarded_conflict: u64,
     pub discarded_out_of_window: u64,
+    pub accumulator_errors: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,6 +100,7 @@ pub struct UserJournalForensics {
     pub journal_capture_max_after_first_epoch_transition: Option<u64>,
     pub emitted_capture_max_after_first_epoch_transition: Option<u64>,
     pub diagnostics: Vec<String>,
+    pub forensics_certified_clean: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,6 +125,7 @@ pub struct LocalJournalForensicsReport {
     pub users: Vec<UserJournalForensics>,
     pub session_framing_fatal_count: u32,
     pub session_framing_recoverable_count: u32,
+    pub session_forensics_certified_clean: bool,
     pub silence_cause_ranking: Vec<SilenceCauseEntry>,
 }
 
@@ -171,7 +174,7 @@ fn journal_record_from_meta(meta: &JournalRecordMeta) -> JournalRecord {
         opus_payload: if payload_len == 0 {
             Vec::new()
         } else {
-            vec![0xAB; payload_len]
+            vec![0x08, 0x01]
         },
     }
 }
@@ -347,7 +350,7 @@ pub fn analyze_local_journal_session(
 
     let silence_cause_ranking = rank_silence_causes(&users_out);
 
-    Ok(LocalJournalForensicsReport {
+    let mut report = LocalJournalForensicsReport {
         session_root: session_root.display().to_string(),
         session_id: manifest.session_id.clone(),
         guild_id: manifest.guild_id.clone(),
@@ -359,8 +362,49 @@ pub fn analyze_local_journal_session(
         users: users_out,
         session_framing_fatal_count: session_fatal,
         session_framing_recoverable_count: session_recoverable,
+        session_forensics_certified_clean: false,
         silence_cause_ranking,
-    })
+    };
+    report.session_forensics_certified_clean = session_forensics_certified_clean(&report);
+    Ok(report)
+}
+
+pub fn session_forensics_certified_clean(report: &LocalJournalForensicsReport) -> bool {
+    if !report.manifest_warnings.is_empty() {
+        return false;
+    }
+    if report.session_framing_fatal_count > 0 || report.session_framing_recoverable_count > 0 {
+        return false;
+    }
+    for seg in &report.segments {
+        if !seg.present {
+            return false;
+        }
+        if !seg.fatal_framing.is_empty() || !seg.recoverable_framing.is_empty() {
+            return false;
+        }
+    }
+    for u in &report.users {
+        if !u.forensics_certified_clean {
+            return false;
+        }
+        if u.accumulator.accumulator_errors > 0 {
+            return false;
+        }
+        if u.local_epoch_frontier_stall || !u.diagnostics.is_empty() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Process exit code for the forensics CLI: 0 certified clean, 2 uncertified (outputs still written).
+pub fn local_journal_forensics_exit_code(report: &LocalJournalForensicsReport) -> i32 {
+    if report.session_forensics_certified_clean {
+        0
+    } else {
+        2
+    }
 }
 
 fn analyze_user(
@@ -445,13 +489,14 @@ fn analyze_user(
         last_seq_by_epoch.insert(rec.meta.ssrc_epoch, rec.meta.sequence);
     }
 
-    let mut acc = UserPacketAccumulator::default();
+    let mut acc = UserPacketAccumulator::new(&discord_user_id, target_samples);
     let mut counts = AccumulatorDispositionCounts {
         decode: 0,
         lost_placement: 0,
         discarded_duplicate: 0,
         discarded_conflict: 0,
         discarded_out_of_window: 0,
+        accumulator_errors: 0,
     };
     let mut first_emitted: Option<u64> = None;
     let mut last_emitted_end: Option<u64> = None;
@@ -459,14 +504,21 @@ fn analyze_user(
     let first_epoch = epochs.keys().next().copied();
     let mut emitted_capture_max_after_transition: Option<u64> = None;
     let mut emitted_in_later_epochs = 0u64;
+    let mut diagnostics = Vec::new();
 
     for rec in rows {
         let jr = journal_record_from_meta(&rec.meta);
-        let ready = acc.ingest(jr);
+        let ready = match acc.ingest_timeline(jr) {
+            Ok(v) => v,
+            Err(e) => {
+                counts.accumulator_errors += 1;
+                diagnostics.push(format!("ACCUMULATOR_INGEST_ERROR: {e:?}"));
+                Vec::new()
+            }
+        };
         for pkt in ready {
             track_emitted(
                 &pkt,
-                &mut acc,
                 &mut counts,
                 &mut first_emitted,
                 &mut last_emitted_end,
@@ -477,18 +529,25 @@ fn analyze_user(
             );
         }
     }
-    for pkt in acc.flush_remaining() {
-        track_emitted(
-            &pkt,
-            &mut acc,
-            &mut counts,
-            &mut first_emitted,
-            &mut last_emitted_end,
-            first_transition_index,
-            first_epoch,
-            &mut emitted_capture_max_after_transition,
-            &mut emitted_in_later_epochs,
-        );
+    match acc.flush_remaining() {
+        Ok(flushed) => {
+            for pkt in flushed {
+                track_emitted(
+                    &pkt,
+                    &mut counts,
+                    &mut first_emitted,
+                    &mut last_emitted_end,
+                    first_transition_index,
+                    first_epoch,
+                    &mut emitted_capture_max_after_transition,
+                    &mut emitted_in_later_epochs,
+                );
+            }
+        }
+        Err(e) => {
+            counts.accumulator_errors += 1;
+            diagnostics.push(format!("ACCUMULATOR_FLUSH_ERROR: {e:?}"));
+        }
     }
 
     let mut journal_capture_max_after_transition: Option<u64> = None;
@@ -513,13 +572,14 @@ fn analyze_user(
     };
 
     let mut local_epoch_frontier_stall = false;
-    let mut diagnostics = Vec::new();
     if !epoch_transitions.is_empty() && later_epoch_nonempty > 0 && emitted_in_later_epochs == 0 {
         local_epoch_frontier_stall = true;
         diagnostics.push("LOCAL_EPOCH_FRONTIER_STALL".into());
     }
 
     let wav_relative_path = format!("{path_nick}.wav");
+    let forensics_certified_clean =
+        counts.accumulator_errors == 0 && !local_epoch_frontier_stall && diagnostics.is_empty();
     UserJournalForensics {
         discord_user_id,
         path_nick,
@@ -544,12 +604,12 @@ fn analyze_user(
         journal_capture_max_after_first_epoch_transition: journal_capture_max_after_transition,
         emitted_capture_max_after_first_epoch_transition: emitted_capture_max_after_transition,
         diagnostics,
+        forensics_certified_clean,
     }
 }
 
 fn track_emitted(
     pkt: &super::accumulator::ReadyPacket,
-    acc: &mut UserPacketAccumulator,
     counts: &mut AccumulatorDispositionCounts,
     first_emitted: &mut Option<u64>,
     last_emitted_end: &mut Option<u64>,
@@ -558,13 +618,19 @@ fn track_emitted(
     emitted_capture_max_after_transition: &mut Option<u64>,
     emitted_in_later_epochs: &mut u64,
 ) {
-    let placement = acc.placement_samples(&pkt.record);
-    let end = placement + span_for_disposition(pkt.disposition);
+    bump_disposition(counts, pkt.disposition);
+    let placement = match pkt.timeline_sample_start {
+        Some(p) => p,
+        None => return,
+    };
+    let end = match placement.checked_add(span_for_packet(pkt)) {
+        Some(e) => e,
+        None => return,
+    };
     if first_emitted.is_none() {
         *first_emitted = Some(placement);
     }
     *last_emitted_end = Some(last_emitted_end.map_or(end, |e| e.max(end)));
-    bump_disposition(counts, pkt.disposition);
 
     if first_transition_index.is_some() && Some(pkt.record.ssrc_epoch) != first_epoch {
         if matches!(
@@ -578,10 +644,11 @@ fn track_emitted(
     }
 }
 
-fn span_for_disposition(d: PacketDisposition) -> u64 {
-    match d {
-        PacketDisposition::Decode => OPUS_FRAME_SAMPLES,
-        PacketDisposition::LostPlacement => lost_marker_span_samples(),
+fn span_for_packet(pkt: &super::accumulator::ReadyPacket) -> u64 {
+    match pkt.disposition {
+        PacketDisposition::Decode | PacketDisposition::LostPlacement => {
+            pkt.span_samples.unwrap_or(0)
+        }
         PacketDisposition::DiscardedDuplicate
         | PacketDisposition::DiscardedConflict
         | PacketDisposition::DiscardedOutOfWindow => 0,
@@ -676,6 +743,16 @@ pub fn render_forensics_table(report: &LocalJournalForensicsReport) -> String {
         "Session {} ({})\n",
         report.session_id, report.session_root
     ));
+    let session_cert = if report.session_forensics_certified_clean {
+        "CERTIFIED CLEAN"
+    } else {
+        "NOT CLEAN"
+    };
+    out.push_str(&format!(
+        "Session forensics: {} | Manifest warnings: {}\n",
+        session_cert,
+        report.manifest_warnings.len()
+    ));
     out.push_str(&format!(
         "Target samples: {} | Segments: {} | Framing fatal/recoverable: {}/{}\n\n",
         report.target_sample_count_48k,
@@ -684,11 +761,11 @@ pub fn render_forensics_table(report: &LocalJournalForensicsReport) -> String {
         report.session_framing_recoverable_count
     ));
     out.push_str(
-        "pathNick          records  epochs  stall  acc(decode/lost/dup/conf/oow)  trailSilence\n",
+        "pathNick          records  epochs  stall  accErr  acc(decode/lost/dup/conf/oow)  trailSilence\n",
     );
     for u in &report.users {
         out.push_str(&format!(
-            "{:<16}  {:7}  {:6}  {:5}  {:>6}/{:>4}/{:>3}/{:>4}/{:>3}  {:>12}\n",
+            "{:<16}  {:7}  {:6}  {:5}  {:>6}  {:>6}/{:>4}/{:>3}/{:>4}/{:>3}  {:>12}\n",
             u.path_nick,
             u.total_records,
             u.distinct_ssrc_epochs,
@@ -697,6 +774,7 @@ pub fn render_forensics_table(report: &LocalJournalForensicsReport) -> String {
             } else {
                 "no"
             },
+            u.accumulator.accumulator_errors,
             u.accumulator.decode,
             u.accumulator.lost_placement,
             u.accumulator.discarded_duplicate,
@@ -704,6 +782,9 @@ pub fn render_forensics_table(report: &LocalJournalForensicsReport) -> String {
             u.accumulator.discarded_out_of_window,
             u.predicted_trailing_silence_samples,
         ));
+        for diag in &u.diagnostics {
+            out.push_str(&format!("  diagnostic [{}]: {}\n", u.path_nick, diag));
+        }
     }
     if !report.silence_cause_ranking.is_empty() {
         out.push_str("\nSilence cause ranking (weight):\n");

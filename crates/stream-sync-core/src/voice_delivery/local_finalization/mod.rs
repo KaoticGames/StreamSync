@@ -10,15 +10,22 @@ mod lease_keeper;
 mod local_publication;
 mod manifest;
 mod opus_decode;
+mod opus_journal_timeline;
+mod opus_packet_duration;
 mod orchestrator;
 mod paths;
 mod processor;
 mod progress;
 mod receipt;
 mod report;
+mod rtp_generation_inference;
 mod storage_preflight;
 mod synj;
 
+pub use accumulator::{
+    lost_marker_span_samples, AccumulatorError, PacketDisposition, ReadyPacket,
+    UserPacketAccumulator,
+};
 pub use cancellation::{LocalFinalizationCancel, LocalFinalizationCancelled};
 pub use client::{
     HttpLocalFinalizationClient, LocalFinalizationClient, LocalPendingItem, LOCAL_PENDING_PATH,
@@ -29,7 +36,8 @@ pub use contract::{
 };
 pub use journal_forensics::{
     analyze_local_journal_session, build_minimal_manifest_json, forensics_report_to_json,
-    render_forensics_table, LocalJournalForensicsReport,
+    local_journal_forensics_exit_code, render_forensics_table, session_forensics_certified_clean,
+    LocalJournalForensicsReport,
 };
 pub use journal_store::LocalJournalStore;
 pub use local_publication::{resolve_published_paths, PublishedLocalOutput};
