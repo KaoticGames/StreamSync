@@ -15,6 +15,7 @@ mod opus_decode;
 mod opus_journal_timeline;
 mod opus_packet_duration;
 mod orchestrator;
+mod packet_loss_policy;
 mod paths;
 mod processor;
 mod progress;
@@ -25,8 +26,8 @@ mod storage_preflight;
 mod synj;
 
 pub use accumulator::{
-    lost_marker_span_samples, AccumulatorError, PacketDisposition, ReadyPacket,
-    UserPacketAccumulator,
+    lost_marker_span_samples, AccumulatorError, AccumulatorPlacementPolicy, PacketDisposition,
+    ReadyPacket, UserPacketAccumulator,
 };
 pub use cancellation::{LocalFinalizationCancel, LocalFinalizationCancelled};
 pub use client::{
@@ -58,8 +59,16 @@ pub use opus_decode::assert_local_opus_available;
 pub use orchestrator::{
     LocalFinalizationControls, LocalFinalizationOrchestrator, LocalOrchestratorError,
 };
+pub use packet_loss_policy::{
+    BoundedPacketLossError, BoundedPacketLossTracker, LocalPacketLossPolicySummary,
+    PacketLossSource, LOCAL_PACKET_LOSS_MAX_SKIPPED, LOCAL_PACKET_LOSS_POLICY_VERSION,
+};
 pub use paths::{
     resolve_canonical_session_paths, validate_path_under_parent, PublishedSessionPaths,
+};
+pub use processor::{
+    process_verified_segments, process_verified_segments_with_options, LocalProcessOutput,
+    LocalProcessorError, LocalProcessorOptions, LocalProcessorProgress,
 };
 pub use progress::{LocalFinalizationPhase, LocalFinalizationProgressEvent};
 pub use receipt::{

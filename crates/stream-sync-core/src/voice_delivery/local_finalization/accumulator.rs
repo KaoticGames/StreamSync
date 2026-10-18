@@ -37,6 +37,14 @@ pub enum PacketDisposition {
     DiscardedDuplicate,
     DiscardedConflict,
     DiscardedOutOfWindow,
+    /// Overlapping Opus placement: timeline already has PCM; packet dropped without silence.
+    DiscardedOverlap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccumulatorPlacementPolicy {
+    Strict,
+    PlacementOverlapTolerant,
 }
 
 #[derive(Debug, Clone)]
@@ -130,10 +138,25 @@ impl Default for UserPacketAccumulator {
 
 impl UserPacketAccumulator {
     pub fn new(user_id: &str, target_sample_count: u64) -> Self {
+        Self::new_with_placement_policy(
+            user_id,
+            target_sample_count,
+            AccumulatorPlacementPolicy::Strict,
+        )
+    }
+
+    pub fn new_with_placement_policy(
+        user_id: &str,
+        target_sample_count: u64,
+        policy: AccumulatorPlacementPolicy,
+    ) -> Self {
         Self {
             user_id: user_id.into(),
             target_sample_count,
-            placement_overlap_tolerant: false,
+            placement_overlap_tolerant: matches!(
+                policy,
+                AccumulatorPlacementPolicy::PlacementOverlapTolerant
+            ),
             frontier_extended: None,
             buffer: std::collections::BTreeMap::new(),
             dedupe_by_extended: std::collections::BTreeMap::new(),
@@ -872,7 +895,14 @@ impl UserPacketAccumulator {
         if self.prev_raw_timestamp.is_some() && sample_start < self.prev_end {
             if self.placement_overlap_tolerant {
                 self.note_irrevocably_emitted(&pkt)?;
-                return Ok(None);
+                return Ok(Some(ReadyPacket {
+                    record: pkt.record,
+                    disposition: PacketDisposition::DiscardedOverlap,
+                    extended_sequence: pkt.extended_sequence,
+                    effective_epoch: self.effective_epoch,
+                    timeline_sample_start: Some(sample_start),
+                    span_samples: Some(frame_samples),
+                }));
             }
             return Err(AccumulatorError::Overlap(format!(
                 "overlapping opus placement seq {} sampleStart {} prevEnd {}",

@@ -8,14 +8,14 @@ pub enum OpusDecodeError {
     Unavailable,
 }
 
-#[cfg(all(not(feature = "local-opus-native"), test))]
-struct TestOpusStub;
+#[cfg(not(feature = "local-opus-native"))]
+struct OpusStubDecoder;
 
 pub struct StereoOpusDecoder {
     #[cfg(feature = "local-opus-native")]
     inner: audiopus::coder::Decoder,
-    #[cfg(all(not(feature = "local-opus-native"), test))]
-    _test_stub: TestOpusStub,
+    #[cfg(not(feature = "local-opus-native"))]
+    _stub: OpusStubDecoder,
 }
 
 impl StereoOpusDecoder {
@@ -27,15 +27,11 @@ impl StereoOpusDecoder {
                 .map_err(|_| OpusDecodeError::Failed)?;
             return Ok(Self { inner });
         }
-        #[cfg(all(not(feature = "local-opus-native"), test))]
+        #[cfg(not(feature = "local-opus-native"))]
         {
             return Ok(Self {
-                _test_stub: TestOpusStub,
+                _stub: OpusStubDecoder,
             });
-        }
-        #[cfg(all(not(feature = "local-opus-native"), not(test)))]
-        {
-            Err(OpusDecodeError::Unavailable)
         }
     }
 
@@ -58,13 +54,23 @@ impl StereoOpusDecoder {
         }
         #[cfg(not(feature = "local-opus-native"))]
         {
-            let _ = (record, pcm_out);
-            Err(OpusDecodeError::Unavailable)
+            let _ = pcm_out;
+            if record.opus_payload.is_empty() || record.opus_payload == [0xff, 0xff] {
+                return Err(OpusDecodeError::Failed);
+            }
+            Ok(960)
         }
     }
 }
 
-/// Production builds with In-Sync processing must link native Opus (see `local-opus-native`).
+/// Production / offline recovery entrypoints require native Opus (`local-opus-native`).
 pub fn assert_local_opus_available() -> Result<(), OpusDecodeError> {
-    StereoOpusDecoder::new().map(|_| ())
+    #[cfg(feature = "local-opus-native")]
+    {
+        return StereoOpusDecoder::new().map(|_| ());
+    }
+    #[cfg(not(feature = "local-opus-native"))]
+    {
+        Err(OpusDecodeError::Unavailable)
+    }
 }

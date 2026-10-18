@@ -71,6 +71,7 @@ pub struct AccumulatorDispositionCounts {
     pub discarded_duplicate: u64,
     pub discarded_conflict: u64,
     pub discarded_out_of_window: u64,
+    pub discarded_overlap: u64,
     pub accumulator_errors: u64,
 }
 
@@ -496,6 +497,7 @@ fn analyze_user(
         discarded_duplicate: 0,
         discarded_conflict: 0,
         discarded_out_of_window: 0,
+        discarded_overlap: 0,
         accumulator_errors: 0,
     };
     let mut first_emitted: Option<u64> = None;
@@ -508,11 +510,24 @@ fn analyze_user(
 
     for rec in rows {
         let jr = journal_record_from_meta(&rec.meta);
+        let toc_hint = if jr.opus_payload.is_empty() {
+            "tocDurationSamples=loss_marker".to_string()
+        } else {
+            super::opus_packet_duration::opus_packet_duration_samples(&jr.opus_payload)
+                .map(|d| format!("tocDurationSamples={d}"))
+                .unwrap_or_else(|_| "tocDurationUnknown".into())
+        };
         let ready = match acc.ingest_timeline(jr) {
             Ok(v) => v,
             Err(e) => {
                 counts.accumulator_errors += 1;
-                diagnostics.push(format!("ACCUMULATOR_INGEST_ERROR: {e:?}"));
+                if e.is_overlap() {
+                    diagnostics.push(format!(
+                        "PLACEMENT_OVERLAP_METADATA: {e:?}; {toc_hint}; offline processor audits overlap drop without silence"
+                    ));
+                } else {
+                    diagnostics.push(format!("ACCUMULATOR_INGEST_ERROR: {e:?}"));
+                }
                 Vec::new()
             }
         };
@@ -651,7 +666,8 @@ fn span_for_packet(pkt: &super::accumulator::ReadyPacket) -> u64 {
         }
         PacketDisposition::DiscardedDuplicate
         | PacketDisposition::DiscardedConflict
-        | PacketDisposition::DiscardedOutOfWindow => 0,
+        | PacketDisposition::DiscardedOutOfWindow
+        | PacketDisposition::DiscardedOverlap => 0,
     }
 }
 
@@ -662,6 +678,7 @@ fn bump_disposition(counts: &mut AccumulatorDispositionCounts, d: PacketDisposit
         PacketDisposition::DiscardedDuplicate => counts.discarded_duplicate += 1,
         PacketDisposition::DiscardedConflict => counts.discarded_conflict += 1,
         PacketDisposition::DiscardedOutOfWindow => counts.discarded_out_of_window += 1,
+        PacketDisposition::DiscardedOverlap => counts.discarded_overlap += 1,
     }
 }
 

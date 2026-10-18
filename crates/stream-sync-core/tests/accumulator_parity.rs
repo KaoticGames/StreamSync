@@ -4,7 +4,8 @@ use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 use stream_sync_core::voice_delivery::local_finalization::{
-    AccumulatorError, JournalRecord, PacketDisposition, UserPacketAccumulator,
+    AccumulatorError, AccumulatorPlacementPolicy, JournalRecord, PacketDisposition,
+    UserPacketAccumulator,
 };
 
 const USER: &str = "123456789012345678";
@@ -281,6 +282,31 @@ fn parity_overlap_placement_refused() {
     acc.ingest_timeline(records[0].clone()).expect("first");
     let err = acc.ingest_timeline(records[1].clone()).unwrap_err();
     assert!(err.is_overlap());
+}
+
+#[test]
+fn tolerant_overlap_emits_discarded_overlap_without_advancing_timeline() {
+    let records = vec![
+        rec(0, 1, 0, 0, 1, payload_toc_20ms()),
+        rec(0, 2, 480, 0, 2, payload_toc_20ms()),
+    ];
+    let mut acc = UserPacketAccumulator::new_with_placement_policy(
+        USER,
+        TARGET,
+        AccumulatorPlacementPolicy::PlacementOverlapTolerant,
+    );
+    let first = acc.ingest_timeline(records[0].clone()).expect("first");
+    assert_eq!(first[0].disposition, PacketDisposition::Decode);
+    let second = acc.ingest_timeline(records[1].clone()).expect("overlap");
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].disposition, PacketDisposition::DiscardedOverlap);
+    assert_eq!(second[0].timeline_sample_start, Some(480));
+    assert_eq!(second[0].span_samples, Some(FRAME));
+    let third = rec(0, 3, 960, 0, 3, payload_toc_20ms());
+    let after = acc.ingest_timeline(third).expect("continues");
+    assert!(after
+        .iter()
+        .any(|p| p.disposition == PacketDisposition::Decode && p.record.sequence == 3));
 }
 
 #[derive(Deserialize)]

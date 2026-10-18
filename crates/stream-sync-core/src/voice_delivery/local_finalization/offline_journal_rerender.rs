@@ -112,6 +112,21 @@ pub struct OfflineRecoveryReportRef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OfflineRecoveryPacketLossPolicy {
+    pub version: String,
+    pub total_journal_records: u64,
+    pub max_skipped: u64,
+    pub skipped_count: u64,
+    pub framing_or_lost_placement: u64,
+    pub decode_failure: u64,
+    pub placement_overlap: u64,
+    pub out_of_window: u64,
+    pub consecutive_loss_detected: bool,
+    pub within_policy: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OfflineRecoveryManifest {
     pub schema_version: u32,
     pub recovery_algorithm_version: String,
@@ -132,6 +147,7 @@ pub struct OfflineRecoveryManifest {
     pub recovery_report: OfflineRecoveryReportRef,
     pub discarded_packet_count: u64,
     pub silence_range_count: u64,
+    pub packet_loss_policy: OfflineRecoveryPacketLossPolicy,
     pub tool_package_version: String,
     pub tool_build_git_sha: String,
     pub staging_directory_namespace_durability: NamespaceDurability,
@@ -535,6 +551,21 @@ fn build_recovery_manifest(
         },
         discarded_packet_count: output.discarded_packet_count,
         silence_range_count: output.silence_range_count,
+        packet_loss_policy: OfflineRecoveryPacketLossPolicy {
+            version: output.packet_loss_policy.version.clone(),
+            total_journal_records: output.packet_loss_policy.total_journal_records,
+            max_skipped: output.packet_loss_policy.max_skipped,
+            skipped_count: output.packet_loss_policy.skipped_count,
+            framing_or_lost_placement: output
+                .packet_loss_policy
+                .source_counts
+                .framing_or_lost_placement,
+            decode_failure: output.packet_loss_policy.source_counts.decode_failure,
+            placement_overlap: output.packet_loss_policy.source_counts.placement_overlap,
+            out_of_window: output.packet_loss_policy.source_counts.out_of_window,
+            consecutive_loss_detected: output.packet_loss_policy.consecutive_loss_detected,
+            within_policy: output.packet_loss_policy.within_policy,
+        },
         tool_package_version: env!("CARGO_PKG_VERSION").into(),
         tool_build_git_sha: tool_build_git_sha.into(),
         staging_directory_namespace_durability: staging_namespace,

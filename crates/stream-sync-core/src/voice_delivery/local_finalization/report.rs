@@ -20,6 +20,7 @@ pub enum DiscardReason {
     Duplicate,
     Conflict,
     OutOfWindow,
+    Overlap,
     Other,
 }
 
@@ -47,6 +48,7 @@ pub struct StemRecoveryReportBuilder {
     discarded_duplicate: u64,
     discarded_conflict: u64,
     discarded_out_of_window: u64,
+    discarded_overlap: u64,
     discarded_other: u64,
 }
 
@@ -64,6 +66,7 @@ impl StemRecoveryReportBuilder {
             DiscardReason::Duplicate => self.discarded_duplicate += 1,
             DiscardReason::Conflict => self.discarded_conflict += 1,
             DiscardReason::OutOfWindow => self.discarded_out_of_window += 1,
+            DiscardReason::Overlap => self.discarded_overlap += 1,
             DiscardReason::Other => self.discarded_other += 1,
         }
     }
@@ -179,6 +182,10 @@ impl StemRecoveryReportBuilder {
         self.discarded_other
     }
 
+    pub fn discarded_overlap(&self) -> u64 {
+        self.discarded_overlap
+    }
+
     fn render_stem_section(&self, out: &mut String) {
         let file_name = format!("{}.wav", self.path_nick);
         let normal_ms = samples_to_ms_f64(self.normal_timeline_silence_samples);
@@ -200,10 +207,11 @@ impl StemRecoveryReportBuilder {
         );
         let _ = writeln!(
             out,
-            "  discarded duplicate={} conflict={} out_of_window={} other={}",
+            "  discarded duplicate={} conflict={} out_of_window={} overlap={} other={}",
             self.discarded_duplicate,
             self.discarded_conflict,
             self.discarded_out_of_window,
+            self.discarded_overlap,
             self.discarded_other
         );
         let mut incidents = self.incidents.clone();
@@ -236,6 +244,7 @@ impl StemRecoveryReportBuilder {
 pub struct SessionRecoveryReportBuilder {
     stems: Vec<StemRecoveryReportBuilder>,
     session_discarded_other: u64,
+    packet_loss_policy: Option<super::packet_loss_policy::LocalPacketLossPolicySummary>,
 }
 
 impl SessionRecoveryReportBuilder {
@@ -245,6 +254,13 @@ impl SessionRecoveryReportBuilder {
 
     pub fn push_stem(&mut self, stem: StemRecoveryReportBuilder) {
         self.stems.push(stem);
+    }
+
+    pub fn set_packet_loss_policy(
+        &mut self,
+        summary: super::packet_loss_policy::LocalPacketLossPolicySummary,
+    ) {
+        self.packet_loss_policy = Some(summary);
     }
 
     pub fn sort_stems_deterministic(&mut self) {
@@ -260,6 +276,7 @@ impl SessionRecoveryReportBuilder {
             acc + s.discarded_duplicate()
                 + s.discarded_conflict()
                 + s.discarded_out_of_window()
+                + s.discarded_overlap()
                 + s.discarded_other()
         });
         stem + self.session_discarded_other
@@ -298,7 +315,11 @@ impl SessionRecoveryReportBuilder {
         );
         let _ = writeln!(
             out,
-            "  discarded duplicate/conflict/out_of_window — packet dropped to preserve a deterministic per-stem timeline (counts per stem)."
+            "  discarded duplicate/conflict/out_of_window/overlap — packet dropped to preserve a deterministic per-stem timeline (counts per stem)."
+        );
+        let _ = writeln!(
+            out,
+            "  overlap — overlapping Opus placement was dropped because the timeline already had PCM for that interval; no recovery silence was inserted."
         );
         let _ = writeln!(
             out,
@@ -349,6 +370,25 @@ impl SessionRecoveryReportBuilder {
             self.session_discarded_other
         );
         let _ = writeln!(out);
+
+        if let Some(policy) = &self.packet_loss_policy {
+            let _ = writeln!(out, "Packet-loss policy (local bounded audited):");
+            let _ = writeln!(
+                out,
+                "  version={} totalJournalRecords={} maxSkipped={} skippedCount={} framingOrPlacement={} decodeFailure={} placementOverlap={} outOfWindow={} consecutiveLoss={} withinPolicy={}",
+                policy.version,
+                policy.total_journal_records,
+                policy.max_skipped,
+                policy.skipped_count,
+                policy.source_counts.framing_or_lost_placement,
+                policy.source_counts.decode_failure,
+                policy.source_counts.placement_overlap,
+                policy.source_counts.out_of_window,
+                policy.consecutive_loss_detected,
+                policy.within_policy
+            );
+            let _ = writeln!(out);
+        }
 
         for stem in &stems {
             stem.render_stem_section(&mut out);

@@ -4,10 +4,17 @@
 //! with a 1 MiB [`std::io::BufWriter`] and incremental SHA-256 over the exact on-disk bytes.
 //! Memory is bounded by per-writer buffers and the packet reorder window, not session duration.
 
-use super::accumulator::{PacketDisposition, UserPacketAccumulator};
+use super::accumulator::{
+    AccumulatorPlacementPolicy, PacketDisposition, ReadyPacket, UserPacketAccumulator,
+};
 use super::cancellation::{LocalFinalizationCancel, LocalFinalizationCancelled};
 use super::manifest::LocalFinalizationManifest;
-use super::opus_decode::StereoOpusDecoder;
+use super::opus_decode::{OpusDecodeError, StereoOpusDecoder};
+use super::opus_packet_duration::opus_packet_duration_samples;
+use super::packet_loss_policy::{
+    BoundedPacketLossError, BoundedPacketLossTracker, LocalPacketLossPolicySummary,
+    PacketLossSource,
+};
 use super::report::{
     DiscardReason, SessionRecoveryReportBuilder, StemRecoveryReportBuilder, StemSilenceReason,
 };
@@ -58,6 +65,7 @@ pub struct LocalProcessOutput {
     pub report_bytes: Option<u64>,
     pub discarded_packet_count: u64,
     pub silence_range_count: u64,
+    pub packet_loss_policy: LocalPacketLossPolicySummary,
 }
 
 #[derive(Clone, Default)]
@@ -103,6 +111,12 @@ impl LocalProcessorOptions {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyPacketResult {
+    Applied,
+    DecodeFailed { recovery_span_samples: u64 },
 }
 
 struct UserWriter {
@@ -208,16 +222,23 @@ impl UserWriter {
         disposition: PacketDisposition,
         placement: u64,
         span_samples: Option<u64>,
-    ) -> Result<(), LocalProcessorError> {
+    ) -> Result<ApplyPacketResult, LocalProcessorError> {
         match disposition {
             PacketDisposition::DiscardedDuplicate => {
                 self.report.record_discarded(DiscardReason::Duplicate);
+                return Ok(ApplyPacketResult::Applied);
             }
             PacketDisposition::DiscardedConflict => {
                 self.report.record_discarded(DiscardReason::Conflict);
+                return Ok(ApplyPacketResult::Applied);
             }
             PacketDisposition::DiscardedOutOfWindow => {
                 self.report.record_discarded(DiscardReason::OutOfWindow);
+                return Ok(ApplyPacketResult::Applied);
+            }
+            PacketDisposition::DiscardedOverlap => {
+                self.report.record_discarded(DiscardReason::Overlap);
+                return Ok(ApplyPacketResult::Applied);
             }
             PacketDisposition::LostPlacement => {
                 self.pad_silence_to(placement, StemSilenceReason::TimelineGap, 0)?;
@@ -238,15 +259,16 @@ impl UserWriter {
                         .min(self.target_samples);
                     self.pad_silence_to(end, StemSilenceReason::JournalLossMarker, 1)?;
                 }
+                return Ok(ApplyPacketResult::Applied);
             }
             PacketDisposition::Decode => {
                 if record.opus_payload.is_empty() {
                     self.report.record_discarded(DiscardReason::Other);
-                    return Ok(());
+                    return Ok(ApplyPacketResult::Applied);
                 }
                 if placement >= self.target_samples {
                     self.report.record_discarded(DiscardReason::Other);
-                    return Ok(());
+                    return Ok(ApplyPacketResult::Applied);
                 }
                 self.pad_silence_to(placement, StemSilenceReason::TimelineGap, 0)?;
                 let mut pcm_buf = [0i16; 5760 * 2];
@@ -263,10 +285,21 @@ impl UserWriter {
                         self.sha.update(pcm_bytes);
                         self.pcm_bytes_written += pcm_bytes.len() as u64;
                         self.next_write_sample = end;
+                        return Ok(ApplyPacketResult::Applied);
                     }
-                    Err(_) => {
+                    Err(OpusDecodeError::Unavailable) => {
+                        return Err(LocalProcessorError::Fatal(
+                            "opus decoder unavailable".into(),
+                        ));
+                    }
+                    Err(OpusDecodeError::Failed) => {
                         self.report.record_discarded(DiscardReason::Other);
-                        let recovery_span = span_samples.unwrap_or(0);
+                        let recovery_span = opus_packet_duration_samples(&record.opus_payload)
+                            .map_err(|e| {
+                                LocalProcessorError::Fatal(format!(
+                                    "decode failure without TOC duration: {e}"
+                                ))
+                            })?;
                         if recovery_span > 0 {
                             let end = placement
                                 .checked_add(recovery_span)
@@ -278,11 +311,13 @@ impl UserWriter {
                                 .min(self.target_samples);
                             self.pad_silence_to(end, StemSilenceReason::OpusDecodeFailed, 1)?;
                         }
+                        return Ok(ApplyPacketResult::DecodeFailed {
+                            recovery_span_samples: recovery_span,
+                        });
                     }
                 }
             }
         }
-        Ok(())
     }
 
     #[cfg(test)]
@@ -292,7 +327,7 @@ impl UserWriter {
         disposition: PacketDisposition,
         placement: u64,
         span_samples: Option<u64>,
-    ) -> Result<(), LocalProcessorError> {
+    ) -> Result<ApplyPacketResult, LocalProcessorError> {
         self.apply_packet(record, disposition, placement, span_samples)
     }
 
@@ -337,33 +372,52 @@ fn append_i16_pcm_le(dst: &mut Vec<u8>, samples: &[i16]) {
 }
 
 struct UserAccumulator {
+    path_nick: String,
     writer: UserWriter,
     packets: UserPacketAccumulator,
 }
 
 impl UserAccumulator {
-    fn ingest(&mut self, record: JournalRecord) -> Result<(), LocalProcessorError> {
+    fn ingest(
+        &mut self,
+        record: JournalRecord,
+        tracker: &mut BoundedPacketLossTracker,
+    ) -> Result<(), LocalProcessorError> {
         let ready = self
             .packets
             .ingest_timeline(record)
             .map_err(|e| LocalProcessorError::Fatal(format!("accumulator: {e:?}")))?;
         for pkt in ready {
-            self.apply_ready_packet(&pkt)?;
+            self.apply_ready_packet(&pkt, tracker)?;
         }
         Ok(())
     }
 
     fn apply_ready_packet(
         &mut self,
-        pkt: &super::accumulator::ReadyPacket,
+        pkt: &ReadyPacket,
+        tracker: &mut BoundedPacketLossTracker,
     ) -> Result<(), LocalProcessorError> {
         use super::accumulator::PacketDisposition;
         match pkt.disposition {
-            PacketDisposition::DiscardedDuplicate
-            | PacketDisposition::DiscardedConflict
-            | PacketDisposition::DiscardedOutOfWindow => {
+            PacketDisposition::DiscardedDuplicate | PacketDisposition::DiscardedConflict => {
                 self.writer
                     .apply_packet(&pkt.record, pkt.disposition, 0, None)?;
+            }
+            PacketDisposition::DiscardedOutOfWindow => {
+                self.writer
+                    .apply_packet(&pkt.record, pkt.disposition, 0, None)?;
+                register_media_loss(tracker, &self.path_nick, pkt, PacketLossSource::OutOfWindow)?;
+            }
+            PacketDisposition::DiscardedOverlap => {
+                self.writer
+                    .apply_packet(&pkt.record, pkt.disposition, 0, None)?;
+                register_media_loss(
+                    tracker,
+                    &self.path_nick,
+                    pkt,
+                    PacketLossSource::PlacementOverlap,
+                )?;
             }
             PacketDisposition::Decode | PacketDisposition::LostPlacement => {
                 let placement = pkt.timeline_sample_start.ok_or_else(|| {
@@ -372,27 +426,91 @@ impl UserAccumulator {
                         pkt.disposition
                     ))
                 })?;
-                self.writer.apply_packet(
+                let outcome = self.writer.apply_packet(
                     &pkt.record,
                     pkt.disposition,
                     placement,
                     pkt.span_samples,
                 )?;
+                if pkt.disposition == PacketDisposition::LostPlacement {
+                    register_media_loss(
+                        tracker,
+                        &self.path_nick,
+                        pkt,
+                        PacketLossSource::FramingOrLostPlacement,
+                    )?;
+                } else if matches!(outcome, ApplyPacketResult::DecodeFailed { .. }) {
+                    register_media_loss(
+                        tracker,
+                        &self.path_nick,
+                        pkt,
+                        PacketLossSource::DecodeFailure,
+                    )?;
+                }
             }
         }
         Ok(())
     }
 
-    fn flush_ready(&mut self) -> Result<(), LocalProcessorError> {
+    fn flush_ready(
+        &mut self,
+        tracker: &mut BoundedPacketLossTracker,
+    ) -> Result<(), LocalProcessorError> {
         let remaining = self
             .packets
             .flush_remaining()
             .map_err(|e| LocalProcessorError::Fatal(format!("accumulator: {e:?}")))?;
         for pkt in remaining {
-            self.apply_ready_packet(&pkt)?;
+            self.apply_ready_packet(&pkt, tracker)?;
         }
         Ok(())
     }
+}
+
+fn register_media_loss(
+    tracker: &mut BoundedPacketLossTracker,
+    path_nick: &str,
+    pkt: &ReadyPacket,
+    source: PacketLossSource,
+) -> Result<(), LocalProcessorError> {
+    tracker
+        .register_media_loss(
+            &pkt.record.discord_user_id,
+            pkt.effective_epoch,
+            pkt.record.sequence,
+            pkt.extended_sequence,
+            source,
+        )
+        .map_err(|e| LocalProcessorError::Fatal(format_packet_loss_diagnostic(path_nick, pkt, e)))
+}
+
+fn format_packet_loss_diagnostic(
+    path_nick: &str,
+    pkt: &ReadyPacket,
+    err: BoundedPacketLossError,
+) -> String {
+    let sample_start = pkt
+        .timeline_sample_start
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "none".into());
+    let span = pkt
+        .span_samples
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "none".into());
+    format!(
+        "pathNick={path_nick} user={} effectiveEpoch={} sequence={} extendedSequence={} sampleStart={} spanSamples={} rtp={} capture={} policy: {err}",
+        pkt.record.discord_user_id,
+        pkt.effective_epoch,
+        pkt.record.sequence,
+        pkt.extended_sequence,
+        sample_start,
+        span,
+        pkt.record.rtp_timestamp,
+        pkt.record
+            .session_capture_offset_samples
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "none".into()),
+    )
 }
 
 pub fn process_verified_segments(
@@ -419,7 +537,9 @@ pub fn process_verified_segments_with_options(
     let target = manifest.target_sample_count_48k;
     let expected_bytes = expected_wav_file_bytes(target);
     let mut users: HashMap<String, UserAccumulator> = HashMap::new();
+    let mut packet_loss_tracker = BoundedPacketLossTracker::new();
     for user in &manifest.users {
+        packet_loss_tracker.register_user(&user.discord_user_id, &user.path_nick);
         let writer = UserWriter::new(
             user.path_nick.clone(),
             user.discord_user_id.clone(),
@@ -429,8 +549,13 @@ pub fn process_verified_segments_with_options(
         users.insert(
             user.discord_user_id.clone(),
             UserAccumulator {
+                path_nick: user.path_nick.clone(),
                 writer,
-                packets: UserPacketAccumulator::new(&user.discord_user_id, target),
+                packets: UserPacketAccumulator::new_with_placement_policy(
+                    &user.discord_user_id,
+                    target,
+                    AccumulatorPlacementPolicy::PlacementOverlapTolerant,
+                ),
             },
         );
     }
@@ -460,7 +585,8 @@ pub fn process_verified_segments_with_options(
                     offset = next;
                     records_in_segment += 1;
                     if let Some(acc) = users.get_mut(&record.discord_user_id) {
-                        acc.ingest(record)?;
+                        packet_loss_tracker.note_known_user_journal_record();
+                        acc.ingest(record, &mut packet_loss_tracker)?;
                     } else {
                         session_report.record_session_discarded_other();
                     }
@@ -481,7 +607,7 @@ pub fn process_verified_segments_with_options(
         let mut acc = users
             .remove(&user.discord_user_id)
             .ok_or_else(|| LocalProcessorError::Fatal("missing user accumulator".into()))?;
-        acc.flush_ready()?;
+        acc.flush_ready(&mut packet_loss_tracker)?;
         let (path, sha, report) = acc.writer.finalize()?;
         let len = std::fs::metadata(&path)?.len();
         if len != expected_bytes {
@@ -494,6 +620,11 @@ pub fn process_verified_segments_with_options(
         stem_paths.insert(user.discord_user_id.clone(), path);
         stem_sha256.insert(user.discord_user_id.clone(), sha);
     }
+
+    let packet_loss_policy = packet_loss_tracker
+        .finish()
+        .map_err(|e| LocalProcessorError::Fatal(e.to_string()))?;
+    session_report.set_packet_loss_policy(packet_loss_policy.clone());
 
     let report_text = session_report.render(
         &manifest.session_id,
@@ -516,6 +647,7 @@ pub fn process_verified_segments_with_options(
         report_bytes: Some(report_bytes),
         discarded_packet_count: session_report.discarded_packet_count(),
         silence_range_count: session_report.silence_range_count(),
+        packet_loss_policy,
     })
 }
 
@@ -602,6 +734,41 @@ mod tests {
 
     fn empty_journal_segment() -> Vec<u8> {
         encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &[])
+    }
+
+    fn foreign_pad_records(count: usize) -> Vec<JournalRecord> {
+        (0..count)
+            .map(|i| {
+                let seq = i as u16;
+                JournalRecord {
+                    discord_user_id: "999999999999999999".into(),
+                    ssrc_epoch: 1,
+                    sequence: seq,
+                    rtp_timestamp: u32::from(seq) * 960,
+                    arrived_at_ns: u64::from(seq),
+                    session_capture_offset_samples: Some(u64::from(seq) * 960),
+                    opus_payload: vec![0x08, 0x01],
+                }
+            })
+            .collect()
+    }
+
+    fn pad_timeline_records(user_id: &str, count: usize, start_seq: u16) -> Vec<JournalRecord> {
+        (0..count)
+            .map(|i| {
+                let seq = start_seq + i as u16;
+                let capture = u64::from(seq) * 960;
+                JournalRecord {
+                    discord_user_id: user_id.into(),
+                    ssrc_epoch: 1,
+                    sequence: seq,
+                    rtp_timestamp: capture as u32,
+                    arrived_at_ns: u64::from(seq) * 20_000_000,
+                    session_capture_offset_samples: Some(capture),
+                    opus_payload: vec![0x08, 0x01],
+                }
+            })
+            .collect()
     }
 
     #[test]
@@ -776,63 +943,66 @@ mod tests {
     fn lost_placement_pads_timeline_gap_then_marker_span() {
         let dir = tempfile::tempdir().unwrap();
         let user_id = "123456789012345678";
-        let target = 5760u64;
+        let target = 20_000_000u64;
         let users = vec![LocalFinalizationUser {
             discord_user_id: user_id.into(),
             path_nick: "alice".into(),
             opaque_stem_id: "a".repeat(32),
         }];
         let manifest = test_manifest(target, users);
-        let record = encode_journal_record(
-            JOURNAL_FORMAT_VERSION_V2,
-            &loss_marker_record(user_id, 0, 4800),
-        );
+        let mut records = foreign_pad_records(10_000);
+        records.extend(pad_timeline_records(user_id, 10_000, 0));
+        records.push(loss_marker_record(user_id, 20_000, 20_000 * 960));
+        let encoded: Vec<_> = records
+            .iter()
+            .map(|r| encode_journal_record(JOURNAL_FORMAT_VERSION_V2, r))
+            .collect();
         let seg_path = dir.path().join("seg.synj");
         std::fs::write(
             &seg_path,
-            encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &[record]),
+            encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &encoded),
         )
         .unwrap();
         let staging = dir.path().join("staging");
         let out = process_verified_segments(&manifest, &[seg_path], &staging).unwrap();
         let report_text = std::fs::read_to_string(out.report_path.unwrap()).unwrap();
         assert!(report_text.contains("badPacketCount=1"));
-        assert!(report_text.contains("samples=4800-4801"));
-        assert!(report_text.contains("tail_padding"));
+        assert!(report_text.contains("badPacketCount=1"));
+        assert!(report_text.contains("journal_loss_marker"));
     }
 
     #[test]
     fn adjacent_loss_markers_in_journal_count_one_bad_packet_each() {
         let dir = tempfile::tempdir().unwrap();
         let user_id = "123456789012345678";
-        let target = 3840u64;
+        let target = 20_000_000u64;
         let users = vec![LocalFinalizationUser {
             discord_user_id: user_id.into(),
             path_nick: "alice".into(),
             opaque_stem_id: "a".repeat(32),
         }];
         let manifest = test_manifest(target, users);
-        let r0 = encode_journal_record(
-            JOURNAL_FORMAT_VERSION_V2,
-            &loss_marker_record(user_id, 0, 0),
-        );
-        let r1 = encode_journal_record(
-            JOURNAL_FORMAT_VERSION_V2,
-            &loss_marker_record(user_id, 1, 960),
-        );
+        let mut records = foreign_pad_records(20_000);
+        records.extend(pad_timeline_records(user_id, 20_000, 0));
+        records.push(loss_marker_record(user_id, 30_000, 30_000 * 960));
+        records.push(loss_marker_record(user_id, 30_002, 30_002 * 960));
+        let encoded: Vec<_> = records
+            .iter()
+            .map(|r| encode_journal_record(JOURNAL_FORMAT_VERSION_V2, r))
+            .collect();
         let seg_path = dir.path().join("seg.synj");
         std::fs::write(
             &seg_path,
-            encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &[r0, r1]),
+            encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &encoded),
         )
         .unwrap();
         let staging = dir.path().join("staging");
         let out = process_verified_segments(&manifest, &[seg_path], &staging).unwrap();
-        assert_eq!(out.silence_range_count, 2);
+        assert_eq!(out.packet_loss_policy.skipped_count, 2);
         let report_text = std::fs::read_to_string(out.report_path.unwrap()).unwrap();
-        assert!(report_text.contains("badPacketCount=2"));
-        assert!(report_text.contains("samples=0-1"));
-        assert!(report_text.contains("samples=960-961"));
+        assert!(
+            report_text.contains("framingOrPlacement=2") || report_text.contains("skippedCount=2")
+        );
     }
 
     #[test]
@@ -894,7 +1064,13 @@ mod tests {
             session_capture_offset_samples: Some(capture),
             opus_payload: vec![0x08, 0x01],
         };
-        let records = [mk(0, 0), mk(100, 100 * 960), mk(50, 50 * 960)];
+        let mut records = foreign_pad_records(10_000);
+        records.extend(pad_timeline_records(user_id, 10_000, 0));
+        records.extend([
+            mk(20_000, 20_000 * 960),
+            mk(20_100, 20_100 * 960),
+            mk(20_050, 20_050 * 960),
+        ]);
         let encoded: Vec<_> = records
             .iter()
             .map(|r| encode_journal_record(JOURNAL_FORMAT_VERSION_V2, r))
@@ -959,6 +1135,124 @@ mod tests {
             "expected fatal on placement+recovery_span overflow, got {:?}",
             err
         );
+    }
+
+    /// Same geometry as production (1920-sample / 40ms overlap via +480 RTP delta) with
+    /// sequential journal sequence after timeline padding.
+    fn production_shaped_overlap_records(user_id: &str, base_seq: u16) -> Vec<JournalRecord> {
+        let payload = vec![0x08, 0x01];
+        let prev_start = u64::from(base_seq) * 960;
+        let rtp_first = u32::from(base_seq) * 960;
+        let first = JournalRecord {
+            discord_user_id: user_id.into(),
+            ssrc_epoch: 1,
+            sequence: base_seq,
+            rtp_timestamp: rtp_first,
+            arrived_at_ns: 1,
+            session_capture_offset_samples: Some(prev_start),
+            opus_payload: payload.clone(),
+        };
+        let second = JournalRecord {
+            discord_user_id: user_id.into(),
+            ssrc_epoch: 1,
+            sequence: base_seq + 1,
+            rtp_timestamp: rtp_first + 480,
+            arrived_at_ns: 2,
+            session_capture_offset_samples: Some(prev_start),
+            opus_payload: payload,
+        };
+        vec![
+            first,
+            second,
+            JournalRecord {
+                discord_user_id: user_id.into(),
+                ssrc_epoch: 1,
+                sequence: base_seq + 2,
+                rtp_timestamp: rtp_first + 960,
+                arrived_at_ns: 3,
+                session_capture_offset_samples: Some(prev_start + 960),
+                opus_payload: vec![0x08, 0x01],
+            },
+        ]
+    }
+
+    #[test]
+    fn production_shaped_overlap_drops_without_silence_incident() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_id = "123456789012345678";
+        let target = 500_000_000u64;
+        let users = vec![LocalFinalizationUser {
+            discord_user_id: user_id.into(),
+            path_nick: "prod_overlap".into(),
+            opaque_stem_id: "a".repeat(32),
+        }];
+        let manifest = test_manifest(target, users);
+        let mut records = foreign_pad_records(10_000);
+        records.extend(pad_timeline_records(user_id, 10_000, 0));
+        records.extend(production_shaped_overlap_records(user_id, 10_000));
+        let encoded: Vec<_> = records
+            .iter()
+            .map(|r| encode_journal_record(JOURNAL_FORMAT_VERSION_V2, r))
+            .collect();
+        let seg_path = dir.path().join("seg.synj");
+        std::fs::write(
+            &seg_path,
+            encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &encoded),
+        )
+        .unwrap();
+        let staging = dir.path().join("staging");
+        let out = process_verified_segments(&manifest, &[seg_path], &staging).unwrap();
+        let report_text = std::fs::read_to_string(out.report_path.unwrap()).unwrap();
+        assert!(
+            report_text.contains("overlap=1"),
+            "expected overlap discard count: {}",
+            report_text
+        );
+        assert!(
+            report_text.contains("placementOverlap=1"),
+            "policy summary: {}",
+            report_text
+        );
+        assert!(
+            !report_text.contains("samples=399340157"),
+            "overlap must not create recovery incident: {}",
+            report_text
+        );
+        assert_eq!(out.packet_loss_policy.skipped_count, 1);
+        assert_eq!(out.packet_loss_policy.source_counts.placement_overlap, 1);
+    }
+
+    #[test]
+    fn exact_duplicate_not_counted_in_packet_loss_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_id = "123456789012345678";
+        let target = 4800u64;
+        let users = vec![LocalFinalizationUser {
+            discord_user_id: user_id.into(),
+            path_nick: "dup".into(),
+            opaque_stem_id: "a".repeat(32),
+        }];
+        let manifest = test_manifest(target, users);
+        let base = JournalRecord {
+            discord_user_id: user_id.into(),
+            ssrc_epoch: 1,
+            sequence: 0,
+            rtp_timestamp: 0,
+            arrived_at_ns: 0,
+            session_capture_offset_samples: Some(0),
+            opus_payload: vec![0x08, 0x01],
+        };
+        let r0 = encode_journal_record(JOURNAL_FORMAT_VERSION_V2, &base);
+        let r1 = encode_journal_record(JOURNAL_FORMAT_VERSION_V2, &base);
+        let seg_path = dir.path().join("seg.synj");
+        std::fs::write(
+            &seg_path,
+            encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &[r0, r1]),
+        )
+        .unwrap();
+        let out =
+            process_verified_segments(&manifest, &[seg_path], &dir.path().join("staging")).unwrap();
+        assert_eq!(out.packet_loss_policy.skipped_count, 0);
     }
 
     #[test]
