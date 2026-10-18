@@ -1,5 +1,6 @@
 //! Bounded audited local packet-loss policy (production offline / one-pass processor).
 
+use serde::Serialize;
 use std::collections::HashMap;
 
 pub const LOCAL_PACKET_LOSS_POLICY_VERSION: &str = "bounded-audited-v1";
@@ -69,7 +70,8 @@ impl std::fmt::Display for BoundedPacketLossError {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PacketLossSourceCounts {
     pub framing_or_lost_placement: u64,
     pub decode_failure: u64,
@@ -77,7 +79,8 @@ pub struct PacketLossSourceCounts {
     pub out_of_window: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LocalPacketLossPolicySummary {
     pub version: String,
     pub total_journal_records: u64,
@@ -327,6 +330,45 @@ mod tests {
         .expect("other user");
         assert_eq!(t.skipped_count(), 3);
         assert!(t.finish().unwrap().within_policy);
+    }
+
+    #[test]
+    fn consecutive_out_of_window_adjacent_refused() {
+        let mut t = tracker_with_user();
+        t.note_known_user_journal_record();
+        register(&mut t, 0, 10, 10, PacketLossSource::OutOfWindow);
+        let err = t
+            .register_media_loss(USER, 0, 11, 11, PacketLossSource::OutOfWindow)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BoundedPacketLossError::ConsecutiveLoss { .. }
+        ));
+    }
+
+    #[test]
+    fn nonadjacent_out_of_window_allowed() {
+        let mut t = tracker_with_user();
+        for _ in 0..20_000 {
+            t.note_known_user_journal_record();
+        }
+        register(&mut t, 0, 10, 10, PacketLossSource::OutOfWindow);
+        register(&mut t, 0, 12, 12, PacketLossSource::OutOfWindow);
+        assert!(t.finish().unwrap().within_policy);
+    }
+
+    #[test]
+    fn out_of_window_then_overlap_adjacent_refused() {
+        let mut t = tracker_with_user();
+        t.note_known_user_journal_record();
+        register(&mut t, 0, 10, 10, PacketLossSource::OutOfWindow);
+        let err = t
+            .register_media_loss(USER, 0, 11, 11, PacketLossSource::PlacementOverlap)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BoundedPacketLossError::ConsecutiveLoss { .. }
+        ));
     }
 
     #[test]

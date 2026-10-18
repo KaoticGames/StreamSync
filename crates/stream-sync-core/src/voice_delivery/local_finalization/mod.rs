@@ -38,9 +38,10 @@ pub use contract::{
     LeaseGrant, LeaseProof, LEASE_GENERATION_HEADER, LEASE_TOKEN_HEADER,
 };
 pub use journal_forensics::{
-    analyze_local_journal_session, build_minimal_manifest_json, forensics_report_to_json,
-    local_journal_forensics_exit_code, render_forensics_table, session_forensics_certified_clean,
-    LocalJournalForensicsReport,
+    analyze_local_journal_session, analyze_local_journal_session_with_options,
+    build_minimal_manifest_json, forensics_report_to_json, local_journal_forensics_exit_code,
+    offline_journal_forensics_options, render_forensics_table, session_forensics_certified_clean,
+    LocalJournalForensicsOptions, LocalJournalForensicsReport,
 };
 pub use journal_store::LocalJournalStore;
 pub use local_publication::{resolve_published_paths, PublishedLocalOutput};
@@ -66,10 +67,7 @@ pub use packet_loss_policy::{
 pub use paths::{
     resolve_canonical_session_paths, validate_path_under_parent, PublishedSessionPaths,
 };
-pub use processor::{
-    process_verified_segments, process_verified_segments_with_options, LocalProcessOutput,
-    LocalProcessorError, LocalProcessorOptions, LocalProcessorProgress,
-};
+pub use processor::LocalProcessorError;
 pub use progress::{LocalFinalizationPhase, LocalFinalizationProgressEvent};
 pub use receipt::{
     assert_local_finalization_receipt_matches_manifest, parse_local_finalization_receipt,

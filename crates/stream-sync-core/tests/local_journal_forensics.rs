@@ -1,9 +1,11 @@
 use std::fs;
 use std::path::Path;
 use stream_sync_core::voice_delivery::local_finalization::{
-    analyze_local_journal_session, build_minimal_manifest_json, encode_journal_file,
-    encode_journal_record, forensics_report_to_json, local_journal_forensics_exit_code,
-    render_forensics_table, JournalRecord, JOURNAL_FORMAT_VERSION_V2,
+    analyze_local_journal_session, analyze_local_journal_session_with_options,
+    build_minimal_manifest_json, encode_journal_file, encode_journal_record,
+    forensics_report_to_json, local_journal_forensics_exit_code, offline_journal_forensics_options,
+    render_forensics_table, session_forensics_certified_clean, JournalRecord,
+    JOURNAL_FORMAT_VERSION_V2,
 };
 
 fn write_session(root: &Path, session_id: &str, users: &[(&str, &str)], records: &[JournalRecord]) {
@@ -342,6 +344,112 @@ fn recoverable_framing_session_not_certified() {
     fs::write(seg_path, bytes).unwrap();
     let report = analyze_local_journal_session(dir.path()).unwrap();
     assert_session_not_certified(&report);
+}
+
+fn production_shaped_40ms_overlap_records(user: &str, base_seq: u16) -> Vec<JournalRecord> {
+    let prev_start = u64::from(base_seq) * 960;
+    let rtp_first = u32::from(base_seq) * 960;
+    let payload = vec![0x08, 0x01];
+    vec![
+        JournalRecord {
+            discord_user_id: user.into(),
+            ssrc_epoch: 1,
+            sequence: base_seq,
+            rtp_timestamp: rtp_first,
+            arrived_at_ns: 1,
+            session_capture_offset_samples: Some(prev_start),
+            opus_payload: payload.clone(),
+        },
+        JournalRecord {
+            discord_user_id: user.into(),
+            ssrc_epoch: 1,
+            sequence: base_seq + 1,
+            rtp_timestamp: rtp_first + 480,
+            arrived_at_ns: 2,
+            session_capture_offset_samples: Some(prev_start),
+            opus_payload: payload,
+        },
+        JournalRecord {
+            discord_user_id: user.into(),
+            ssrc_epoch: 1,
+            sequence: base_seq + 2,
+            rtp_timestamp: rtp_first + 960,
+            arrived_at_ns: 3,
+            session_capture_offset_samples: Some(prev_start + 960),
+            opus_payload: vec![0x08, 0x01],
+        },
+    ]
+}
+
+#[test]
+fn production_shaped_overlap_strict_forensics_not_certified() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = "123456789012345678";
+    let mut records = Vec::new();
+    for seq in 0..10_000u16 {
+        let capture = u64::from(seq) * 960;
+        records.push(sample_record(user, 1, seq, capture, 120));
+    }
+    records.extend(production_shaped_40ms_overlap_records(user, 10_000));
+    let session_id = "550e8400-e29b-41d4-a716-446655440020";
+    let session_root = dir.path().join(session_id);
+    write_session(
+        &session_root,
+        session_id,
+        &[("123456789012345678", "overlap_strict")],
+        &records,
+    );
+    let report = analyze_local_journal_session(&session_root).unwrap();
+    assert_session_not_certified(&report);
+    assert_eq!(report.accumulator_placement_policy, "strict");
+    let u = report
+        .users
+        .iter()
+        .find(|u| u.path_nick == "overlap_strict")
+        .unwrap();
+    assert!(u.accumulator.accumulator_errors > 0);
+    let json = forensics_report_to_json(&report).unwrap();
+    assert!(json.contains("\"accumulatorPlacementPolicy\": \"strict\""));
+}
+
+#[test]
+fn production_shaped_overlap_tolerant_forensics_clean_within_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = "123456789012345678";
+    let mut records = Vec::new();
+    for seq in 0..10_000u16 {
+        let capture = u64::from(seq) * 960;
+        records.push(sample_record(user, 1, seq, capture, 120));
+    }
+    records.extend(production_shaped_40ms_overlap_records(user, 10_000));
+    let session_id = "550e8400-e29b-41d4-a716-446655440021";
+    let session_root = dir.path().join(session_id);
+    write_session(
+        &session_root,
+        session_id,
+        &[("123456789012345678", "overlap_tolerant")],
+        &records,
+    );
+    let report = analyze_local_journal_session_with_options(
+        &session_root,
+        offline_journal_forensics_options(),
+    )
+    .unwrap();
+    assert!(session_forensics_certified_clean(&report));
+    assert_eq!(report.accumulator_placement_policy, "overlapTolerant");
+    let u = report
+        .users
+        .iter()
+        .find(|u| u.path_nick == "overlap_tolerant")
+        .unwrap();
+    assert_eq!(u.accumulator.discarded_overlap, 1);
+    assert_eq!(u.accumulator.accumulator_errors, 0);
+    let preflight = report.packet_loss_preflight.as_ref().unwrap();
+    assert_eq!(preflight.source_counts.placement_overlap, 1);
+    assert!(preflight.within_policy);
+    let table = render_forensics_table(&report);
+    assert!(table.contains("overlapTolerant"));
+    assert!(table.contains("overlap=1"));
 }
 
 #[test]

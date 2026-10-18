@@ -57,6 +57,7 @@ pub enum LocalProcessorError {
     Paused,
 }
 
+#[derive(Debug)]
 pub struct LocalProcessOutput {
     pub stem_paths: HashMap<String, PathBuf>,
     pub stem_sha256: HashMap<String, String>,
@@ -1253,6 +1254,167 @@ mod tests {
         let out =
             process_verified_segments(&manifest, &[seg_path], &dir.path().join("staging")).unwrap();
         assert_eq!(out.packet_loss_policy.skipped_count, 0);
+    }
+
+    fn overlap_pair(user: &str, base_seq: u16) -> Vec<JournalRecord> {
+        let capture = u64::from(base_seq) * 960;
+        let first = JournalRecord {
+            discord_user_id: user.into(),
+            ssrc_epoch: 1,
+            sequence: base_seq,
+            rtp_timestamp: capture as u32,
+            arrived_at_ns: u64::from(base_seq),
+            session_capture_offset_samples: Some(capture),
+            opus_payload: vec![0x08, 0x01],
+        };
+        let second = JournalRecord {
+            discord_user_id: user.into(),
+            ssrc_epoch: 1,
+            sequence: base_seq + 1,
+            rtp_timestamp: (capture as u32) + 480,
+            arrived_at_ns: u64::from(base_seq) + 1,
+            session_capture_offset_samples: Some(capture),
+            opus_payload: vec![0x08, 0x01],
+        };
+        vec![first, second]
+    }
+
+    fn run_journal_policy(
+        user: &str,
+        records: &[JournalRecord],
+    ) -> Result<LocalProcessOutput, LocalProcessorError> {
+        let dir = tempfile::tempdir().unwrap();
+        let encoded: Vec<_> = records
+            .iter()
+            .map(|r| encode_journal_record(JOURNAL_FORMAT_VERSION_V2, r))
+            .collect();
+        let seg_path = dir.path().join("seg.synj");
+        std::fs::write(
+            &seg_path,
+            encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &encoded),
+        )
+        .unwrap();
+        let users = vec![LocalFinalizationUser {
+            discord_user_id: user.into(),
+            path_nick: "u".into(),
+            opaque_stem_id: "a".repeat(32),
+        }];
+        let manifest = test_manifest(10_000_000, users);
+        process_verified_segments(&manifest, &[seg_path], &dir.path().join("staging"))
+    }
+
+    #[test]
+    fn isolated_overlap_among_ten_thousand_records_allowed() {
+        let user = "123456789012345678";
+        let mut records = pad_timeline_records(user, 10_000, 0);
+        records.extend(overlap_pair(user, 20_000));
+        assert!(run_journal_policy(user, &records).is_ok());
+    }
+
+    #[test]
+    fn ratio_violation_refused() {
+        let user = "123456789012345678";
+        let mut records = pad_timeline_records(user, 5000, 0);
+        records.extend(overlap_pair(user, 10_000));
+        records.extend(overlap_pair(user, 10_002));
+        let err = run_journal_policy(user, &records).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("0.01%") || msg.contains("Ratio"),
+            "expected ratio refusal: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn thirty_third_overlap_refused() {
+        let user = "123456789012345678";
+        let mut records = pad_timeline_records(user, 200, 0);
+        for block in 0..33u16 {
+            let base = 1_000 + block * 4;
+            records.extend(overlap_pair(user, base));
+        }
+        let err = run_journal_policy(user, &records).unwrap_err();
+        assert!(
+            err.to_string().contains("maximum 32") || err.to_string().contains("exceeds session"),
+            "expected max skipped: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn consecutive_loss_markers_same_stream_refused() {
+        let user = "123456789012345678";
+        let records = vec![
+            JournalRecord {
+                discord_user_id: user.into(),
+                ssrc_epoch: 1,
+                sequence: 0,
+                rtp_timestamp: 0,
+                arrived_at_ns: 0,
+                session_capture_offset_samples: Some(0),
+                opus_payload: vec![0x08, 0x01],
+            },
+            loss_marker_record(user, 1, 960),
+            loss_marker_record(user, 2, 1920),
+        ];
+        let err = run_journal_policy(user, &records).unwrap_err();
+        assert!(
+            err.to_string().contains("consecutive"),
+            "expected consecutive refusal: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn decode_framing_and_overlap_share_one_budget() {
+        let user = "123456789012345678";
+        let mut records = foreign_pad_records(10_000);
+        records.extend(pad_timeline_records(user, 20_000, 0));
+        records.push(loss_marker_record(user, 20_000, 20_000 * 960));
+        records.extend(overlap_pair(user, 20_010));
+        let out = run_journal_policy(user, &records).unwrap();
+        assert_eq!(out.packet_loss_policy.skipped_count, 2);
+        assert_eq!(
+            out.packet_loss_policy
+                .source_counts
+                .framing_or_lost_placement,
+            1
+        );
+        assert_eq!(out.packet_loss_policy.source_counts.placement_overlap, 1);
+    }
+
+    #[test]
+    fn adjacent_out_of_window_extended_identity_refuses_consecutive() {
+        let user = "123456789012345678";
+        let mut records = foreign_pad_records(10_000);
+        records.extend(pad_timeline_records(user, 10_000, 0));
+        records.extend([
+            JournalRecord {
+                discord_user_id: user.into(),
+                ssrc_epoch: 1,
+                sequence: 50,
+                rtp_timestamp: 50u32 * 960,
+                arrived_at_ns: 1,
+                session_capture_offset_samples: Some(50u64 * 960),
+                opus_payload: vec![0x08, 0x01],
+            },
+            JournalRecord {
+                discord_user_id: user.into(),
+                ssrc_epoch: 1,
+                sequence: 51,
+                rtp_timestamp: 51u32 * 960,
+                arrived_at_ns: 2,
+                session_capture_offset_samples: Some(51u64 * 960),
+                opus_payload: vec![0x08, 0x01],
+            },
+        ]);
+        let err = run_journal_policy(user, &records).unwrap_err();
+        assert!(
+            err.to_string().contains("consecutive"),
+            "adjacent OOW must refuse consecutive policy: {}",
+            err
+        );
     }
 
     #[test]

@@ -1,7 +1,14 @@
 //! Read-only local journal forensics (framing + timeline metadata only; no Opus decode).
 
-use super::accumulator::{lost_marker_span_samples, PacketDisposition, UserPacketAccumulator};
+use super::accumulator::{
+    lost_marker_span_samples, AccumulatorPlacementPolicy, PacketDisposition, ReadyPacket,
+    UserPacketAccumulator,
+};
 use super::manifest::{derive_voice_v2_opaque_stem_id, parse_local_finalization_manifest};
+use super::packet_loss_policy::{
+    BoundedPacketLossError, BoundedPacketLossTracker, LocalPacketLossPolicySummary,
+    PacketLossSource,
+};
 use super::synj::{decode_journal_record, read_file_header, JournalFramingError, JournalRecord};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -122,12 +129,45 @@ pub struct LocalJournalForensicsReport {
     pub target_sample_count_48k: u64,
     pub manifest_valid: bool,
     pub manifest_warnings: Vec<String>,
+    pub accumulator_placement_policy: String,
+    pub bounded_packet_loss_preflight: bool,
+    pub packet_loss_preflight: Option<LocalPacketLossPolicySummary>,
     pub segments: Vec<SegmentForensics>,
     pub users: Vec<UserJournalForensics>,
     pub session_framing_fatal_count: u32,
     pub session_framing_recoverable_count: u32,
     pub session_forensics_certified_clean: bool,
     pub silence_cause_ranking: Vec<SilenceCauseEntry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LocalJournalForensicsOptions {
+    pub placement_policy: AccumulatorPlacementPolicy,
+    pub bounded_packet_loss_preflight: bool,
+}
+
+impl Default for LocalJournalForensicsOptions {
+    fn default() -> Self {
+        Self {
+            placement_policy: AccumulatorPlacementPolicy::Strict,
+            bounded_packet_loss_preflight: false,
+        }
+    }
+}
+
+/// Offline journal rerender source/snapshot preflight (overlap-tolerant + bounded loss audit).
+pub fn offline_journal_forensics_options() -> LocalJournalForensicsOptions {
+    LocalJournalForensicsOptions {
+        placement_policy: AccumulatorPlacementPolicy::PlacementOverlapTolerant,
+        bounded_packet_loss_preflight: true,
+    }
+}
+
+fn placement_policy_label(policy: AccumulatorPlacementPolicy) -> &'static str {
+    match policy {
+        AccumulatorPlacementPolicy::Strict => "strict",
+        AccumulatorPlacementPolicy::PlacementOverlapTolerant => "overlapTolerant",
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +222,16 @@ fn journal_record_from_meta(meta: &JournalRecordMeta) -> JournalRecord {
 
 pub fn analyze_local_journal_session(
     session_root: &Path,
+) -> Result<LocalJournalForensicsReport, JournalForensicsError> {
+    analyze_local_journal_session_with_options(
+        session_root,
+        LocalJournalForensicsOptions::default(),
+    )
+}
+
+pub fn analyze_local_journal_session_with_options(
+    session_root: &Path,
+    options: LocalJournalForensicsOptions,
 ) -> Result<LocalJournalForensicsReport, JournalForensicsError> {
     let manifest_path = session_root.join("manifest.json");
     let raw = fs::read_to_string(&manifest_path)?;
@@ -316,8 +366,16 @@ pub fn analyze_local_journal_session(
     }
 
     let target = manifest.target_sample_count_48k;
+    let mut packet_loss_tracker = if options.bounded_packet_loss_preflight {
+        Some(BoundedPacketLossTracker::new())
+    } else {
+        None
+    };
     let mut users_out = Vec::new();
     for user in &manifest.users {
+        if let Some(tracker) = &mut packet_loss_tracker {
+            tracker.register_user(&user.discord_user_id, &user.path_nick);
+        }
         let rows = per_user_records
             .get(&user.discord_user_id)
             .map(|v| v.as_slice())
@@ -328,18 +386,25 @@ pub fn analyze_local_journal_session(
             user.opaque_stem_id.clone(),
             rows,
             target,
+            options.placement_policy,
+            &mut packet_loss_tracker,
         ));
     }
 
     for (discord_user_id, rows) in &per_user_records {
         if !user_map.contains_key(discord_user_id) {
             let (path_nick, opaque) = (format!("unknown-{}", discord_user_id), "unknown".into());
+            if let Some(tracker) = &mut packet_loss_tracker {
+                tracker.register_user(discord_user_id, &path_nick);
+            }
             users_out.push(analyze_user(
                 discord_user_id.clone(),
                 path_nick,
                 opaque,
                 rows,
                 target,
+                options.placement_policy,
+                &mut packet_loss_tracker,
             ));
             manifest_warnings.push(format!(
                 "journal records for discordUserId not listed in manifest: {}",
@@ -351,6 +416,23 @@ pub fn analyze_local_journal_session(
 
     let silence_cause_ranking = rank_silence_causes(&users_out);
 
+    let packet_loss_preflight = if options.bounded_packet_loss_preflight {
+        match packet_loss_tracker.as_mut().expect("tracker").finish() {
+            Ok(summary) => Some(summary),
+            Err(e) => {
+                manifest_warnings.push(format!("bounded packet-loss preflight refused: {e}"));
+                Some(
+                    packet_loss_tracker
+                        .as_ref()
+                        .expect("tracker")
+                        .summary(false),
+                )
+            }
+        }
+    } else {
+        None
+    };
+
     let mut report = LocalJournalForensicsReport {
         session_root: session_root.display().to_string(),
         session_id: manifest.session_id.clone(),
@@ -359,6 +441,9 @@ pub fn analyze_local_journal_session(
         target_sample_count_48k: target,
         manifest_valid: true,
         manifest_warnings,
+        accumulator_placement_policy: placement_policy_label(options.placement_policy).into(),
+        bounded_packet_loss_preflight: options.bounded_packet_loss_preflight,
+        packet_loss_preflight,
         segments: segments_out,
         users: users_out,
         session_framing_fatal_count: session_fatal,
@@ -373,6 +458,12 @@ pub fn analyze_local_journal_session(
 pub fn session_forensics_certified_clean(report: &LocalJournalForensicsReport) -> bool {
     if !report.manifest_warnings.is_empty() {
         return false;
+    }
+    if report.bounded_packet_loss_preflight {
+        match &report.packet_loss_preflight {
+            Some(summary) if summary.within_policy && !summary.consecutive_loss_detected => {}
+            _ => return false,
+        }
     }
     if report.session_framing_fatal_count > 0 || report.session_framing_recoverable_count > 0 {
         return false;
@@ -408,12 +499,28 @@ pub fn local_journal_forensics_exit_code(report: &LocalJournalForensicsReport) -
     }
 }
 
+fn forensics_register_media_loss(
+    tracker: &mut BoundedPacketLossTracker,
+    pkt: &ReadyPacket,
+    source: PacketLossSource,
+) -> Result<(), BoundedPacketLossError> {
+    tracker.register_media_loss(
+        &pkt.record.discord_user_id,
+        pkt.effective_epoch,
+        pkt.record.sequence,
+        pkt.extended_sequence,
+        source,
+    )
+}
+
 fn analyze_user(
     discord_user_id: String,
     path_nick: String,
     opaque_stem_id: String,
     rows: &[&RecordRef],
     target_samples: u64,
+    placement_policy: AccumulatorPlacementPolicy,
+    packet_loss_tracker: &mut Option<BoundedPacketLossTracker>,
 ) -> UserJournalForensics {
     let mut total_records = 0u64;
     let mut nonempty = 0u64;
@@ -490,7 +597,11 @@ fn analyze_user(
         last_seq_by_epoch.insert(rec.meta.ssrc_epoch, rec.meta.sequence);
     }
 
-    let mut acc = UserPacketAccumulator::new(&discord_user_id, target_samples);
+    let mut acc = UserPacketAccumulator::new_with_placement_policy(
+        &discord_user_id,
+        target_samples,
+        placement_policy,
+    );
     let mut counts = AccumulatorDispositionCounts {
         decode: 0,
         lost_placement: 0,
@@ -509,6 +620,9 @@ fn analyze_user(
     let mut diagnostics = Vec::new();
 
     for rec in rows {
+        if let Some(tracker) = packet_loss_tracker.as_mut() {
+            tracker.note_known_user_journal_record();
+        }
         let jr = journal_record_from_meta(&rec.meta);
         let toc_hint = if jr.opus_payload.is_empty() {
             "tocDurationSamples=loss_marker".to_string()
@@ -532,6 +646,10 @@ fn analyze_user(
             }
         };
         for pkt in ready {
+            if let Err(e) = apply_forensics_packet_loss_audit(packet_loss_tracker.as_mut(), &pkt) {
+                counts.accumulator_errors += 1;
+                diagnostics.push(format!("PACKET_LOSS_PREFLIGHT: {e}"));
+            }
             track_emitted(
                 &pkt,
                 &mut counts,
@@ -547,6 +665,12 @@ fn analyze_user(
     match acc.flush_remaining() {
         Ok(flushed) => {
             for pkt in flushed {
+                if let Err(e) =
+                    apply_forensics_packet_loss_audit(packet_loss_tracker.as_mut(), &pkt)
+                {
+                    counts.accumulator_errors += 1;
+                    diagnostics.push(format!("PACKET_LOSS_PREFLIGHT: {e}"));
+                }
                 track_emitted(
                     &pkt,
                     &mut counts,
@@ -620,6 +744,29 @@ fn analyze_user(
         emitted_capture_max_after_first_epoch_transition: emitted_capture_max_after_transition,
         diagnostics,
         forensics_certified_clean,
+    }
+}
+
+fn apply_forensics_packet_loss_audit(
+    tracker: Option<&mut BoundedPacketLossTracker>,
+    pkt: &ReadyPacket,
+) -> Result<(), BoundedPacketLossError> {
+    let Some(tracker) = tracker else {
+        return Ok(());
+    };
+    match pkt.disposition {
+        PacketDisposition::DiscardedOutOfWindow => {
+            forensics_register_media_loss(tracker, pkt, PacketLossSource::OutOfWindow)
+        }
+        PacketDisposition::DiscardedOverlap => {
+            forensics_register_media_loss(tracker, pkt, PacketLossSource::PlacementOverlap)
+        }
+        PacketDisposition::LostPlacement => {
+            forensics_register_media_loss(tracker, pkt, PacketLossSource::FramingOrLostPlacement)
+        }
+        PacketDisposition::DiscardedDuplicate
+        | PacketDisposition::DiscardedConflict
+        | PacketDisposition::Decode => Ok(()),
     }
 }
 
@@ -766,10 +913,21 @@ pub fn render_forensics_table(report: &LocalJournalForensicsReport) -> String {
         "NOT CLEAN"
     };
     out.push_str(&format!(
-        "Session forensics: {} | Manifest warnings: {}\n",
+        "Session forensics: {} | Placement policy: {} | Manifest warnings: {}\n",
         session_cert,
+        report.accumulator_placement_policy,
         report.manifest_warnings.len()
     ));
+    if let Some(policy) = &report.packet_loss_preflight {
+        out.push_str(&format!(
+            "Packet-loss preflight: skipped={} overlap={} outOfWindow={} withinPolicy={} consecutive={}\n",
+            policy.skipped_count,
+            policy.source_counts.placement_overlap,
+            policy.source_counts.out_of_window,
+            policy.within_policy,
+            policy.consecutive_loss_detected
+        ));
+    }
     out.push_str(&format!(
         "Target samples: {} | Segments: {} | Framing fatal/recoverable: {}/{}\n\n",
         report.target_sample_count_48k,
