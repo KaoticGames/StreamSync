@@ -21,7 +21,7 @@ use std::io::Write;
 
 pub const LOCAL_PENDING_PATH: &str = "/api/stream-sync/voice/local-v1/deliveries/pending";
 
-pub use super::contract::{parse_local_pending_item, LocalPendingItem};
+pub use super::contract::LocalPendingItem;
 
 pub trait LocalFinalizationClient: Send + Sync {
     fn fetch_pending(&self, limit: u32) -> Result<Vec<LocalPendingItem>, VoiceV2ClientError>;

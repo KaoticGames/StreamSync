@@ -29,12 +29,12 @@ pub struct RtpCandidatePacket {
 
 #[derive(Debug, Clone)]
 pub struct InferredRtpGenerationBoundary {
-    pub journal_ssrc_epoch: u32,
-    pub implicit_generation_ordinal: u32,
-    pub prior_effective_epoch: u32,
-    pub new_effective_epoch: u32,
-    pub sequence: u16,
-    pub capture_offset_samples: u64,
+    pub _journal_ssrc_epoch: u32,
+    pub _implicit_generation_ordinal: u32,
+    pub _prior_effective_epoch: u32,
+    pub _new_effective_epoch: u32,
+    pub _sequence: u16,
+    pub _capture_offset_samples: u64,
 }
 
 #[derive(Debug)]
@@ -49,19 +49,6 @@ pub enum RtpDiscontinuityAction {
     Gap { sample_start: u64 },
     ImplicitBoundary,
     Refuse { reason: String },
-}
-
-pub fn discontinuity_decision_to_action(
-    decision: RtpDiscontinuityDecision,
-    sample_start_for_gap: impl Fn(u64) -> u64,
-) -> RtpDiscontinuityAction {
-    match decision {
-        RtpDiscontinuityDecision::Gap { rtp_delta_samples } => RtpDiscontinuityAction::Gap {
-            sample_start: sample_start_for_gap(rtp_delta_samples),
-        },
-        RtpDiscontinuityDecision::ImplicitGeneration => RtpDiscontinuityAction::ImplicitBoundary,
-        RtpDiscontinuityDecision::Refuse { reason } => RtpDiscontinuityAction::Refuse { reason },
-    }
 }
 
 pub fn rtp_forward_delta(prev_raw: u32, raw_timestamp: u32) -> u64 {

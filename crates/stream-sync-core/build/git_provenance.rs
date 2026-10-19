@@ -18,7 +18,7 @@ pub fn git_provenance_watch_paths(repo_root: &Path) -> Vec<PathBuf> {
 }
 
 pub fn repo_root_from_manifest(manifest_dir: &Path) -> Option<PathBuf> {
-    git_stdout(manifest_dir, &["rev-parse", "--show-toplevel"]).map(|s| PathBuf::from(s))
+    git_stdout(manifest_dir, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
 }
 
 /// Tracked-tree cleanliness only (`git diff` / `git diff --cached`); untracked/ignored files are ignored.

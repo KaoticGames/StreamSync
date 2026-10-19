@@ -68,7 +68,7 @@ fn parse_code3_layout(payload: &[u8], toc_index: usize) -> Result<Code3Layout, S
     let vbr = ctrl & 0x80 != 0;
     let padding_flag = ctrl & 0x40 != 0;
     let frame_count = ctrl & 0x3f;
-    if frame_count < 1 || frame_count > 48 {
+    if !(1..=48).contains(&frame_count) {
         return Err("code 3 frame count M must be 1..48".into());
     }
     let mut idx = toc_index + 1;
@@ -94,7 +94,7 @@ fn parse_code3_layout(payload: &[u8], toc_index: usize) -> Result<Code3Layout, S
     }
 
     if !vbr {
-        if available % usize::from(frame_count) != 0 {
+        if !available.is_multiple_of(usize::from(frame_count)) {
             return Err("code 3 CBR frame body not divisible by M".into());
         }
         let per_frame = available / usize::from(frame_count);
@@ -146,8 +146,8 @@ fn validate_strict_for_toc_byte(toc: u8, payload: &[u8], offset: usize) -> Resul
             }
         }
         1 => {
-            let body_bytes = payload.len().checked_sub(offset + 1).unwrap_or(0);
-            if body_bytes < 2 || body_bytes % 2 != 0 {
+            let body_bytes = payload.len().saturating_sub(offset + 1);
+            if body_bytes < 2 || !body_bytes.is_multiple_of(2) {
                 return Err("code 1 requires even payload >= 2 bytes after TOC".into());
             }
         }
@@ -281,7 +281,7 @@ mod tests {
     fn code2_extended_length_prefix_accepted() {
         let first_len = 252usize;
         let mut p = vec![0x0a, 252, 0];
-        p.extend(std::iter::repeat(0xaa).take(first_len));
+        p.extend(std::iter::repeat_n(0xaa, first_len));
         p.push(0xbb);
         assert_eq!(validate_opus_packet_for_journal_timeline(&p).unwrap(), 1920);
     }

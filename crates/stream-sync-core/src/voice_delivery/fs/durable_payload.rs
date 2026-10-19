@@ -7,7 +7,8 @@ use super::file::VoiceFile;
 use crate::voice_delivery::hash::{hex_digest, sha256_hex_reader, DEFAULT_STREAM_CHUNK};
 use sha2::{Digest, Sha256};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(test)]
@@ -50,10 +51,7 @@ pub fn write_durable_payload_at_path(
     file.flush()?;
     #[cfg(test)]
     if TEST_INJECT_SYNC_FAIL.load(Ordering::SeqCst) {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "injected sync failure",
-        ));
+        return Err(io::Error::other("injected sync failure"));
     }
     file.sync_all()?;
     let readback = std::fs::read(path)?;
@@ -96,10 +94,7 @@ pub fn copy_durable_create_new<R: io::Read>(
     file.flush()?;
     #[cfg(test)]
     if TEST_INJECT_SYNC_FAIL.load(Ordering::SeqCst) {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "injected sync failure",
-        ));
+        return Err(io::Error::other("injected sync failure"));
     }
     file.sync_all()?;
     if total != expected_len {
@@ -132,10 +127,7 @@ pub fn copy_durable_create_new<R: io::Read>(
 fn durable_finish_voice_file(file: &VoiceFile, expected: &[u8]) -> Result<(), FsError> {
     #[cfg(test)]
     if TEST_INJECT_SYNC_FAIL.load(Ordering::SeqCst) {
-        return Err(FsError::Io(io::Error::new(
-            io::ErrorKind::Other,
-            "injected sync failure",
-        )));
+        return Err(FsError::Io(io::Error::other("injected sync failure")));
     }
     sync_file(file)?;
     let len = file.len()?;

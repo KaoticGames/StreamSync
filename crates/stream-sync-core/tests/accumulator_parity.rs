@@ -274,7 +274,7 @@ fn parity_loss_marker_among_valid_packets() {
 
 #[test]
 fn parity_overlap_placement_refused() {
-    let records = vec![
+    let records = [
         rec(0, 1, 0, 0, 1, payload_toc_20ms()),
         rec(0, 2, 480, 0, 2, payload_toc_20ms()),
     ];
@@ -286,7 +286,7 @@ fn parity_overlap_placement_refused() {
 
 #[test]
 fn tolerant_overlap_emits_discarded_overlap_without_advancing_timeline() {
-    let records = vec![
+    let records = [
         rec(0, 1, 0, 0, 1, payload_toc_20ms()),
         rec(0, 2, 480, 0, 2, payload_toc_20ms()),
     ];
@@ -553,6 +553,7 @@ fn prev_timeline_plus_rtp_delta_overflow_pathological() {
 #[test]
 fn parity_json_fixture_seq_wrap() {
     let fx = load_fixture("seq_wrap.json");
+    assert_eq!(fx.scenario, "seq_wrap_65534_65535_0_1");
     let records: Vec<JournalRecord> = fx
         .records
         .iter()

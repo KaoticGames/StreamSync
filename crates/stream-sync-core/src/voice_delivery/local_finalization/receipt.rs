@@ -5,14 +5,10 @@ use super::manifest::{
     LOCAL_FINALIZATION_FINALIZER_ALGORITHM_VERSION,
 };
 use crate::voice_delivery::finalized_manifest::expected_wav_file_bytes;
-use crate::voice_delivery::finalized_manifest::{
-    compare_ascii_for_digest, validate_discord_snowflake, validate_sha256_hex,
-};
-use crate::voice_delivery::hash::hex_digest;
+use crate::voice_delivery::finalized_manifest::{validate_discord_snowflake, validate_sha256_hex};
 use crate::voice_delivery::recovery_report::RECOVERY_REPORT_RELATIVE_PATH;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -345,80 +341,6 @@ pub fn parse_local_finalization_receipt(
         discarded_packet_count: discarded_packet_count as u64,
         silence_range_count: silence_range_count as u64,
     })
-}
-
-pub fn canonicalize_local_finalization_receipt_for_digest(
-    receipt: &LocalFinalizationReceipt,
-) -> String {
-    let mut stems: Vec<_> = receipt
-        .stems
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "byteLength": s.byte_length,
-                "discordUserId": s.discord_user_id,
-                "relativePath": s.relative_path,
-                "sha256": s.sha256,
-            })
-        })
-        .collect();
-    stems.sort_by(|a, b| {
-        compare_ascii_for_digest(
-            a.get("relativePath").and_then(|v| v.as_str()).unwrap_or(""),
-            b.get("relativePath").and_then(|v| v.as_str()).unwrap_or(""),
-        )
-    });
-    let mut payload = serde_json::Map::new();
-    payload.insert(
-        "completedAtMs".into(),
-        serde_json::json!(receipt.completed_at_ms),
-    );
-    payload.insert(
-        "deliveryManifestDigest".into(),
-        serde_json::Value::String(receipt.delivery_manifest_digest.clone()),
-    );
-    payload.insert(
-        "deviceId".into(),
-        serde_json::Value::String(receipt.device_id.clone()),
-    );
-    payload.insert(
-        "discardedPacketCount".into(),
-        serde_json::json!(receipt.discarded_packet_count),
-    );
-    payload.insert(
-        "finalizerAlgorithmVersion".into(),
-        serde_json::Value::String(receipt.finalizer_algorithm_version.clone()),
-    );
-    payload.insert(
-        "outputManifestDigest".into(),
-        serde_json::Value::String(receipt.output_manifest_digest.clone()),
-    );
-    payload.insert(
-        "sessionId".into(),
-        serde_json::Value::String(receipt.session_id.clone()),
-    );
-    payload.insert(
-        "silenceRangeCount".into(),
-        serde_json::json!(receipt.silence_range_count),
-    );
-    payload.insert("stems".into(), serde_json::Value::Array(stems));
-    payload.insert("version".into(), serde_json::json!(receipt.version));
-    if let Some(report) = &receipt.recovery_report {
-        payload.insert(
-            "recoveryReport".into(),
-            serde_json::json!({
-                "byteLength": report.byte_length,
-                "relativePath": report.relative_path,
-                "sha256": report.sha256,
-            }),
-        );
-    }
-    serde_json::to_string(&serde_json::Value::Object(payload)).expect("receipt json")
-}
-
-pub fn compute_local_finalization_receipt_digest(receipt: &LocalFinalizationReceipt) -> String {
-    let canonical = canonicalize_local_finalization_receipt_for_digest(receipt);
-    hex_digest(&Sha256::digest(canonical.as_bytes()))
 }
 
 pub fn assert_local_finalization_receipt_matches_manifest(
