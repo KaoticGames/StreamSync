@@ -56,14 +56,9 @@ pub fn git_rev_parse_git_path(repo_root: &Path, git_path: &str) -> Option<PathBu
     if path.is_absolute() {
         return Some(path);
     }
-    let git_dir = git_stdout(repo_root, &["rev-parse", "--git-dir"])?;
-    let git_dir = PathBuf::from(git_dir);
-    let base = if git_dir.is_absolute() {
-        git_dir
-    } else {
-        repo_root.join(git_dir)
-    };
-    Some(base.join(path))
+    // `git rev-parse --git-path` returns a path relative to the command's
+    // current working directory, not a path relative to `--git-dir`.
+    Some(repo_root.join(path))
 }
 
 pub fn is_valid_git_sha(s: &str) -> bool {

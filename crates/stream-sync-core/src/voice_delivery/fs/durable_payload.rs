@@ -6,17 +6,19 @@ use super::error::FsError;
 use super::file::VoiceFile;
 use crate::voice_delivery::hash::{hex_digest, sha256_hex_reader, DEFAULT_STREAM_CHUNK};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::cell::Cell;
 use std::io::{self, Write};
 use std::path::Path;
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(test)]
-static TEST_INJECT_SYNC_FAIL: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static TEST_INJECT_SYNC_FAIL: Cell<bool> = const { Cell::new(false) };
+}
 
 #[cfg(test)]
 pub(crate) fn test_inject_sync_fail(enabled: bool) {
-    TEST_INJECT_SYNC_FAIL.store(enabled, Ordering::SeqCst);
+    TEST_INJECT_SYNC_FAIL.set(enabled);
 }
 
 #[derive(Debug, Clone)]
@@ -50,7 +52,7 @@ pub fn write_durable_payload_at_path(
     file.write_all(bytes)?;
     file.flush()?;
     #[cfg(test)]
-    if TEST_INJECT_SYNC_FAIL.load(Ordering::SeqCst) {
+    if TEST_INJECT_SYNC_FAIL.get() {
         return Err(io::Error::other("injected sync failure"));
     }
     file.sync_all()?;
@@ -93,7 +95,7 @@ pub fn copy_durable_create_new<R: io::Read>(
     }
     file.flush()?;
     #[cfg(test)]
-    if TEST_INJECT_SYNC_FAIL.load(Ordering::SeqCst) {
+    if TEST_INJECT_SYNC_FAIL.get() {
         return Err(io::Error::other("injected sync failure"));
     }
     file.sync_all()?;
@@ -126,7 +128,7 @@ pub fn copy_durable_create_new<R: io::Read>(
 
 fn durable_finish_voice_file(file: &VoiceFile, expected: &[u8]) -> Result<(), FsError> {
     #[cfg(test)]
-    if TEST_INJECT_SYNC_FAIL.load(Ordering::SeqCst) {
+    if TEST_INJECT_SYNC_FAIL.get() {
         return Err(FsError::Io(io::Error::other("injected sync failure")));
     }
     sync_file(file)?;
@@ -169,6 +171,21 @@ mod tests {
         let dir = root.open_dir_relative(&[]).unwrap();
         assert!(write_durable_payload_create_new(&dir, "payload.txt", b"one").is_err());
         test_inject_sync_fail(false);
+    }
+
+    #[test]
+    fn injected_sync_failure_is_thread_local() {
+        test_inject_sync_fail(true);
+        let child_result = std::thread::spawn(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = DestRoot::open(tmp.path()).unwrap();
+            let dir = root.open_dir_relative(&[]).unwrap();
+            write_durable_payload_create_new(&dir, "payload.txt", b"one")
+        })
+        .join()
+        .unwrap();
+        test_inject_sync_fail(false);
+        assert!(child_result.is_ok());
     }
 
     #[test]
