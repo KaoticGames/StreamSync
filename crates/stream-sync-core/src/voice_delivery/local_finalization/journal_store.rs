@@ -337,6 +337,19 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), JournalStoreError> {
     Ok(())
 }
 
+fn sync_dir(path: &Path) -> Result<(), JournalStoreError> {
+    #[cfg(unix)]
+    {
+        let f = File::open(path)?;
+        f.sync_all()?;
+    }
+    #[cfg(windows)]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod preflight_tests {
     use super::*;
@@ -657,17 +670,4 @@ mod preflight_tests {
         let err = LocalJournalStore::disk_preflight_bytes(&manifest, 0).unwrap_err();
         assert_eq!(err, StoragePreflightFailure::RequiredBytesOverflow);
     }
-}
-
-fn sync_dir(path: &Path) -> Result<(), JournalStoreError> {
-    #[cfg(unix)]
-    {
-        let f = File::open(path)?;
-        f.sync_all()?;
-    }
-    #[cfg(windows)]
-    {
-        let _ = path;
-    }
-    Ok(())
 }

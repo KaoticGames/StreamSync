@@ -1,4 +1,3 @@
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -9,10 +8,10 @@ use stream_sync_core::voice_delivery::local_finalization::{
     LocalFinalizationOutputPolicy, LocalFinalizationSegment, LocalFinalizationUser,
     OfflineJournalRerenderError, OfflineJournalRerenderNetworkSeal, OfflineJournalRerenderOptions,
     JOURNAL_FORMAT_VERSION_V2, LOCAL_FINALIZATION_FINALIZER_ALGORITHM_VERSION,
-    LOCAL_FINALIZATION_WAV_FORMAT, OFFLINE_RECOVERY_MANIFEST_FILENAME,
+    LOCAL_FINALIZATION_WAV_FORMAT,
 };
 use stream_sync_core::voice_delivery::{
-    hex_digest, sha256_hex_reader, DEFAULT_STREAM_CHUNK, RECOVERY_REPORT_RELATIVE_PATH,
+    sha256_hex_reader, DEFAULT_STREAM_CHUNK, RECOVERY_REPORT_RELATIVE_PATH,
 };
 
 fn test_user(session_id: &str, discord: &str, nick: &str) -> LocalFinalizationUser {
@@ -162,7 +161,7 @@ fn refuses_uncertified_source_before_staging() {
     let session_id = "550e8400-e29b-41d4-a716-446655440013";
     let session_root = tmp.path().join(session_id);
     let user = "123456789012345678";
-    let records = vec![sample_record(user, 1, 0, 0), sample_record(user, 1, 5, 0)];
+    let records = [sample_record(user, 1, 0, 0), sample_record(user, 1, 5, 0)];
     let encoded: Vec<Vec<u8>> = records
         .iter()
         .map(|r| encode_journal_record(JOURNAL_FORMAT_VERSION_V2, r))
@@ -244,6 +243,9 @@ fn offline_rerender_source_has_no_network_client_symbols() {
 #[cfg(feature = "local-opus-native")]
 mod native_opus_success {
     use super::*;
+    use sha2::{Digest, Sha256};
+    use stream_sync_core::voice_delivery::hex_digest;
+    use stream_sync_core::voice_delivery::local_finalization::OFFLINE_RECOVERY_MANIFEST_FILENAME;
 
     #[test]
     fn success_publishes_recovery_manifest_with_build_provenance() {
@@ -270,7 +272,7 @@ mod native_opus_success {
             manifest_before
         );
         let digest = hex_digest(&Sha256::digest(
-            &fs::read(session_root.join("manifest.json")).unwrap(),
+            fs::read(session_root.join("manifest.json")).unwrap(),
         ));
         assert!(recovery_json.contains(&digest));
         let marker = fs::read_to_string(&outcome.completion_marker_path).unwrap();

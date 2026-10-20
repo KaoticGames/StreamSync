@@ -31,7 +31,7 @@ fn opus_packet_nb_frames(payload: &[u8]) -> Result<u64, String> {
         return Err("code 3 missing control byte".into());
     }
     let frame_count = payload[1] & 0x3f;
-    if frame_count < 1 || frame_count > 48 {
+    if !(1..=48).contains(&frame_count) {
         return Err("code 3 frame count M must be 1..48".into());
     }
     Ok(u64::from(frame_count))

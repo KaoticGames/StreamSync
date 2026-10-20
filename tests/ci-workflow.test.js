@@ -27,7 +27,39 @@ const prodTauriConfig = JSON.parse(
   )
 );
 
+function workflowStep(workflow, name) {
+  const match = workflow.match(
+    new RegExp(
+      `^\\s{6}- name: ${name}\\n([\\s\\S]*?)(?=^\\s{6}- (?:name|uses):|^\\s{2}[a-zA-Z0-9_-]+:|(?![\\s\\S]))`,
+      "m"
+    )
+  );
+  assert.ok(match, `${name} step exists`);
+  return match[0];
+}
+
 describe("CI workflow", () => {
+  it("pins vendored Opus compatibility for CI and release installer builds", () => {
+    for (const [pathName, step] of [
+      ["CI", workflowStep(ciWorkflow, "NSIS installer")],
+      [
+        "release",
+        workflowStep(releaseWorkflow, "NSIS installer with updater artifacts"),
+      ],
+    ]) {
+      assert.match(
+        step,
+        /CMAKE_POLICY_VERSION_MINIMUM:\s*"3\.5"/,
+        `${pathName} installer pins the third-party Opus CMake policy floor`
+      );
+      assert.match(
+        step,
+        /npx tauri build --features windows-vendored-opus --bundles nsis --ci/,
+        `${pathName} installer explicitly enables vendored Opus`
+      );
+    }
+  });
+
   it("windows-installer smoke uses checked-in CI Tauri config override", () => {
     const jobStart = ciWorkflow.indexOf("  windows-installer:");
     assert.ok(jobStart >= 0, "windows-installer job exists");
@@ -35,7 +67,7 @@ describe("CI workflow", () => {
     const job = ciWorkflow.slice(jobStart, nextJob);
     assert.match(
       job,
-      /npx tauri build --bundles nsis --ci --no-sign --config tauri\.ci\.conf\.json/
+      /npx tauri build --features windows-vendored-opus --bundles nsis --ci --no-sign --config tauri\.ci\.conf\.json/
     );
     assert.doesNotMatch(
       job,
@@ -69,7 +101,7 @@ describe("CI workflow", () => {
     assert.equal(prodTauriConfig.bundle.createUpdaterArtifacts, true);
     assert.match(
       releaseWorkflow,
-      /npx tauri build --bundles nsis --ci\s*\n\s+working-directory: crates\/stream-sync-desktop/
+      /npx tauri build --features windows-vendored-opus --bundles nsis --ci\s*\n\s+working-directory: crates\/stream-sync-desktop/
     );
     assert.doesNotMatch(
       releaseWorkflow,

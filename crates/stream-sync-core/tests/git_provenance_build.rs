@@ -3,7 +3,10 @@
 #[path = "../build/git_provenance.rs"]
 mod git_provenance;
 
-use git_provenance::{git_provenance_watch_paths, is_valid_git_sha, repo_root_from_manifest};
+use git_provenance::{
+    git_provenance_watch_paths, is_tracked_tree_clean, is_valid_git_sha, repo_root_from_manifest,
+    resolve_git_sha,
+};
 use std::path::PathBuf;
 
 #[test]
@@ -16,6 +19,10 @@ fn watch_paths_include_existing_head() {
         "expected HEAD in {:?}",
         paths
     );
+    let _tracked_tree_clean = is_tracked_tree_clean(&repo_root);
+    if let Some(sha) = resolve_git_sha(&manifest_dir) {
+        assert!(is_valid_git_sha(&sha));
+    }
 }
 
 #[test]

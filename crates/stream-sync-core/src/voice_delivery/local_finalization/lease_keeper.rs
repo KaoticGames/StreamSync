@@ -30,7 +30,7 @@ impl LeaseKeeper {
         let stop_thread = stop.clone();
         let renew_failed_thread = renew_failed.clone();
         let handle = thread::spawn(move || {
-            let mut proof = proof;
+            let proof = proof;
             let mut expires_at_ms = expires_at_ms;
             while !stop_thread.load(Ordering::SeqCst) {
                 let now_ms = chrono::Utc::now().timestamp_millis();

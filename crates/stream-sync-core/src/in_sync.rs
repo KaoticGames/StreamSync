@@ -18,7 +18,9 @@ const IN_SYNC_DISCOVERY_MESSAGE_MAX: usize = 240;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum InSyncSupervisorStatus {
+    #[default]
     Starting,
     Polling,
     Ready,
@@ -48,12 +50,6 @@ pub struct InSyncSupervisorSnapshot {
     pub last_success_at_ms: Option<i64>,
     pub pending_count: usize,
     pub last_error: Option<String>,
-}
-
-impl Default for InSyncSupervisorStatus {
-    fn default() -> Self {
-        Self::Starting
-    }
 }
 
 impl InSyncSupervisorSnapshot {
@@ -120,35 +116,6 @@ pub fn bound_client_error(err: &VoiceV2ClientError) -> String {
     bound_discovery_message(err.to_string())
 }
 
-pub async fn set_in_sync_discovery_blocked(state: &AppState, message: impl Into<String>) {
-    let mut slot = state.in_sync_pending.write().await;
-    slot.sessions.clear();
-    slot.discovery = InSyncDiscoverySnapshot {
-        status: "blocked".into(),
-        message: Some(bound_discovery_message(message.into())),
-    };
-    update_in_sync_supervisor_snapshot(state, InSyncSupervisorStatus::Blocked, None, None).await;
-}
-
-pub async fn set_in_sync_pending_fetch_error(state: &AppState, message: impl Into<String>) {
-    let mut slot = state.in_sync_pending.write().await;
-    slot.sessions.clear();
-    slot.discovery = InSyncDiscoverySnapshot {
-        status: "error".into(),
-        message: Some(bound_discovery_message(message.into())),
-    };
-}
-
-pub async fn set_in_sync_pending_deliveries(state: &AppState, deliveries: &[LocalPendingItem]) {
-    let sessions = deliveries.iter().map(pending_summary_from_item).collect();
-    let mut slot = state.in_sync_pending.write().await;
-    slot.sessions = sessions;
-    slot.discovery = InSyncDiscoverySnapshot {
-        status: "ok".into(),
-        message: None,
-    };
-}
-
 pub async fn update_in_sync_supervisor_snapshot(
     state: &AppState,
     status: InSyncSupervisorStatus,
@@ -179,28 +146,6 @@ pub struct InSyncWorkerState {
     pub active: Option<Arc<LocalFinalizationOrchestrator>>,
     pub published_by_session:
         HashMap<String, crate::voice_delivery::local_finalization::PublishedSessionPaths>,
-}
-
-pub async fn worker_state(state: &AppState) -> InSyncWorkerState {
-    state.in_sync_worker.read().await.clone()
-}
-
-pub async fn set_active_orchestrator(
-    state: &AppState,
-    orch: Option<Arc<LocalFinalizationOrchestrator>>,
-) {
-    let mut slot = state.in_sync_worker.write().await;
-    slot.active = orch;
-}
-
-pub async fn record_published_paths(
-    state: &AppState,
-    session_id: &str,
-    paths: crate::voice_delivery::local_finalization::PublishedSessionPaths,
-) {
-    let mut slot = state.in_sync_worker.write().await;
-    slot.published_by_session
-        .insert(session_id.to_string(), paths);
 }
 
 /// Signal cancellation for the active in-sync finalization job (shared worker controls + orchestrator).

@@ -3,9 +3,8 @@
 use crate::app_state::AppState;
 use crate::config_types::LocalProcessingMode;
 use crate::in_sync::{
-    bound_client_error, ensure_in_sync_native_opus, record_published_paths,
-    set_active_orchestrator, set_in_sync_discovery_blocked, set_in_sync_pending_deliveries,
-    set_in_sync_pending_fetch_error, update_in_sync_supervisor_snapshot, InSyncSupervisorStatus,
+    bound_client_error, ensure_in_sync_native_opus, update_in_sync_supervisor_snapshot,
+    InSyncSupervisorStatus,
 };
 use crate::voice_delivery::local_finalization::PublishedSessionPaths;
 use crate::voice_delivery::local_finalization::{
@@ -18,7 +17,6 @@ use crate::voice_delivery::{
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Notify;
 use tracing::{info, warn};
 
 pub const LOCAL_POLL_LIMIT: u32 = 5;
@@ -157,12 +155,12 @@ fn blocking_supervisor_cycle(state: &AppState) -> Result<Duration, String> {
     };
 
     set_in_sync_pending_deliveries_blocking(state, &pending);
-    let status = if pending.is_empty() {
-        InSyncSupervisorStatus::Ready
-    } else {
-        InSyncSupervisorStatus::Ready
-    };
-    update_in_sync_supervisor_snapshot_sync(state, status, Some(pending.len()), None);
+    update_in_sync_supervisor_snapshot_sync(
+        state,
+        InSyncSupervisorStatus::Ready,
+        Some(pending.len()),
+        None,
+    );
 
     if pending.is_empty() {
         update_local_runtime_blocking(state, LocalFinalizationPhase::Queued, None, None, None);
@@ -349,9 +347,7 @@ fn published_paths_from_events(
             if sid == session_id {
                 return (
                     Some(std::path::PathBuf::from(final_session_dir)),
-                    recovery_report_path
-                        .as_ref()
-                        .map(|p| std::path::PathBuf::from(p)),
+                    recovery_report_path.as_ref().map(std::path::PathBuf::from),
                 );
             }
         }

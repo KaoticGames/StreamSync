@@ -89,6 +89,7 @@ jobs:
 
       - name: NSIS installer with updater artifacts
         env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         shell: pwsh
@@ -96,7 +97,7 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
             throw "TAURI_SIGNING_PRIVATE_KEY is not configured"
           }
-          npx tauri build --bundles nsis --ci
+          npx tauri build --features windows-vendored-opus --bundles nsis --ci
         working-directory: crates/stream-sync-desktop
 
       - name: Generate release notes

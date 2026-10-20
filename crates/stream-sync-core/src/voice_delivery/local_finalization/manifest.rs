@@ -2,14 +2,12 @@
 
 use crate::voice_delivery::finalized_manifest::{
     compare_ascii_for_digest, expected_wav_file_bytes, is_valid_stem_id,
-    validate_discord_snowflake, validate_sha256_hex, FinalizedManifestError,
-    SyndicateFinalizedManifest, SyndicateFinalizedStem, SyndicateRecoveryReport,
-    FINALIZED_MANIFEST_VERSION, JOURNAL_FORMAT_VERSION_V2,
+    validate_discord_snowflake, validate_sha256_hex, SyndicateFinalizedManifest,
+    SyndicateFinalizedStem, SyndicateRecoveryReport, FINALIZED_MANIFEST_VERSION,
+    JOURNAL_FORMAT_VERSION_V2,
 };
 use crate::voice_delivery::hash::hex_digest;
-use crate::voice_delivery::recovery_report::{
-    RECOVERY_REPORT_CONTENT_TYPE, RECOVERY_REPORT_RELATIVE_PATH,
-};
+use crate::voice_delivery::recovery_report::RECOVERY_REPORT_RELATIVE_PATH;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -21,7 +19,6 @@ pub const LOCAL_FINALIZATION_FINALIZER_ALGORITHM_VERSION: &str =
     "syndicate-local-opus-finalizer-v1";
 pub const LOCAL_FINALIZATION_WAV_FORMAT: &str = "pcm_s16le_stereo_48000";
 const VOICE_DELIVERY_V2_R2_PREFIX: &str = "voice-delivery-v2";
-const JOURNAL_SEGMENT_SEQ_PAD: usize = 8;
 const GUILD_ID_PATTERN_MIN: usize = 17;
 const GUILD_ID_PATTERN_MAX: usize = 20;
 const OPAQUE_STEM_ID_HEX_LEN: usize = 32;

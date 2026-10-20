@@ -735,7 +735,7 @@ mod probe_child_dir_tests {
 
 #[cfg(test)]
 mod dest_root_storage_qualify {
-    use crate::voice_delivery::fs::DestRoot;
+    use crate::voice_delivery::fs::{DestRoot, FsError};
     use stream_sync_windows_fs::storage_qualify::validate_canonical_unc_share_path;
 
     #[test]

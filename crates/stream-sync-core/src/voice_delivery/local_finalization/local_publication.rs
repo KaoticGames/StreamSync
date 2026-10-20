@@ -114,8 +114,8 @@ fn install_outputs_into_staging(
             .stem_paths
             .get(&stem.discord_user_id)
             .ok_or_else(|| OrchestratorError::Other(format!("missing stem {}", stem.path_nick)))?;
-        install_verified_file(&staging, &wav_name, src, stem.wav_bytes, &stem.sha256)?;
-        let file = open_existing_file_at(&staging, &wav_name)
+        install_verified_file(staging, &wav_name, src, stem.wav_bytes, &stem.sha256)?;
+        let file = open_existing_file_at(staging, &wav_name)
             .map_err(|e| OrchestratorError::Other(e.to_string()))?;
         let stem_entry = guard
             .manifest()
@@ -135,13 +135,13 @@ fn install_outputs_into_staging(
             .report_sha256
             .as_deref()
             .ok_or_else(|| OrchestratorError::Other("missing recovery report digest".into()))?;
-        install_verified_file(&staging, &spec.file_name, src, spec.byte_count, sha)?;
-        let file = open_existing_file_at(&staging, &spec.file_name)
+        install_verified_file(staging, &spec.file_name, src, spec.byte_count, sha)?;
+        let file = open_existing_file_at(staging, &spec.file_name)
             .map_err(|e| OrchestratorError::Other(e.to_string()))?;
         verify_recovery_report_from_handle(&file, &spec)
             .map_err(|e| OrchestratorError::Other(e.to_string()))?;
     }
-    sync_dir_exact(&staging).map_err(|e| OrchestratorError::Other(e.to_string()))?;
+    sync_dir_exact(staging).map_err(|e| OrchestratorError::Other(e.to_string()))?;
     Ok(())
 }
 
@@ -177,7 +177,7 @@ fn install_verified_file(
         .map_err(|e| OrchestratorError::Other(e.to_string()))?;
     let mut src_file = File::open(src).map_err(|e| OrchestratorError::Other(e.to_string()))?;
     let mut offset = 0u64;
-    let mut buf = vec![0u8; DEFAULT_STREAM_CHUNK as usize];
+    let mut buf = vec![0u8; DEFAULT_STREAM_CHUNK];
     loop {
         let n = src_file
             .read(&mut buf)

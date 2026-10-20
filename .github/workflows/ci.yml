@@ -94,7 +94,9 @@ jobs:
         run: node scripts/check-desktop-icons.js
 
       - name: NSIS installer
-        run: cargo build -p stream-sync-desktop --features windows-vendored-opus --release && npx tauri build --bundles nsis --ci --no-sign --config tauri.ci.conf.json
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: npx tauri build --features windows-vendored-opus --bundles nsis --ci --no-sign --config tauri.ci.conf.json
         working-directory: crates/stream-sync-desktop
 
   signed-release:

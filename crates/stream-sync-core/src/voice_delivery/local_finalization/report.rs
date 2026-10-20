@@ -215,7 +215,7 @@ impl StemRecoveryReportBuilder {
             self.discarded_other
         );
         let mut incidents = self.incidents.clone();
-        incidents.sort_by(|a, b| a.start_sample.cmp(&b.start_sample));
+        incidents.sort_by_key(|a| a.start_sample);
         for incident in &incidents {
             let dur_samples = incident.end_sample - incident.start_sample;
             let start = format_hms_ms(incident.start_sample);
@@ -261,14 +261,6 @@ impl SessionRecoveryReportBuilder {
         summary: super::packet_loss_policy::LocalPacketLossPolicySummary,
     ) {
         self.packet_loss_policy = Some(summary);
-    }
-
-    pub fn sort_stems_deterministic(&mut self) {
-        self.stems.sort_by(|a, b| {
-            a.path_nick
-                .cmp(&b.path_nick)
-                .then_with(|| a.discord_user_id.cmp(&b.discord_user_id))
-        });
     }
 
     pub fn discarded_packet_count(&self) -> u64 {

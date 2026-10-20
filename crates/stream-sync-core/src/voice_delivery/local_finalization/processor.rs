@@ -22,9 +22,8 @@ use super::synj::{decode_journal_record, read_file_header, JournalFramingError, 
 use crate::voice_delivery::bounds::STEREO_PCM_FRAME_BYTES;
 use crate::voice_delivery::finalized_manifest::expected_wav_file_bytes;
 use crate::voice_delivery::fs::durable_payload::{ensure_parent, write_durable_payload_at_path};
-use crate::voice_delivery::hash::{hex_digest, LiveSha256};
+use crate::voice_delivery::hash::LiveSha256;
 use crate::voice_delivery::wav::minimal_wav_header;
-use sha2::Digest;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
@@ -102,7 +101,7 @@ impl LocalProcessorOptions {
             return;
         }
         let emit = processed_segments == total_segments
-            || processed_segments % PROCESSOR_PROGRESS_EVERY_SEGMENTS == 0;
+            || processed_segments.is_multiple_of(PROCESSOR_PROGRESS_EVERY_SEGMENTS);
         if emit {
             if let Some(cb) = &self.progress {
                 cb(LocalProcessorProgress {
@@ -227,19 +226,19 @@ impl UserWriter {
         match disposition {
             PacketDisposition::DiscardedDuplicate => {
                 self.report.record_discarded(DiscardReason::Duplicate);
-                return Ok(ApplyPacketResult::Applied);
+                Ok(ApplyPacketResult::Applied)
             }
             PacketDisposition::DiscardedConflict => {
                 self.report.record_discarded(DiscardReason::Conflict);
-                return Ok(ApplyPacketResult::Applied);
+                Ok(ApplyPacketResult::Applied)
             }
             PacketDisposition::DiscardedOutOfWindow => {
                 self.report.record_discarded(DiscardReason::OutOfWindow);
-                return Ok(ApplyPacketResult::Applied);
+                Ok(ApplyPacketResult::Applied)
             }
             PacketDisposition::DiscardedOverlap => {
                 self.report.record_discarded(DiscardReason::Overlap);
-                return Ok(ApplyPacketResult::Applied);
+                Ok(ApplyPacketResult::Applied)
             }
             PacketDisposition::LostPlacement => {
                 self.pad_silence_to(placement, StemSilenceReason::TimelineGap, 0)?;
@@ -260,7 +259,7 @@ impl UserWriter {
                         .min(self.target_samples);
                     self.pad_silence_to(end, StemSilenceReason::JournalLossMarker, 1)?;
                 }
-                return Ok(ApplyPacketResult::Applied);
+                Ok(ApplyPacketResult::Applied)
             }
             PacketDisposition::Decode => {
                 if record.opus_payload.is_empty() {
@@ -286,13 +285,11 @@ impl UserWriter {
                         self.sha.update(pcm_bytes);
                         self.pcm_bytes_written += pcm_bytes.len() as u64;
                         self.next_write_sample = end;
-                        return Ok(ApplyPacketResult::Applied);
+                        Ok(ApplyPacketResult::Applied)
                     }
-                    Err(OpusDecodeError::Unavailable) => {
-                        return Err(LocalProcessorError::Fatal(
-                            "opus decoder unavailable".into(),
-                        ));
-                    }
+                    Err(OpusDecodeError::Unavailable) => Err(LocalProcessorError::Fatal(
+                        "opus decoder unavailable".into(),
+                    )),
                     Err(OpusDecodeError::Failed) => {
                         self.report.record_discarded(DiscardReason::Other);
                         let recovery_span = opus_packet_duration_samples(&record.opus_payload)
@@ -312,9 +309,9 @@ impl UserWriter {
                                 .min(self.target_samples);
                             self.pad_silence_to(end, StemSilenceReason::OpusDecodeFailed, 1)?;
                         }
-                        return Ok(ApplyPacketResult::DecodeFailed {
+                        Ok(ApplyPacketResult::DecodeFailed {
                             recovery_span_samples: recovery_span,
-                        });
+                        })
                     }
                 }
             }
@@ -514,6 +511,7 @@ fn format_packet_loss_diagnostic(
     )
 }
 
+#[cfg(test)]
 pub fn process_verified_segments(
     manifest: &LocalFinalizationManifest,
     segment_paths: &[PathBuf],
@@ -578,7 +576,9 @@ pub fn process_verified_segments_with_options(
         let mut offset = 8usize;
         let mut records_in_segment = 0u64;
         while offset < data.len() {
-            if records_in_segment > 0 && records_in_segment % RECORD_INTERRUPT_CHECK_INTERVAL == 0 {
+            if records_in_segment > 0
+                && records_in_segment.is_multiple_of(RECORD_INTERRUPT_CHECK_INTERVAL)
+            {
                 options.check_interrupt()?;
             }
             match decode_journal_record(&data, offset, format_version) {
@@ -633,19 +633,17 @@ pub fn process_verified_segments_with_options(
         &manifest.channel_id,
         target,
     );
-    let report_bytes = report_text.len() as u64;
     let report_path = staging_dir.join("Syndicate Audio Recovery Report.txt");
-    let report_sha = hex_digest(&sha2::Sha256::digest(report_text.as_bytes()));
     ensure_parent(&report_path).map_err(LocalProcessorError::Io)?;
-    write_durable_payload_at_path(&report_path, report_text.as_bytes())
+    let report_write = write_durable_payload_at_path(&report_path, report_text.as_bytes())
         .map_err(LocalProcessorError::Io)?;
 
     Ok(LocalProcessOutput {
         stem_paths,
         stem_sha256,
         report_path: Some(report_path),
-        report_sha256: Some(report_sha),
-        report_bytes: Some(report_bytes),
+        report_sha256: Some(report_write.sha256),
+        report_bytes: Some(report_write.byte_length),
         discarded_packet_count: session_report.discarded_packet_count(),
         silence_range_count: session_report.silence_range_count(),
         packet_loss_policy,

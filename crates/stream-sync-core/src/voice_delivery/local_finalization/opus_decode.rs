@@ -25,7 +25,7 @@ impl StereoOpusDecoder {
             use audiopus::{Channels, SampleRate};
             let inner = audiopus::coder::Decoder::new(SampleRate::Hz48000, Channels::Stereo)
                 .map_err(|_| OpusDecodeError::Failed)?;
-            return Ok(Self { inner });
+            Ok(Self { inner })
         }
         #[cfg(all(test, not(feature = "local-opus-native")))]
         {
@@ -50,11 +50,10 @@ impl StereoOpusDecoder {
             use audiopus::MutSignals;
             let packet =
                 Packet::try_from(&record.opus_payload).map_err(|_| OpusDecodeError::Failed)?;
-            let mut out = MutSignals::try_from(pcm_out).map_err(|_| OpusDecodeError::Failed)?;
-            return self
-                .inner
+            let out = MutSignals::try_from(pcm_out).map_err(|_| OpusDecodeError::Failed)?;
+            self.inner
                 .decode(Some(packet), out, false)
-                .map_err(|_| OpusDecodeError::Failed);
+                .map_err(|_| OpusDecodeError::Failed)
         }
         #[cfg(all(test, not(feature = "local-opus-native")))]
         {
@@ -76,7 +75,7 @@ impl StereoOpusDecoder {
 pub fn assert_local_opus_available() -> Result<(), OpusDecodeError> {
     #[cfg(feature = "local-opus-native")]
     {
-        return StereoOpusDecoder::new().map(|_| ());
+        StereoOpusDecoder::new().map(|_| ())
     }
     #[cfg(not(feature = "local-opus-native"))]
     {

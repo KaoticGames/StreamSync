@@ -545,10 +545,10 @@ fn map_journal_store_err(e: JournalStoreError) -> LocalOrchestratorError {
 struct LeaseSession<C: LocalFinalizationClient + Clone> {
     session_id: String,
     proof: LeaseProof,
-    expires_at_ms: i64,
+    _expires_at_ms: i64,
     keeper: Option<LeaseKeeper>,
     receipt_posted: bool,
-    client: C,
+    _client: C,
 }
 
 impl<C: LocalFinalizationClient + Clone + 'static> LeaseSession<C> {
@@ -564,10 +564,10 @@ impl<C: LocalFinalizationClient + Clone + 'static> LeaseSession<C> {
         Self {
             session_id: grant.session_id,
             proof,
-            expires_at_ms: grant.expires_at_ms,
+            _expires_at_ms: grant.expires_at_ms,
             keeper: Some(keeper),
             receipt_posted: false,
-            client,
+            _client: client,
         }
     }
 

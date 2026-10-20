@@ -655,8 +655,7 @@ fn analyze_user(
                 &mut counts,
                 &mut first_emitted,
                 &mut last_emitted_end,
-                first_transition_index,
-                first_epoch,
+                (first_transition_index, first_epoch),
                 &mut emitted_capture_max_after_transition,
                 &mut emitted_in_later_epochs,
             );
@@ -676,8 +675,7 @@ fn analyze_user(
                     &mut counts,
                     &mut first_emitted,
                     &mut last_emitted_end,
-                    first_transition_index,
-                    first_epoch,
+                    (first_transition_index, first_epoch),
                     &mut emitted_capture_max_after_transition,
                     &mut emitted_in_later_epochs,
                 );
@@ -775,11 +773,11 @@ fn track_emitted(
     counts: &mut AccumulatorDispositionCounts,
     first_emitted: &mut Option<u64>,
     last_emitted_end: &mut Option<u64>,
-    first_transition_index: Option<u64>,
-    first_epoch: Option<u32>,
+    transition: (Option<u64>, Option<u32>),
     emitted_capture_max_after_transition: &mut Option<u64>,
     emitted_in_later_epochs: &mut u64,
 ) {
+    let (first_transition_index, first_epoch) = transition;
     bump_disposition(counts, pkt.disposition);
     let placement = match pkt.timeline_sample_start {
         Some(p) => p,
@@ -794,15 +792,16 @@ fn track_emitted(
     }
     *last_emitted_end = Some(last_emitted_end.map_or(end, |e| e.max(end)));
 
-    if first_transition_index.is_some() && Some(pkt.record.ssrc_epoch) != first_epoch {
-        if matches!(
+    if first_transition_index.is_some()
+        && Some(pkt.record.ssrc_epoch) != first_epoch
+        && matches!(
             pkt.disposition,
             PacketDisposition::Decode | PacketDisposition::LostPlacement
-        ) {
-            *emitted_in_later_epochs += 1;
-            *emitted_capture_max_after_transition =
-                Some(emitted_capture_max_after_transition.map_or(end, |m| m.max(end)));
-        }
+        )
+    {
+        *emitted_in_later_epochs += 1;
+        *emitted_capture_max_after_transition =
+            Some(emitted_capture_max_after_transition.map_or(end, |m| m.max(end)));
     }
 }
 

@@ -90,12 +90,15 @@ pub struct OfflineJournalRerenderOptions {
 }
 
 #[cfg(test)]
+type PostSnapshotHook = Box<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct OfflineJournalRerenderTestHooks {
     /// Opt-in for module tests: use the `cfg(test)` Opus decoder stub without `local-opus-native`.
     pub allow_test_opus_decoder_stub: bool,
     pub fail_after_staging: bool,
-    pub post_snapshot: Option<Box<dyn Fn(&Path) + Send + Sync>>,
+    pub post_snapshot: Option<PostSnapshotHook>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,7 +342,8 @@ fn run_offline_journal_rerender_inner(
                 return;
             }
             let emit = p.processed_segments == p.total_segments
-                || p.processed_segments % PROCESSOR_PROGRESS_EVERY_SEGMENTS == 0;
+                || p.processed_segments
+                    .is_multiple_of(PROCESSOR_PROGRESS_EVERY_SEGMENTS);
             if !emit {
                 return;
             }
@@ -409,20 +413,23 @@ fn run_offline_journal_rerender_inner(
             &marker_bytes,
         )?;
 
-        verify_staging_outputs(
-            &staging_path,
-            &staging_handle,
-            session_root,
-            &manifest,
-            &output,
-            &recovery_manifest_sha256,
-            tool_build_git_sha,
-            staging_namespace,
-        )?;
+        {
+            let verification = StagingOutputVerificationContext {
+                staging_handle: &staging_handle,
+                staging: &staging_path,
+                session_root,
+                manifest: &manifest,
+                output: &output,
+                recovery_manifest_sha256: &recovery_manifest_sha256,
+                tool_build_git_sha,
+                staging_namespace,
+            };
+            verify_staging_outputs(&verification)?;
 
-        publication
-            .rename_stage_to_final(&stage_token, &validated_final)
-            .map_err(|e| OfflineJournalRerenderError::Publish(e.to_string()))?;
+            let rename_result = publication.rename_stage_to_final(&stage_token, &validated_final);
+            let _verified_staging_handle = verification.staging_handle;
+            rename_result.map_err(|e| OfflineJournalRerenderError::Publish(e.to_string()))?;
+        }
 
         let final_parent_handle = final_parent.clone_handle().map_err(map_fs_err)?;
         let final_parent_namespace = sync_dir_exact(&final_parent_handle)
@@ -660,16 +667,29 @@ pub(crate) fn parse_offline_recovery_complete_marker_strict(
     Ok(marker)
 }
 
-fn verify_staging_outputs(
-    staging: &Path,
-    staging_handle: &crate::voice_delivery::fs::DirHandle,
-    session_root: &Path,
-    manifest: &LocalFinalizationManifest,
-    output: &super::processor::LocalProcessOutput,
-    recovery_manifest_sha256: &str,
-    tool_build_git_sha: &str,
+struct StagingOutputVerificationContext<'a> {
+    staging_handle: &'a crate::voice_delivery::fs::DirHandle,
+    staging: &'a Path,
+    session_root: &'a Path,
+    manifest: &'a LocalFinalizationManifest,
+    output: &'a super::processor::LocalProcessOutput,
+    recovery_manifest_sha256: &'a str,
+    tool_build_git_sha: &'a str,
     staging_namespace: NamespaceDurability,
+}
+
+fn verify_staging_outputs(
+    context: &StagingOutputVerificationContext<'_>,
 ) -> Result<(), OfflineJournalRerenderError> {
+    let _verified_staging_handle = context.staging_handle;
+    let staging = context.staging;
+    let session_root = context.session_root;
+    let manifest = context.manifest;
+    let output = context.output;
+    let recovery_manifest_sha256 = context.recovery_manifest_sha256;
+    let tool_build_git_sha = context.tool_build_git_sha;
+    let staging_namespace = context.staging_namespace;
+
     for user in &manifest.users {
         let wav_name = format!("{}.wav", user.path_nick);
         let path = staging.join(&wav_name);
@@ -747,7 +767,6 @@ fn verify_staging_outputs(
             "source snapshot must be removed before publish".into(),
         ));
     }
-    let _ = staging_handle;
     Ok(())
 }
 
@@ -1014,7 +1033,7 @@ mod tests {
     #[test]
     fn success_publishes_recovery_manifest_and_completion_marker() {
         let tmp = tempfile::tempdir().unwrap();
-        let (session_root, manifest) = certified_single_user_session(tmp.path());
+        let (session_root, _manifest) = certified_single_user_session(tmp.path());
         let outcome = run_success_outcome(&tmp, &session_root);
         assert!(outcome.recovery_manifest_path.is_file());
         assert!(outcome.completion_marker_path.is_file());
@@ -1094,7 +1113,7 @@ mod tests {
             OfflineJournalRerenderError::SegmentVerification(_)
         ));
         assert!(!out.exists());
-        assert!(std::fs::read(&session_root.join("manifest.json")).is_ok());
+        assert!(std::fs::read(session_root.join("manifest.json")).is_ok());
         let _ = manifest;
     }
 

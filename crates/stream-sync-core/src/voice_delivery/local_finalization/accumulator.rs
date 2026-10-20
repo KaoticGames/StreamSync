@@ -8,8 +8,6 @@ use super::rtp_generation_inference::{
 };
 use super::synj::JournalRecord;
 
-pub const REORDER_WINDOW: u16 = REORDER_WINDOW_PACKETS;
-const REORDER_BUFFER_EXTRA_PACKETS: u16 = 4;
 const MAX_EPOCH_REORDER_BUFFER_PACKETS: usize = 36;
 const DEDUPE_RETENTION_PACKETS: u64 = 32;
 const MAX_RETAINED_INFERRED_GENERATION_BOUNDARIES: usize = 64;
@@ -265,9 +263,7 @@ impl UserPacketAccumulator {
         }
         let anchor = self.prev_raw_timestamp.unwrap();
         let delta = rtp_forward_delta(anchor, record.rtp_timestamp);
-        self.prev_sample_start
-            .checked_add(delta)
-            .unwrap_or(u64::MAX)
+        self.prev_sample_start.saturating_add(delta)
     }
 
     fn capture_anchor_samples(&self) -> u64 {
@@ -375,9 +371,8 @@ impl UserPacketAccumulator {
         };
         let mut boundary_flush = Vec::new();
         if extended.is_none() {
-            let ctx = self.classify_implicit_boundary_from_sequence(&pkt)?;
-            if ctx.is_some() {
-                boundary_flush = self.apply_implicit_boundary_sync(&pkt, &ctx.unwrap())?;
+            if let Some(ctx) = self.classify_implicit_boundary_from_sequence(&pkt)? {
+                boundary_flush = self.apply_implicit_boundary_sync(&pkt, &ctx)?;
                 extended = match self.extend_one(&pkt)? {
                     ExtendOneOutcome::Mapped(e) => Some(e),
                     ExtendOneOutcome::OutOfWindow(_) => None,
@@ -405,7 +400,7 @@ impl UserPacketAccumulator {
     ) -> Result<(Vec<ReadyPacket>, IngestCoreResult), AccumulatorError> {
         let pkt = self.record_to_packet(record)?;
         let mut prefix = Vec::new();
-        let mut extended = match self.extend_one(&pkt)? {
+        let extended = match self.extend_one(&pkt)? {
             ExtendOneOutcome::Mapped(e) => Some(e),
             ExtendOneOutcome::OutOfWindow(candidate) => {
                 if let Some(ctx) = self.classify_implicit_boundary_from_sequence(&pkt)? {
@@ -503,9 +498,7 @@ impl UserPacketAccumulator {
     }
 
     fn placement_context(&self) -> Option<RtpPlacementContext> {
-        if self.prev_raw_timestamp.is_none() {
-            return None;
-        }
+        self.prev_raw_timestamp?;
         Some(RtpPlacementContext {
             prior_raw_sequence: self.last_emitted_raw_sequence,
             prior_extended_sequence: self.last_emitted_extended_sequence,
@@ -525,7 +518,7 @@ impl UserPacketAccumulator {
         }
         let raw = seq16(pkt.sequence);
         let frontier_raw = seq16_i64(self.frontier_extended.unwrap());
-        let behind = (frontier_raw.wrapping_sub(raw)) & 0xffff;
+        let behind = frontier_raw.wrapping_sub(raw);
         if behind == 0 || behind <= REORDER_WINDOW_PACKETS {
             return Ok(None);
         }
@@ -610,12 +603,12 @@ impl UserPacketAccumulator {
             .capture_offset_samples
             .max(ctx.prior_timeline_sample_end);
         self.record_inferred_boundary(InferredRtpGenerationBoundary {
-            journal_ssrc_epoch: self.journal_ssrc_epoch,
-            implicit_generation_ordinal: self.implicit_generation_ordinal,
-            prior_effective_epoch: prior_effective,
-            new_effective_epoch: self.effective_epoch,
-            sequence: pkt.sequence,
-            capture_offset_samples: anchor,
+            _journal_ssrc_epoch: self.journal_ssrc_epoch,
+            _implicit_generation_ordinal: self.implicit_generation_ordinal,
+            _prior_effective_epoch: prior_effective,
+            _new_effective_epoch: self.effective_epoch,
+            _sequence: pkt.sequence,
+            _capture_offset_samples: anchor,
         });
         self.frontier_extended = None;
         self.dedupe_by_extended.clear();
@@ -649,7 +642,7 @@ impl UserPacketAccumulator {
         }
         let frontier = self.frontier_extended.unwrap();
         let frontier_raw = seq16_i64(frontier);
-        let behind = (frontier_raw.wrapping_sub(raw)) & 0xffff;
+        let behind = frontier_raw.wrapping_sub(raw);
         if behind == HALF_RANGE as u16 {
             return Err(AccumulatorError::SequenceAmbiguity(format!(
                 "ambiguous half-range delta for seq {}",
@@ -662,8 +655,8 @@ impl UserPacketAccumulator {
                 i64::from(behind),
             )?));
         }
-        let ahead = (raw.wrapping_sub(frontier_raw)) & 0xffff;
-        let behind_alt = (frontier_raw.wrapping_sub(raw)) & 0xffff;
+        let ahead = raw.wrapping_sub(frontier_raw);
+        let behind_alt = frontier_raw.wrapping_sub(raw);
         if ahead == HALF_RANGE as u16 || behind_alt == HALF_RANGE as u16 {
             return Err(AccumulatorError::SequenceAmbiguity(
                 "sequence unwrap hits ambiguous half-range (32768)".into(),
@@ -893,10 +886,7 @@ impl UserPacketAccumulator {
                     opus_payload: pkt.record.opus_payload.clone(),
                 };
                 let mut out = self.apply_implicit_boundary_sync(&mp, &ctx)?;
-                out.extend(
-                    self.finalize_placed_packet(pkt, frame_samples, self.epoch_anchor)?
-                        .into_iter(),
-                );
+                out.extend(self.finalize_placed_packet(pkt, frame_samples, self.epoch_anchor)?);
                 Ok(out)
             }
             RtpDiscontinuityAction::Gap { sample_start }
@@ -1022,6 +1012,10 @@ impl Clone for MutablePacket {
     }
 }
 
+pub fn lost_marker_span_samples() -> u64 {
+    OPUS_FRAME_SAMPLES
+}
+
 #[cfg(test)]
 mod extended_sequence_overflow_tests {
     use super::*;
@@ -1049,8 +1043,4 @@ mod extended_sequence_overflow_tests {
             err
         );
     }
-}
-
-pub fn lost_marker_span_samples() -> u64 {
-    OPUS_FRAME_SAMPLES
 }
