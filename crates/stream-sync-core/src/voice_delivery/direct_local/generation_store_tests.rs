@@ -10,9 +10,9 @@ use std::io::Write;
 
 #[test]
 fn generation_scoped_paths_do_not_collide() {
-    let path_a = DirectSegmentFileName::for_identity(SESSION_ID, 1, 0);
-    let path_b = DirectSegmentFileName::for_identity(SESSION_ID, 2, 0);
-    let path_c = DirectSegmentFileName::for_identity(SESSION_ID, 1, 1);
+    let path_a = DirectSegmentFileName::for_identity(SESSION_ID, 1, 0).expect("path a");
+    let path_b = DirectSegmentFileName::for_identity(SESSION_ID, 2, 0).expect("path b");
+    let path_c = DirectSegmentFileName::for_identity(SESSION_ID, 1, 1).expect("path c");
     assert_ne!(path_a.relative_path(), path_b.relative_path());
     assert_ne!(path_a.relative_path(), path_c.relative_path());
     assert_ne!(path_b.relative_path(), path_c.relative_path());

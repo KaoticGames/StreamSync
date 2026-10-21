@@ -54,15 +54,17 @@ pub struct DirectSegmentFileName {
 }
 
 impl DirectSegmentFileName {
-    pub fn for_identity(session_id: &str, delivery_generation: u64, segment_sequence: u64) -> Self {
+    pub fn for_identity(
+        session_id: &str,
+        delivery_generation: u64,
+        segment_sequence: u64,
+    ) -> Result<Self, FsError> {
         let mut relative = PathBuf::new();
-        for comp in generation_relative_components(session_id, delivery_generation)
-            .expect("identity path components")
-        {
+        for comp in generation_relative_components(session_id, delivery_generation)? {
             relative.push(comp);
         }
-        relative.push(segment_filename(segment_sequence).expect("segment filename"));
-        Self { relative }
+        relative.push(segment_filename(segment_sequence)?);
+        Ok(Self { relative })
     }
 
     pub fn relative_path(&self) -> &PathBuf {

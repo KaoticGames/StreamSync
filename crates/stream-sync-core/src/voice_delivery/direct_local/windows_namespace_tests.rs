@@ -2,7 +2,9 @@
 
 #[cfg(windows)]
 mod honesty {
-    use super::super::test_support::{minimal_synj_segment_bytes, sha256_lower_hex, SESSION_ID};
+    use super::super::test_support::{
+        minimal_synj_segment_bytes, sha256_lower_hex, valid_direct_receiver_limits, SESSION_ID,
+    };
     use crate::voice_delivery::direct_local::{
         DirectCumulativeCheckpoint, DirectDurabilityReport, DirectGenerationStore,
         DirectNamespaceDurabilityProbe, DirectSegmentDurabilityPipeline,
@@ -35,7 +37,9 @@ mod honesty {
             .logical_identity_for_incoming(0, bytes.len() as u64, &sha256_lower_hex(&bytes))
             .expect("identity");
         let checkpoint = DirectCumulativeCheckpoint::initial_for_session(SESSION_ID, 1);
-        let mut pipeline = DirectSegmentDurabilityPipeline::new(&store);
+        let mut pipeline =
+            DirectSegmentDurabilityPipeline::try_new(&store, valid_direct_receiver_limits())
+                .expect("pipeline limits");
         let outcome = pipeline
             .persist_for_cumulative_ack(&identity, &bytes, &checkpoint)
             .expect("persist");

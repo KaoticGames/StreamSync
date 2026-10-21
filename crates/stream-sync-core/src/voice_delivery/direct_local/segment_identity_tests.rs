@@ -1,6 +1,8 @@
 //! `LogicalSegmentIdentity` binds session, generation, sequence, length, and digest.
 
-use super::test_support::{minimal_synj_segment_bytes, sha256_lower_hex, SESSION_ID};
+use super::test_support::{
+    minimal_synj_segment_bytes, sha256_lower_hex, JS_MAX_SAFE_INTEGER, SESSION_ID,
+};
 use crate::voice_delivery::direct_local::{LogicalSegmentIdentity, LogicalSegmentIdentityError};
 
 #[test]
@@ -77,6 +79,36 @@ fn rejects_generation_below_binding() {
             identity_generation: 1,
             binding_generation: 2,
         })
+    );
+}
+
+#[test]
+fn rejects_segment_sequence_above_js_safe_integer() {
+    let bytes = minimal_synj_segment_bytes();
+    assert_eq!(
+        LogicalSegmentIdentity::try_new(
+            SESSION_ID,
+            1,
+            JS_MAX_SAFE_INTEGER + 1,
+            bytes.len() as u64,
+            sha256_lower_hex(&bytes),
+        ),
+        Err(LogicalSegmentIdentityError::SegmentSequenceNotJsSafe)
+    );
+}
+
+#[test]
+fn rejects_byte_length_above_js_safe_integer() {
+    let bytes = minimal_synj_segment_bytes();
+    assert_eq!(
+        LogicalSegmentIdentity::try_new(
+            SESSION_ID,
+            1,
+            0,
+            JS_MAX_SAFE_INTEGER + 1,
+            sha256_lower_hex(&bytes),
+        ),
+        Err(LogicalSegmentIdentityError::ByteLengthNotJsSafe)
     );
 }
 

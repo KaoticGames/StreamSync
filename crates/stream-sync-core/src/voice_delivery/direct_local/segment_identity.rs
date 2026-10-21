@@ -1,5 +1,6 @@
 //! `LogicalSegmentIdentity` binds session, generation, sequence, length, and digest.
 
+use super::limits::JS_MAX_SAFE_INTEGER;
 use crate::voice_delivery::finalized_manifest::validate_sha256_hex;
 use crate::voice_delivery::finalized_manifest::FinalizedManifestError;
 use thiserror::Error;
@@ -26,6 +27,10 @@ pub enum LogicalSegmentIdentityError {
         identity_generation: u64,
         binding_generation: u64,
     },
+    #[error("segment sequence exceeds js safe integer")]
+    SegmentSequenceNotJsSafe,
+    #[error("byte length exceeds js safe integer")]
+    ByteLengthNotJsSafe,
 }
 
 impl LogicalSegmentIdentity {
@@ -38,6 +43,12 @@ impl LogicalSegmentIdentity {
     ) -> Result<Self, LogicalSegmentIdentityError> {
         if delivery_generation == 0 {
             return Err(LogicalSegmentIdentityError::StaleGeneration);
+        }
+        if segment_sequence > JS_MAX_SAFE_INTEGER {
+            return Err(LogicalSegmentIdentityError::SegmentSequenceNotJsSafe);
+        }
+        if byte_length > JS_MAX_SAFE_INTEGER {
+            return Err(LogicalSegmentIdentityError::ByteLengthNotJsSafe);
         }
         let sha256_hex = match validate_sha256_hex(sha256_hex.as_ref(), "sha256") {
             Ok(s) => s,
