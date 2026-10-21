@@ -22,7 +22,8 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 use stream_sync_windows_fs::rename_buffer::{
-    build_no_replace_rename_buffer, built_rename_info_view, RenameBufferError,
+    build_no_replace_rename_buffer, build_replace_rename_buffer, built_rename_info_view,
+    RenameBufferError,
 };
 use stream_sync_windows_fs::storage_qualify::StorageQualifyError;
 use windows_sys::Win32::Foundation::{
@@ -383,6 +384,52 @@ pub(crate) fn rename_no_replace_same_parent(
 
     let dst_wide: Vec<u16> = dst_path.as_os_str().encode_wide().collect();
     let built = build_no_replace_rename_buffer(&dst_wide).map_err(map_rename_buffer_err)?;
+    let (ptr, size) = built_rename_info_view(&built);
+
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            src.raw(),
+            windows_sys::Win32::Storage::FileSystem::FileRenameInfo,
+            ptr as *mut c_void,
+            size,
+        )
+    };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        if let Some(mapped) = map_exists_win32(err) {
+            return Err(mapped);
+        }
+        return Err(FsError::Io(io::Error::from_raw_os_error(err as i32)));
+    }
+    Ok(())
+}
+
+pub(crate) fn rename_replace_same_parent(
+    final_parent: &DirHandle,
+    src_name: &str,
+    dst_name: &str,
+) -> Result<(), FsError> {
+    let parent_path = final_parent.windows_handle().absolute_path();
+    let src_path = parent_path.join(src_name);
+    let dst_path = parent_path.join(dst_name);
+
+    let src_wide = wide_path(&src_path);
+    let src_handle = unsafe {
+        CreateFileW(
+            src_wide.as_ptr(),
+            DELETE | FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    let src = OwnedWinHandle::from_create_result(src_handle)?;
+    src.ensure_not_reparse_component(src_name)?;
+
+    let dst_wide: Vec<u16> = dst_path.as_os_str().encode_wide().collect();
+    let built = build_replace_rename_buffer(&dst_wide).map_err(map_rename_buffer_err)?;
     let (ptr, size) = built_rename_info_view(&built);
 
     let ok = unsafe {

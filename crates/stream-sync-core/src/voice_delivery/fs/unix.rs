@@ -5,7 +5,7 @@ use super::error::FsError;
 use super::file::VoiceFile;
 use rustix::fs::{mkdirat, open, openat, Mode, OFlags};
 #[cfg(target_os = "linux")]
-use rustix::fs::{renameat_with, RenameFlags};
+use rustix::fs::{renameat, renameat_with, RenameFlags};
 use rustix::io::fcntl_dupfd_cloexec;
 use std::io;
 use std::path::Path;
@@ -105,6 +105,31 @@ pub(crate) fn rename_no_replace_same_parent(
         ) {
             Ok(()) => Ok(()),
             Err(rustix::io::Errno::EXIST) => Err(FsError::AlreadyExists),
+            Err(e) => Err(FsError::Io(e.into())),
+        }
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let _ = (final_parent, src_name, dst_name);
+        Err(FsError::Unsupported)
+    }
+}
+
+/// Same final-parent fd; atomically replaces `dst_name` when it already exists (Linux).
+pub(crate) fn rename_replace_same_parent(
+    final_parent: &DirHandle,
+    src_name: &str,
+    dst_name: &str,
+) -> Result<(), FsError> {
+    #[cfg(target_os = "linux")]
+    {
+        match renameat(
+            final_parent.as_fd(),
+            src_name,
+            final_parent.as_fd(),
+            dst_name,
+        ) {
+            Ok(()) => Ok(()),
             Err(e) => Err(FsError::Io(e.into())),
         }
     }

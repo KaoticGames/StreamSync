@@ -71,15 +71,16 @@ pub struct BuiltFileRenameInfo {
 ///
 /// `RootDirectory` is always `NULL`; `dst_utf16` must be the full destination path (NUL written after
 /// the copy; `FileNameLength` is `dst_utf16.len() * 2` bytes, excluding that terminator).
-pub fn build_no_replace_rename_buffer(
+fn build_rename_buffer(
     dst_utf16: &[u16],
+    replace_if_exists: u8,
 ) -> Result<BuiltFileRenameInfo, RenameBufferError> {
     let (buffer_size, buffer_size_u32, name_bytes) = file_rename_info_buffer_size(dst_utf16.len())?;
     let mut storage = AlignedRenameStorage::new(buffer_size);
     let info = storage.as_mut_file_rename_info();
     let name_ptr = unsafe { (*info).FileName.as_mut_ptr() };
     unsafe {
-        (*info).Anonymous.ReplaceIfExists = 0;
+        (*info).Anonymous.ReplaceIfExists = replace_if_exists;
         (*info).RootDirectory = 0 as HANDLE;
         (*info).FileNameLength = name_bytes;
         std::ptr::copy_nonoverlapping(dst_utf16.as_ptr(), name_ptr, dst_utf16.len());
@@ -89,6 +90,19 @@ pub fn build_no_replace_rename_buffer(
         storage,
         size_u32: buffer_size_u32,
     })
+}
+
+pub fn build_no_replace_rename_buffer(
+    dst_utf16: &[u16],
+) -> Result<BuiltFileRenameInfo, RenameBufferError> {
+    build_rename_buffer(dst_utf16, 0)
+}
+
+/// Build a replace-if-exists rename buffer (`ReplaceIfExists = 1`).
+pub fn build_replace_rename_buffer(
+    dst_utf16: &[u16],
+) -> Result<BuiltFileRenameInfo, RenameBufferError> {
+    build_rename_buffer(dst_utf16, 1)
 }
 
 impl BuiltFileRenameInfo {
@@ -139,5 +153,25 @@ mod tests {
         let (ptr, api_size) = built_rename_info_view(&built);
         assert_eq!(api_size, size_u32);
         assert_eq!(ptr, built.storage.api_ptr());
+    }
+
+    #[test]
+    fn replace_buffer_sets_replace_if_exists_without_changing_name_layout() {
+        let dst = r"C:\voice\direct-local\checkpoint.json";
+        let wide: Vec<u16> = dst.encode_utf16().collect();
+        let built = build_replace_rename_buffer(&wide).expect("build replace buffer");
+        let (_, expected_size, expected_name_bytes) =
+            file_rename_info_buffer_size(wide.len()).expect("size");
+
+        let info = built.as_file_rename_info();
+        assert_eq!(unsafe { (*info).Anonymous.ReplaceIfExists }, 1);
+        assert_eq!(unsafe { (*info).RootDirectory }, 0 as HANDLE);
+        assert_eq!(unsafe { (*info).FileNameLength }, expected_name_bytes);
+        assert_eq!(built.size_u32, expected_size);
+
+        let name_ptr = unsafe { (*info).FileName.as_ptr() };
+        let read_back = unsafe { std::slice::from_raw_parts(name_ptr, wide.len()) };
+        assert_eq!(read_back, wide);
+        assert_eq!(unsafe { *name_ptr.add(wide.len()) }, 0);
     }
 }

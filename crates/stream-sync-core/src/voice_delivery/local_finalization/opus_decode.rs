@@ -29,9 +29,9 @@ impl StereoOpusDecoder {
         }
         #[cfg(all(test, not(feature = "local-opus-native")))]
         {
-            return Ok(Self {
+            Ok(Self {
                 _stub: OpusStubDecoder,
-            });
+            })
         }
         #[cfg(not(any(feature = "local-opus-native", test)))]
         {
