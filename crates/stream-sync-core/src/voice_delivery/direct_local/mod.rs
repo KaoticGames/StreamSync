@@ -1,4 +1,4 @@
-//! Dark direct-local receiver durable core (slice 2, vertical 1).
+//! Dark direct-local receiver durable core (slice 2, vertical 1–2).
 
 mod checkpoint;
 mod durability_pipeline;
@@ -10,6 +10,7 @@ mod limits;
 mod segment_identity;
 mod session_binding;
 mod synj_validate;
+pub mod wss;
 
 pub use checkpoint::DirectCumulativeCheckpoint;
 #[cfg(test)]
@@ -56,3 +57,39 @@ mod segment_identity_tests;
 #[cfg(test)]
 #[path = "windows_namespace_tests.rs"]
 mod windows_namespace;
+
+#[cfg(test)]
+#[path = "wss_test_support.rs"]
+mod wss_test_support;
+
+#[cfg(test)]
+#[path = "wss_connect_tests.rs"]
+mod wss_connect;
+
+#[cfg(test)]
+#[path = "wss_protocol_tests.rs"]
+mod wss_protocol;
+
+#[cfg(test)]
+#[path = "wss_segment_fsm_tests.rs"]
+mod wss_segment_fsm;
+
+#[cfg(test)]
+#[path = "wss_hello_resume_tests.rs"]
+mod wss_hello_resume;
+
+#[cfg(test)]
+#[path = "wss_session_ack_tests.rs"]
+mod wss_session_ack;
+
+#[cfg(test)]
+#[path = "wss_session_lifecycle_tests.rs"]
+mod wss_session_lifecycle;
+
+#[cfg(test)]
+#[path = "wss_session_time_bounds_tests.rs"]
+mod wss_session_time_bounds;
+
+#[cfg(test)]
+#[path = "wss_dark_policy_tests.rs"]
+mod wss_dark_policy;

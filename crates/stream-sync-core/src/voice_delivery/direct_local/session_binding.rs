@@ -276,7 +276,7 @@ fn validate_public_wss_url(url_str: &str) -> bool {
     if !url.username().is_empty() || url.password().is_some() {
         return false;
     }
-    if url.fragment().is_some() {
+    if url.fragment().is_some() || url.query().is_some() {
         return false;
     }
     let host = match url.host() {
