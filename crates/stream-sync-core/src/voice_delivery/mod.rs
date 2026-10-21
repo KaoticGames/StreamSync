@@ -25,6 +25,9 @@ mod lock;
 
 pub mod local_finalization;
 
+/// Dark direct-local canonical segment receiver (slice 2).
+pub mod direct_local;
+
 pub use client::parse_pending_response;
 pub use client::PENDING_PATH;
 pub use client::{

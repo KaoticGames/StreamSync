@@ -31,6 +31,7 @@ anyhow.workspace = true
 twitch-irc.workspace = true
 dotenvy.workspace = true
 urlencoding.workspace = true
+url.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate"] }
 fs2 = "0.4"
 sha2 = "0.10"

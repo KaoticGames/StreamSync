@@ -35,4 +35,5 @@ twitch-irc = { version = "5", features = ["transport-tcp"] }
 dotenvy = "0.15"
 clap = { version = "4", features = ["derive", "env"] }
 urlencoding = "2"
+url = "2.5"
 dirs = "6"

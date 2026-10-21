@@ -44,6 +44,29 @@ pub(crate) fn rename_no_replace_same_parent(
     }
 }
 
+/// Same final-parent handle; atomically replaces `dst_name` when it already exists.
+pub(crate) fn rename_replace_same_parent(
+    final_parent: &DirHandle,
+    src_name: &str,
+    dst_name: &str,
+) -> Result<(), FsError> {
+    validate_single_component(src_name)?;
+    validate_single_component(dst_name)?;
+    #[cfg(unix)]
+    {
+        unix::rename_replace_same_parent(final_parent, src_name, dst_name)
+    }
+    #[cfg(windows)]
+    {
+        windows::rename_replace_same_parent(final_parent, src_name, dst_name)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (final_parent, src_name, dst_name);
+        Err(FsError::Unsupported)
+    }
+}
+
 pub(crate) fn open_lock_file_at_root(
     root: &DestRoot,
     rel_components: &[String],
@@ -176,6 +199,67 @@ mod linux_rename_no_replace_same_parent {
         parent.create_child_dir("stage-x").expect("stage");
         let err = rename_no_replace_same_parent(&parent, "stage-x", "final-y");
         assert!(matches!(err, Err(FsError::Unsupported)));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_rename_replace_same_parent {
+    use super::*;
+    use std::fs;
+
+    fn stage(hex32: &str) -> String {
+        assert_eq!(hex32.len(), 32);
+        format!(".streamsync-stage-{hex32}")
+    }
+
+    fn temp_final_parent() -> (tempfile::TempDir, DirHandle) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent_path = tmp.path().join("final-parent");
+        fs::create_dir_all(&parent_path).expect("mkdir");
+        let root = DestRoot::open(tmp.path()).expect("open root");
+        let parent = root
+            .open_dir_relative(&["final-parent"])
+            .expect("open parent");
+        (tmp, parent)
+    }
+
+    #[test]
+    fn replace_existing_file_changes_destination_atomically() {
+        let (tmp, parent) = temp_final_parent();
+        let dest_path = tmp.path().join("final-parent").join("published-session");
+        fs::write(&dest_path, b"PRIOR_BYTES").expect("prior");
+        let st = stage("ffffffffffffffffffffffffffffffff");
+        let stage_path = tmp.path().join("final-parent").join(&st);
+        fs::write(&stage_path, b"NEW_BYTES").expect("stage");
+        rename_replace_same_parent(&parent, &st, "published-session").expect("replace");
+        assert_eq!(fs::read(&dest_path).expect("read dest"), b"NEW_BYTES");
+        assert!(!stage_path.exists());
+        assert!(parent.read_file_all(&st).is_err());
+    }
+
+    #[test]
+    fn replace_into_missing_destination_still_succeeds() {
+        let (_tmp, parent) = temp_final_parent();
+        let st = stage("11111111111111111111111111111111");
+        let stage_path = _tmp.path().join("final-parent").join(&st);
+        fs::write(&stage_path, b"FRESH").expect("stage");
+        rename_replace_same_parent(&parent, &st, "new-final").expect("rename");
+        assert_eq!(parent.read_file_all("new-final").expect("read"), b"FRESH");
+        assert!(parent.read_file_all(&st).is_err());
+    }
+
+    #[test]
+    fn no_replace_behavior_unchanged_after_adding_replace_primitive() {
+        let (tmp, parent) = temp_final_parent();
+        let st = stage("22222222222222222222222222222222");
+        let stage_path = tmp.path().join("final-parent").join(&st);
+        fs::write(&stage_path, b"STAGE").expect("stage");
+        let dest_path = tmp.path().join("final-parent").join("existing-final");
+        fs::write(&dest_path, b"DEST_BYTES").expect("dest");
+        let result = rename_no_replace_same_parent(&parent, &st, "existing-final");
+        assert!(matches!(result, Err(FsError::AlreadyExists)));
+        assert_eq!(fs::read(&dest_path).expect("read dest"), b"DEST_BYTES");
+        assert!(stage_path.exists());
     }
 }
 

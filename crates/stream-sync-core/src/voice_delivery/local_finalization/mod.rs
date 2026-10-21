@@ -23,7 +23,7 @@ mod receipt;
 mod report;
 mod rtp_generation_inference;
 mod storage_preflight;
-mod synj;
+pub(crate) mod synj;
 
 pub use accumulator::{
     lost_marker_span_samples, AccumulatorError, AccumulatorPlacementPolicy, PacketDisposition,
