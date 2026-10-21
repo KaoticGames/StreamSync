@@ -224,6 +224,10 @@ impl DirectLocalWssDarkSession {
                     let _ = transport.close(CloseCode::Normal, "").await;
                     return Ok(Some(DirectLocalWssStopReason::Rejected));
                 }
+                DirectWssControlMessage::SessionRevoke(_) => {
+                    let _ = transport.close(CloseCode::Normal, "").await;
+                    return Ok(Some(DirectLocalWssStopReason::Revoked));
+                }
                 _ => return Self::fail_protocol(transport).await,
             }
         }
