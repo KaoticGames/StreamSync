@@ -71,7 +71,7 @@ impl LocalJournalStore {
             let parsed: serde_json::Value = serde_json::from_str(&existing)
                 .map_err(|e| JournalStoreError::Other(e.to_string()))?;
             let existing_manifest = super::manifest::parse_local_finalization_manifest(&parsed)
-                .map_err(|e| JournalStoreError::Other(e.to_string()))?;
+                .map_err(|_| JournalStoreError::Conflict)?;
             if existing_manifest != *manifest {
                 return Err(JournalStoreError::Conflict);
             }

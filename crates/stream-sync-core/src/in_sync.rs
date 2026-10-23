@@ -167,9 +167,11 @@ pub async fn status_json(state: &AppState) -> Value {
     let cfg = state.discord_voice_config.read().await.clone();
     let runtime = state.in_sync_runtime.read().await.clone();
     let queue = state.in_sync_manual_queue.read().await.clone();
-    let active_orchestrator = {
+    let (active_orchestrator, phase) = {
         let worker = state.in_sync_worker.read().await;
-        worker.active.clone()
+        let active = worker.active.clone();
+        let phase = active.as_ref().map(|orch| orch.phase()).or(runtime.phase);
+        (active, phase)
     };
     let mut events: BoundedProgressEvents = state.in_sync_progress_events.read().await.clone();
     if let Some(orch) = active_orchestrator {
@@ -191,7 +193,7 @@ pub async fn status_json(state: &AppState) -> Value {
     };
     json!({
         "localProcessingMode": cfg.local_processing_mode,
-        "phase": runtime.phase,
+        "phase": phase,
         "activeSessionId": runtime.active_session_id,
         "manualQueue": queue,
         "pendingSessions": pending.sessions,

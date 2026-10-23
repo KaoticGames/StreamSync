@@ -1,6 +1,8 @@
 //! RED: same-session manifest identity must be exact immutable manifest equality, not session_id alone.
 
 use std::fs;
+
+use serde_json::Value;
 use stream_sync_core::voice_delivery::local_finalization::{
     derive_voice_v2_opaque_stem_id, LocalFinalizationManifest, LocalFinalizationObjectRef,
     LocalFinalizationOutputPolicy, LocalFinalizationSegment, LocalFinalizationUser,
@@ -75,6 +77,41 @@ fn assert_journal_store_conflict(err: impl std::fmt::Display) {
     );
 }
 
+fn seed_manifest_on_disk(
+    store: &LocalJournalStore,
+    manifest: &LocalFinalizationManifest,
+) -> Vec<u8> {
+    store.persist_manifest(manifest).expect("seed manifest");
+    fs::read(manifest_on_disk(store)).expect("read seeded manifest")
+}
+
+fn mutate_manifest_json_on_disk(store: &LocalJournalStore, mutator: impl FnOnce(&mut Value)) {
+    let path = manifest_on_disk(store);
+    let raw = fs::read_to_string(&path).expect("read manifest for mutation");
+    let mut value: Value = serde_json::from_str(&raw).expect("manifest must be readable json");
+    mutator(&mut value);
+    let rewritten = serde_json::to_string_pretty(&value).expect("rewrite manifest json");
+    fs::write(&path, rewritten).expect("write mutated manifest");
+}
+
+fn persist_authority_after_on_disk_mutation(
+    store: &LocalJournalStore,
+    authority: &LocalFinalizationManifest,
+    mutator: impl FnOnce(&mut Value),
+) {
+    mutate_manifest_json_on_disk(store, mutator);
+    let mutated_bytes = fs::read(manifest_on_disk(store)).expect("read mutated manifest");
+    let err = store
+        .persist_manifest(authority)
+        .expect_err("mutated on-disk manifest must not be overwritten by authority persist");
+    assert_journal_store_conflict(err);
+    let on_disk = fs::read(manifest_on_disk(store)).expect("read manifest after conflict");
+    assert_eq!(
+        on_disk, mutated_bytes,
+        "conflicting persist must leave mutated on-disk manifest bytes unchanged"
+    );
+}
+
 #[test]
 fn persist_manifest_idempotent_for_identical_manifest() {
     let tmp = tempfile::tempdir().unwrap();
@@ -93,175 +130,87 @@ fn persist_manifest_idempotent_for_identical_manifest() {
 }
 
 #[test]
-fn persist_manifest_rejects_same_session_different_immutable_journal_sha256() {
+fn persist_manifest_rejects_on_disk_mutated_journal_sha256() {
     let tmp = tempfile::tempdir().unwrap();
     let store = LocalJournalStore::open(tmp.path(), SESSION_ID).expect("open store");
-    let manifest_a = sample_manifest(&"a".repeat(64), 48_000);
-    store.persist_manifest(&manifest_a).expect("persist A");
-    let original = fs::read(manifest_on_disk(&store)).expect("read original manifest bytes");
-
-    let manifest_b = sample_manifest(&"e".repeat(64), 48_000);
-    assert_eq!(manifest_a.session_id, manifest_b.session_id);
-    assert_ne!(manifest_a.journal_sha256, manifest_b.journal_sha256);
-
-    let err = store
-        .persist_manifest(&manifest_b)
-        .expect_err("conflicting manifest must not be accepted");
-    assert_journal_store_conflict(err);
-    let on_disk = fs::read(manifest_on_disk(&store)).expect("read manifest after conflict");
-    assert_eq!(
-        on_disk, original,
-        "conflicting persist must leave original manifest bytes unchanged"
-    );
+    let authority = sample_manifest(&"a".repeat(64), 48_000);
+    seed_manifest_on_disk(&store, &authority);
+    persist_authority_after_on_disk_mutation(&store, &authority, |v| {
+        v["journalSha256"] = Value::String("e".repeat(64));
+    });
 }
 
 #[test]
-fn persist_manifest_rejects_same_session_different_target_sample_count() {
+fn persist_manifest_rejects_on_disk_mutated_target_sample_count() {
     let tmp = tempfile::tempdir().unwrap();
     let store = LocalJournalStore::open(tmp.path(), SESSION_ID).expect("open store");
-    let manifest_a = sample_manifest(&"a".repeat(64), 48_000);
-    store.persist_manifest(&manifest_a).expect("persist A");
-    let original = fs::read(manifest_on_disk(&store)).expect("read original");
-
-    let manifest_b = sample_manifest(&"a".repeat(64), 96_000);
-    assert_eq!(manifest_a.session_id, manifest_b.session_id);
-    assert_ne!(
-        manifest_a.target_sample_count_48k,
-        manifest_b.target_sample_count_48k
-    );
-
-    let err = store
-        .persist_manifest(&manifest_b)
-        .expect_err("target sample count change must conflict");
-    assert_journal_store_conflict(err);
-    assert_eq!(
-        fs::read(manifest_on_disk(&store)).expect("read after"),
-        original
-    );
+    let authority = sample_manifest(&"a".repeat(64), 48_000);
+    seed_manifest_on_disk(&store, &authority);
+    persist_authority_after_on_disk_mutation(&store, &authority, |v| {
+        v["targetSampleCount48k"] = Value::from(96_000_i64);
+    });
 }
 
 #[test]
-fn persist_manifest_rejects_same_session_different_segment_sha256() {
+fn persist_manifest_rejects_on_disk_mutated_segment_sha256() {
     let tmp = tempfile::tempdir().unwrap();
     let store = LocalJournalStore::open(tmp.path(), SESSION_ID).expect("open store");
-    let manifest_a = sample_manifest(&"a".repeat(64), 48_000);
-    store.persist_manifest(&manifest_a).expect("persist A");
-    let original = fs::read(manifest_on_disk(&store)).expect("read original");
-
-    let mut manifest_b = sample_manifest(&"a".repeat(64), 48_000);
-    manifest_b.segments[0].sha256 = "f".repeat(64);
-    assert_eq!(manifest_a.session_id, manifest_b.session_id);
-    assert_ne!(manifest_a.segments[0].sha256, manifest_b.segments[0].sha256);
-
-    let err = store
-        .persist_manifest(&manifest_b)
-        .expect_err("segment digest change must conflict");
-    assert_journal_store_conflict(err);
-    assert_eq!(
-        fs::read(manifest_on_disk(&store)).expect("read after"),
-        original
-    );
+    let authority = sample_manifest(&"a".repeat(64), 48_000);
+    seed_manifest_on_disk(&store, &authority);
+    persist_authority_after_on_disk_mutation(&store, &authority, |v| {
+        v["segments"][0]["sha256"] = Value::String("f".repeat(64));
+    });
 }
 
 #[test]
-fn persist_manifest_rejects_same_session_different_segment_key() {
+fn persist_manifest_rejects_on_disk_mutated_segment_key() {
     let tmp = tempfile::tempdir().unwrap();
     let store = LocalJournalStore::open(tmp.path(), SESSION_ID).expect("open store");
-    let manifest_a = sample_manifest(&"a".repeat(64), 48_000);
-    store.persist_manifest(&manifest_a).expect("persist A");
-    let original = fs::read(manifest_on_disk(&store)).expect("read original");
-
-    let mut manifest_b = sample_manifest(&"a".repeat(64), 48_000);
-    manifest_b.segments[0].key = format!(
-        "voice-delivery-v2/{GUILD_ID}/{SESSION_ID}/journal/{:08}.synj",
-        1u32
-    );
-    assert_eq!(manifest_a.session_id, manifest_b.session_id);
-    assert_ne!(manifest_a.segments[0].key, manifest_b.segments[0].key);
-
-    let err = store
-        .persist_manifest(&manifest_b)
-        .expect_err("segment key change must conflict");
-    assert_journal_store_conflict(err);
-    assert_eq!(
-        fs::read(manifest_on_disk(&store)).expect("read after"),
-        original
-    );
+    let authority = sample_manifest(&"a".repeat(64), 48_000);
+    seed_manifest_on_disk(&store, &authority);
+    persist_authority_after_on_disk_mutation(&store, &authority, |v| {
+        v["segments"][0]["key"] = Value::String(format!(
+            "voice-delivery-v2/{GUILD_ID}/{SESSION_ID}/journal/{:08}.synj",
+            1u32
+        ));
+    });
 }
 
 #[test]
-fn persist_manifest_rejects_same_session_different_segment_byte_length() {
+fn persist_manifest_rejects_on_disk_mutated_segment_byte_length() {
     let tmp = tempfile::tempdir().unwrap();
     let store = LocalJournalStore::open(tmp.path(), SESSION_ID).expect("open store");
-    let manifest_a = sample_manifest(&"a".repeat(64), 48_000);
-    store.persist_manifest(&manifest_a).expect("persist A");
-    let original = fs::read(manifest_on_disk(&store)).expect("read original");
-
-    let mut manifest_b = sample_manifest(&"a".repeat(64), 48_000);
-    manifest_b.segments[0].byte_length = 128;
-    assert_eq!(manifest_a.session_id, manifest_b.session_id);
-    assert_ne!(
-        manifest_a.segments[0].byte_length,
-        manifest_b.segments[0].byte_length
-    );
-
-    let err = store
-        .persist_manifest(&manifest_b)
-        .expect_err("segment byte length change must conflict");
-    assert_journal_store_conflict(err);
-    assert_eq!(
-        fs::read(manifest_on_disk(&store)).expect("read after"),
-        original
-    );
+    let authority = sample_manifest(&"a".repeat(64), 48_000);
+    seed_manifest_on_disk(&store, &authority);
+    persist_authority_after_on_disk_mutation(&store, &authority, |v| {
+        v["segments"][0]["byteLength"] = Value::from(128_i64);
+    });
 }
 
 #[test]
-fn persist_manifest_rejects_same_session_different_user_mapping() {
+fn persist_manifest_rejects_on_disk_mutated_user_mapping() {
     let tmp = tempfile::tempdir().unwrap();
     let store = LocalJournalStore::open(tmp.path(), SESSION_ID).expect("open store");
-    let manifest_a = sample_manifest(&"a".repeat(64), 48_000);
-    store.persist_manifest(&manifest_a).expect("persist A");
-    let original = fs::read(manifest_on_disk(&store)).expect("read original");
-
-    let mut manifest_b = sample_manifest(&"a".repeat(64), 48_000);
-    manifest_b.users[0].path_nick = "other-player".into();
-    manifest_b.users[0].opaque_stem_id =
-        derive_voice_v2_opaque_stem_id(SESSION_ID, GUILD_ID, "123456789012345678", "other-player");
-    assert_eq!(manifest_a.session_id, manifest_b.session_id);
-    assert_ne!(manifest_a.users, manifest_b.users);
-
-    let err = store
-        .persist_manifest(&manifest_b)
-        .expect_err("user mapping change must conflict");
-    assert_journal_store_conflict(err);
-    assert_eq!(
-        fs::read(manifest_on_disk(&store)).expect("read after"),
-        original
-    );
+    let authority = sample_manifest(&"a".repeat(64), 48_000);
+    seed_manifest_on_disk(&store, &authority);
+    persist_authority_after_on_disk_mutation(&store, &authority, |v| {
+        v["users"][0]["pathNick"] = Value::String("other-player".into());
+        v["users"][0]["opaqueStemId"] = Value::String(derive_voice_v2_opaque_stem_id(
+            SESSION_ID,
+            GUILD_ID,
+            "123456789012345678",
+            "other-player",
+        ));
+    });
 }
 
 #[test]
-fn persist_manifest_rejects_same_session_different_finalizer_algorithm_version() {
+fn persist_manifest_rejects_on_disk_mutated_finalizer_algorithm_version() {
     let tmp = tempfile::tempdir().unwrap();
     let store = LocalJournalStore::open(tmp.path(), SESSION_ID).expect("open store");
-    let manifest_a = sample_manifest(&"a".repeat(64), 48_000);
-    store.persist_manifest(&manifest_a).expect("persist A");
-    let original = fs::read(manifest_on_disk(&store)).expect("read original");
-
-    let mut manifest_b = sample_manifest(&"a".repeat(64), 48_000);
-    manifest_b.finalizer_algorithm_version = "other-finalizer-v99".into();
-    assert_eq!(manifest_a.session_id, manifest_b.session_id);
-    assert_ne!(
-        manifest_a.finalizer_algorithm_version,
-        manifest_b.finalizer_algorithm_version
-    );
-
-    let err = store
-        .persist_manifest(&manifest_b)
-        .expect_err("finalizer algorithm version change must conflict");
-    assert_journal_store_conflict(err);
-    assert_eq!(
-        fs::read(manifest_on_disk(&store)).expect("read after"),
-        original
-    );
+    let authority = sample_manifest(&"a".repeat(64), 48_000);
+    seed_manifest_on_disk(&store, &authority);
+    persist_authority_after_on_disk_mutation(&store, &authority, |v| {
+        v["finalizerAlgorithmVersion"] = Value::String("other-finalizer-v99".into());
+    });
 }

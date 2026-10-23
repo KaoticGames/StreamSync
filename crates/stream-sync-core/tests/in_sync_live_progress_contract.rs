@@ -61,6 +61,26 @@ async fn test_router_and_state() -> (axum::Router, Arc<AppState>, tempfile::Temp
     (router, state, userdata)
 }
 
+async fn post_in_sync_pause(router: &axum::Router, state: &AppState, paused: bool) {
+    let origin = format!("http://127.0.0.1:{}", state.port);
+    let body = serde_json::json!({ "paused": paused });
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/in-sync/pause")
+                .header(header::ORIGIN, origin)
+                .header(CONTROL_TOKEN_HEADER, state.control_token())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("pause response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 async fn fetch_in_sync_status(router: &axum::Router, state: &AppState) -> Value {
     let origin = format!("http://127.0.0.1:{}", state.port);
     let response = router
@@ -295,7 +315,17 @@ async fn in_sync_status_includes_live_orchestrator_progress_before_process_pendi
     let worker = thread::spawn(move || orch_run.process_pending(&client_run, &pending));
 
     client.wait_until_download_blocked();
+    {
+        let mut runtime = state.in_sync_runtime.write().await;
+        runtime.phase = Some(LocalFinalizationPhase::Claiming);
+        runtime.active_session_id = Some(SESSION_ID.into());
+    }
     let status = fetch_in_sync_status(&router, &state).await;
+    assert_eq!(
+        status.get("phase").and_then(|v| v.as_str()),
+        Some("downloading"),
+        "GET /api/in-sync/status must report live orchestrator phase while download is in-flight; got {status}"
+    );
 
     let events = status
         .get("progressEvents")
@@ -313,6 +343,62 @@ async fn in_sync_status_includes_live_orchestrator_progress_before_process_pendi
     );
 
     client.release_download();
+    let _ = worker.join().expect("process_pending thread");
+}
+
+struct ReleaseDownloadOnDrop(BlockingDownloadClient);
+
+impl Drop for ReleaseDownloadOnDrop {
+    fn drop(&mut self) {
+        self.0.release_download();
+    }
+}
+
+#[tokio::test]
+async fn in_sync_status_reports_paused_while_download_blocked_before_process_pending_returns() {
+    let (router, state, _userdata) = test_router_and_state().await;
+    let parent = state
+        .discord_voice_config
+        .read()
+        .await
+        .recording_parent
+        .clone()
+        .expect("recording parent");
+    let manifest = sample_manifest(1);
+    let digest = compute_local_finalization_manifest_digest(&manifest);
+    let client = BlockingDownloadClient::new(manifest);
+    let controls = state.in_sync_worker.read().await.controls.clone();
+    let orch = Arc::new(LocalFinalizationOrchestrator::open_with_controls(
+        std::path::Path::new(&parent),
+        "test-device",
+        controls,
+    ));
+    {
+        let mut worker = state.in_sync_worker.write().await;
+        worker.active = Some(orch.clone());
+    }
+    let pending = LocalPendingItem {
+        session_id: SESSION_ID.into(),
+        manifest_digest: digest,
+        sealed_at_ms: 1,
+    };
+
+    let orch_run = orch.clone();
+    let client_run = client.clone();
+    let worker = thread::spawn(move || orch_run.process_pending(&client_run, &pending));
+
+    {
+        let _release_guard = ReleaseDownloadOnDrop(client.clone());
+        client.wait_until_download_blocked();
+        post_in_sync_pause(&router, &state, true).await;
+        let status = fetch_in_sync_status(&router, &state).await;
+        assert_eq!(
+            status.get("phase").and_then(|v| v.as_str()),
+            Some("paused"),
+            "GET /api/in-sync/status must surface in-flight pause before process_pending returns; got {status}"
+        );
+    }
+
     let _ = worker.join().expect("process_pending thread");
 }
 
