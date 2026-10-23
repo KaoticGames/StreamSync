@@ -205,6 +205,25 @@ fn persist_manifest_rejects_on_disk_mutated_user_mapping() {
 }
 
 #[test]
+fn persist_manifest_rejects_syntactically_malformed_existing_manifest_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = LocalJournalStore::open(tmp.path(), SESSION_ID).expect("open store");
+    let authority = sample_manifest(&"a".repeat(64), 48_000);
+    seed_manifest_on_disk(&store, &authority);
+    let malformed = b"{not valid json".to_vec();
+    fs::write(manifest_on_disk(&store), &malformed).expect("write malformed manifest");
+    let err = store
+        .persist_manifest(&authority)
+        .expect_err("malformed on-disk manifest must not be overwritten by authority persist");
+    assert_journal_store_conflict(err);
+    let on_disk = fs::read(manifest_on_disk(&store)).expect("read manifest after conflict");
+    assert_eq!(
+        on_disk, malformed,
+        "conflicting persist must leave malformed on-disk manifest bytes unchanged"
+    );
+}
+
+#[test]
 fn persist_manifest_rejects_on_disk_mutated_finalizer_algorithm_version() {
     let tmp = tempfile::tempdir().unwrap();
     let store = LocalJournalStore::open(tmp.path(), SESSION_ID).expect("open store");

@@ -68,8 +68,8 @@ impl LocalJournalStore {
         let path = self.session_root.join(MANIFEST_FILE);
         if path.exists() {
             let existing = std::fs::read_to_string(&path)?;
-            let parsed: serde_json::Value = serde_json::from_str(&existing)
-                .map_err(|e| JournalStoreError::Other(e.to_string()))?;
+            let parsed: serde_json::Value =
+                serde_json::from_str(&existing).map_err(|_| JournalStoreError::Conflict)?;
             let existing_manifest = super::manifest::parse_local_finalization_manifest(&parsed)
                 .map_err(|_| JournalStoreError::Conflict)?;
             if existing_manifest != *manifest {
