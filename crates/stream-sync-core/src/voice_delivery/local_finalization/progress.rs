@@ -123,3 +123,18 @@ pub enum LocalFinalizationPhase {
     FailedBlocked,
     Quarantined,
 }
+
+impl LocalFinalizationPhase {
+    /// Supervisor-recorded outcomes and other phases that must not be masked by a stale active orchestrator.
+    pub fn is_terminal_status_phase(self) -> bool {
+        matches!(
+            self,
+            LocalFinalizationPhase::Complete
+                | LocalFinalizationPhase::Paused
+                | LocalFinalizationPhase::Cancelled
+                | LocalFinalizationPhase::FailedBlocked
+                | LocalFinalizationPhase::Quarantined
+                | LocalFinalizationPhase::FailedRetryable
+        )
+    }
+}

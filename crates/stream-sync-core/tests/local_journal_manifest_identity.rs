@@ -205,6 +205,25 @@ fn persist_manifest_rejects_on_disk_mutated_user_mapping() {
 }
 
 #[test]
+fn persist_manifest_rejects_existing_manifest_with_invalid_utf8() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = LocalJournalStore::open(tmp.path(), SESSION_ID).expect("open store");
+    let authority = sample_manifest(&"a".repeat(64), 48_000);
+    seed_manifest_on_disk(&store, &authority);
+    let invalid_utf8 = vec![0xff, 0xfe, 0xfd];
+    fs::write(manifest_on_disk(&store), &invalid_utf8).expect("write invalid utf-8 manifest");
+    let err = store
+        .persist_manifest(&authority)
+        .expect_err("invalid utf-8 on-disk manifest must not be overwritten by authority persist");
+    assert_journal_store_conflict(err);
+    let on_disk = fs::read(manifest_on_disk(&store)).expect("read manifest after conflict");
+    assert_eq!(
+        on_disk, invalid_utf8,
+        "conflicting persist must leave invalid utf-8 manifest bytes unchanged"
+    );
+}
+
+#[test]
 fn persist_manifest_rejects_syntactically_malformed_existing_manifest_json() {
     let tmp = tempfile::tempdir().unwrap();
     let store = LocalJournalStore::open(tmp.path(), SESSION_ID).expect("open store");

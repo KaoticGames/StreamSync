@@ -284,6 +284,54 @@ impl LocalFinalizationClient for BlockingDownloadClient {
 }
 
 #[tokio::test]
+async fn in_sync_status_prefers_terminal_runtime_phase_over_stale_active_orchestrator() {
+    let (router, state, _userdata) = test_router_and_state().await;
+    let parent = state
+        .discord_voice_config
+        .read()
+        .await
+        .recording_parent
+        .clone()
+        .expect("recording parent");
+    let manifest = sample_manifest(1);
+    let digest = compute_local_finalization_manifest_digest(&manifest);
+    let client = BlockingDownloadClient::new(manifest);
+    let orch = Arc::new(LocalFinalizationOrchestrator::open(
+        std::path::Path::new(&parent),
+        "test-device",
+    ));
+    {
+        let mut worker = state.in_sync_worker.write().await;
+        worker.active = Some(orch.clone());
+    }
+    let pending = LocalPendingItem {
+        session_id: SESSION_ID.into(),
+        manifest_digest: digest,
+        sealed_at_ms: 1,
+    };
+
+    let orch_run = orch.clone();
+    let client_run = client.clone();
+    let worker = thread::spawn(move || orch_run.process_pending(&client_run, &pending));
+
+    client.wait_until_download_blocked();
+    {
+        let mut runtime = state.in_sync_runtime.write().await;
+        runtime.phase = Some(LocalFinalizationPhase::Quarantined);
+        runtime.active_session_id = Some(SESSION_ID.into());
+    }
+    let status = fetch_in_sync_status(&router, &state).await;
+    assert_eq!(
+        status.get("phase").and_then(|v| v.as_str()),
+        Some("quarantined"),
+        "terminal runtime phase must win over stale active orchestrator phase; got {status}"
+    );
+
+    client.release_download();
+    let _ = worker.join().expect("process_pending thread");
+}
+
+#[tokio::test]
 async fn in_sync_status_includes_live_orchestrator_progress_before_process_pending_returns() {
     let (router, state, _userdata) = test_router_and_state().await;
     let parent = state

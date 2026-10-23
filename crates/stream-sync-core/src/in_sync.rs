@@ -170,7 +170,11 @@ pub async fn status_json(state: &AppState) -> Value {
     let (active_orchestrator, phase) = {
         let worker = state.in_sync_worker.read().await;
         let active = worker.active.clone();
-        let phase = active.as_ref().map(|orch| orch.phase()).or(runtime.phase);
+        let phase = if runtime.phase.is_some_and(|p| p.is_terminal_status_phase()) {
+            runtime.phase
+        } else {
+            active.as_ref().map(|orch| orch.phase()).or(runtime.phase)
+        };
         (active, phase)
     };
     let mut events: BoundedProgressEvents = state.in_sync_progress_events.read().await.clone();
