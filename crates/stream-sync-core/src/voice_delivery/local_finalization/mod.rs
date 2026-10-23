@@ -68,7 +68,10 @@ pub use paths::{
     resolve_canonical_session_paths, validate_path_under_parent, PublishedSessionPaths,
 };
 pub use processor::LocalProcessorError;
-pub use progress::{LocalFinalizationPhase, LocalFinalizationProgressEvent};
+pub use progress::{
+    BoundedProgressEvents, LocalFinalizationPhase, LocalFinalizationProgressEvent,
+    IN_SYNC_PROGRESS_EVENT_RETENTION_CAP,
+};
 pub use receipt::{
     assert_local_finalization_receipt_matches_manifest, parse_local_finalization_receipt,
     LocalFinalizationReceipt,

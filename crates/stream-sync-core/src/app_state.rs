@@ -582,7 +582,7 @@ pub struct AppState {
     pub in_sync_manual_queue: RwLock<Vec<String>>,
     /// Sessions deferred after storage preflight failure until explicit Process now.
     pub in_sync_storage_deferred: RwLock<std::collections::HashSet<String>>,
-    pub in_sync_progress_events: RwLock<Vec<crate::voice_delivery::LocalFinalizationProgressEvent>>,
+    pub in_sync_progress_events: RwLock<crate::voice_delivery::BoundedProgressEvents>,
     pub in_sync_worker: RwLock<crate::in_sync::InSyncWorkerState>,
     pub in_sync_wake: Arc<tokio::sync::Notify>,
     pub in_sync_supervisor: RwLock<crate::in_sync::InSyncSupervisorSnapshot>,
@@ -851,7 +851,9 @@ impl AppState {
             in_sync_pending: RwLock::new(crate::in_sync::InSyncPendingState::default()),
             in_sync_manual_queue: RwLock::new(Vec::new()),
             in_sync_storage_deferred: RwLock::new(std::collections::HashSet::new()),
-            in_sync_progress_events: RwLock::new(Vec::new()),
+            in_sync_progress_events: RwLock::new(
+                crate::voice_delivery::BoundedProgressEvents::default(),
+            ),
             in_sync_worker: RwLock::new(crate::in_sync::InSyncWorkerState::default()),
             in_sync_wake: crate::in_sync::new_in_sync_wake(),
             in_sync_supervisor: RwLock::new(crate::in_sync::InSyncSupervisorSnapshot::from_status(

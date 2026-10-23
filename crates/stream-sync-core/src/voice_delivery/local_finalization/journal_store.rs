@@ -72,7 +72,7 @@ impl LocalJournalStore {
                 .map_err(|e| JournalStoreError::Other(e.to_string()))?;
             let existing_manifest = super::manifest::parse_local_finalization_manifest(&parsed)
                 .map_err(|e| JournalStoreError::Other(e.to_string()))?;
-            if existing_manifest.session_id != manifest.session_id {
+            if existing_manifest != *manifest {
                 return Err(JournalStoreError::Conflict);
             }
             return Ok(());
