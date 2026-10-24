@@ -13,7 +13,9 @@ use super::processor::{
     process_verified_segments_with_options, LocalProcessorError, LocalProcessorOptions,
     LocalProcessorProgress,
 };
-use super::progress::{LocalFinalizationPhase, LocalFinalizationProgressEvent};
+use super::progress::{
+    BoundedProgressEvents, LocalFinalizationPhase, LocalFinalizationProgressEvent,
+};
 use super::receipt::{
     assert_local_finalization_receipt_matches_manifest, LocalFinalizationReceipt,
     LocalFinalizationReceiptRecoveryReport, LocalFinalizationReceiptStem,
@@ -79,7 +81,7 @@ pub struct LocalFinalizationOrchestrator {
     parent: PathBuf,
     device_id: String,
     phase: Mutex<LocalFinalizationPhase>,
-    events: Arc<Mutex<Vec<LocalFinalizationProgressEvent>>>,
+    events: Arc<Mutex<BoundedProgressEvents>>,
     controls: LocalFinalizationControls,
 }
 
@@ -97,7 +99,7 @@ impl LocalFinalizationOrchestrator {
             parent: parent.to_path_buf(),
             device_id: device_id.into(),
             phase: Mutex::new(LocalFinalizationPhase::Queued),
-            events: Arc::new(Mutex::new(Vec::new())),
+            events: Arc::new(Mutex::new(BoundedProgressEvents::default())),
             controls,
         }
     }
@@ -122,10 +124,12 @@ impl LocalFinalizationOrchestrator {
     }
 
     pub fn drain_events(&self) -> Vec<LocalFinalizationProgressEvent> {
-        let mut events = self.events.lock().unwrap();
-        let out = events.clone();
-        events.clear();
-        out
+        self.events.lock().unwrap().drain()
+    }
+
+    /// Non-destructive bounded snapshot for live `/api/in-sync/status` while `process_pending` runs.
+    pub fn progress_events_snapshot(&self) -> Vec<LocalFinalizationProgressEvent> {
+        self.events.lock().unwrap().snapshot()
     }
 
     fn emit(&self, event: LocalFinalizationProgressEvent) {

@@ -2,6 +2,39 @@
 
 var inSyncInitState = "idle";
 var inSyncLastRefreshAt = null;
+var IN_SYNC_POLL_INTERVAL_MS = 2000;
+var inSyncLiveRefreshTimerId = null;
+var inSyncPollFetchInFlight = false;
+var inSyncPollFetchWait = null;
+var inSyncActiveRefresh = null;
+var inSyncStatusFetchInFlight = false;
+var inSyncUiWired = false;
+
+function stopInSyncLiveRefresh() {
+  if (inSyncLiveRefreshTimerId != null) {
+    clearInterval(inSyncLiveRefreshTimerId);
+    inSyncLiveRefreshTimerId = null;
+  }
+}
+
+function ensureInSyncLiveRefresh() {
+  if (inSyncLiveRefreshTimerId != null) return;
+  inSyncLiveRefreshTimerId = setInterval(function () {
+    return pollInSyncStatus().catch(console.error);
+  }, IN_SYNC_POLL_INTERVAL_MS);
+}
+
+async function pollInSyncStatus() {
+  if (inSyncPollFetchInFlight) return inSyncPollFetchWait;
+  inSyncPollFetchInFlight = true;
+  inSyncPollFetchWait = refreshInSyncRecordings({ skipIfBusy: true }).finally(
+    function () {
+      inSyncPollFetchInFlight = false;
+      inSyncPollFetchWait = null;
+    }
+  );
+  return inSyncPollFetchWait;
+}
 
 function inSyncModeLabel(mode) {
   return mode === "automatic_after_seal" ? "Automatic" : "Manual";
@@ -42,6 +75,27 @@ function setInSyncBusy(busy, label) {
     refreshBtn.disabled = !!busy;
     if (busy && label) refreshBtn.dataset.busyLabel = label;
   }
+}
+
+async function fetchInSyncStatusPayload() {
+  if (!window.streamSyncControlApi || !window.streamSyncControlApi.privilegedFetch) {
+    throw new Error("control API unavailable");
+  }
+  inSyncStatusFetchInFlight = true;
+  var res;
+  try {
+    res = await window.streamSyncControlApi.privilegedFetch(
+      "/api/in-sync/status",
+      {}
+    );
+  } finally {
+    inSyncStatusFetchInFlight = false;
+  }
+  var data = await res.json().catch(function () {
+    return {};
+  });
+  if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
+  return data;
 }
 
 async function inSyncPrivileged(path, options) {
@@ -92,6 +146,94 @@ function formatDuration(secs) {
 function formatGiB(bytes) {
   if (bytes == null || !isFinite(bytes)) return "—";
   return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GiB";
+}
+
+function formatByteProgress(complete, total) {
+  var c = complete != null && isFinite(complete) ? complete : 0;
+  if (total == null || !isFinite(total)) return c + " bytes";
+  return c + " / " + total + " bytes";
+}
+
+function formatInSyncProgressEventLine(event) {
+  if (!event || !event.type) return "";
+  switch (event.type) {
+    case "journal_ready":
+      return "Journal ready";
+    case "download_progress":
+      return (
+        "Download segment " +
+        (event.segmentSeq != null ? event.segmentSeq : "—") +
+        ": " +
+        formatByteProgress(event.bytesComplete, event.bytesTotal)
+      );
+    case "segment_verified":
+      return (
+        "Segment " +
+        (event.segmentSeq != null ? event.segmentSeq : "—") +
+        " verified"
+      );
+    case "processing_started":
+      return "Processing started";
+    case "timeline_progress":
+      return (
+        "Timeline " +
+        (event.processedSegments != null ? event.processedSegments : "—") +
+        " / " +
+        (event.totalSegments != null ? event.totalSegments : "—") +
+        " segments"
+      );
+    case "publication_complete":
+      return (
+        "Published: " +
+        (event.finalSessionDir || "—") +
+        (event.recoveryReportPath
+          ? " (report: " + event.recoveryReportPath + ")"
+          : "")
+      );
+    case "receipt_acknowledged":
+      return "Receipt acknowledged";
+    default:
+      return formatPhase(event.type);
+  }
+}
+
+function buildInSyncProgressLogText(status) {
+  var events = (status && status.progressEvents) || [];
+  var phase = status && status.phase ? String(status.phase) : "";
+  var lines = [];
+
+  if (phase === "paused") {
+    lines.push("Phase: Paused");
+  } else if (phase === "failed_retryable") {
+    lines.push("Phase: Failed (retryable — use Retry)");
+  } else if (phase === "failed_blocked") {
+    lines.push("Phase: Blocked");
+  } else if (phase) {
+    lines.push("Phase: " + formatPhase(phase));
+  }
+
+  for (var i = 0; i < events.length; i++) {
+    var line = formatInSyncProgressEventLine(events[i]);
+    if (line) lines.push(line);
+  }
+
+  if (!lines.length) {
+    return { primary: "No events yet", diagnostics: "" };
+  }
+
+  var diagnostics = events.length
+    ? "--- Diagnostics ---\n" + JSON.stringify(events, null, 2)
+    : "";
+  return { primary: lines.join("\n"), diagnostics: diagnostics };
+}
+
+function renderInSyncProgressLog(status) {
+  var log = document.getElementById("in-sync-progress-log");
+  if (!log) return;
+  var rendered = buildInSyncProgressLogText(status);
+  log.textContent = rendered.diagnostics
+    ? rendered.primary + "\n\n" + rendered.diagnostics
+    : rendered.primary;
 }
 
 function renderInSyncStorageBlocked(status) {
@@ -253,7 +395,6 @@ function applyInSyncStatus(status) {
   var activeId = status.activeSessionId || "";
   var phase = status.phase || "";
   var published = status.publishedSessions || [];
-  var events = status.progressEvents || [];
 
   setInSyncModeToggle(mode === "automatic_after_seal" ? "automatic_after_seal" : "manual");
   renderInSyncSupervisorMeta(status);
@@ -267,7 +408,6 @@ function applyInSyncStatus(status) {
   var cardPublished = document.getElementById("in-sync-card-published");
   var empty = document.getElementById("in-sync-empty");
   var fields = document.getElementById("in-sync-session-fields");
-  var log = document.getElementById("in-sync-progress-log");
   var processBtn = document.getElementById("in-sync-process-now");
   var revealBtn = document.getElementById("in-sync-reveal");
   var reportBtn = document.getElementById("in-sync-open-report");
@@ -329,11 +469,7 @@ function applyInSyncStatus(status) {
       : "None yet";
   }
 
-  if (log) {
-    log.textContent = events.length
-      ? JSON.stringify(events, null, 2)
-      : "No events yet";
-  }
+  renderInSyncProgressLog(status);
 
   if (!activeId) {
     if (empty) {
@@ -380,10 +516,20 @@ function applyInSyncStatus(status) {
   };
 }
 
-async function refreshInSyncRecordings() {
+async function refreshInSyncRecordings(options) {
+  var skipIfBusy = options && options.skipIfBusy;
+  if (inSyncActiveRefresh) {
+    if (skipIfBusy) {
+      return inSyncActiveRefresh.then(function () {
+        return refreshInSyncRecordings({ skipIfBusy: true });
+      });
+    }
+    await inSyncActiveRefresh;
+  }
+  var run = (async function () {
   setInSyncBusy(true, "Refreshing…");
   try {
-    var status = await inSyncPrivileged("/api/in-sync/status");
+    var status = await fetchInSyncStatusPayload();
     inSyncInitState = "ready";
     inSyncLastRefreshAt = Date.now();
     clearInSyncPanelError();
@@ -440,6 +586,13 @@ async function refreshInSyncRecordings() {
     );
   } finally {
     setInSyncBusy(false);
+  }
+  })();
+  inSyncActiveRefresh = run;
+  try {
+    return await run;
+  } finally {
+    if (inSyncActiveRefresh === run) inSyncActiveRefresh = null;
   }
 }
 
@@ -515,7 +668,11 @@ function wireInSyncRecordingsUi() {
     refreshInSyncRecordings().catch(console.error);
   });
 
-  inSyncInitState = "starting";
-  applyInSyncEmptyUi();
-  refreshInSyncRecordings().catch(console.error);
+  ensureInSyncLiveRefresh();
+  if (!inSyncUiWired) {
+    inSyncUiWired = true;
+    inSyncInitState = "starting";
+    applyInSyncEmptyUi();
+    refreshInSyncRecordings().catch(console.error);
+  }
 }

@@ -3,8 +3,8 @@
 use crate::app_state::AppState;
 use crate::config_types::LocalProcessingMode;
 use crate::voice_delivery::local_finalization::{
-    assert_local_opus_available, LocalFinalizationControls, LocalFinalizationOrchestrator,
-    LocalPendingItem,
+    assert_local_opus_available, BoundedProgressEvents, LocalFinalizationControls,
+    LocalFinalizationOrchestrator, LocalPendingItem,
 };
 use crate::voice_delivery::VoiceV2ClientError;
 use serde::Deserialize;
@@ -167,7 +167,20 @@ pub async fn status_json(state: &AppState) -> Value {
     let cfg = state.discord_voice_config.read().await.clone();
     let runtime = state.in_sync_runtime.read().await.clone();
     let queue = state.in_sync_manual_queue.read().await.clone();
-    let events = state.in_sync_progress_events.read().await.clone();
+    let (active_orchestrator, phase) = {
+        let worker = state.in_sync_worker.read().await;
+        let active = worker.active.clone();
+        let phase = if runtime.phase.is_some_and(|p| p.is_terminal_status_phase()) {
+            runtime.phase
+        } else {
+            active.as_ref().map(|orch| orch.phase()).or(runtime.phase)
+        };
+        (active, phase)
+    };
+    let mut events: BoundedProgressEvents = state.in_sync_progress_events.read().await.clone();
+    if let Some(orch) = active_orchestrator {
+        events.extend(orch.progress_events_snapshot());
+    }
     let published = state
         .in_sync_worker
         .read()
@@ -184,12 +197,12 @@ pub async fn status_json(state: &AppState) -> Value {
     };
     json!({
         "localProcessingMode": cfg.local_processing_mode,
-        "phase": runtime.phase,
+        "phase": phase,
         "activeSessionId": runtime.active_session_id,
         "manualQueue": queue,
         "pendingSessions": pending.sessions,
         "discovery": pending.discovery,
-        "progressEvents": events,
+        "progressEvents": events.snapshot(),
         "publishedSessions": published_ids,
         "publishedOutputDir": runtime.published_output_dir,
         "recoveryReportPath": runtime.recovery_report_path,
