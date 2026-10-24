@@ -7,9 +7,11 @@ use super::receipt::{
     LocalFinalizationReceiptRecoveryReport, LocalFinalizationReceiptStem,
 };
 use super::storage_preflight::{storage_preflight, StoragePreflightFailure};
-use crate::voice_delivery::fs::durability::sync_dir_exact;
+use crate::voice_delivery::fs::durability::{sync_dir_exact, NamespaceDurability};
 use crate::voice_delivery::fs::durable_payload::write_durable_payload_create_new;
-use crate::voice_delivery::fs::{rename_no_replace_same_parent, DestRoot, FsError};
+use crate::voice_delivery::fs::{
+    open_lock_file_at_root, rename_no_replace_same_parent, DestRoot, DirHandle, FsError,
+};
 use crate::voice_delivery::hash::{sha256_hex_reader, DEFAULT_STREAM_CHUNK};
 use crate::voice_delivery::publication::verify_final_session_directory;
 use crate::voice_delivery::session::DeliverySessionGuard;
@@ -26,6 +28,7 @@ const CHECKPOINT_LEGACY_TMP: &str = "download-checkpoint.tmp";
 const MANIFEST_FILE: &str = "manifest.json";
 const RECEIPT_INTENT_FILE: &str = "receipt-intent.json";
 const RECEIPT_ACK_FILE: &str = "receipt-ack.json";
+pub(crate) const RECEIPT_INSTALL_LOCK: &str = ".receipt-install.lock";
 const SEGMENTS_DIR: &str = "journal/segments";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,18 +293,10 @@ impl LocalJournalStore {
     }
 
     pub fn load_receipt_durable_state(&self) -> Result<ReceiptDurableState, JournalStoreError> {
-        let intent_path = self.session_root.join(RECEIPT_INTENT_FILE);
-        let ack_path = self.session_root.join(RECEIPT_ACK_FILE);
-        let intent = if intent_path.exists() {
-            Some(load_receipt_file(&intent_path)?)
-        } else {
-            None
-        };
-        let ack = if ack_path.exists() {
-            Some(load_receipt_file(&ack_path)?)
-        } else {
-            None
-        };
+        let root = DestRoot::open(&self.session_root).map_err(journal_from_fs)?;
+        let dir = root.handle();
+        let intent = load_optional_receipt_from_dir(dir, RECEIPT_INTENT_FILE)?;
+        let ack = load_optional_receipt_from_dir(dir, RECEIPT_ACK_FILE)?;
         if ack.is_some() && intent.is_none() {
             return Err(JournalStoreError::Conflict);
         }
@@ -326,11 +321,15 @@ impl LocalJournalStore {
         &self,
         receipt: &LocalFinalizationReceipt,
     ) -> Result<(), JournalStoreError> {
-        let intent_path = self.session_root.join(RECEIPT_INTENT_FILE);
-        if !intent_path.exists() {
-            return Err(JournalStoreError::Conflict);
-        }
-        let intent = load_receipt_file(&intent_path)?;
+        let root = DestRoot::open(&self.session_root).map_err(journal_from_fs)?;
+        let dir = root.handle();
+        let intent = match dir.read_file_all(RECEIPT_INTENT_FILE) {
+            Ok(bytes) => parse_receipt_bytes(&bytes)?,
+            Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(JournalStoreError::Conflict);
+            }
+            Err(e) => return Err(journal_from_fs(e)),
+        };
         if intent != *receipt {
             return Err(JournalStoreError::Conflict);
         }
@@ -435,9 +434,15 @@ fn verify_published_artifacts_from_authority(
     Ok(())
 }
 
-fn load_receipt_file(path: &Path) -> Result<LocalFinalizationReceipt, JournalStoreError> {
-    let bytes = std::fs::read(path)?;
-    parse_receipt_bytes(&bytes)
+fn load_optional_receipt_from_dir(
+    dir: &DirHandle,
+    name: &str,
+) -> Result<Option<LocalFinalizationReceipt>, JournalStoreError> {
+    match dir.read_file_all(name) {
+        Ok(bytes) => Ok(Some(parse_receipt_bytes(&bytes)?)),
+        Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(journal_from_fs(e)),
+    }
 }
 
 fn receipt_json_bytes(receipt: &LocalFinalizationReceipt) -> Result<Vec<u8>, JournalStoreError> {
@@ -463,7 +468,78 @@ fn journal_from_fs(err: FsError) -> JournalStoreError {
     }
 }
 
-/// Create-new durable receipt install: unique stage file → `rename_no_replace_same_parent`.
+/// RAII exclusive receipt-install lock; file is never deleted on release.
+struct ReceiptInstallLockGuard {
+    file: File,
+}
+
+fn acquire_receipt_install_lock(
+    session_root: &Path,
+) -> Result<ReceiptInstallLockGuard, JournalStoreError> {
+    use fs2::FileExt;
+
+    let root = DestRoot::open(session_root).map_err(journal_from_fs)?;
+    let file = open_lock_file_at_root(&root, &[RECEIPT_INSTALL_LOCK.to_string()])
+        .map_err(journal_from_fs)?;
+    file.lock_exclusive().map_err(JournalStoreError::Io)?;
+    Ok(ReceiptInstallLockGuard { file })
+}
+
+impl Drop for ReceiptInstallLockGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+fn require_proven_namespace_durability(
+    durability: NamespaceDurability,
+) -> Result<(), JournalStoreError> {
+    match durability {
+        NamespaceDurability::Proven => Ok(()),
+        NamespaceDurability::Unavailable => Err(JournalStoreError::Other(
+            "receipt install requires proven session directory durability".into(),
+        )),
+    }
+}
+
+fn receipt_stage_install_rename(
+    dir: &DirHandle,
+    stage_name: &str,
+    dest_name: &str,
+) -> Result<(), FsError> {
+    #[cfg(windows)]
+    {
+        use crate::voice_delivery::fs::rename_no_replace_write_through_same_parent;
+        rename_no_replace_write_through_same_parent(dir, stage_name, dest_name)
+    }
+    #[cfg(not(windows))]
+    {
+        rename_no_replace_same_parent(dir, stage_name, dest_name)
+    }
+}
+
+/// After an exact-equal collision, Linux proves namespace durability via `sync_dir_exact`.
+#[cfg(not(windows))]
+fn receipt_install_collision_namespace_barrier(dir: &DirHandle) -> Result<(), JournalStoreError> {
+    let durability = sync_dir_exact(dir).map_err(journal_from_fs)?;
+    require_proven_namespace_durability(durability)
+}
+
+/// Exact-equal collision on Windows: lock + no-follow readback; optional flush of the destination file.
+#[cfg(windows)]
+fn receipt_install_collision_namespace_barrier(
+    dir: &DirHandle,
+    dest_name: &str,
+) -> Result<(), JournalStoreError> {
+    use crate::voice_delivery::fs::durability::sync_file;
+    use crate::voice_delivery::fs::file::open_existing_file_at;
+
+    // Defense in depth only; write-through winning moves + the install lock are the namespace proof.
+    let file = open_existing_file_at(dir, dest_name).map_err(journal_from_fs)?;
+    sync_file(&file).map_err(journal_from_fs)
+}
+
+/// Create-new durable receipt install: unique stage file → platform no-replace install under lock.
 fn persist_receipt_create_new(
     session_root: &Path,
     dest_name: &str,
@@ -472,6 +548,7 @@ fn persist_receipt_create_new(
     let json_bytes = receipt_json_bytes(receipt)?;
     let root = DestRoot::open(session_root).map_err(journal_from_fs)?;
     let dir = root.handle();
+    let _install_lock = acquire_receipt_install_lock(session_root)?;
     let stage_name = format!(".receipt-write-{}", uuid::Uuid::new_v4().simple());
 
     if let Err(e) = write_durable_payload_create_new(dir, &stage_name, &json_bytes) {
@@ -479,9 +556,13 @@ fn persist_receipt_create_new(
         return Err(journal_from_fs(e));
     }
 
-    match rename_no_replace_same_parent(dir, &stage_name, dest_name) {
+    match receipt_stage_install_rename(dir, &stage_name, dest_name) {
         Ok(()) => {
-            sync_dir_exact(dir).map_err(journal_from_fs)?;
+            #[cfg(not(windows))]
+            {
+                let durability = sync_dir_exact(dir).map_err(journal_from_fs)?;
+                require_proven_namespace_durability(durability)?;
+            }
             Ok(())
         }
         Err(FsError::AlreadyExists) => {
@@ -489,7 +570,10 @@ fn persist_receipt_create_new(
             let existing_bytes = dir.read_file_all(dest_name).map_err(journal_from_fs)?;
             match parse_receipt_bytes(&existing_bytes) {
                 Ok(existing) if existing == *receipt => {
-                    sync_dir_exact(dir).map_err(journal_from_fs)?;
+                    #[cfg(not(windows))]
+                    receipt_install_collision_namespace_barrier(dir)?;
+                    #[cfg(windows)]
+                    receipt_install_collision_namespace_barrier(dir, dest_name)?;
                     Ok(())
                 }
                 _ => Err(JournalStoreError::Conflict),
@@ -1155,6 +1239,7 @@ mod preflight_tests {
     /// Regression (HIGH): identical receipt AlreadyExists collision must re-sync the session
     /// directory before reporting idempotent Ok; otherwise durability can be skipped permanently.
     #[test]
+    #[cfg(target_os = "linux")]
     fn receipt_intent_identical_collision_requires_dir_sync_before_ok() {
         use crate::voice_delivery::fs::durability::fail_next_sync_dir_exact::{
             install_fail_next_sync_dir_exact, INJECTED_MESSAGE,
@@ -1175,8 +1260,106 @@ mod preflight_tests {
         );
     }
 
+    /// Winning intent install must not treat `NamespaceDurability::Unavailable` as success (Linux).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn receipt_intent_winning_install_rejects_unavailable_dir_sync() {
+        use crate::voice_delivery::fs::durability::fail_next_sync_dir_exact::install_next_sync_dir_exact_unavailable;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let receipt = sample_receipt("550e8400-e29b-41d4-a716-446655440099");
+        let _guard = install_next_sync_dir_exact_unavailable();
+        assert!(
+            store.persist_receipt_intent(&receipt).is_err(),
+            "winning intent install must fail when directory durability is Unavailable"
+        );
+    }
+
+    /// Winning ack install must not treat `NamespaceDurability::Unavailable` as success (Linux).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn receipt_ack_winning_install_rejects_unavailable_dir_sync() {
+        use crate::voice_delivery::fs::durability::fail_next_sync_dir_exact::install_next_sync_dir_exact_unavailable;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let receipt = sample_receipt("550e8400-e29b-41d4-a716-446655440099");
+        store.persist_receipt_intent(&receipt).unwrap();
+        let _guard = install_next_sync_dir_exact_unavailable();
+        assert!(
+            store.persist_receipt_ack(&receipt).is_err(),
+            "winning ack install must fail when directory durability is Unavailable"
+        );
+    }
+
+    /// Receipt installs must serialize on the stable session-root lock file.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn persist_receipt_intent_blocks_on_external_receipt_install_lock() {
+        use fs2::FileExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let recording_parent = tmp.path().to_path_buf();
+        let holder = open_test_store(&recording_parent);
+        let lock_path = holder.session_root().join(super::RECEIPT_INSTALL_LOCK);
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        lock_file.lock_exclusive().unwrap();
+
+        let receipt = sample_receipt("550e8400-e29b-41d4-a716-446655440099");
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        let child = std::thread::spawn({
+            let recording_parent = recording_parent.clone();
+            let receipt = receipt.clone();
+            move || {
+                let store =
+                    LocalJournalStore::open(&recording_parent, "test-session").expect("open");
+                started_tx.send(()).expect("signal start");
+                let result = store.persist_receipt_intent(&receipt);
+                done_tx.send(result).expect("signal done");
+            }
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("child thread must start persist_receipt_intent");
+        match done_rx.recv_timeout(Duration::from_millis(750)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(result) => {
+                panic!(
+                    "persist_receipt_intent must not complete while external receipt-install lock is held; got {result:?}"
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("child exited before releasing external lock");
+            }
+        }
+
+        lock_file.unlock().unwrap();
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("persist_receipt_intent must complete after lock release");
+        result.expect("persist after lock release");
+        child.join().expect("join child");
+
+        let store = open_test_store(&recording_parent);
+        let state = store.load_receipt_durable_state().unwrap();
+        assert_eq!(state.intent.as_ref(), Some(&receipt));
+        assert!(state.ack.is_none());
+    }
+
     /// Same collision-path durability requirement for acknowledgement installs.
     #[test]
+    #[cfg(target_os = "linux")]
     fn receipt_ack_identical_collision_requires_dir_sync_before_ok() {
         use crate::voice_delivery::fs::durability::fail_next_sync_dir_exact::{
             install_fail_next_sync_dir_exact, INJECTED_MESSAGE,
@@ -1432,5 +1615,120 @@ mod preflight_tests {
         );
         let err = LocalJournalStore::disk_preflight_bytes(&manifest, 0).unwrap_err();
         assert_eq!(err, StoragePreflightFailure::RequiredBytesOverflow);
+    }
+
+    /// Receipt durable-state loads must not follow symlinks (ambient `exists`/`read`).
+    #[cfg(unix)]
+    mod receipt_symlink_no_follow_security {
+        use super::*;
+        use std::os::unix::fs::symlink;
+
+        const SESSION_ID: &str = "550e8400-e29b-41d4-a716-446655440099";
+
+        fn write_external_valid_receipt(path: &Path, receipt: &LocalFinalizationReceipt) {
+            let json = serde_json::to_string_pretty(receipt).unwrap();
+            std::fs::write(path, json).unwrap();
+        }
+
+        fn assert_load_fails_closed(store: &LocalJournalStore, receipt: &LocalFinalizationReceipt) {
+            let result = store.load_receipt_durable_state();
+            assert!(
+                result.is_err(),
+                "load_receipt_durable_state must fail closed when receipt paths are symlinks; \
+                 got {:?} — ambient read followed the link to the external receipt",
+                result
+            );
+            if let Ok(state) = result {
+                assert_ne!(
+                    state.intent.as_ref(),
+                    Some(receipt),
+                    "must not return receipt body loaded through receipt-intent.json symlink"
+                );
+                assert_ne!(
+                    state.ack.as_ref(),
+                    Some(receipt),
+                    "must not return receipt body loaded through receipt-ack.json symlink"
+                );
+            }
+        }
+
+        #[test]
+        fn load_receipt_durable_state_rejects_symlinked_receipt_intent() {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = open_test_store(tmp.path());
+            let receipt = sample_receipt(SESSION_ID);
+            let external = tmp.path().join("external-receipt-intent.json");
+            write_external_valid_receipt(&external, &receipt);
+            let external_before = std::fs::read(&external).unwrap();
+
+            let intent_link = store.session_root().join(RECEIPT_INTENT_FILE);
+            symlink(&external, &intent_link).unwrap();
+
+            assert_load_fails_closed(&store, &receipt);
+            assert_eq!(std::fs::read(&external).unwrap(), external_before);
+            assert!(
+                intent_link.is_symlink(),
+                "session receipt-intent must remain the symlink under test"
+            );
+            assert!(
+                !store.session_root().join(RECEIPT_ACK_FILE).exists(),
+                "symlinked intent load must not create receipt-ack.json"
+            );
+        }
+
+        #[test]
+        fn load_receipt_durable_state_rejects_symlinked_receipt_ack() {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = open_test_store(tmp.path());
+            let receipt = sample_receipt(SESSION_ID);
+            store.persist_receipt_intent(&receipt).unwrap();
+
+            let external = tmp.path().join("external-receipt-ack.json");
+            write_external_valid_receipt(&external, &receipt);
+            let external_before = std::fs::read(&external).unwrap();
+
+            let ack_link = store.session_root().join(RECEIPT_ACK_FILE);
+            symlink(&external, &ack_link).unwrap();
+
+            assert_load_fails_closed(&store, &receipt);
+            assert_eq!(std::fs::read(&external).unwrap(), external_before);
+            assert!(
+                ack_link.is_symlink(),
+                "receipt-ack must remain a symlink, not a canonical durable file"
+            );
+            let intent_path = store.session_root().join(RECEIPT_INTENT_FILE);
+            assert!(
+                intent_path.exists() && !intent_path.is_symlink(),
+                "canonical intent from persist_receipt_intent must be unchanged"
+            );
+        }
+
+        #[test]
+        fn persist_receipt_ack_rejects_symlinked_receipt_intent() {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = open_test_store(tmp.path());
+            let receipt = sample_receipt(SESSION_ID);
+            let external = tmp.path().join("external-receipt-for-ack.json");
+            write_external_valid_receipt(&external, &receipt);
+            let external_before = std::fs::read(&external).unwrap();
+
+            let intent_link = store.session_root().join(RECEIPT_INTENT_FILE);
+            symlink(&external, &intent_link).unwrap();
+
+            let result = store.persist_receipt_ack(&receipt);
+            assert!(
+                result.is_err(),
+                "persist_receipt_ack must fail closed when intent is a symlink to a valid receipt; \
+                 ambient read followed the link and got {:?}",
+                result
+            );
+
+            assert_eq!(std::fs::read(&external).unwrap(), external_before);
+            assert!(intent_link.is_symlink());
+            assert!(
+                !store.session_root().join(RECEIPT_ACK_FILE).exists(),
+                "must not install receipt-ack.json when intent was resolved through a symlink"
+            );
+        }
     }
 }

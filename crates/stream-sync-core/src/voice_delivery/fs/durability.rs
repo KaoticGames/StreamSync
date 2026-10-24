@@ -22,8 +22,8 @@ pub fn sync_file(file: &VoiceFile) -> Result<(), FsError> {
 /// `fsync` the supplied directory handle on Linux; Windows reports `Unavailable` (no faux dir flush).
 pub fn sync_dir_exact(dir: &DirHandle) -> Result<NamespaceDurability, FsError> {
     #[cfg(test)]
-    if let Some(err) = fail_next_sync_dir_exact::take_armed_failure() {
-        return Err(err);
+    if let Some(outcome) = fail_next_sync_dir_exact::take_armed_outcome() {
+        return outcome;
     }
 
     #[cfg(target_os = "linux")]
@@ -48,31 +48,43 @@ pub fn sync_dir_exact(dir: &DirHandle) -> Result<NamespaceDurability, FsError> {
     }
 }
 
-/// Test-only: fail the next `sync_dir_exact` on the installing thread (crate unit tests).
+/// Test-only: consume-once `sync_dir_exact` outcome injection on the installing thread.
 #[cfg(test)]
 pub(crate) mod fail_next_sync_dir_exact {
-    use super::FsError;
+    use super::{FsError, NamespaceDurability};
     use std::cell::RefCell;
     use std::io;
 
-    /// Stable synthetic error returned when the armed injection fires (test-only).
+    /// Stable synthetic error returned when the armed Io injection fires (test-only).
     pub(crate) const INJECTED_MESSAGE: &str = "injected fail-next sync_dir_exact (test only)";
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ArmedOutcome {
+        Io,
+        Unavailable,
+    }
+
     thread_local! {
-        static ARMED: RefCell<bool> = const { RefCell::new(false) };
+        static ARMED: RefCell<Option<ArmedOutcome>> = const { RefCell::new(None) };
     }
 
     fn synthetic_fs_error() -> FsError {
         FsError::Io(io::Error::other(INJECTED_MESSAGE))
     }
 
-    pub(crate) fn take_armed_failure() -> Option<FsError> {
+    pub(crate) fn take_armed_outcome() -> Option<Result<NamespaceDurability, FsError>> {
         ARMED.with(|cell| {
-            if *cell.borrow() {
-                *cell.borrow_mut() = false;
-                Some(synthetic_fs_error())
-            } else {
-                None
+            let mut armed = cell.borrow_mut();
+            match *armed {
+                Some(ArmedOutcome::Io) => {
+                    *armed = None;
+                    Some(Err(synthetic_fs_error()))
+                }
+                Some(ArmedOutcome::Unavailable) => {
+                    *armed = None;
+                    Some(Ok(NamespaceDurability::Unavailable))
+                }
+                None => None,
             }
         })
     }
@@ -83,19 +95,27 @@ pub(crate) mod fail_next_sync_dir_exact {
     impl Drop for FailNextSyncDirExactGuard {
         fn drop(&mut self) {
             ARMED.with(|cell| {
-                *cell.borrow_mut() = false;
+                *cell.borrow_mut() = None;
             });
         }
     }
 
-    pub(crate) fn install_fail_next_sync_dir_exact() -> FailNextSyncDirExactGuard {
+    fn install_armed(outcome: ArmedOutcome) -> FailNextSyncDirExactGuard {
         ARMED.with(|cell| {
-            if *cell.borrow() {
+            if cell.borrow().is_some() {
                 panic!("duplicate fail-next sync_dir_exact injection on the current thread");
             }
-            *cell.borrow_mut() = true;
+            *cell.borrow_mut() = Some(outcome);
         });
         FailNextSyncDirExactGuard
+    }
+
+    pub(crate) fn install_fail_next_sync_dir_exact() -> FailNextSyncDirExactGuard {
+        install_armed(ArmedOutcome::Io)
+    }
+
+    pub(crate) fn install_next_sync_dir_exact_unavailable() -> FailNextSyncDirExactGuard {
+        install_armed(ArmedOutcome::Unavailable)
     }
 }
 
@@ -161,5 +181,33 @@ mod tests {
 
         let _first = install_fail_next_sync_dir_exact();
         let _second = install_fail_next_sync_dir_exact();
+    }
+
+    #[test]
+    fn next_sync_dir_exact_unavailable_injection_consumes_once() {
+        use super::fail_next_sync_dir_exact::install_next_sync_dir_exact_unavailable;
+
+        let (_tmp, parent) = temp_final_parent();
+        let _guard = install_next_sync_dir_exact_unavailable();
+        assert_eq!(
+            sync_dir_exact(&parent).expect("injected unavailable"),
+            NamespaceDurability::Unavailable
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            sync_dir_exact(&parent).expect("second sync after consume"),
+            NamespaceDurability::Proven
+        );
+    }
+
+    #[test]
+    #[should_panic = "duplicate fail-next sync_dir_exact injection on the current thread"]
+    fn sync_dir_exact_injection_rejects_mixed_duplicate_install() {
+        use super::fail_next_sync_dir_exact::{
+            install_fail_next_sync_dir_exact, install_next_sync_dir_exact_unavailable,
+        };
+
+        let _first = install_fail_next_sync_dir_exact();
+        let _second = install_next_sync_dir_exact_unavailable();
     }
 }

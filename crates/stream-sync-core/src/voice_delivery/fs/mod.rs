@@ -44,6 +44,18 @@ pub(crate) fn rename_no_replace_same_parent(
     }
 }
 
+/// Windows receipt install: `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` only (no replace).
+#[cfg(windows)]
+pub(crate) fn rename_no_replace_write_through_same_parent(
+    final_parent: &DirHandle,
+    src_name: &str,
+    dst_name: &str,
+) -> Result<(), FsError> {
+    validate_single_component(src_name)?;
+    validate_single_component(dst_name)?;
+    windows::rename_no_replace_write_through_same_parent(final_parent, src_name, dst_name)
+}
+
 /// Same final-parent handle; atomically replaces `dst_name` when it already exists.
 pub(crate) fn rename_replace_same_parent(
     final_parent: &DirHandle,
