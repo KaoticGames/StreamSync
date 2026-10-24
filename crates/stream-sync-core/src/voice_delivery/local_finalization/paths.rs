@@ -10,8 +10,12 @@ use crate::voice_delivery::finalized_manifest::{
 };
 use crate::voice_delivery::fs::DestRoot;
 use crate::voice_delivery::identity::DeliveryImmutableIdentity;
+use crate::voice_delivery::ids::delivery_opaque_dir_id;
+use crate::voice_delivery::manifest::ValidatedManifest;
 use crate::voice_delivery::records::ledger_generation::read_highest_valid_in_opaque_dir;
-use crate::voice_delivery::recovery_report::recovery_report_spec_from_manifest;
+use crate::voice_delivery::recovery_report::{
+    recovery_report_spec_from_manifest, RecoveryReportSpec,
+};
 use crate::voice_delivery::session::DeliverySessionGuard;
 use crate::voice_delivery::state::LedgerState;
 use std::path::{Path, PathBuf};
@@ -28,6 +32,9 @@ pub struct DurablePublicationAuthority {
     pub paths: PublishedSessionPaths,
     pub output_manifest_digest: String,
     pub manifest: SyndicateFinalizedManifest,
+    pub(crate) ledger_identity: DeliveryImmutableIdentity,
+    pub(crate) validated_manifest: ValidatedManifest,
+    pub(crate) recovery_report: Option<RecoveryReportSpec>,
 }
 
 pub fn validate_path_under_parent(parent: &Path, candidate: &Path) -> Result<PathBuf, String> {
@@ -64,51 +71,60 @@ fn resolve_from_ledger(
     recording_parent: &Path,
     session_id: &str,
 ) -> Result<DurablePublicationAuthority, String> {
-    let root = DestRoot::open(recording_parent).map_err(|e| e.to_string())?;
+    const UNAVAILABLE: &str = "ledger publication authority unavailable";
+
+    let root = DestRoot::open(recording_parent).map_err(|_| UNAVAILABLE.to_string())?;
     let control = root
         .handle()
         .open_child_dir(".streamsync-control")
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| UNAVAILABLE.to_string())?;
     let ledgers = control
         .open_child_dir("ledgers")
-        .map_err(|e| e.to_string())?;
-    for opaque in ledgers.list_child_names().map_err(|e| e.to_string())? {
-        let ledger_dir = ledgers.open_child_dir(&opaque).map_err(|e| e.to_string())?;
-        let record = match read_highest_valid_in_opaque_dir(&ledger_dir) {
-            Ok(Some(r)) => r,
-            _ => continue,
-        };
-        if record.state != LedgerState::Published || record.delivery_uuid != session_id {
-            continue;
-        }
-        let identity =
-            DeliveryImmutableIdentity::from_ledger_record(&record).map_err(|e| e.to_string())?;
-        let binding = read_api_binding(&ledger_dir, &identity).map_err(|e| e.to_string())?;
-        let (validated_manifest, id) =
-            bind_delivery_identity(&binding.manifest, &identity.manifest_digest)
-                .map_err(|e| e.to_string())?;
-        let finalized_manifest = binding.manifest.clone();
-        let recovery =
-            recovery_report_spec_from_manifest(finalized_manifest.recovery_report.as_ref());
-        let guard = DeliverySessionGuard::begin_for_recovery(
-            DestRoot::open(recording_parent).map_err(|e| e.to_string())?,
-            id,
-            validated_manifest,
-            recovery,
-            true,
-        )
-        .map_err(|e| e.to_string())?;
-        let published = resolve_published_paths(recording_parent, &guard);
-        return Ok(DurablePublicationAuthority {
-            paths: PublishedSessionPaths {
-                final_session_dir: published.final_session_dir,
-                recovery_report_path: published.recovery_report_path,
-            },
-            output_manifest_digest: identity.manifest_digest.clone(),
-            manifest: finalized_manifest,
-        });
+        .map_err(|_| UNAVAILABLE.to_string())?;
+
+    let opaque = delivery_opaque_dir_id(session_id);
+    let ledger_dir = ledgers
+        .open_child_dir(&opaque)
+        .map_err(|_| UNAVAILABLE.to_string())?;
+
+    let record = read_highest_valid_in_opaque_dir(&ledger_dir)
+        .map_err(|_| UNAVAILABLE.to_string())?
+        .filter(|r| r.state == LedgerState::Published && r.delivery_uuid == session_id)
+        .ok_or_else(|| UNAVAILABLE.to_string())?;
+
+    let ledger_identity = DeliveryImmutableIdentity::from_ledger_record(&record)
+        .map_err(|_| UNAVAILABLE.to_string())?;
+    let binding =
+        read_api_binding(&ledger_dir, &ledger_identity).map_err(|_| UNAVAILABLE.to_string())?;
+    let (validated_manifest, manifest_identity) =
+        bind_delivery_identity(&binding.manifest, &ledger_identity.manifest_digest)
+            .map_err(|_| UNAVAILABLE.to_string())?;
+    if ledger_identity != manifest_identity {
+        return Err(UNAVAILABLE.into());
     }
-    Err("not found".into())
+
+    let finalized_manifest = binding.manifest.clone();
+    let recovery = recovery_report_spec_from_manifest(finalized_manifest.recovery_report.as_ref());
+    let guard = DeliverySessionGuard::begin_for_recovery(
+        DestRoot::open(recording_parent).map_err(|_| UNAVAILABLE.to_string())?,
+        ledger_identity.clone(),
+        validated_manifest.clone(),
+        recovery.clone(),
+        true,
+    )
+    .map_err(|_| UNAVAILABLE.to_string())?;
+    let published = resolve_published_paths(recording_parent, &guard);
+    Ok(DurablePublicationAuthority {
+        paths: PublishedSessionPaths {
+            final_session_dir: published.final_session_dir,
+            recovery_report_path: published.recovery_report_path,
+        },
+        output_manifest_digest: manifest_identity.manifest_digest.clone(),
+        manifest: finalized_manifest,
+        ledger_identity,
+        validated_manifest,
+        recovery_report: recovery,
+    })
 }
 
 fn resolve_from_local_manifest(

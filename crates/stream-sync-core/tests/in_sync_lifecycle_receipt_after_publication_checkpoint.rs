@@ -6,6 +6,7 @@
 #![cfg(feature = "local-opus-native")]
 
 use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -383,6 +384,36 @@ fn receipt_intent_path(store: &LocalJournalStore) -> std::path::PathBuf {
 
 fn receipt_ack_path(store: &LocalJournalStore) -> std::path::PathBuf {
     store.session_root().join("receipt-ack.json")
+}
+
+fn streamsync_ledgers_dir(recording_parent: &Path) -> std::path::PathBuf {
+    recording_parent.join(".streamsync-control").join("ledgers")
+}
+
+fn list_ledger_opaque_children(ledgers_dir: &Path) -> Vec<String> {
+    std::fs::read_dir(ledgers_dir)
+        .expect("ledgers directory must exist")
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            if !entry.file_type().ok()?.is_dir() {
+                return None;
+            }
+            Some(entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+fn alternate_safe_opaque_basename(canonical: &str) -> String {
+    assert_eq!(
+        canonical.len(),
+        64,
+        "ledger opaque directory basename must be a 64-char SHA-256 hex digest"
+    );
+    let mut alternate = canonical.to_string();
+    let last = alternate.pop().expect("non-empty basename");
+    let flipped = if last == '0' { '1' } else { '0' };
+    alternate.push(flipped);
+    alternate
 }
 
 #[test]
@@ -1033,6 +1064,449 @@ fn receipt_only_recovery_must_not_trust_receipt_stem_hashes_over_ledger_authorit
     assert_eq!(
         paths_after_tamper.final_session_dir, published_paths.final_session_dir,
         "tampered receipt recovery must not create a second published session directory"
+    );
+}
+
+/// Regression: receipt-only recovery must bind publication authority to the canonical ledger
+/// opaque directory for the complete delivery identity, not any child whose record matches
+/// `delivery_uuid == session_id`.
+#[test]
+fn receipt_only_recovery_must_require_canonical_ledger_opaque_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manifest = sample_manifest();
+    let segment_body = valid_segment_body();
+    let digest = compute_local_finalization_manifest_digest(&manifest);
+    let client = ReceiptAfterPublicationClient::new(manifest.clone(), segment_body);
+    let controls = LocalFinalizationControls::default();
+    let orch = LocalFinalizationOrchestrator::open_with_controls(tmp.path(), DEVICE_ID, controls);
+    let store = LocalJournalStore::open(tmp.path(), SESSION_ID).expect("open store");
+    let pending = LocalPendingItem {
+        session_id: SESSION_ID.into(),
+        manifest_digest: digest,
+        sealed_at_ms: 1,
+    };
+
+    let first = orch
+        .process_pending(&client, &pending)
+        .expect_err("receipt failure after publication must abort the first run");
+    assert!(
+        matches!(first, LocalOrchestratorError::Client(_)),
+        "expected client error after receipt failure, got {first:?}"
+    );
+
+    let published_paths =
+        resolve_canonical_session_paths(tmp.path(), SESSION_ID).expect("published ledger");
+    assert!(
+        published_paths.final_session_dir.is_dir(),
+        "publication must be durably committed before ledger namespace tamper"
+    );
+    let receipt_state = store
+        .load_receipt_durable_state()
+        .expect("load receipt durable state");
+    assert!(
+        receipt_state.intent.is_some(),
+        "durable receipt intent must exist after first run"
+    );
+    assert!(
+        receipt_state.ack.is_none(),
+        "receipt must remain unacknowledged after failed POST"
+    );
+    assert_eq!(
+        client.receipt_attempts().len(),
+        1,
+        "first run must record exactly one receipt POST attempt"
+    );
+    assert!(
+        client.receipt_acknowledgements().is_empty(),
+        "failed receipt POST must not count as an acknowledged receipt"
+    );
+    let _ = orch.drain_events();
+
+    let ledgers_dir = streamsync_ledgers_dir(tmp.path());
+    let children_before = list_ledger_opaque_children(&ledgers_dir);
+    assert_eq!(
+        children_before.len(),
+        1,
+        "canonical publication must create exactly one ledger opaque child; got {children_before:?}"
+    );
+    let canonical_opaque_basename = children_before[0].clone();
+    let canonical_ledger_dir = ledgers_dir.join(&canonical_opaque_basename);
+    assert!(
+        canonical_ledger_dir.is_dir(),
+        "canonical ledger directory must exist at {canonical_ledger_dir:?}"
+    );
+
+    let noncanonical_opaque_basename = alternate_safe_opaque_basename(&canonical_opaque_basename);
+    assert_ne!(
+        noncanonical_opaque_basename, canonical_opaque_basename,
+        "noncanonical ledger basename must differ from canonical opaque directory id"
+    );
+    let noncanonical_ledger_dir = ledgers_dir.join(&noncanonical_opaque_basename);
+    std::fs::rename(&canonical_ledger_dir, &noncanonical_ledger_dir).expect(
+        "rename ledger directory namespace without mutating ledger record or publication artifacts",
+    );
+    assert!(
+        !canonical_ledger_dir.exists(),
+        "canonical ledger path must be absent after rename"
+    );
+    assert!(
+        noncanonical_ledger_dir.is_dir(),
+        "ledger record must remain intact under renamed opaque directory"
+    );
+    let children_after_rename = list_ledger_opaque_children(&ledgers_dir);
+    assert_eq!(
+        children_after_rename,
+        vec![noncanonical_opaque_basename.clone()],
+        "only the renamed noncanonical ledger child may remain"
+    );
+
+    let second = orch
+        .process_pending(&client, &pending)
+        .expect_err(
+            "receipt-only recovery must fail closed when ledger directory is not in canonical namespace",
+        );
+    assert!(
+        matches!(second, LocalOrchestratorError::StoreConflict),
+        "expected terminal store conflict for noncanonical ledger namespace, got {second:?}"
+    );
+    assert_ne!(orch.phase(), LocalFinalizationPhase::Complete);
+
+    assert_eq!(
+        client.receipt_attempts().len(),
+        1,
+        "noncanonical ledger namespace must not trigger generation-2 receipt POST"
+    );
+    assert!(
+        client.receipt_acknowledgements().is_empty(),
+        "noncanonical ledger namespace must not acknowledge receipt locally"
+    );
+    assert_eq!(
+        client.claim_generations(),
+        vec![1, 2],
+        "re-entry must claim generation 2 before failing closed"
+    );
+
+    let events_after_rename = orch.drain_events();
+    assert_eq!(
+        publication_complete_count(&events_after_rename),
+        0,
+        "ledger namespace tamper must not re-publish; got {events_after_rename:?}"
+    );
+    assert_eq!(
+        processing_started_count(&events_after_rename),
+        0,
+        "ledger namespace tamper must not start processing; got {events_after_rename:?}"
+    );
+    assert_eq!(
+        receipt_acknowledged_count(&events_after_rename),
+        0,
+        "ledger namespace tamper must not emit ReceiptAcknowledged; got {events_after_rename:?}"
+    );
+
+    assert!(
+        published_paths.final_session_dir.is_dir(),
+        "ledger namespace tamper must not create a second published session directory; original final session dir must remain at {:?}",
+        published_paths.final_session_dir
+    );
+    assert!(
+        store
+            .load_receipt_durable_state()
+            .expect("receipt state")
+            .ack
+            .is_none(),
+        "failed closed recovery must not persist receipt ack"
+    );
+}
+
+const UNEXPECTED_SESSION_INTRUDER_FILENAME: &str =
+    "lifecycle-receipt-exact-membership-intruder.bin";
+const UNEXPECTED_SESSION_INTRUDER_BYTES: &[u8] =
+    b"fixed-harmless-intruder-for-exact-membership-regression";
+
+/// Regression: receipt-only recovery must reject published session directories whose on-disk
+/// membership is not exactly the marker-bound canonical publication (unexpected ordinary files).
+#[test]
+fn receipt_only_recovery_must_reject_unexpected_final_session_directory_members() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manifest = sample_manifest();
+    let segment_body = valid_segment_body();
+    let digest = compute_local_finalization_manifest_digest(&manifest);
+    let client = ReceiptAfterPublicationClient::new(manifest.clone(), segment_body);
+    let controls = LocalFinalizationControls::default();
+    let orch = LocalFinalizationOrchestrator::open_with_controls(tmp.path(), DEVICE_ID, controls);
+    let store = LocalJournalStore::open(tmp.path(), SESSION_ID).expect("open store");
+    let pending = LocalPendingItem {
+        session_id: SESSION_ID.into(),
+        manifest_digest: digest,
+        sealed_at_ms: 1,
+    };
+
+    let first = orch
+        .process_pending(&client, &pending)
+        .expect_err("receipt failure after publication must abort the first run");
+    assert!(
+        matches!(first, LocalOrchestratorError::Client(_)),
+        "expected client error after receipt failure, got {first:?}"
+    );
+
+    let published_paths =
+        resolve_canonical_session_paths(tmp.path(), SESSION_ID).expect("published ledger");
+    assert!(
+        published_paths.final_session_dir.is_dir(),
+        "publication must be durably committed before tampering final session directory"
+    );
+    let receipt_state = store
+        .load_receipt_durable_state()
+        .expect("load receipt durable state");
+    assert!(
+        receipt_state.intent.is_some(),
+        "durable receipt intent must exist after first run"
+    );
+    assert!(
+        receipt_state.ack.is_none(),
+        "receipt must remain unacknowledged after failed POST"
+    );
+    assert_eq!(
+        client.receipt_attempts().len(),
+        1,
+        "first run must record exactly one receipt POST attempt"
+    );
+    assert!(
+        client.receipt_acknowledgements().is_empty(),
+        "failed receipt POST must not count as an acknowledged receipt"
+    );
+    let _ = orch.drain_events();
+
+    let intruder_path = published_paths
+        .final_session_dir
+        .join(UNEXPECTED_SESSION_INTRUDER_FILENAME);
+    std::fs::write(&intruder_path, UNEXPECTED_SESSION_INTRUDER_BYTES)
+        .expect("inject unexpected ordinary file into final published session directory");
+    assert!(
+        intruder_path.is_file(),
+        "unexpected intruder file must exist before receipt-only recovery"
+    );
+
+    let second = orch
+        .process_pending(&client, &pending)
+        .expect_err(
+            "receipt-only recovery must fail closed when final session directory has unexpected members",
+        );
+    assert!(
+        matches!(second, LocalOrchestratorError::StoreConflict),
+        "expected terminal store conflict for unexpected directory membership, got {second:?}"
+    );
+    assert_ne!(orch.phase(), LocalFinalizationPhase::Complete);
+
+    assert_eq!(
+        client.receipt_attempts().len(),
+        1,
+        "unexpected directory member must not trigger generation-2 receipt POST"
+    );
+    assert!(
+        client.receipt_acknowledgements().is_empty(),
+        "unexpected directory member must not acknowledge receipt locally"
+    );
+    assert_eq!(
+        client.claim_generations(),
+        vec![1, 2],
+        "re-entry must claim generation 2 before failing closed"
+    );
+
+    let events_after_tamper = orch.drain_events();
+    assert_eq!(
+        publication_complete_count(&events_after_tamper),
+        0,
+        "unexpected membership tamper must not re-publish; got {events_after_tamper:?}"
+    );
+    assert_eq!(
+        processing_started_count(&events_after_tamper),
+        0,
+        "unexpected membership tamper must not start processing; got {events_after_tamper:?}"
+    );
+    assert_eq!(
+        receipt_acknowledged_count(&events_after_tamper),
+        0,
+        "unexpected membership tamper must not emit ReceiptAcknowledged; got {events_after_tamper:?}"
+    );
+
+    let paths_after_tamper =
+        resolve_canonical_session_paths(tmp.path(), SESSION_ID).expect("published paths");
+    assert_eq!(
+        paths_after_tamper.final_session_dir, published_paths.final_session_dir,
+        "unexpected membership tamper must not create a second published session directory"
+    );
+    assert!(
+        published_paths.final_session_dir.is_dir(),
+        "canonical publication must remain present after failed closed recovery"
+    );
+    assert!(
+        store
+            .load_receipt_durable_state()
+            .expect("receipt state")
+            .ack
+            .is_none(),
+        "failed closed recovery must not persist receipt ack"
+    );
+}
+
+/// Regression: receipt-only recovery must not follow symlinks when verifying authoritative WAV
+/// artifacts (no-follow / exact canonical publication membership).
+#[cfg(unix)]
+#[test]
+fn receipt_only_recovery_must_not_follow_symlinked_authoritative_wav_artifacts() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manifest = sample_manifest();
+    let segment_body = valid_segment_body();
+    let digest = compute_local_finalization_manifest_digest(&manifest);
+    let client = ReceiptAfterPublicationClient::new(manifest.clone(), segment_body);
+    let controls = LocalFinalizationControls::default();
+    let orch = LocalFinalizationOrchestrator::open_with_controls(tmp.path(), DEVICE_ID, controls);
+    let store = LocalJournalStore::open(tmp.path(), SESSION_ID).expect("open store");
+    let pending = LocalPendingItem {
+        session_id: SESSION_ID.into(),
+        manifest_digest: digest,
+        sealed_at_ms: 1,
+    };
+
+    let first = orch
+        .process_pending(&client, &pending)
+        .expect_err("receipt failure after publication must abort the first run");
+    assert!(
+        matches!(first, LocalOrchestratorError::Client(_)),
+        "expected client error after receipt failure, got {first:?}"
+    );
+
+    let published_paths =
+        resolve_canonical_session_paths(tmp.path(), SESSION_ID).expect("published ledger");
+    assert!(
+        published_paths.final_session_dir.is_dir(),
+        "publication must be durably committed before symlink tamper"
+    );
+    let receipt_state = store
+        .load_receipt_durable_state()
+        .expect("load receipt durable state");
+    assert!(
+        receipt_state.intent.is_some(),
+        "durable receipt intent must exist after first run"
+    );
+    assert!(
+        receipt_state.ack.is_none(),
+        "receipt must remain unacknowledged after failed POST"
+    );
+    assert_eq!(
+        client.receipt_attempts().len(),
+        1,
+        "first run must record exactly one receipt POST attempt"
+    );
+    assert!(
+        client.receipt_acknowledgements().is_empty(),
+        "failed receipt POST must not count as an acknowledged receipt"
+    );
+    let canonical_receipt = client.receipt_attempts()[0].receipt.clone();
+    assert_eq!(
+        canonical_receipt.stems.len(),
+        1,
+        "fixture must publish exactly one canonical WAV stem"
+    );
+    let stem_meta = &canonical_receipt.stems[0];
+    let _ = orch.drain_events();
+
+    let canonical_wav_path = published_paths
+        .final_session_dir
+        .join(&stem_meta.relative_path);
+    assert!(
+        canonical_wav_path.is_file(),
+        "canonical published WAV must exist at receipt stem relativePath"
+    );
+    let canonical_wav_bytes =
+        std::fs::read(&canonical_wav_path).expect("read canonical published WAV bytes");
+    let external_same_byte_copy = tmp
+        .path()
+        .join("external-same-byte-wav-copy-for-symlink-regression.wav");
+    std::fs::write(&external_same_byte_copy, &canonical_wav_bytes)
+        .expect("copy authoritative WAV bytes outside final session directory");
+    assert!(
+        !external_same_byte_copy.starts_with(&published_paths.final_session_dir),
+        "same-byte copy must live outside the final published session directory"
+    );
+    std::fs::remove_file(&canonical_wav_path).expect("remove canonical WAV before symlink install");
+    symlink(&external_same_byte_copy, &canonical_wav_path)
+        .expect("install symlink at canonical WAV path pointing to external same-byte copy");
+    assert!(
+        canonical_wav_path.is_symlink(),
+        "canonical WAV path must be a symlink after tamper"
+    );
+    let symlink_target_sha = sha256_hex_reader(
+        std::fs::File::open(&canonical_wav_path).expect("ambient open follows symlink"),
+        DEFAULT_STREAM_CHUNK,
+    )
+    .expect("hash symlink target via ambient open");
+    assert_eq!(
+        symlink_target_sha, stem_meta.sha256,
+        "symlink must preserve exact authoritative WAV bytes/hash for ambient verification"
+    );
+
+    let second = orch.process_pending(&client, &pending).expect_err(
+        "receipt-only recovery must fail closed when authoritative WAV is only a symlink",
+    );
+    assert!(
+        matches!(second, LocalOrchestratorError::StoreConflict),
+        "expected terminal store conflict for symlinked authoritative WAV, got {second:?}"
+    );
+    assert_ne!(orch.phase(), LocalFinalizationPhase::Complete);
+
+    assert_eq!(
+        client.receipt_attempts().len(),
+        1,
+        "symlink tamper must not trigger generation-2 receipt POST"
+    );
+    assert!(
+        client.receipt_acknowledgements().is_empty(),
+        "symlink tamper must not acknowledge receipt locally"
+    );
+    assert_eq!(
+        client.claim_generations(),
+        vec![1, 2],
+        "re-entry must claim generation 2 before failing closed"
+    );
+
+    let events_after_tamper = orch.drain_events();
+    assert_eq!(
+        publication_complete_count(&events_after_tamper),
+        0,
+        "symlink tamper must not re-publish; got {events_after_tamper:?}"
+    );
+    assert_eq!(
+        processing_started_count(&events_after_tamper),
+        0,
+        "symlink tamper must not start processing; got {events_after_tamper:?}"
+    );
+    assert_eq!(
+        receipt_acknowledged_count(&events_after_tamper),
+        0,
+        "symlink tamper must not emit ReceiptAcknowledged; got {events_after_tamper:?}"
+    );
+
+    let paths_after_tamper =
+        resolve_canonical_session_paths(tmp.path(), SESSION_ID).expect("published paths");
+    assert_eq!(
+        paths_after_tamper.final_session_dir, published_paths.final_session_dir,
+        "symlink tamper must not create a second published session directory"
+    );
+    assert!(
+        published_paths.final_session_dir.is_dir(),
+        "canonical publication directory must remain present after failed closed recovery"
+    );
+    assert!(
+        store
+            .load_receipt_durable_state()
+            .expect("receipt state")
+            .ack
+            .is_none(),
+        "failed closed recovery must not persist receipt ack"
     );
 }
 

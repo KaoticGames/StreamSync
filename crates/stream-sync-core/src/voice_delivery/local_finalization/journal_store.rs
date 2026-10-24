@@ -11,6 +11,8 @@ use crate::voice_delivery::fs::durability::sync_dir_exact;
 use crate::voice_delivery::fs::durable_payload::write_durable_payload_create_new;
 use crate::voice_delivery::fs::{rename_no_replace_same_parent, DestRoot, FsError};
 use crate::voice_delivery::hash::{sha256_hex_reader, DEFAULT_STREAM_CHUNK};
+use crate::voice_delivery::publication::verify_final_session_directory;
+use crate::voice_delivery::session::DeliverySessionGuard;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -343,7 +345,7 @@ impl LocalJournalStore {
             resolve_durable_publication_authority(recording_parent, &receipt.session_id)
                 .map_err(|_| JournalStoreError::Conflict)?;
         verify_receipt_against_publication_authority(&authority, receipt)?;
-        verify_published_artifacts_from_authority(&authority)?;
+        verify_published_artifacts_from_authority(recording_parent, &authority)?;
         Ok(())
     }
 }
@@ -411,26 +413,25 @@ fn verify_receipt_recovery_report_matches_authority(
 }
 
 fn verify_published_artifacts_from_authority(
+    recording_parent: &Path,
     authority: &DurablePublicationAuthority,
 ) -> Result<(), JournalStoreError> {
-    let session_dir = &authority.paths.final_session_dir;
-    if !session_dir.is_dir() {
-        return Err(JournalStoreError::Conflict);
-    }
-    for stem in &authority.manifest.stems {
-        let file_path = session_dir.join(&stem.wav_relative_path);
-        verify_file_digest(&file_path, stem.wav_bytes, &stem.sha256)?;
-    }
-    if let Some(report) = authority.manifest.recovery_report.as_ref() {
-        let file_path = authority
-            .paths
-            .recovery_report_path
-            .as_ref()
-            .filter(|p| p.is_file())
-            .cloned()
-            .unwrap_or_else(|| session_dir.join(&report.relative_path));
-        verify_file_digest(&file_path, report.byte_length, &report.sha256)?;
-    }
+    let root = DestRoot::open(recording_parent).map_err(|_| JournalStoreError::Conflict)?;
+    let guard = DeliverySessionGuard::begin_for_recovery(
+        root,
+        authority.ledger_identity.clone(),
+        authority.validated_manifest.clone(),
+        authority.recovery_report.clone(),
+        true,
+    )
+    .map_err(|_| JournalStoreError::Conflict)?;
+    verify_final_session_directory(
+        guard.final_parent_dir(),
+        guard.identity(),
+        guard.manifest(),
+        guard.recovery_report(),
+    )
+    .map_err(|_| JournalStoreError::Conflict)?;
     Ok(())
 }
 
@@ -487,7 +488,10 @@ fn persist_receipt_create_new(
             let _ = dir.remove_child_file(&stage_name);
             let existing_bytes = dir.read_file_all(dest_name).map_err(journal_from_fs)?;
             match parse_receipt_bytes(&existing_bytes) {
-                Ok(existing) if existing == *receipt => Ok(()),
+                Ok(existing) if existing == *receipt => {
+                    sync_dir_exact(dir).map_err(journal_from_fs)?;
+                    Ok(())
+                }
                 _ => Err(JournalStoreError::Conflict),
             }
         }
@@ -496,27 +500,6 @@ fn persist_receipt_create_new(
             Err(journal_from_fs(e))
         }
     }
-}
-
-fn verify_file_digest(
-    path: &Path,
-    expected_len: u64,
-    expected_sha: &str,
-) -> Result<(), JournalStoreError> {
-    if !path.is_file() {
-        return Err(JournalStoreError::Conflict);
-    }
-    let meta = std::fs::metadata(path)?;
-    if meta.len() != expected_len {
-        return Err(JournalStoreError::Conflict);
-    }
-    let file = File::open(path)?;
-    let sha = sha256_hex_reader(file, DEFAULT_STREAM_CHUNK)
-        .map_err(|e| JournalStoreError::Other(e.to_string()))?;
-    if sha != expected_sha {
-        return Err(JournalStoreError::Conflict);
-    }
-    Ok(())
 }
 
 fn parse_checkpoint_file(path: &Path) -> Result<DownloadCheckpoint, JournalStoreError> {
@@ -944,6 +927,31 @@ mod preflight_tests {
         manifest: crate::voice_delivery::finalized_manifest::SyndicateFinalizedManifest,
         digest: &str,
     ) -> DurablePublicationAuthority {
+        use crate::voice_delivery::identity::DeliveryImmutableIdentity;
+        use crate::voice_delivery::manifest::{StemManifestEntry, ValidatedManifest};
+
+        let validated_manifest = ValidatedManifest {
+            schema_version: 1,
+            stems: manifest
+                .stems
+                .iter()
+                .map(|s| StemManifestEntry {
+                    file_name: s.wav_relative_path.clone(),
+                    byte_count: s.wav_bytes,
+                    sha256: s.sha256.clone(),
+                })
+                .collect(),
+        };
+        let ledger_identity = DeliveryImmutableIdentity::new_bound(
+            &manifest.session_id,
+            digest,
+            &validated_manifest,
+            ".streamsync-stage-deadbeefdeadbeefdeadbeefdeadbeef",
+            vec![],
+            "final-only",
+            None,
+        )
+        .expect("sample publication authority identity");
         let recovery_report_path = manifest
             .recovery_report
             .as_ref()
@@ -955,6 +963,9 @@ mod preflight_tests {
             },
             output_manifest_digest: digest.to_string(),
             manifest,
+            ledger_identity,
+            validated_manifest,
+            recovery_report: None,
         }
     }
 
@@ -1120,10 +1131,13 @@ mod preflight_tests {
             super::verify_receipt_against_publication_authority(&authority, &receipt),
             Err(JournalStoreError::Conflict)
         ));
-        assert!(matches!(
-            super::verify_published_artifacts_from_authority(&authority),
-            Ok(())
-        ));
+        assert!(
+            matches!(
+                super::verify_published_artifacts_from_authority(tmp.path(), &authority),
+                Err(JournalStoreError::Conflict)
+            ),
+            "unexpected directory members must fail canonical publication verification"
+        );
     }
 
     #[test]
@@ -1136,6 +1150,52 @@ mod preflight_tests {
         assert_eq!(state.intent.as_ref(), Some(&receipt));
         assert!(state.ack.is_none());
         store.persist_receipt_intent(&receipt).unwrap();
+    }
+
+    /// Regression (HIGH): identical receipt AlreadyExists collision must re-sync the session
+    /// directory before reporting idempotent Ok; otherwise durability can be skipped permanently.
+    #[test]
+    fn receipt_intent_identical_collision_requires_dir_sync_before_ok() {
+        use crate::voice_delivery::fs::durability::fail_next_sync_dir_exact::{
+            install_fail_next_sync_dir_exact, INJECTED_MESSAGE,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let receipt = sample_receipt("550e8400-e29b-41d4-a716-446655440099");
+        store.persist_receipt_intent(&receipt).unwrap();
+
+        let _guard = install_fail_next_sync_dir_exact();
+        let err = store
+            .persist_receipt_intent(&receipt)
+            .expect_err("identical intent replay must sync directory before Ok");
+        assert!(
+            matches!(&err, JournalStoreError::Io(io) if io.to_string().contains(INJECTED_MESSAGE)),
+            "expected injected sync_dir_exact durability error, got {err:?}"
+        );
+    }
+
+    /// Same collision-path durability requirement for acknowledgement installs.
+    #[test]
+    fn receipt_ack_identical_collision_requires_dir_sync_before_ok() {
+        use crate::voice_delivery::fs::durability::fail_next_sync_dir_exact::{
+            install_fail_next_sync_dir_exact, INJECTED_MESSAGE,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let receipt = sample_receipt("550e8400-e29b-41d4-a716-446655440099");
+        store.persist_receipt_intent(&receipt).unwrap();
+        store.persist_receipt_ack(&receipt).unwrap();
+
+        let _guard = install_fail_next_sync_dir_exact();
+        let err = store
+            .persist_receipt_ack(&receipt)
+            .expect_err("identical ack replay must sync directory before Ok");
+        assert!(
+            matches!(&err, JournalStoreError::Io(io) if io.to_string().contains(INJECTED_MESSAGE)),
+            "expected injected sync_dir_exact durability error, got {err:?}"
+        );
     }
 
     #[test]

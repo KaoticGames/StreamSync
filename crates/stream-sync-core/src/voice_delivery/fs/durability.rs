@@ -21,6 +21,11 @@ pub fn sync_file(file: &VoiceFile) -> Result<(), FsError> {
 
 /// `fsync` the supplied directory handle on Linux; Windows reports `Unavailable` (no faux dir flush).
 pub fn sync_dir_exact(dir: &DirHandle) -> Result<NamespaceDurability, FsError> {
+    #[cfg(test)]
+    if let Some(err) = fail_next_sync_dir_exact::take_armed_failure() {
+        return Err(err);
+    }
+
     #[cfg(target_os = "linux")]
     {
         rustix::fs::fsync(dir.as_fd()).map_err(|e| FsError::Io(e.into()))?;
@@ -40,6 +45,57 @@ pub fn sync_dir_exact(dir: &DirHandle) -> Result<NamespaceDurability, FsError> {
     {
         let _ = dir;
         Err(FsError::Unsupported)
+    }
+}
+
+/// Test-only: fail the next `sync_dir_exact` on the installing thread (crate unit tests).
+#[cfg(test)]
+pub(crate) mod fail_next_sync_dir_exact {
+    use super::FsError;
+    use std::cell::RefCell;
+    use std::io;
+
+    /// Stable synthetic error returned when the armed injection fires (test-only).
+    pub(crate) const INJECTED_MESSAGE: &str = "injected fail-next sync_dir_exact (test only)";
+
+    thread_local! {
+        static ARMED: RefCell<bool> = const { RefCell::new(false) };
+    }
+
+    fn synthetic_fs_error() -> FsError {
+        FsError::Io(io::Error::other(INJECTED_MESSAGE))
+    }
+
+    pub(crate) fn take_armed_failure() -> Option<FsError> {
+        ARMED.with(|cell| {
+            if *cell.borrow() {
+                *cell.borrow_mut() = false;
+                Some(synthetic_fs_error())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// RAII guard: disarms any still-pending injection when dropped (panic-safe).
+    pub(crate) struct FailNextSyncDirExactGuard;
+
+    impl Drop for FailNextSyncDirExactGuard {
+        fn drop(&mut self) {
+            ARMED.with(|cell| {
+                *cell.borrow_mut() = false;
+            });
+        }
+    }
+
+    pub(crate) fn install_fail_next_sync_dir_exact() -> FailNextSyncDirExactGuard {
+        ARMED.with(|cell| {
+            if *cell.borrow() {
+                panic!("duplicate fail-next sync_dir_exact injection on the current thread");
+            }
+            *cell.borrow_mut() = true;
+        });
+        FailNextSyncDirExactGuard
     }
 }
 
@@ -78,5 +134,32 @@ mod tests {
             sync_dir_exact(&parent).expect("sync"),
             NamespaceDurability::Unavailable
         );
+    }
+
+    #[test]
+    fn fail_next_sync_dir_exact_consumes_once_then_succeeds() {
+        use super::fail_next_sync_dir_exact::{install_fail_next_sync_dir_exact, INJECTED_MESSAGE};
+
+        let (_tmp, parent) = temp_final_parent();
+        let _guard = install_fail_next_sync_dir_exact();
+        let err = sync_dir_exact(&parent).expect_err("injected failure");
+        assert!(
+            matches!(&err, FsError::Io(io) if io.to_string().contains(INJECTED_MESSAGE)),
+            "unexpected injected error: {err:?}"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            sync_dir_exact(&parent).expect("second sync after consume"),
+            NamespaceDurability::Proven
+        );
+    }
+
+    #[test]
+    #[should_panic = "duplicate fail-next sync_dir_exact injection on the current thread"]
+    fn fail_next_sync_dir_exact_rejects_duplicate_install() {
+        use super::fail_next_sync_dir_exact::install_fail_next_sync_dir_exact;
+
+        let _first = install_fail_next_sync_dir_exact();
+        let _second = install_fail_next_sync_dir_exact();
     }
 }
