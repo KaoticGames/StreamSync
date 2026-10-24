@@ -203,12 +203,6 @@ impl LocalFinalizationOrchestrator {
                 ));
             }
 
-            if let Err(pref) =
-                LocalJournalStore::run_storage_preflight(&self.parent, &manifest, 512 * 1024 * 1024)
-            {
-                return Err(LocalOrchestratorError::StoragePreflight(pref));
-            }
-
             let store = LocalJournalStore::open(&self.parent, &manifest.session_id)
                 .map_err(map_journal_store_err)?;
             store
@@ -454,6 +448,13 @@ impl LocalFinalizationOrchestrator {
         }
 
         self.set_phase(LocalFinalizationPhase::Receipting);
+        #[cfg(debug_assertions)]
+        super::post_publication_receipt_gate::pause_post_publication_receipt_gate(
+            &self.parent,
+            &manifest.session_id,
+            super::post_publication_receipt_gate::PostPublicationReceiptBoundary::BeforeReceiptReplayPost,
+        );
+        lease.fence_lease_authority(client, &self.device_id)?;
         client
             .post_receipt(&manifest.session_id, &intent, lease.proof())
             .map_err(LocalOrchestratorError::Client)?;
@@ -540,6 +541,13 @@ impl LocalFinalizationOrchestrator {
                 .recovery_report_path
                 .map(|p| p.to_string_lossy().to_string()),
         });
+        #[cfg(debug_assertions)]
+        super::post_publication_receipt_gate::pause_post_publication_receipt_gate(
+            &self.parent,
+            &manifest.session_id,
+            super::post_publication_receipt_gate::PostPublicationReceiptBoundary::AfterPublicationBeforeReceiptIntent,
+        );
+        lease.fence_lease_authority(client, &self.device_id)?;
         self.set_phase(LocalFinalizationPhase::Receipting);
         let receipt = LocalFinalizationReceipt {
             version: 1,
@@ -578,6 +586,7 @@ impl LocalFinalizationOrchestrator {
         store
             .persist_receipt_intent(&receipt)
             .map_err(map_journal_store_err)?;
+        lease.fence_lease_authority(client, &self.device_id)?;
         client
             .post_receipt(&manifest.session_id, &receipt, lease.proof())
             .map_err(LocalOrchestratorError::Client)?;
@@ -616,7 +625,7 @@ fn map_journal_store_err(e: JournalStoreError) -> LocalOrchestratorError {
 struct LeaseSession<C: LocalFinalizationClient + Clone> {
     session_id: String,
     proof: LeaseProof,
-    _expires_at_ms: i64,
+    expires_at_ms: i64,
     keeper: Option<LeaseKeeper>,
     receipt_posted: bool,
     _client: C,
@@ -635,10 +644,30 @@ impl<C: LocalFinalizationClient + Clone + 'static> LeaseSession<C> {
         Self {
             session_id: grant.session_id,
             proof,
-            _expires_at_ms: grant.expires_at_ms,
+            expires_at_ms: grant.expires_at_ms,
             keeper: Some(keeper),
             receipt_posted: false,
             _client: client,
+        }
+    }
+
+    /// Synchronous lease-authority fence at receipt boundaries (not the background keeper interval).
+    fn fence_lease_authority(
+        &mut self,
+        client: &C,
+        device_id: &str,
+    ) -> Result<(), LocalOrchestratorError> {
+        if self.keeper.as_ref().is_some_and(|k| k.renew_failed()) {
+            return Err(LocalOrchestratorError::Other("lease renewal failed".into()));
+        }
+        match client.renew_lease(&self.session_id, device_id, &self.proof) {
+            Ok(next_expires) => {
+                if let Some(ms) = next_expires {
+                    self.expires_at_ms = ms;
+                }
+                Ok(())
+            }
+            Err(err) => Err(LocalOrchestratorError::Client(err)),
         }
     }
 

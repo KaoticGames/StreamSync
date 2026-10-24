@@ -6,7 +6,7 @@ use super::manifest::{local_manifest_to_syndicate_finalized, parse_local_finaliz
 use crate::voice_delivery::api_binding::read_api_binding;
 use crate::voice_delivery::finalized_manifest::{
     bind_delivery_identity, compute_finalized_manifest_digest, expected_wav_file_bytes,
-    SyndicateFinalizedStem,
+    SyndicateFinalizedManifest, SyndicateFinalizedStem,
 };
 use crate::voice_delivery::fs::DestRoot;
 use crate::voice_delivery::identity::DeliveryImmutableIdentity;
@@ -22,11 +22,12 @@ pub struct PublishedSessionPaths {
     pub recovery_report_path: Option<PathBuf>,
 }
 
-/// Publication paths plus the ledger-bound finalized manifest digest (receipt authority).
+/// Publication paths plus ledger-bound finalized manifest authority for receipt recovery.
 #[derive(Debug, Clone)]
 pub struct DurablePublicationAuthority {
     pub paths: PublishedSessionPaths,
     pub output_manifest_digest: String,
+    pub manifest: SyndicateFinalizedManifest,
 }
 
 pub fn validate_path_under_parent(parent: &Path, candidate: &Path) -> Result<PathBuf, String> {
@@ -83,14 +84,16 @@ fn resolve_from_ledger(
         let identity =
             DeliveryImmutableIdentity::from_ledger_record(&record).map_err(|e| e.to_string())?;
         let binding = read_api_binding(&ledger_dir, &identity).map_err(|e| e.to_string())?;
-        let (manifest, id) = bind_delivery_identity(&binding.manifest, &identity.manifest_digest)
-            .map_err(|e| e.to_string())?;
+        let (validated_manifest, id) =
+            bind_delivery_identity(&binding.manifest, &identity.manifest_digest)
+                .map_err(|e| e.to_string())?;
+        let finalized_manifest = binding.manifest.clone();
         let recovery =
-            recovery_report_spec_from_manifest(binding.manifest.recovery_report.as_ref());
+            recovery_report_spec_from_manifest(finalized_manifest.recovery_report.as_ref());
         let guard = DeliverySessionGuard::begin_for_recovery(
             DestRoot::open(recording_parent).map_err(|e| e.to_string())?,
             id,
-            manifest,
+            validated_manifest,
             recovery,
             true,
         )
@@ -102,6 +105,7 @@ fn resolve_from_ledger(
                 recovery_report_path: published.recovery_report_path,
             },
             output_manifest_digest: identity.manifest_digest.clone(),
+            manifest: finalized_manifest,
         });
     }
     Err("not found".into())

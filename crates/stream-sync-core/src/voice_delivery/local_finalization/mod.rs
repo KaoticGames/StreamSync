@@ -17,6 +17,8 @@ mod opus_packet_duration;
 mod orchestrator;
 mod packet_loss_policy;
 mod paths;
+#[cfg(debug_assertions)]
+mod post_publication_receipt_gate;
 mod processor;
 mod progress;
 mod receipt;
@@ -67,6 +69,13 @@ pub use packet_loss_policy::{
 pub use paths::{
     resolve_canonical_session_paths, validate_path_under_parent, PublishedSessionPaths,
 };
+#[doc(hidden)]
+pub use paths::{resolve_durable_publication_authority, DurablePublicationAuthority};
+#[cfg(debug_assertions)]
+pub use post_publication_receipt_gate::{
+    install_post_publication_receipt_gate, pause_post_publication_receipt_gate,
+    PostPublicationReceiptBoundary, PostPublicationReceiptGateGuard,
+};
 pub use processor::LocalProcessorError;
 pub use progress::{
     BoundedProgressEvents, LocalFinalizationPhase, LocalFinalizationProgressEvent,
@@ -77,6 +86,8 @@ pub use receipt::{
     LocalFinalizationReceipt,
 };
 pub use storage_preflight::{bytes_to_gib, StoragePreflightFailure};
+#[cfg(debug_assertions)]
+pub use storage_preflight::{install_storage_preflight_injection, StoragePreflightInjectGuard};
 pub use synj::{
     encode_journal_file, encode_journal_record, JournalRecord, JOURNAL_FORMAT_VERSION_V2,
 };

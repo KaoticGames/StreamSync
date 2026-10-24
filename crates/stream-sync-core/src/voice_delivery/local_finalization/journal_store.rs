@@ -1,9 +1,15 @@
 //! Durable `.in-sync/<session-id>/` journal ingest under the voice recording parent.
 
 use super::manifest::LocalFinalizationManifest;
-use super::paths::resolve_durable_publication_authority;
-use super::receipt::{parse_local_finalization_receipt, LocalFinalizationReceipt};
+use super::paths::{resolve_durable_publication_authority, DurablePublicationAuthority};
+use super::receipt::{
+    parse_local_finalization_receipt, LocalFinalizationReceipt,
+    LocalFinalizationReceiptRecoveryReport, LocalFinalizationReceiptStem,
+};
 use super::storage_preflight::{storage_preflight, StoragePreflightFailure};
+use crate::voice_delivery::fs::durability::sync_dir_exact;
+use crate::voice_delivery::fs::durable_payload::write_durable_payload_create_new;
+use crate::voice_delivery::fs::{rename_no_replace_same_parent, DestRoot, FsError};
 use crate::voice_delivery::hash::{sha256_hex_reader, DEFAULT_STREAM_CHUNK};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -310,16 +316,7 @@ impl LocalJournalStore {
         &self,
         receipt: &LocalFinalizationReceipt,
     ) -> Result<(), JournalStoreError> {
-        let path = self.session_root.join(RECEIPT_INTENT_FILE);
-        if path.exists() {
-            let existing = load_receipt_file(&path)?;
-            if existing != *receipt {
-                return Err(JournalStoreError::Conflict);
-            }
-            return Ok(());
-        }
-        write_receipt_atomic(&path, receipt)?;
-        Ok(())
+        persist_receipt_create_new(&self.session_root, RECEIPT_INTENT_FILE, receipt)
     }
 
     /// Durable acknowledgement bound to the persisted intent; must match intent exactly.
@@ -335,16 +332,7 @@ impl LocalJournalStore {
         if intent != *receipt {
             return Err(JournalStoreError::Conflict);
         }
-        let ack_path = self.session_root.join(RECEIPT_ACK_FILE);
-        if ack_path.exists() {
-            let existing = load_receipt_file(&ack_path)?;
-            if existing != *receipt {
-                return Err(JournalStoreError::Conflict);
-            }
-            return Ok(());
-        }
-        write_receipt_atomic(&ack_path, receipt)?;
-        Ok(())
+        persist_receipt_create_new(&self.session_root, RECEIPT_ACK_FILE, receipt)
     }
 
     pub fn verify_canonical_publication_matches_receipt(
@@ -354,48 +342,160 @@ impl LocalJournalStore {
         let authority =
             resolve_durable_publication_authority(recording_parent, &receipt.session_id)
                 .map_err(|_| JournalStoreError::Conflict)?;
-        if receipt.output_manifest_digest != authority.output_manifest_digest {
-            return Err(JournalStoreError::Conflict);
-        }
-        let paths = &authority.paths;
-        let session_dir = &paths.final_session_dir;
-        if !session_dir.is_dir() {
-            return Err(JournalStoreError::Conflict);
-        }
-        for stem in &receipt.stems {
-            let file_path = session_dir.join(&stem.relative_path);
-            verify_file_digest(&file_path, stem.byte_length, &stem.sha256)?;
-        }
-        if let Some(report) = &receipt.recovery_report {
-            let file_path = paths
-                .recovery_report_path
-                .as_ref()
-                .filter(|p| p.is_file())
-                .cloned()
-                .unwrap_or_else(|| session_dir.join(&report.relative_path));
-            verify_file_digest(&file_path, report.byte_length, &report.sha256)?;
-        }
+        verify_receipt_against_publication_authority(&authority, receipt)?;
+        verify_published_artifacts_from_authority(&authority)?;
         Ok(())
     }
 }
 
-fn load_receipt_file(path: &Path) -> Result<LocalFinalizationReceipt, JournalStoreError> {
-    let raw = std::fs::read_to_string(path)?;
-    let value: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|_| JournalStoreError::Conflict)?;
-    parse_local_finalization_receipt(&value).map_err(|_| JournalStoreError::Conflict)
-}
-
-fn write_receipt_atomic(
-    path: &Path,
+pub(crate) fn verify_receipt_against_publication_authority(
+    authority: &DurablePublicationAuthority,
     receipt: &LocalFinalizationReceipt,
 ) -> Result<(), JournalStoreError> {
+    if receipt.session_id != authority.manifest.session_id {
+        return Err(JournalStoreError::Conflict);
+    }
+    if receipt.output_manifest_digest != authority.output_manifest_digest {
+        return Err(JournalStoreError::Conflict);
+    }
+    verify_receipt_stems_match_authority_manifest(&authority.manifest, &receipt.stems)?;
+    verify_receipt_recovery_report_matches_authority(
+        authority.manifest.recovery_report.as_ref(),
+        receipt.recovery_report.as_ref(),
+    )?;
+    Ok(())
+}
+
+fn verify_receipt_stems_match_authority_manifest(
+    manifest: &crate::voice_delivery::finalized_manifest::SyndicateFinalizedManifest,
+    receipt_stems: &[LocalFinalizationReceiptStem],
+) -> Result<(), JournalStoreError> {
+    let mut unmatched = receipt_stems.to_vec();
+    for auth_stem in &manifest.stems {
+        let idx = unmatched.iter().position(|r| {
+            r.discord_user_id == auth_stem.discord_user_id
+                && r.relative_path == auth_stem.wav_relative_path
+                && r.byte_length == auth_stem.wav_bytes
+                && r.sha256 == auth_stem.sha256
+        });
+        match idx {
+            Some(i) => {
+                unmatched.remove(i);
+            }
+            None => return Err(JournalStoreError::Conflict),
+        }
+    }
+    if !unmatched.is_empty() {
+        return Err(JournalStoreError::Conflict);
+    }
+    Ok(())
+}
+
+fn verify_receipt_recovery_report_matches_authority(
+    authority_report: Option<&crate::voice_delivery::finalized_manifest::SyndicateRecoveryReport>,
+    receipt_report: Option<&LocalFinalizationReceiptRecoveryReport>,
+) -> Result<(), JournalStoreError> {
+    match (authority_report, receipt_report) {
+        (None, None) => Ok(()),
+        (Some(auth), Some(rec)) => {
+            if rec.relative_path != auth.relative_path
+                || rec.byte_length != auth.byte_length
+                || rec.sha256 != auth.sha256
+            {
+                return Err(JournalStoreError::Conflict);
+            }
+            Ok(())
+        }
+        _ => Err(JournalStoreError::Conflict),
+    }
+}
+
+fn verify_published_artifacts_from_authority(
+    authority: &DurablePublicationAuthority,
+) -> Result<(), JournalStoreError> {
+    let session_dir = &authority.paths.final_session_dir;
+    if !session_dir.is_dir() {
+        return Err(JournalStoreError::Conflict);
+    }
+    for stem in &authority.manifest.stems {
+        let file_path = session_dir.join(&stem.wav_relative_path);
+        verify_file_digest(&file_path, stem.wav_bytes, &stem.sha256)?;
+    }
+    if let Some(report) = authority.manifest.recovery_report.as_ref() {
+        let file_path = authority
+            .paths
+            .recovery_report_path
+            .as_ref()
+            .filter(|p| p.is_file())
+            .cloned()
+            .unwrap_or_else(|| session_dir.join(&report.relative_path));
+        verify_file_digest(&file_path, report.byte_length, &report.sha256)?;
+    }
+    Ok(())
+}
+
+fn load_receipt_file(path: &Path) -> Result<LocalFinalizationReceipt, JournalStoreError> {
+    let bytes = std::fs::read(path)?;
+    parse_receipt_bytes(&bytes)
+}
+
+fn receipt_json_bytes(receipt: &LocalFinalizationReceipt) -> Result<Vec<u8>, JournalStoreError> {
     let value =
         serde_json::to_value(receipt).map_err(|e| JournalStoreError::Other(e.to_string()))?;
     parse_local_finalization_receipt(&value).map_err(|_| JournalStoreError::Conflict)?;
-    let json = serde_json::to_string_pretty(receipt)
-        .map_err(|e| JournalStoreError::Other(e.to_string()))?;
-    write_atomic(path, json.as_bytes())
+    serde_json::to_string_pretty(receipt)
+        .map_err(|e| JournalStoreError::Other(e.to_string()))
+        .map(|s| s.into_bytes())
+}
+
+fn parse_receipt_bytes(bytes: &[u8]) -> Result<LocalFinalizationReceipt, JournalStoreError> {
+    let raw = std::str::from_utf8(bytes).map_err(|_| JournalStoreError::Conflict)?;
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| JournalStoreError::Conflict)?;
+    parse_local_finalization_receipt(&value).map_err(|_| JournalStoreError::Conflict)
+}
+
+fn journal_from_fs(err: FsError) -> JournalStoreError {
+    match err {
+        FsError::Io(io) => JournalStoreError::Io(io),
+        other => JournalStoreError::Other(other.to_string()),
+    }
+}
+
+/// Create-new durable receipt install: unique stage file → `rename_no_replace_same_parent`.
+fn persist_receipt_create_new(
+    session_root: &Path,
+    dest_name: &str,
+    receipt: &LocalFinalizationReceipt,
+) -> Result<(), JournalStoreError> {
+    let json_bytes = receipt_json_bytes(receipt)?;
+    let root = DestRoot::open(session_root).map_err(journal_from_fs)?;
+    let dir = root.handle();
+    let stage_name = format!(".receipt-write-{}", uuid::Uuid::new_v4().simple());
+
+    if let Err(e) = write_durable_payload_create_new(dir, &stage_name, &json_bytes) {
+        let _ = dir.remove_child_file(&stage_name);
+        return Err(journal_from_fs(e));
+    }
+
+    match rename_no_replace_same_parent(dir, &stage_name, dest_name) {
+        Ok(()) => {
+            sync_dir_exact(dir).map_err(journal_from_fs)?;
+            Ok(())
+        }
+        Err(FsError::AlreadyExists) => {
+            let _ = dir.remove_child_file(&stage_name);
+            let existing_bytes = dir.read_file_all(dest_name).map_err(journal_from_fs)?;
+            match parse_receipt_bytes(&existing_bytes) {
+                Ok(existing) if existing == *receipt => Ok(()),
+                _ => Err(JournalStoreError::Conflict),
+            }
+        }
+        Err(e) => {
+            let _ = dir.remove_child_file(&stage_name);
+            Err(journal_from_fs(e))
+        }
+    }
 }
 
 fn verify_file_digest(
@@ -507,6 +607,8 @@ mod preflight_tests {
         LocalFinalizationSegment, LocalFinalizationUser,
         LOCAL_FINALIZATION_FINALIZER_ALGORITHM_VERSION,
     };
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     fn minimal_manifest(
         segments: Vec<LocalFinalizationSegment>,
@@ -837,6 +939,193 @@ mod preflight_tests {
         }
     }
 
+    fn sample_publication_authority(
+        session_dir: &Path,
+        manifest: crate::voice_delivery::finalized_manifest::SyndicateFinalizedManifest,
+        digest: &str,
+    ) -> DurablePublicationAuthority {
+        let recovery_report_path = manifest
+            .recovery_report
+            .as_ref()
+            .map(|r| session_dir.join(&r.relative_path));
+        DurablePublicationAuthority {
+            paths: crate::voice_delivery::local_finalization::paths::PublishedSessionPaths {
+                final_session_dir: session_dir.to_path_buf(),
+                recovery_report_path,
+            },
+            output_manifest_digest: digest.to_string(),
+            manifest,
+        }
+    }
+
+    fn sample_syndicate_manifest(
+        session_id: &str,
+        stems: Vec<crate::voice_delivery::finalized_manifest::SyndicateFinalizedStem>,
+        recovery: Option<crate::voice_delivery::finalized_manifest::SyndicateRecoveryReport>,
+    ) -> crate::voice_delivery::finalized_manifest::SyndicateFinalizedManifest {
+        crate::voice_delivery::finalized_manifest::SyndicateFinalizedManifest {
+            version: 1,
+            session_id: session_id.into(),
+            guild_id: "1".into(),
+            channel_id: "2".into(),
+            session_start_wall_ms: 0,
+            session_start_monotonic_ns: "0".into(),
+            sealed_stop_wall_ms: 1,
+            sealed_stop_monotonic_ns: "1".into(),
+            target_sample_count_48k: 1,
+            journal_format_version: 2,
+            journal_sha256: "c".repeat(64),
+            stems,
+            recovery_report: recovery,
+        }
+    }
+
+    #[test]
+    fn publication_authority_rejects_extra_receipt_stem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_id = "550e8400-e29b-41d4-a716-446655440099";
+        let stem = crate::voice_delivery::finalized_manifest::SyndicateFinalizedStem {
+            discord_user_id: "123456789012345678".into(),
+            path_nick: "player".into(),
+            wav_relative_path: "player.wav".into(),
+            wav_bytes: 4,
+            sha256: "a".repeat(64),
+        };
+        let manifest = sample_syndicate_manifest(session_id, vec![stem.clone()], None);
+        let authority = sample_publication_authority(tmp.path(), manifest, "d".repeat(64).as_str());
+        let mut receipt = sample_receipt(session_id);
+        receipt.stems.push(receipt.stems[0].clone());
+        assert!(matches!(
+            super::verify_receipt_against_publication_authority(&authority, &receipt),
+            Err(JournalStoreError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn publication_authority_rejects_missing_receipt_stem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_id = "550e8400-e29b-41d4-a716-446655440099";
+        let stem = crate::voice_delivery::finalized_manifest::SyndicateFinalizedStem {
+            discord_user_id: "123456789012345678".into(),
+            path_nick: "player".into(),
+            wav_relative_path: "player.wav".into(),
+            wav_bytes: 4,
+            sha256: "a".repeat(64),
+        };
+        let manifest = sample_syndicate_manifest(session_id, vec![stem], None);
+        let authority = sample_publication_authority(tmp.path(), manifest, "d".repeat(64).as_str());
+        let mut receipt = sample_receipt(session_id);
+        receipt.stems.clear();
+        assert!(matches!(
+            super::verify_receipt_against_publication_authority(&authority, &receipt),
+            Err(JournalStoreError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn publication_authority_rejects_stem_hash_and_path_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_id = "550e8400-e29b-41d4-a716-446655440099";
+        let stem = crate::voice_delivery::finalized_manifest::SyndicateFinalizedStem {
+            discord_user_id: "123456789012345678".into(),
+            path_nick: "player".into(),
+            wav_relative_path: "player.wav".into(),
+            wav_bytes: 4,
+            sha256: "a".repeat(64),
+        };
+        let manifest = sample_syndicate_manifest(session_id, vec![stem], None);
+        let authority = sample_publication_authority(tmp.path(), manifest, "d".repeat(64).as_str());
+        let mut receipt = sample_receipt(session_id);
+        receipt.stems[0].sha256 = "f".repeat(64);
+        assert!(matches!(
+            super::verify_receipt_against_publication_authority(&authority, &receipt),
+            Err(JournalStoreError::Conflict)
+        ));
+        receipt = sample_receipt(session_id);
+        receipt.stems[0].relative_path = "other.wav".into();
+        assert!(matches!(
+            super::verify_receipt_against_publication_authority(&authority, &receipt),
+            Err(JournalStoreError::Conflict)
+        ));
+        receipt = sample_receipt(session_id);
+        receipt.stems[0].byte_length = 99;
+        assert!(matches!(
+            super::verify_receipt_against_publication_authority(&authority, &receipt),
+            Err(JournalStoreError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn publication_authority_rejects_recovery_report_presence_and_content_mismatch() {
+        use crate::voice_delivery::finalized_manifest::SyndicateRecoveryReport;
+        use crate::voice_delivery::recovery_report::{
+            RECOVERY_REPORT_CONTENT_TYPE, RECOVERY_REPORT_RELATIVE_PATH,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let session_id = "550e8400-e29b-41d4-a716-446655440099";
+        let stem = crate::voice_delivery::finalized_manifest::SyndicateFinalizedStem {
+            discord_user_id: "123456789012345678".into(),
+            path_nick: "player".into(),
+            wav_relative_path: "player.wav".into(),
+            wav_bytes: 4,
+            sha256: "a".repeat(64),
+        };
+        let report = SyndicateRecoveryReport {
+            relative_path: RECOVERY_REPORT_RELATIVE_PATH.into(),
+            byte_length: 50,
+            sha256: "b".repeat(64),
+            content_type: RECOVERY_REPORT_CONTENT_TYPE.into(),
+        };
+        let manifest = sample_syndicate_manifest(session_id, vec![stem], Some(report));
+        let authority = sample_publication_authority(tmp.path(), manifest, "d".repeat(64).as_str());
+        let mut receipt = sample_receipt(session_id);
+        receipt.recovery_report = None;
+        assert!(matches!(
+            super::verify_receipt_against_publication_authority(&authority, &receipt),
+            Err(JournalStoreError::Conflict)
+        ));
+        receipt = sample_receipt(session_id);
+        receipt.recovery_report.as_mut().unwrap().sha256 = "e".repeat(64);
+        assert!(matches!(
+            super::verify_receipt_against_publication_authority(&authority, &receipt),
+            Err(JournalStoreError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn publication_authority_verifies_on_disk_stems_from_manifest_not_receipt_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_id = "550e8400-e29b-41d4-a716-446655440099";
+        let body = b"abcd";
+        let sha = sha256_hex_reader(std::io::Cursor::new(body), DEFAULT_STREAM_CHUNK).unwrap();
+        let stem = crate::voice_delivery::finalized_manifest::SyndicateFinalizedStem {
+            discord_user_id: "123456789012345678".into(),
+            path_nick: "player".into(),
+            wav_relative_path: "player.wav".into(),
+            wav_bytes: body.len() as u64,
+            sha256: sha.clone(),
+        };
+        let manifest = sample_syndicate_manifest(session_id, vec![stem], None);
+        let authority = sample_publication_authority(tmp.path(), manifest, "d".repeat(64).as_str());
+        std::fs::create_dir_all(&authority.paths.final_session_dir).unwrap();
+        std::fs::write(authority.paths.final_session_dir.join("player.wav"), body).unwrap();
+        let mut receipt = sample_receipt(session_id);
+        receipt.output_manifest_digest = authority.output_manifest_digest.clone();
+        receipt.stems[0].relative_path = "rogue.wav".into();
+        receipt.stems[0].byte_length = body.len() as u64;
+        receipt.stems[0].sha256 = sha;
+        std::fs::write(authority.paths.final_session_dir.join("rogue.wav"), body).unwrap();
+        assert!(matches!(
+            super::verify_receipt_against_publication_authority(&authority, &receipt),
+            Err(JournalStoreError::Conflict)
+        ));
+        assert!(matches!(
+            super::verify_published_artifacts_from_authority(&authority),
+            Ok(())
+        ));
+    }
+
     #[test]
     fn receipt_intent_persist_and_reload() {
         let tmp = tempfile::tempdir().unwrap();
@@ -855,12 +1144,17 @@ mod preflight_tests {
         let store = open_test_store(tmp.path());
         let receipt = sample_receipt("550e8400-e29b-41d4-a716-446655440099");
         store.persist_receipt_intent(&receipt).unwrap();
+        let intent_path = store.session_root().join(RECEIPT_INTENT_FILE);
+        let before = std::fs::read(&intent_path).unwrap();
         let mut other = receipt.clone();
         other.completed_at_ms += 1;
         assert!(matches!(
             store.persist_receipt_intent(&other),
             Err(JournalStoreError::Conflict)
         ));
+        assert_eq!(std::fs::read(&intent_path).unwrap(), before);
+        let state = store.load_receipt_durable_state().unwrap();
+        assert_eq!(state.intent.as_ref(), Some(&receipt));
     }
 
     #[test]
@@ -903,6 +1197,158 @@ mod preflight_tests {
             store.load_receipt_durable_state(),
             Err(JournalStoreError::Conflict)
         ));
+    }
+
+    fn spawn_concurrent_receipt_writer(
+        store: LocalJournalStore,
+        receipt: LocalFinalizationReceipt,
+        ack: bool,
+        start: Arc<Barrier>,
+    ) -> thread::JoinHandle<Result<(), JournalStoreError>> {
+        thread::spawn(move || {
+            start.wait();
+            if ack {
+                store.persist_receipt_ack(&receipt)
+            } else {
+                store.persist_receipt_intent(&receipt)
+            }
+        })
+    }
+
+    fn assert_single_winner_install_semantics(
+        receipt_a: &LocalFinalizationReceipt,
+        receipt_b: &LocalFinalizationReceipt,
+        result_a: Result<(), JournalStoreError>,
+        result_b: Result<(), JournalStoreError>,
+        durable: &LocalFinalizationReceipt,
+    ) {
+        let ok_inputs: Vec<&LocalFinalizationReceipt> =
+            [(&result_a, receipt_a), (&result_b, receipt_b)]
+                .iter()
+                .filter_map(|(r, input)| r.as_ref().ok().map(|_| *input))
+                .collect();
+        let conflicts = [&result_a, &result_b]
+            .iter()
+            .filter(|r| matches!(r, Err(JournalStoreError::Conflict)))
+            .count();
+        assert_eq!(
+            ok_inputs.len(),
+            1,
+            "expected exactly one Ok and one Conflict; got results {:?} / {:?}",
+            result_a,
+            result_b
+        );
+        assert_eq!(conflicts, 1, "expected Conflict for losing writer");
+        assert_eq!(
+            ok_inputs[0], durable,
+            "successful call input must equal durable receipt body"
+        );
+        assert_ne!(
+            receipt_a, receipt_b,
+            "conflicting concurrent installs require distinct valid receipts"
+        );
+    }
+
+    fn assert_identical_concurrent_both_ok(
+        receipt: &LocalFinalizationReceipt,
+        result_a: Result<(), JournalStoreError>,
+        result_b: Result<(), JournalStoreError>,
+        durable: Option<&LocalFinalizationReceipt>,
+    ) {
+        assert!(
+            result_a.is_ok(),
+            "identical concurrent persist must return Ok for writer A: {:?}",
+            result_a
+        );
+        assert!(
+            result_b.is_ok(),
+            "identical concurrent persist must return Ok for writer B: {:?}",
+            result_b
+        );
+        if let Some(durable) = durable {
+            assert_eq!(durable, receipt);
+        }
+    }
+
+    /// Concurrent conflicting intent installs: exactly one winner (create-new + no-replace rename).
+    #[test]
+    fn receipt_intent_conflicting_concurrent_create_atomic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let mut receipt_a = sample_receipt("550e8400-e29b-41d4-a716-446655440099");
+        let mut receipt_b = receipt_a.clone();
+        receipt_a.completed_at_ms = 1_700_000_000_001;
+        receipt_b.completed_at_ms = 1_700_000_000_002;
+
+        let start = Arc::new(Barrier::new(2));
+        let store_a = open_test_store(tmp.path());
+        let store_b = open_test_store(tmp.path());
+        let handle_a =
+            spawn_concurrent_receipt_writer(store_a, receipt_a.clone(), false, Arc::clone(&start));
+        let handle_b =
+            spawn_concurrent_receipt_writer(store_b, receipt_b.clone(), false, Arc::clone(&start));
+
+        let result_a = handle_a.join().expect("writer a join");
+        let result_b = handle_b.join().expect("writer b join");
+        let durable = store
+            .load_receipt_durable_state()
+            .expect("load durable state")
+            .intent
+            .expect("intent installed");
+
+        assert_single_winner_install_semantics(
+            &receipt_a, &receipt_b, result_a, result_b, &durable,
+        );
+    }
+
+    /// Identical concurrent intent installs are idempotent (both Ok).
+    #[test]
+    fn receipt_intent_identical_concurrent_idempotent_atomic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let receipt = sample_receipt("550e8400-e29b-41d4-a716-446655440099");
+
+        let start = Arc::new(Barrier::new(2));
+        let store_a = open_test_store(tmp.path());
+        let store_b = open_test_store(tmp.path());
+        let handle_a =
+            spawn_concurrent_receipt_writer(store_a, receipt.clone(), false, Arc::clone(&start));
+        let handle_b =
+            spawn_concurrent_receipt_writer(store_b, receipt.clone(), false, Arc::clone(&start));
+
+        let result_a = handle_a.join().expect("writer a join");
+        let result_b = handle_b.join().expect("writer b join");
+        let state = store
+            .load_receipt_durable_state()
+            .expect("load durable state");
+        let durable = state.intent.as_ref();
+
+        assert_identical_concurrent_both_ok(&receipt, result_a, result_b, durable);
+    }
+
+    /// Identical concurrent ack installs are idempotent (both Ok).
+    #[test]
+    fn receipt_ack_identical_concurrent_idempotent_atomic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let receipt = sample_receipt("550e8400-e29b-41d4-a716-446655440099");
+        store.persist_receipt_intent(&receipt).unwrap();
+
+        let start = Arc::new(Barrier::new(2));
+        let store_a = open_test_store(tmp.path());
+        let store_b = open_test_store(tmp.path());
+        let handle_a =
+            spawn_concurrent_receipt_writer(store_a, receipt.clone(), true, Arc::clone(&start));
+        let handle_b =
+            spawn_concurrent_receipt_writer(store_b, receipt.clone(), true, Arc::clone(&start));
+
+        let result_a = handle_a.join().expect("writer a join");
+        let result_b = handle_b.join().expect("writer b join");
+        let state = store
+            .load_receipt_durable_state()
+            .expect("load durable state");
+        assert_identical_concurrent_both_ok(&receipt, result_a, result_b, state.ack.as_ref());
+        assert_eq!(state.intent.as_ref(), Some(&receipt));
     }
 
     #[test]

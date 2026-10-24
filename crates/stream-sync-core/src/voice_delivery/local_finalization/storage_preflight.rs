@@ -108,6 +108,11 @@ pub fn storage_preflight(
         Err(e) => return Err(map_dest_open_err(e)),
     }
 
+    #[cfg(debug_assertions)]
+    if let Some(failure) = injection::active_failure() {
+        return Err(failure);
+    }
+
     #[cfg(windows)]
     {
         let query = stream_sync_windows_fs::disk_space::query_available_bytes(recording_parent);
@@ -137,6 +142,50 @@ pub fn storage_preflight(
 
     Ok(())
 }
+
+/// Debug-only integration hooks for deterministic storage preflight failures (not production API).
+#[cfg(debug_assertions)]
+pub mod injection {
+    use super::StoragePreflightFailure;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ACTIVE: RefCell<Option<StoragePreflightFailure>> = const { RefCell::new(None) };
+    }
+
+    pub fn active_failure() -> Option<StoragePreflightFailure> {
+        ACTIVE.with(|cell| cell.borrow().clone())
+    }
+
+    /// RAII guard: restores any prior injection when dropped (per-thread, panic-safe).
+    pub struct StoragePreflightInjectGuard {
+        previous: Option<StoragePreflightFailure>,
+    }
+
+    impl StoragePreflightInjectGuard {
+        pub fn install(failure: StoragePreflightFailure) -> Self {
+            let previous = ACTIVE.with(|cell| cell.borrow_mut().replace(failure));
+            Self { previous }
+        }
+    }
+
+    impl Drop for StoragePreflightInjectGuard {
+        fn drop(&mut self) {
+            ACTIVE.with(|cell| {
+                *cell.borrow_mut() = self.previous.take();
+            });
+        }
+    }
+
+    pub fn install_storage_preflight_injection(
+        failure: StoragePreflightFailure,
+    ) -> StoragePreflightInjectGuard {
+        StoragePreflightInjectGuard::install(failure)
+    }
+}
+
+#[cfg(debug_assertions)]
+pub use injection::{install_storage_preflight_injection, StoragePreflightInjectGuard};
 
 #[cfg(test)]
 mod tests {

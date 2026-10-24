@@ -101,6 +101,14 @@ pub mod test_support {
     pub use crate::twitch::identity_commit::{
         rollback_superseded_apply, DurableApplySnapshot, LiveApplySnapshot,
     };
+    #[cfg(debug_assertions)]
+    pub use crate::voice_delivery::local_finalization::{
+        install_post_publication_receipt_gate, install_storage_preflight_injection,
+        PostPublicationReceiptBoundary, StoragePreflightFailure, StoragePreflightInjectGuard,
+    };
+    pub use crate::voice_delivery::local_finalization::{
+        resolve_durable_publication_authority, DurablePublicationAuthority,
+    };
 }
 
 /// Back-compat alias.
