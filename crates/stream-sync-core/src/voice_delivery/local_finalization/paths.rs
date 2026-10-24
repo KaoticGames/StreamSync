@@ -22,6 +22,13 @@ pub struct PublishedSessionPaths {
     pub recovery_report_path: Option<PathBuf>,
 }
 
+/// Publication paths plus the ledger-bound finalized manifest digest (receipt authority).
+#[derive(Debug, Clone)]
+pub struct DurablePublicationAuthority {
+    pub paths: PublishedSessionPaths,
+    pub output_manifest_digest: String,
+}
+
 pub fn validate_path_under_parent(parent: &Path, candidate: &Path) -> Result<PathBuf, String> {
     let parent = parent
         .canonicalize()
@@ -39,16 +46,23 @@ pub fn resolve_canonical_session_paths(
     recording_parent: &Path,
     session_id: &str,
 ) -> Result<PublishedSessionPaths, String> {
-    if let Ok(paths) = resolve_from_ledger(recording_parent, session_id) {
-        return Ok(paths);
-    }
-    resolve_from_local_manifest(recording_parent, session_id)
+    resolve_durable_publication_authority(recording_parent, session_id)
+        .map(|a| a.paths)
+        .or_else(|_| resolve_from_local_manifest(recording_parent, session_id))
+}
+
+/// Ledger + api-binding authority for receipt recovery (no local-manifest fallback).
+pub fn resolve_durable_publication_authority(
+    recording_parent: &Path,
+    session_id: &str,
+) -> Result<DurablePublicationAuthority, String> {
+    resolve_from_ledger(recording_parent, session_id)
 }
 
 fn resolve_from_ledger(
     recording_parent: &Path,
     session_id: &str,
-) -> Result<PublishedSessionPaths, String> {
+) -> Result<DurablePublicationAuthority, String> {
     let root = DestRoot::open(recording_parent).map_err(|e| e.to_string())?;
     let control = root
         .handle()
@@ -82,9 +96,12 @@ fn resolve_from_ledger(
         )
         .map_err(|e| e.to_string())?;
         let published = resolve_published_paths(recording_parent, &guard);
-        return Ok(PublishedSessionPaths {
-            final_session_dir: published.final_session_dir,
-            recovery_report_path: published.recovery_report_path,
+        return Ok(DurablePublicationAuthority {
+            paths: PublishedSessionPaths {
+                final_session_dir: published.final_session_dir,
+                recovery_report_path: published.recovery_report_path,
+            },
+            output_manifest_digest: identity.manifest_digest.clone(),
         });
     }
     Err("not found".into())

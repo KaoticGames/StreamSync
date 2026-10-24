@@ -1,6 +1,8 @@
 //! Durable `.in-sync/<session-id>/` journal ingest under the voice recording parent.
 
 use super::manifest::LocalFinalizationManifest;
+use super::paths::resolve_durable_publication_authority;
+use super::receipt::{parse_local_finalization_receipt, LocalFinalizationReceipt};
 use super::storage_preflight::{storage_preflight, StoragePreflightFailure};
 use crate::voice_delivery::hash::{sha256_hex_reader, DEFAULT_STREAM_CHUNK};
 use std::fs::{File, OpenOptions};
@@ -14,7 +16,15 @@ const CHECKPOINT_BAK_FILE: &str = "download-checkpoint.json.bak";
 /// Legacy fixed temp from immutable `write_atomic` (`download-checkpoint.json` → `.tmp` extension).
 const CHECKPOINT_LEGACY_TMP: &str = "download-checkpoint.tmp";
 const MANIFEST_FILE: &str = "manifest.json";
+const RECEIPT_INTENT_FILE: &str = "receipt-intent.json";
+const RECEIPT_ACK_FILE: &str = "receipt-ack.json";
 const SEGMENTS_DIR: &str = "journal/segments";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptDurableState {
+    pub intent: Option<LocalFinalizationReceipt>,
+    pub ack: Option<LocalFinalizationReceipt>,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SegmentCheckpoint {
@@ -270,6 +280,143 @@ impl LocalJournalStore {
         let required = Self::disk_preflight_bytes(manifest, reserve)?;
         storage_preflight(recording_parent, required)
     }
+
+    pub fn load_receipt_durable_state(&self) -> Result<ReceiptDurableState, JournalStoreError> {
+        let intent_path = self.session_root.join(RECEIPT_INTENT_FILE);
+        let ack_path = self.session_root.join(RECEIPT_ACK_FILE);
+        let intent = if intent_path.exists() {
+            Some(load_receipt_file(&intent_path)?)
+        } else {
+            None
+        };
+        let ack = if ack_path.exists() {
+            Some(load_receipt_file(&ack_path)?)
+        } else {
+            None
+        };
+        if ack.is_some() && intent.is_none() {
+            return Err(JournalStoreError::Conflict);
+        }
+        if let (Some(i), Some(a)) = (&intent, &ack) {
+            if i != a {
+                return Err(JournalStoreError::Conflict);
+            }
+        }
+        Ok(ReceiptDurableState { intent, ack })
+    }
+
+    /// Durable receipt body to POST after publication; write-once with exact equality on replay.
+    pub fn persist_receipt_intent(
+        &self,
+        receipt: &LocalFinalizationReceipt,
+    ) -> Result<(), JournalStoreError> {
+        let path = self.session_root.join(RECEIPT_INTENT_FILE);
+        if path.exists() {
+            let existing = load_receipt_file(&path)?;
+            if existing != *receipt {
+                return Err(JournalStoreError::Conflict);
+            }
+            return Ok(());
+        }
+        write_receipt_atomic(&path, receipt)?;
+        Ok(())
+    }
+
+    /// Durable acknowledgement bound to the persisted intent; must match intent exactly.
+    pub fn persist_receipt_ack(
+        &self,
+        receipt: &LocalFinalizationReceipt,
+    ) -> Result<(), JournalStoreError> {
+        let intent_path = self.session_root.join(RECEIPT_INTENT_FILE);
+        if !intent_path.exists() {
+            return Err(JournalStoreError::Conflict);
+        }
+        let intent = load_receipt_file(&intent_path)?;
+        if intent != *receipt {
+            return Err(JournalStoreError::Conflict);
+        }
+        let ack_path = self.session_root.join(RECEIPT_ACK_FILE);
+        if ack_path.exists() {
+            let existing = load_receipt_file(&ack_path)?;
+            if existing != *receipt {
+                return Err(JournalStoreError::Conflict);
+            }
+            return Ok(());
+        }
+        write_receipt_atomic(&ack_path, receipt)?;
+        Ok(())
+    }
+
+    pub fn verify_canonical_publication_matches_receipt(
+        recording_parent: &Path,
+        receipt: &LocalFinalizationReceipt,
+    ) -> Result<(), JournalStoreError> {
+        let authority =
+            resolve_durable_publication_authority(recording_parent, &receipt.session_id)
+                .map_err(|_| JournalStoreError::Conflict)?;
+        if receipt.output_manifest_digest != authority.output_manifest_digest {
+            return Err(JournalStoreError::Conflict);
+        }
+        let paths = &authority.paths;
+        let session_dir = &paths.final_session_dir;
+        if !session_dir.is_dir() {
+            return Err(JournalStoreError::Conflict);
+        }
+        for stem in &receipt.stems {
+            let file_path = session_dir.join(&stem.relative_path);
+            verify_file_digest(&file_path, stem.byte_length, &stem.sha256)?;
+        }
+        if let Some(report) = &receipt.recovery_report {
+            let file_path = paths
+                .recovery_report_path
+                .as_ref()
+                .filter(|p| p.is_file())
+                .cloned()
+                .unwrap_or_else(|| session_dir.join(&report.relative_path));
+            verify_file_digest(&file_path, report.byte_length, &report.sha256)?;
+        }
+        Ok(())
+    }
+}
+
+fn load_receipt_file(path: &Path) -> Result<LocalFinalizationReceipt, JournalStoreError> {
+    let raw = std::fs::read_to_string(path)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|_| JournalStoreError::Conflict)?;
+    parse_local_finalization_receipt(&value).map_err(|_| JournalStoreError::Conflict)
+}
+
+fn write_receipt_atomic(
+    path: &Path,
+    receipt: &LocalFinalizationReceipt,
+) -> Result<(), JournalStoreError> {
+    let value =
+        serde_json::to_value(receipt).map_err(|e| JournalStoreError::Other(e.to_string()))?;
+    parse_local_finalization_receipt(&value).map_err(|_| JournalStoreError::Conflict)?;
+    let json = serde_json::to_string_pretty(receipt)
+        .map_err(|e| JournalStoreError::Other(e.to_string()))?;
+    write_atomic(path, json.as_bytes())
+}
+
+fn verify_file_digest(
+    path: &Path,
+    expected_len: u64,
+    expected_sha: &str,
+) -> Result<(), JournalStoreError> {
+    if !path.is_file() {
+        return Err(JournalStoreError::Conflict);
+    }
+    let meta = std::fs::metadata(path)?;
+    if meta.len() != expected_len {
+        return Err(JournalStoreError::Conflict);
+    }
+    let file = File::open(path)?;
+    let sha = sha256_hex_reader(file, DEFAULT_STREAM_CHUNK)
+        .map_err(|e| JournalStoreError::Other(e.to_string()))?;
+    if sha != expected_sha {
+        return Err(JournalStoreError::Conflict);
+    }
+    Ok(())
 }
 
 fn parse_checkpoint_file(path: &Path) -> Result<DownloadCheckpoint, JournalStoreError> {
@@ -646,6 +793,114 @@ mod preflight_tests {
         };
         assert!(matches!(
             LocalJournalStore::validate_checkpoint_against_manifest(&over, &manifest),
+            Err(JournalStoreError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn receipt_state_absent_when_no_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let state = store.load_receipt_durable_state().unwrap();
+        assert!(state.intent.is_none());
+        assert!(state.ack.is_none());
+    }
+
+    fn sample_receipt(session_id: &str) -> LocalFinalizationReceipt {
+        use crate::voice_delivery::local_finalization::manifest::LOCAL_FINALIZATION_FINALIZER_ALGORITHM_VERSION;
+        use crate::voice_delivery::local_finalization::receipt::{
+            LocalFinalizationReceiptRecoveryReport, LocalFinalizationReceiptStem,
+            LOCAL_FINALIZATION_RECEIPT_VERSION,
+        };
+        use crate::voice_delivery::recovery_report::RECOVERY_REPORT_RELATIVE_PATH;
+        LocalFinalizationReceipt {
+            version: LOCAL_FINALIZATION_RECEIPT_VERSION,
+            session_id: session_id.into(),
+            delivery_manifest_digest: "a".repeat(64),
+            finalizer_algorithm_version: LOCAL_FINALIZATION_FINALIZER_ALGORITHM_VERSION.into(),
+            device_id: "device".into(),
+            completed_at_ms: 1_700_000_000_000,
+            output_manifest_digest: "b".repeat(64),
+            stems: vec![LocalFinalizationReceiptStem {
+                discord_user_id: "123456789012345678".into(),
+                relative_path: "player.wav".into(),
+                byte_length: 100,
+                sha256: "a".repeat(64),
+            }],
+            recovery_report: Some(LocalFinalizationReceiptRecoveryReport {
+                relative_path: RECOVERY_REPORT_RELATIVE_PATH.into(),
+                byte_length: 50,
+                sha256: "b".repeat(64),
+            }),
+            discarded_packet_count: 0,
+            silence_range_count: 0,
+        }
+    }
+
+    #[test]
+    fn receipt_intent_persist_and_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let receipt = sample_receipt("550e8400-e29b-41d4-a716-446655440099");
+        store.persist_receipt_intent(&receipt).unwrap();
+        let state = store.load_receipt_durable_state().unwrap();
+        assert_eq!(state.intent.as_ref(), Some(&receipt));
+        assert!(state.ack.is_none());
+        store.persist_receipt_intent(&receipt).unwrap();
+    }
+
+    #[test]
+    fn receipt_intent_mismatch_is_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let receipt = sample_receipt("550e8400-e29b-41d4-a716-446655440099");
+        store.persist_receipt_intent(&receipt).unwrap();
+        let mut other = receipt.clone();
+        other.completed_at_ms += 1;
+        assert!(matches!(
+            store.persist_receipt_intent(&other),
+            Err(JournalStoreError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn receipt_ack_without_intent_is_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let receipt = sample_receipt("550e8400-e29b-41d4-a716-446655440099");
+        let ack_path = store.session_root().join(RECEIPT_ACK_FILE);
+        std::fs::write(&ack_path, serde_json::to_string_pretty(&receipt).unwrap()).unwrap();
+        assert!(matches!(
+            store.load_receipt_durable_state(),
+            Err(JournalStoreError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn receipt_ack_must_match_intent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let receipt = sample_receipt("550e8400-e29b-41d4-a716-446655440099");
+        store.persist_receipt_intent(&receipt).unwrap();
+        store.persist_receipt_ack(&receipt).unwrap();
+        let state = store.load_receipt_durable_state().unwrap();
+        assert_eq!(state.intent, state.ack);
+        let mut other = receipt.clone();
+        other.completed_at_ms += 1;
+        assert!(matches!(
+            store.persist_receipt_ack(&other),
+            Err(JournalStoreError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn receipt_corrupt_json_is_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_test_store(tmp.path());
+        let intent_path = store.session_root().join(RECEIPT_INTENT_FILE);
+        std::fs::write(&intent_path, b"{not valid receipt").unwrap();
+        assert!(matches!(
+            store.load_receipt_durable_state(),
             Err(JournalStoreError::Conflict)
         ));
     }

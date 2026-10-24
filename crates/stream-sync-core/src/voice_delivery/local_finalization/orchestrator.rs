@@ -21,13 +21,12 @@ use super::receipt::{
     LocalFinalizationReceiptRecoveryReport, LocalFinalizationReceiptStem,
 };
 use super::storage_preflight::StoragePreflightFailure;
-use crate::voice_delivery::client::ReceiptRequestBody;
 use crate::voice_delivery::client::VoiceV2ClientError;
 use crate::voice_delivery::finalized_manifest::{
     compute_finalized_manifest_digest, expected_wav_file_bytes, SyndicateFinalizedStem,
     SyndicateRecoveryReport,
 };
-use crate::voice_delivery::orchestrator::{FinalizedVoiceDelivery, LOCAL_PUBLICATION_STATE};
+use crate::voice_delivery::orchestrator::FinalizedVoiceDelivery;
 use crate::voice_delivery::recovery_report::RECOVERY_REPORT_CONTENT_TYPE;
 use crate::voice_delivery::recovery_report::RECOVERY_REPORT_RELATIVE_PATH;
 use std::io::Seek;
@@ -142,9 +141,9 @@ impl LocalFinalizationOrchestrator {
 
     fn check_pause_cancel<C: LocalFinalizationClient + Clone + 'static>(
         &self,
-        client: &C,
-        session_id: &str,
-        lease: &mut LeaseSession<C>,
+        _client: &C,
+        _session_id: &str,
+        _lease: &mut LeaseSession<C>,
     ) -> Result<(), LocalOrchestratorError> {
         self.controls
             .cancel
@@ -152,10 +151,6 @@ impl LocalFinalizationOrchestrator {
             .map_err(|_| LocalOrchestratorError::Cancelled)?;
         if self.controls.paused.load(Ordering::SeqCst) {
             self.set_phase(LocalFinalizationPhase::Paused);
-            lease.stop_keeper();
-            if self.controls.release_lease_on_pause.load(Ordering::SeqCst) {
-                let _ = client.release_delivery(session_id, &self.device_id, lease.proof());
-            }
             return Err(LocalOrchestratorError::Paused);
         }
         Ok(())
@@ -223,6 +218,18 @@ impl LocalFinalizationOrchestrator {
                 session_id: manifest.session_id.clone(),
             });
 
+            if self.try_receipt_only_completion(
+                client,
+                &store,
+                &manifest,
+                &pending.manifest_digest,
+                &mut lease,
+            )? {
+                lease.stop_keeper_without_release();
+                self.set_phase(LocalFinalizationPhase::Complete);
+                return Ok(());
+            }
+
             self.check_pause_cancel(client, &pending.session_id, &mut lease)?;
             self.ensure_lease_alive(&lease)?;
             self.download_all(client, &store, &manifest, &mut lease)?;
@@ -285,6 +292,9 @@ impl LocalFinalizationOrchestrator {
                     client.release_delivery(&pending.session_id, &self.device_id, lease.proof());
             }
             return run_result;
+        }
+        if matches!(&run_result, Err(LocalOrchestratorError::Cancelled)) {
+            self.set_phase(LocalFinalizationPhase::Cancelled);
         }
         if run_result.is_err() && !lease.receipt_posted {
             lease.release_best_effort(client, &self.device_id);
@@ -419,6 +429,61 @@ impl LocalFinalizationOrchestrator {
         Ok(())
     }
 
+    fn try_receipt_only_completion<C: LocalFinalizationClient + Clone + 'static>(
+        &self,
+        client: &C,
+        store: &LocalJournalStore,
+        manifest: &LocalFinalizationManifest,
+        manifest_digest: &str,
+        lease: &mut LeaseSession<C>,
+    ) -> Result<bool, LocalOrchestratorError> {
+        let state = store
+            .load_receipt_durable_state()
+            .map_err(map_journal_store_err)?;
+        let intent = match state.intent {
+            None => return Ok(false),
+            Some(receipt) => receipt,
+        };
+        self.validate_durable_receipt_for_recovery(&intent, manifest, manifest_digest)?;
+        LocalJournalStore::verify_canonical_publication_matches_receipt(&self.parent, &intent)
+            .map_err(map_journal_store_err)?;
+
+        if state.ack.is_some() {
+            lease.receipt_posted = true;
+            return Ok(true);
+        }
+
+        self.set_phase(LocalFinalizationPhase::Receipting);
+        client
+            .post_receipt(&manifest.session_id, &intent, lease.proof())
+            .map_err(LocalOrchestratorError::Client)?;
+        store
+            .persist_receipt_ack(&intent)
+            .map_err(map_journal_store_err)?;
+        lease.receipt_posted = true;
+        self.emit(LocalFinalizationProgressEvent::ReceiptAcknowledged {
+            session_id: manifest.session_id.clone(),
+        });
+        Ok(true)
+    }
+
+    fn validate_durable_receipt_for_recovery(
+        &self,
+        receipt: &LocalFinalizationReceipt,
+        manifest: &LocalFinalizationManifest,
+        manifest_digest: &str,
+    ) -> Result<(), LocalOrchestratorError> {
+        assert_local_finalization_receipt_matches_manifest(receipt, manifest)
+            .map_err(|_| LocalOrchestratorError::StoreConflict)?;
+        if receipt.device_id != self.device_id {
+            return Err(LocalOrchestratorError::StoreConflict);
+        }
+        if receipt.delivery_manifest_digest != manifest_digest {
+            return Err(LocalOrchestratorError::StoreConflict);
+        }
+        Ok(())
+    }
+
     fn publish_and_receipt<C: LocalFinalizationClient + Clone + 'static>(
         &self,
         client: &C,
@@ -428,6 +493,8 @@ impl LocalFinalizationOrchestrator {
         output: super::processor::LocalProcessOutput,
         lease: &mut LeaseSession<C>,
     ) -> Result<(), LocalOrchestratorError> {
+        let store = LocalJournalStore::open(&self.parent, &manifest.session_id)
+            .map_err(map_journal_store_err)?;
         self.set_phase(LocalFinalizationPhase::Publishing);
         let wav_bytes = expected_wav_file_bytes(manifest.target_sample_count_48k);
         let stems: Vec<SyndicateFinalizedStem> = manifest
@@ -508,19 +575,19 @@ impl LocalFinalizationOrchestrator {
         };
         assert_local_finalization_receipt_matches_manifest(&receipt, manifest)
             .map_err(|e| LocalOrchestratorError::Other(e.to_string()))?;
+        store
+            .persist_receipt_intent(&receipt)
+            .map_err(map_journal_store_err)?;
         client
             .post_receipt(&manifest.session_id, &receipt, lease.proof())
             .map_err(LocalOrchestratorError::Client)?;
+        store
+            .persist_receipt_ack(&receipt)
+            .map_err(map_journal_store_err)?;
         lease.receipt_posted = true;
         self.emit(LocalFinalizationProgressEvent::ReceiptAcknowledged {
             session_id: manifest.session_id.clone(),
         });
-        let _ = ReceiptRequestBody {
-            manifest_digest: manifest_digest.to_string(),
-            device_id: self.device_id.clone(),
-            local_receipt_id: uuid::Uuid::new_v4().to_string(),
-            local_publication_state: LOCAL_PUBLICATION_STATE.to_string(),
-        };
         Ok(())
     }
 }
