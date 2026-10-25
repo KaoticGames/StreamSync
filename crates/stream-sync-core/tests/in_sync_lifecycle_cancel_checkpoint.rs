@@ -453,3 +453,522 @@ fn cancel_during_segment_one_fetch_aborts_without_publication_or_receipt() {
         "segment 1 fetch must have started before cancel was observed at the cooperative boundary"
     );
 }
+
+#[cfg(all(feature = "local-opus-native", feature = "lifecycle-test-support"))]
+mod cancel_publication_receipt_boundaries {
+    use super::progress_has_publication_or_receipt;
+    use super::proofs_equal;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    use stream_sync_core::test_support::{
+        install_post_publication_receipt_gate, PostPublicationReceiptBoundary,
+    };
+
+    const GATE_WAIT_BUDGET: Duration = Duration::from_secs(30);
+    use stream_sync_core::voice_delivery::local_finalization::{
+        compute_local_finalization_manifest_digest, derive_voice_v2_opaque_stem_id,
+        encode_journal_file, LeaseGrant, LeaseProof, LocalFinalizationControls,
+        LocalFinalizationManifest, LocalFinalizationObjectRef, LocalFinalizationOutputPolicy,
+        LocalFinalizationReceipt, LocalFinalizationSegment, LocalFinalizationUser,
+        LocalJournalStore, LocalOrchestratorError, JOURNAL_FORMAT_VERSION_V2,
+        LOCAL_FINALIZATION_FINALIZER_ALGORITHM_VERSION, LOCAL_FINALIZATION_WAV_FORMAT,
+    };
+    use stream_sync_core::voice_delivery::{
+        sha256_hex_reader, LocalFinalizationClient, LocalFinalizationOrchestrator,
+        LocalFinalizationPhase, LocalPendingItem, StemRangeMeta, VoiceV2ClientError,
+        DEFAULT_STREAM_CHUNK, RECOVERY_REPORT_RELATIVE_PATH,
+    };
+
+    const GUILD_ID: &str = "123456789012345678";
+    const DEVICE_OPUS: &str = "lifecycle-cancel-opus-device";
+    const SESSION_BEFORE_PUBLICATION: &str = "550e8400-e29b-41d4-a716-4466554400cc";
+    const SESSION_FRESH_RECEIPT_POST: &str = "550e8400-e29b-41d4-a716-4466554400ee";
+    const SESSION_RECEIPT_REPLAY: &str = "550e8400-e29b-41d4-a716-4466554400dd";
+    const TARGET_SAMPLES: u64 = 4_800;
+
+    fn valid_segment_body() -> Vec<u8> {
+        encode_journal_file(JOURNAL_FORMAT_VERSION_V2, &[])
+    }
+
+    fn opus_manifest(session_id: &str) -> LocalFinalizationManifest {
+        let user = LocalFinalizationUser {
+            discord_user_id: "123456789012345678".into(),
+            path_nick: "player".into(),
+            opaque_stem_id: derive_voice_v2_opaque_stem_id(
+                session_id,
+                GUILD_ID,
+                "123456789012345678",
+                "player",
+            ),
+        };
+        let body = valid_segment_body();
+        let sha =
+            sha256_hex_reader(std::io::Cursor::new(&body), DEFAULT_STREAM_CHUNK).expect("sha");
+        let segments = vec![LocalFinalizationSegment {
+            segment_seq: 0,
+            key: format!(
+                "voice-delivery-v2/{GUILD_ID}/{session_id}/journal/{:08}.synj",
+                0
+            ),
+            byte_length: body.len() as u64,
+            sha256: sha,
+        }];
+        LocalFinalizationManifest {
+            version: 1,
+            finalizer_algorithm_version: LOCAL_FINALIZATION_FINALIZER_ALGORITHM_VERSION.into(),
+            session_id: session_id.into(),
+            guild_id: GUILD_ID.into(),
+            channel_id: "234567890123456789".into(),
+            session_start_wall_ms: 1,
+            session_start_monotonic_ns: "100".into(),
+            sealed_stop_wall_ms: 2,
+            sealed_stop_monotonic_ns: "200".into(),
+            target_sample_count_48k: TARGET_SAMPLES,
+            journal_sha256: "a".repeat(64),
+            recording_manifest: LocalFinalizationObjectRef {
+                key: format!(
+                    "voice-delivery-v2/{GUILD_ID}/{session_id}/manifest/recording.manifest.json"
+                ),
+                sha256: "b".repeat(64),
+                byte_length: 4096,
+            },
+            sealed_index: LocalFinalizationObjectRef {
+                key: format!("voice-delivery-v2/{GUILD_ID}/{session_id}/journal/index.sealed.json"),
+                sha256: "c".repeat(64),
+                byte_length: 512,
+            },
+            segments,
+            users: vec![user],
+            output: LocalFinalizationOutputPolicy {
+                wav_format: LOCAL_FINALIZATION_WAV_FORMAT.into(),
+                recovery_report_relative_path: RECOVERY_REPORT_RELATIVE_PATH.into(),
+            },
+        }
+    }
+
+    #[derive(Clone)]
+    struct OpusLifecycleCancelClient {
+        manifest: LocalFinalizationManifest,
+        segment_body: Vec<u8>,
+        digest: String,
+        next_generation: Arc<AtomicI64>,
+        fail_receipt_once: Arc<AtomicBool>,
+        releases: Arc<Mutex<Vec<LeaseProof>>>,
+        receipt_posts: Arc<AtomicI64>,
+    }
+
+    impl OpusLifecycleCancelClient {
+        fn new(manifest: LocalFinalizationManifest, segment_body: Vec<u8>) -> Self {
+            Self::new_with_fail_receipt_once(manifest, segment_body, false)
+        }
+
+        fn new_with_fail_receipt_once(
+            manifest: LocalFinalizationManifest,
+            segment_body: Vec<u8>,
+            fail_receipt_once: bool,
+        ) -> Self {
+            let digest = compute_local_finalization_manifest_digest(&manifest);
+            Self {
+                manifest,
+                segment_body,
+                digest,
+                next_generation: Arc::new(AtomicI64::new(1)),
+                fail_receipt_once: Arc::new(AtomicBool::new(fail_receipt_once)),
+                releases: Arc::new(Mutex::new(Vec::new())),
+                receipt_posts: Arc::new(AtomicI64::new(0)),
+            }
+        }
+
+        fn receipt_posts(&self) -> i64 {
+            self.receipt_posts.load(Ordering::SeqCst)
+        }
+
+        fn releases(&self) -> Vec<LeaseProof> {
+            self.releases.lock().unwrap().clone()
+        }
+    }
+
+    impl LocalFinalizationClient for OpusLifecycleCancelClient {
+        fn fetch_pending(&self, _limit: u32) -> Result<Vec<LocalPendingItem>, VoiceV2ClientError> {
+            Ok(vec![])
+        }
+
+        fn claim_delivery(
+            &self,
+            session_id: &str,
+            _device_id: &str,
+        ) -> Result<LeaseGrant, VoiceV2ClientError> {
+            let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+            let token = format!("lease-token-gen-{generation}");
+            Ok(LeaseGrant {
+                session_id: session_id.into(),
+                manifest_digest: self.digest.clone(),
+                generation,
+                token,
+                expires_at_ms: i64::MAX,
+            })
+        }
+
+        fn renew_lease(
+            &self,
+            _session_id: &str,
+            _device_id: &str,
+            _proof: &LeaseProof,
+        ) -> Result<Option<i64>, VoiceV2ClientError> {
+            Ok(None)
+        }
+
+        fn fetch_manifest(
+            &self,
+            _session_id: &str,
+            _proof: &LeaseProof,
+        ) -> Result<LocalFinalizationManifest, VoiceV2ClientError> {
+            Ok(self.manifest.clone())
+        }
+
+        fn fetch_segment_range(
+            &self,
+            _session_id: &str,
+            segment_seq: u32,
+            _offset: u64,
+            length: u64,
+            _proof: &LeaseProof,
+            writer: &mut dyn Write,
+        ) -> Result<StemRangeMeta, VoiceV2ClientError> {
+            assert_eq!(segment_seq, 0);
+            let chunk = length.min(self.segment_body.len() as u64) as usize;
+            writer.write_all(&self.segment_body[..chunk]).map_err(|e| {
+                VoiceV2ClientError::Parse(format!("mock segment write failed: {e}"))
+            })?;
+            Ok(StemRangeMeta {
+                status: 206,
+                content_range: format!("bytes 0-{}/{}", chunk - 1, self.segment_body.len()),
+                content_length: chunk as u64,
+                etag: "\"mock\"".into(),
+                total_length: self.segment_body.len() as u64,
+            })
+        }
+
+        fn post_receipt(
+            &self,
+            _session_id: &str,
+            _receipt: &LocalFinalizationReceipt,
+            _proof: &LeaseProof,
+        ) -> Result<(), VoiceV2ClientError> {
+            if self.fail_receipt_once.swap(false, Ordering::SeqCst) {
+                return Err(VoiceV2ClientError::Network {
+                    message: "simulated receipt endpoint unavailable after publication".into(),
+                    retry_after: None,
+                });
+            }
+            self.receipt_posts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn release_delivery(
+            &self,
+            _session_id: &str,
+            _device_id: &str,
+            proof: &LeaseProof,
+        ) -> Result<(), VoiceV2ClientError> {
+            self.releases.lock().unwrap().push(proof.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cancel_after_processing_before_publication_must_not_publish_or_receipt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest = opus_manifest(SESSION_BEFORE_PUBLICATION);
+        let segment_body = valid_segment_body();
+        let digest = compute_local_finalization_manifest_digest(&manifest);
+        let client = OpusLifecycleCancelClient::new(manifest.clone(), segment_body);
+        let controls = LocalFinalizationControls::default();
+        let orch = Arc::new(LocalFinalizationOrchestrator::open_with_controls(
+            tmp.path(),
+            DEVICE_OPUS,
+            controls,
+        ));
+        let pending = LocalPendingItem {
+            session_id: SESSION_BEFORE_PUBLICATION.into(),
+            manifest_digest: digest,
+            sealed_at_ms: 1,
+        };
+
+        let (_gate, arrived_rx, resume_tx) = install_post_publication_receipt_gate(
+            tmp.path(),
+            SESSION_BEFORE_PUBLICATION,
+            PostPublicationReceiptBoundary::BeforePublication,
+        );
+
+        let orch_run = Arc::clone(&orch);
+        let client_run = client.clone();
+        let worker = thread::spawn(move || orch_run.process_pending(&client_run, &pending));
+
+        arrived_rx
+            .recv_timeout(GATE_WAIT_BUDGET)
+            .expect("worker must block after processing at pre-publication boundary");
+        orch.cancellation().cancel();
+        resume_tx
+            .send(())
+            .expect("release pre-publication gate so cancel boundary can run");
+
+        let cancelled = worker
+            .join()
+            .expect("process_pending thread")
+            .expect_err("cancel after processing must abort before publication");
+        assert!(
+            matches!(cancelled, LocalOrchestratorError::Cancelled),
+            "expected Cancelled, got {cancelled:?}"
+        );
+        assert_eq!(
+            orch.phase(),
+            LocalFinalizationPhase::Cancelled,
+            "orchestrator must surface Cancelled phase"
+        );
+        assert_eq!(
+            client.receipt_posts(),
+            0,
+            "cancel must not post a receipt after processing"
+        );
+        let events = orch.drain_events();
+        assert!(
+            !progress_has_publication_or_receipt(&events),
+            "cancel must not emit publication or receipt progress; got {events:?}"
+        );
+        assert!(
+            stream_sync_core::voice_delivery::local_finalization::resolve_canonical_session_paths(
+                tmp.path(),
+                SESSION_BEFORE_PUBLICATION,
+            )
+            .is_err(),
+            "cancel must not commit canonical publication"
+        );
+        let releases = client.releases();
+        assert_eq!(
+            releases.len(),
+            1,
+            "cancel must release the active lease once; got {releases:?}"
+        );
+        let expected_proof = LeaseProof {
+            generation: 1,
+            token: "lease-token-gen-1".into(),
+        };
+        assert!(
+            proofs_equal(&releases[0], &expected_proof),
+            "release must use generation-1 lease proof"
+        );
+    }
+
+    #[test]
+    fn cancel_after_fresh_receipt_intent_before_post_must_not_post_receipt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest = opus_manifest(SESSION_FRESH_RECEIPT_POST);
+        let segment_body = valid_segment_body();
+        let digest = compute_local_finalization_manifest_digest(&manifest);
+        let client = OpusLifecycleCancelClient::new(manifest.clone(), segment_body);
+        let controls = LocalFinalizationControls::default();
+        let orch = Arc::new(LocalFinalizationOrchestrator::open_with_controls(
+            tmp.path(),
+            DEVICE_OPUS,
+            controls,
+        ));
+        let store =
+            LocalJournalStore::open(tmp.path(), SESSION_FRESH_RECEIPT_POST).expect("open store");
+        let pending = LocalPendingItem {
+            session_id: SESSION_FRESH_RECEIPT_POST.into(),
+            manifest_digest: digest,
+            sealed_at_ms: 1,
+        };
+
+        let (_gate, arrived_rx, resume_tx) = install_post_publication_receipt_gate(
+            tmp.path(),
+            SESSION_FRESH_RECEIPT_POST,
+            PostPublicationReceiptBoundary::AfterReceiptIntentBeforeFreshReceiptPost,
+        );
+
+        let orch_run = Arc::clone(&orch);
+        let client_run = client.clone();
+        let worker = thread::spawn(move || orch_run.process_pending(&client_run, &pending));
+
+        arrived_rx
+            .recv_timeout(GATE_WAIT_BUDGET)
+            .expect("fresh finalization must block after durable receipt intent before POST");
+        orch.cancellation().cancel();
+        resume_tx
+            .send(())
+            .expect("release fresh POST gate so cancel boundary can run");
+
+        let cancelled = worker
+            .join()
+            .expect("process_pending thread")
+            .expect_err("cancel after fresh receipt intent must abort before POST");
+        assert!(
+            matches!(cancelled, LocalOrchestratorError::Cancelled),
+            "expected Cancelled, got {cancelled:?}"
+        );
+        assert_eq!(
+            orch.phase(),
+            LocalFinalizationPhase::Cancelled,
+            "orchestrator must surface Cancelled phase"
+        );
+        assert_eq!(
+            client.receipt_posts(),
+            0,
+            "cancel must not complete fresh receipt POST"
+        );
+        let receipt_state = store.load_receipt_durable_state().expect("receipt state");
+        assert!(
+            receipt_state.intent.is_some(),
+            "durable receipt intent must remain for receipt-only recovery"
+        );
+        assert!(
+            receipt_state.ack.is_none(),
+            "cancel must not persist receipt ack on fresh path"
+        );
+        stream_sync_core::voice_delivery::local_finalization::resolve_canonical_session_paths(
+            tmp.path(),
+            SESSION_FRESH_RECEIPT_POST,
+        )
+        .expect("canonical publication must remain valid after publication committed");
+        let events = orch.drain_events();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(
+                    e,
+                    stream_sync_core::voice_delivery::LocalFinalizationProgressEvent::ReceiptAcknowledged { .. }
+                )),
+            "cancel must not emit ReceiptAcknowledged on fresh path; got {events:?}"
+        );
+        let releases = client.releases();
+        assert_eq!(
+            releases.len(),
+            1,
+            "cancel must release the active lease exactly once; got {releases:?}"
+        );
+        let expected_proof = LeaseProof {
+            generation: 1,
+            token: "lease-token-gen-1".into(),
+        };
+        assert!(
+            proofs_equal(&releases[0], &expected_proof),
+            "release must use generation-1 lease proof"
+        );
+    }
+
+    #[test]
+    fn cancel_during_receipt_only_replay_must_not_post_receipt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest = opus_manifest(SESSION_RECEIPT_REPLAY);
+        let segment_body = valid_segment_body();
+        let digest = compute_local_finalization_manifest_digest(&manifest);
+        let client = OpusLifecycleCancelClient::new_with_fail_receipt_once(
+            manifest.clone(),
+            segment_body.clone(),
+            true,
+        );
+        let controls = LocalFinalizationControls::default();
+        let orch_prime = LocalFinalizationOrchestrator::open_with_controls(
+            tmp.path(),
+            DEVICE_OPUS,
+            controls.clone(),
+        );
+        let store =
+            LocalJournalStore::open(tmp.path(), SESSION_RECEIPT_REPLAY).expect("open store");
+        let pending = LocalPendingItem {
+            session_id: SESSION_RECEIPT_REPLAY.into(),
+            manifest_digest: digest.clone(),
+            sealed_at_ms: 1,
+        };
+
+        let first = orch_prime
+            .process_pending(&client, &pending)
+            .expect_err("prime durable publication and receipt intent via failed POST");
+        assert!(matches!(first, LocalOrchestratorError::Client(_)));
+        assert!(
+            store
+                .load_receipt_durable_state()
+                .expect("receipt state")
+                .intent
+                .is_some(),
+            "first run must persist receipt intent"
+        );
+        assert_eq!(
+            client.receipt_posts(),
+            0,
+            "failed POST must not count as a successful receipt"
+        );
+        let _ = orch_prime.drain_events();
+
+        let orch = Arc::new(LocalFinalizationOrchestrator::open_with_controls(
+            tmp.path(),
+            DEVICE_OPUS,
+            controls,
+        ));
+        let (_gate, arrived_rx, resume_tx) = install_post_publication_receipt_gate(
+            tmp.path(),
+            SESSION_RECEIPT_REPLAY,
+            PostPublicationReceiptBoundary::BeforeReceiptReplayPost,
+        );
+
+        let orch_run = Arc::clone(&orch);
+        let client_run = client.clone();
+        let worker = thread::spawn(move || orch_run.process_pending(&client_run, &pending));
+
+        arrived_rx
+            .recv_timeout(GATE_WAIT_BUDGET)
+            .expect("receipt-only replay must block at replay POST boundary");
+        orch.cancellation().cancel();
+        resume_tx
+            .send(())
+            .expect("release replay gate so cancel boundary can run");
+
+        let cancelled = worker
+            .join()
+            .expect("process_pending thread")
+            .expect_err("cancel during receipt replay must abort before POST");
+        assert!(
+            matches!(cancelled, LocalOrchestratorError::Cancelled),
+            "expected Cancelled, got {cancelled:?}"
+        );
+        assert_eq!(
+            orch.phase(),
+            LocalFinalizationPhase::Cancelled,
+            "orchestrator must surface Cancelled phase"
+        );
+        assert_eq!(
+            client.receipt_posts(),
+            0,
+            "cancel must not complete receipt replay POST"
+        );
+        assert!(
+            store
+                .load_receipt_durable_state()
+                .expect("receipt state")
+                .ack
+                .is_none(),
+            "cancel must not persist receipt ack during replay"
+        );
+        let events = orch.drain_events();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(
+                    e,
+                    stream_sync_core::voice_delivery::LocalFinalizationProgressEvent::ReceiptAcknowledged { .. }
+                )),
+            "cancel must not emit ReceiptAcknowledged during replay; got {events:?}"
+        );
+        let releases = client.releases();
+        assert_eq!(
+            releases.len(),
+            2,
+            "prime run and cancel replay must each release once; got {releases:?}"
+        );
+    }
+}

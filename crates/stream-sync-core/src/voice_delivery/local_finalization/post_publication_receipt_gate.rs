@@ -12,8 +12,12 @@ pub mod injection {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub enum PostPublicationReceiptBoundary {
+        /// After decode/processing completes and before canonical publication is committed.
+        BeforePublication,
         /// After canonical publication is durably committed and `PublicationComplete` is emitted.
         AfterPublicationBeforeReceiptIntent,
+        /// After durable fresh receipt intent is persisted and before the fresh-path receipt POST.
+        AfterReceiptIntentBeforeFreshReceiptPost,
         /// Before replaying a persisted receipt intent to the cloud (`try_receipt_only_completion`).
         BeforeReceiptReplayPost,
     }

@@ -460,6 +460,7 @@ impl LocalFinalizationOrchestrator {
             &manifest.session_id,
             super::post_publication_receipt_gate::PostPublicationReceiptBoundary::BeforeReceiptReplayPost,
         );
+        self.check_pause_cancel(client, &manifest.session_id, lease)?;
         lease.fence_lease_authority(client, &self.device_id)?;
         client
             .post_receipt(&manifest.session_id, &intent, lease.proof())
@@ -537,6 +538,13 @@ impl LocalFinalizationOrchestrator {
         let delivery = FinalizedVoiceDelivery::open_recording_parent(&self.parent)
             .map_err(|e| LocalOrchestratorError::Other(e.to_string()))?
             .with_device_id(self.device_id.clone());
+        #[cfg(all(debug_assertions, feature = "lifecycle-test-support"))]
+        super::post_publication_receipt_gate::pause_post_publication_receipt_gate(
+            &self.parent,
+            &manifest.session_id,
+            super::post_publication_receipt_gate::PostPublicationReceiptBoundary::BeforePublication,
+        );
+        self.check_pause_cancel(client, &manifest.session_id, lease)?;
         let published = delivery
             .publish_local_decoded(&syndicate, &output_digest, sealed_at, &output)
             .map_err(|e| LocalOrchestratorError::Other(e.to_string()))?;
@@ -553,6 +561,7 @@ impl LocalFinalizationOrchestrator {
             &manifest.session_id,
             super::post_publication_receipt_gate::PostPublicationReceiptBoundary::AfterPublicationBeforeReceiptIntent,
         );
+        self.check_pause_cancel(client, &manifest.session_id, lease)?;
         lease.fence_lease_authority(client, &self.device_id)?;
         self.set_phase(LocalFinalizationPhase::Receipting);
         let receipt = LocalFinalizationReceipt {
@@ -592,6 +601,13 @@ impl LocalFinalizationOrchestrator {
         store
             .persist_receipt_intent(&receipt)
             .map_err(map_journal_store_err)?;
+        #[cfg(all(debug_assertions, feature = "lifecycle-test-support"))]
+        super::post_publication_receipt_gate::pause_post_publication_receipt_gate(
+            &self.parent,
+            &manifest.session_id,
+            super::post_publication_receipt_gate::PostPublicationReceiptBoundary::AfterReceiptIntentBeforeFreshReceiptPost,
+        );
+        self.check_pause_cancel(client, &manifest.session_id, lease)?;
         lease.fence_lease_authority(client, &self.device_id)?;
         client
             .post_receipt(&manifest.session_id, &receipt, lease.proof())
