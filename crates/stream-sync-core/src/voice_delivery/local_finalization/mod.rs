@@ -17,7 +17,7 @@ mod opus_packet_duration;
 mod orchestrator;
 mod packet_loss_policy;
 mod paths;
-#[cfg(debug_assertions)]
+#[cfg(any(test, all(debug_assertions, feature = "lifecycle-test-support")))]
 mod post_publication_receipt_gate;
 mod processor;
 mod progress;
@@ -71,7 +71,7 @@ pub use paths::{
 };
 #[doc(hidden)]
 pub use paths::{resolve_durable_publication_authority, DurablePublicationAuthority};
-#[cfg(debug_assertions)]
+#[cfg(any(test, all(debug_assertions, feature = "lifecycle-test-support")))]
 pub use post_publication_receipt_gate::{
     install_post_publication_receipt_gate, pause_post_publication_receipt_gate,
     PostPublicationReceiptBoundary, PostPublicationReceiptGateGuard,
@@ -86,7 +86,7 @@ pub use receipt::{
     LocalFinalizationReceipt,
 };
 pub use storage_preflight::{bytes_to_gib, StoragePreflightFailure};
-#[cfg(debug_assertions)]
+#[cfg(any(test, all(debug_assertions, feature = "lifecycle-test-support")))]
 pub use storage_preflight::{install_storage_preflight_injection, StoragePreflightInjectGuard};
 pub use synj::{
     encode_journal_file, encode_journal_record, JournalRecord, JOURNAL_FORMAT_VERSION_V2,

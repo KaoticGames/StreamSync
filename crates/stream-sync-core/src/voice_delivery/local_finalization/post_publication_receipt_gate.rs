@@ -1,6 +1,6 @@
-//! Debug-only synchronization at the publication→receipt boundary (integration tests only).
+//! Synchronization at the publication→receipt boundary (`lifecycle-test-support` / unit tests only).
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, all(debug_assertions, feature = "lifecycle-test-support")))]
 pub mod injection {
     use std::collections::HashMap;
     use std::path::{Component, Path, PathBuf};
@@ -148,11 +148,11 @@ pub mod injection {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, all(debug_assertions, feature = "lifecycle-test-support")))]
 pub use injection::{
     install_post_publication_receipt_gate, pause_blocking as pause_post_publication_receipt_gate,
     PostPublicationReceiptBoundary, PostPublicationReceiptGateGuard,
 };
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(any(test, all(debug_assertions, feature = "lifecycle-test-support"))))]
 pub enum PostPublicationReceiptBoundary {}

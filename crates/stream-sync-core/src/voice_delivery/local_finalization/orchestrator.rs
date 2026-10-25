@@ -43,6 +43,8 @@ pub enum LocalOrchestratorError {
     Cancelled,
     #[error("paused")]
     Paused,
+    #[error("pause lease release failed")]
+    PauseLeaseReleaseFailed,
     #[error("client: {0}")]
     Client(#[from] VoiceV2ClientError),
     #[error("store: {0}")]
@@ -282,8 +284,12 @@ impl LocalFinalizationOrchestrator {
         if matches!(&run_result, Err(LocalOrchestratorError::Paused)) {
             lease.stop_keeper();
             if self.controls.release_lease_on_pause.load(Ordering::SeqCst) {
-                let _ =
-                    client.release_delivery(&pending.session_id, &self.device_id, lease.proof());
+                match client.release_delivery(&pending.session_id, &self.device_id, lease.proof()) {
+                    Ok(()) => return run_result,
+                    Err(_) => {
+                        return Err(LocalOrchestratorError::PauseLeaseReleaseFailed);
+                    }
+                }
             }
             return run_result;
         }
@@ -448,7 +454,7 @@ impl LocalFinalizationOrchestrator {
         }
 
         self.set_phase(LocalFinalizationPhase::Receipting);
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, feature = "lifecycle-test-support"))]
         super::post_publication_receipt_gate::pause_post_publication_receipt_gate(
             &self.parent,
             &manifest.session_id,
@@ -541,7 +547,7 @@ impl LocalFinalizationOrchestrator {
                 .recovery_report_path
                 .map(|p| p.to_string_lossy().to_string()),
         });
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, feature = "lifecycle-test-support"))]
         super::post_publication_receipt_gate::pause_post_publication_receipt_gate(
             &self.parent,
             &manifest.session_id,

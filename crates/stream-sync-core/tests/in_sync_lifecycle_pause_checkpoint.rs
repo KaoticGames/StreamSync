@@ -2,7 +2,7 @@
 //! and persist a resumable download checkpoint for a later run.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -95,6 +95,8 @@ struct SegmentBoundaryPauseClient {
     claim_generations: Arc<Mutex<Vec<i64>>>,
     segment_fetches: Arc<Mutex<Vec<u32>>>,
     receipt_posts: Arc<AtomicI64>,
+    release_attempts: Arc<AtomicU32>,
+    release_error: Arc<Mutex<Option<VoiceV2ClientError>>>,
 }
 
 impl SegmentBoundaryPauseClient {
@@ -109,7 +111,17 @@ impl SegmentBoundaryPauseClient {
             claim_generations: Arc::new(Mutex::new(Vec::new())),
             segment_fetches: Arc::new(Mutex::new(Vec::new())),
             receipt_posts: Arc::new(AtomicI64::new(0)),
+            release_attempts: Arc::new(AtomicU32::new(0)),
+            release_error: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn fail_release_with(&self, err: VoiceV2ClientError) {
+        *self.release_error.lock().unwrap() = Some(err);
+    }
+
+    fn release_attempts(&self) -> u32 {
+        self.release_attempts.load(Ordering::SeqCst)
     }
 
     fn releases(&self) -> Vec<LeaseProof> {
@@ -212,9 +224,18 @@ impl LocalFinalizationClient for SegmentBoundaryPauseClient {
         _device_id: &str,
         proof: &LeaseProof,
     ) -> Result<(), VoiceV2ClientError> {
+        self.release_attempts.fetch_add(1, Ordering::SeqCst);
         self.releases.lock().unwrap().push(proof.clone());
+        if let Some(err) = self.release_error.lock().unwrap().clone() {
+            return Err(err);
+        }
         Ok(())
     }
+}
+
+fn orchestrator_error_is_bounded_non_secret(err: &LocalOrchestratorError, secret: &str) -> bool {
+    let display = err.to_string();
+    !display.contains(secret) && display.len() <= 256
 }
 
 fn proofs_equal(a: &LeaseProof, b: &LeaseProof) -> bool {
@@ -239,6 +260,85 @@ fn wait_for_segment_checkpoint(
         thread::sleep(Duration::from_millis(2));
     }
     false
+}
+
+#[test]
+fn pause_at_segment_boundary_does_not_report_ordinary_paused_when_release_fails() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manifest = sample_manifest(2);
+    let digest = compute_local_finalization_manifest_digest(&manifest);
+    let client = SegmentBoundaryPauseClient::new(manifest);
+    client.fail_release_with(VoiceV2ClientError::DeliveryNotFound);
+    let controls = LocalFinalizationControls::default();
+    let orch = Arc::new(LocalFinalizationOrchestrator::open_with_controls(
+        tmp.path(),
+        DEVICE_ID,
+        controls.clone(),
+    ));
+    let store = LocalJournalStore::open(tmp.path(), SESSION_ID).expect("open store");
+    let pending = LocalPendingItem {
+        session_id: SESSION_ID.into(),
+        manifest_digest: digest,
+        sealed_at_ms: 1,
+    };
+
+    let pending_first = pending.clone();
+    let orch_run = orch.clone();
+    let client_run = client.clone();
+    let worker = thread::spawn(move || orch_run.process_pending(&client_run, &pending_first));
+
+    assert!(
+        wait_for_segment_checkpoint(&store, 0, true, WAIT_BUDGET),
+        "segment 0 must be checkpointed complete before pausing at the next boundary"
+    );
+    orch.set_paused(true);
+
+    let result = worker.join().expect("process_pending thread");
+    assert_eq!(
+        client.release_attempts(),
+        1,
+        "pause must attempt lease release exactly once even when the server rejects release"
+    );
+    assert!(
+        !matches!(result, Err(LocalOrchestratorError::Paused)),
+        "ordinary Paused must mean release succeeded; must not mask release failure (got {result:?})"
+    );
+    let err = result.expect_err("release failure must surface as a bounded orchestrator error");
+    assert!(matches!(
+        &err,
+        LocalOrchestratorError::PauseLeaseReleaseFailed
+    ));
+    assert!(
+        orchestrator_error_is_bounded_non_secret(&err, "lease-token-gen-1"),
+        "release failure must stay bounded and non-secret; got {err:?}"
+    );
+    assert_eq!(
+        client.receipt_posts(),
+        0,
+        "failed pause release must not post a receipt"
+    );
+
+    let checkpoint = store.load_checkpoint().expect("checkpoint on disk");
+    let seg0 = checkpoint
+        .segments
+        .iter()
+        .find(|s| s.segment_seq == 0)
+        .expect("segment 0 checkpoint entry");
+    assert!(
+        seg0.complete,
+        "verified segment 0 checkpoint must remain intact"
+    );
+    assert_eq!(seg0.bytes_complete, 1);
+    let seg1 = checkpoint
+        .segments
+        .iter()
+        .find(|s| s.segment_seq == 1)
+        .expect("segment 1 checkpoint entry");
+    assert!(
+        !seg1.complete,
+        "segment 1 must not be marked complete after boundary pause"
+    );
+    assert_eq!(seg1.bytes_complete, 0);
 }
 
 #[test]

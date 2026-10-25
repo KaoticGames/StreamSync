@@ -3,6 +3,11 @@
 //! Embed in a parent broadcasting app via [`OverlayServer`], or run standalone with
 //! the `stream-sync-server` binary (default port **4040**).
 
+#[cfg(all(feature = "lifecycle-test-support", not(debug_assertions)))]
+compile_error!(
+    "the `lifecycle-test-support` feature is only available in debug builds (not release/optimized)"
+);
+
 mod app_state;
 mod broadcast;
 mod config_types;
@@ -101,7 +106,7 @@ pub mod test_support {
     pub use crate::twitch::identity_commit::{
         rollback_superseded_apply, DurableApplySnapshot, LiveApplySnapshot,
     };
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, all(debug_assertions, feature = "lifecycle-test-support")))]
     pub use crate::voice_delivery::local_finalization::{
         install_post_publication_receipt_gate, install_storage_preflight_injection,
         PostPublicationReceiptBoundary, StoragePreflightFailure, StoragePreflightInjectGuard,

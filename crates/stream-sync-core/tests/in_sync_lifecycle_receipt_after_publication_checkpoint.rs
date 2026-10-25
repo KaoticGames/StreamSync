@@ -3,7 +3,7 @@
 //!
 //! Requires `local-opus-native` so integration tests can decode the seeded journal segment.
 
-#![cfg(feature = "local-opus-native")]
+#![cfg(all(feature = "local-opus-native", feature = "lifecycle-test-support"))]
 
 use std::io::Write;
 use std::path::Path;

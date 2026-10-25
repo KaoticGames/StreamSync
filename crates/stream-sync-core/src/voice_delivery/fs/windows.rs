@@ -797,7 +797,9 @@ mod probe_child_dir_tests {
                 Err(e) => assert!(matches!(e, FsError::SymlinkOrReparseComponent(_))),
                 Ok(_) => panic!("expected SymlinkOrReparseComponent for junction"),
             },
-            Err(reason) => eprintln!("SKIP reparse_directory_junction_rejected: {reason}"),
+            Err(reason) => {
+                panic!("reparse_directory_junction_rejected fixture mklink failed: {reason}")
+            }
         }
     }
 
@@ -813,7 +815,7 @@ mod probe_child_dir_tests {
                 Err(e) => assert!(matches!(e, FsError::SymlinkOrReparseComponent(_))),
                 Ok(_) => panic!("expected SymlinkOrReparseComponent for symlink"),
             },
-            Err(reason) => eprintln!("SKIP reparse_file_symlink_rejected: {reason}"),
+            Err(reason) => panic!("reparse_file_symlink_rejected fixture mklink failed: {reason}"),
         }
     }
 }
@@ -873,8 +875,8 @@ mod read_file_all_reparse_leaf_tests {
                 assert_eq!(fs::read(&target).expect("read target"), target_before);
             }
             Err(reason) => {
-                eprintln!(
-                    "SKIP read_file_all_rejects_file_symlink_external_target_unchanged: {reason}"
+                panic!(
+                    "read_file_all_rejects_file_symlink_external_target_unchanged fixture mklink failed: {reason}"
                 )
             }
         }
@@ -981,7 +983,9 @@ mod rename_no_replace_write_through_same_parent_tests {
                 assert_eq!(fs::read(&target).expect("read target"), target_before);
             }
             Err(reason) => {
-                eprintln!("SKIP reparse_stage_leaf_rejected_external_target_unchanged: {reason}")
+                panic!(
+                    "reparse_stage_leaf_rejected_external_target_unchanged fixture mklink failed: {reason}"
+                )
             }
         }
     }

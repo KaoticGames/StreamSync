@@ -108,7 +108,7 @@ pub fn storage_preflight(
         Err(e) => return Err(map_dest_open_err(e)),
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, all(debug_assertions, feature = "lifecycle-test-support")))]
     if let Some(failure) = injection::active_failure() {
         return Err(failure);
     }
@@ -143,8 +143,8 @@ pub fn storage_preflight(
     Ok(())
 }
 
-/// Debug-only integration hooks for deterministic storage preflight failures (not production API).
-#[cfg(debug_assertions)]
+/// Integration hooks for deterministic storage preflight failures (not production API).
+#[cfg(any(test, all(debug_assertions, feature = "lifecycle-test-support")))]
 pub mod injection {
     use super::StoragePreflightFailure;
     use std::cell::RefCell;
@@ -184,7 +184,7 @@ pub mod injection {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, all(debug_assertions, feature = "lifecycle-test-support")))]
 pub use injection::{install_storage_preflight_injection, StoragePreflightInjectGuard};
 
 #[cfg(test)]

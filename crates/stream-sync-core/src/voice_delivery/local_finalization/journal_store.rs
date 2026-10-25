@@ -20,6 +20,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+#[cfg(test)]
+#[path = "receipt_ack_transaction_observation.rs"]
+mod receipt_ack_transaction_observation;
+
 pub const IN_SYNC_DIR: &str = ".in-sync";
 const CHECKPOINT_FILE: &str = "download-checkpoint.json";
 const CHECKPOINT_BAK_FILE: &str = "download-checkpoint.json.bak";
@@ -323,6 +327,7 @@ impl LocalJournalStore {
     ) -> Result<(), JournalStoreError> {
         let root = DestRoot::open(&self.session_root).map_err(journal_from_fs)?;
         let dir = root.handle();
+        let _install_lock = acquire_receipt_install_lock_at_root(&root)?;
         let intent = match dir.read_file_all(RECEIPT_INTENT_FILE) {
             Ok(bytes) => parse_receipt_bytes(&bytes)?,
             Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -333,7 +338,9 @@ impl LocalJournalStore {
         if intent != *receipt {
             return Err(JournalStoreError::Conflict);
         }
-        persist_receipt_create_new(&self.session_root, RECEIPT_ACK_FILE, receipt)
+        #[cfg(test)]
+        receipt_ack_transaction_observation::signal_after_intent_read_validated(&self.session_root);
+        persist_receipt_install_locked(dir, RECEIPT_ACK_FILE, receipt)
     }
 
     pub fn verify_canonical_publication_matches_receipt(
@@ -473,13 +480,12 @@ struct ReceiptInstallLockGuard {
     file: File,
 }
 
-fn acquire_receipt_install_lock(
-    session_root: &Path,
+fn acquire_receipt_install_lock_at_root(
+    root: &DestRoot,
 ) -> Result<ReceiptInstallLockGuard, JournalStoreError> {
     use fs2::FileExt;
 
-    let root = DestRoot::open(session_root).map_err(journal_from_fs)?;
-    let file = open_lock_file_at_root(&root, &[RECEIPT_INSTALL_LOCK.to_string()])
+    let file = open_lock_file_at_root(root, &[RECEIPT_INSTALL_LOCK.to_string()])
         .map_err(journal_from_fs)?;
     file.lock_exclusive().map_err(JournalStoreError::Io)?;
     Ok(ReceiptInstallLockGuard { file })
@@ -489,6 +495,33 @@ impl Drop for ReceiptInstallLockGuard {
     fn drop(&mut self) {
         let _ = fs2::FileExt::unlock(&self.file);
     }
+}
+
+/// Integration tests: hold the production `.receipt-install.lock` via the same open/lock path as installs.
+#[cfg(test)]
+pub(crate) struct TestReceiptInstallLockGuard {
+    _guard: ReceiptInstallLockGuard,
+}
+
+#[cfg(test)]
+pub(crate) fn test_acquire_receipt_install_lock(
+    session_root: &Path,
+) -> Result<TestReceiptInstallLockGuard, JournalStoreError> {
+    let root = DestRoot::open(session_root).map_err(journal_from_fs)?;
+    acquire_receipt_install_lock_at_root(&root)
+        .map(|guard| TestReceiptInstallLockGuard { _guard: guard })
+}
+
+/// Integration tests: participating writer replaces canonical receipt JSON while already holding the install lock.
+#[cfg(test)]
+pub(crate) fn install_receipt_dest_under_held_install_lock(
+    session_root: &Path,
+    dest_name: &str,
+    receipt: &LocalFinalizationReceipt,
+) -> Result<(), JournalStoreError> {
+    let root = DestRoot::open(session_root).map_err(journal_from_fs)?;
+    let dir = root.handle();
+    persist_receipt_install_locked(dir, dest_name, receipt)
 }
 
 fn require_proven_namespace_durability(
@@ -539,16 +572,46 @@ fn receipt_install_collision_namespace_barrier(
     sync_file(&file).map_err(journal_from_fs)
 }
 
-/// Create-new durable receipt install: unique stage file → platform no-replace install under lock.
-fn persist_receipt_create_new(
-    session_root: &Path,
+/// No-follow readback of the canonical destination before reporting install success.
+///
+/// Supported model: participating writers hold `.receipt-install.lock` and use unique stage
+/// names; this does not claim TOCTOU resistance against an uncooperative same-user process that
+/// can write arbitrary bytes after install returns.
+fn verify_installed_receipt_readback(
+    dir: &DirHandle,
+    dest_name: &str,
+    expected_bytes: &[u8],
+    expected_receipt: &LocalFinalizationReceipt,
+) -> Result<(), JournalStoreError> {
+    use crate::voice_delivery::fs::file::open_existing_file_at;
+
+    let file = open_existing_file_at(dir, dest_name).map_err(journal_from_fs)?;
+    let len = file.len().map_err(journal_from_fs)? as usize;
+    if len != expected_bytes.len() {
+        return Err(JournalStoreError::Conflict);
+    }
+    let mut readback = vec![0u8; len];
+    file.read_exact_at(0, &mut readback)
+        .map_err(journal_from_fs)?;
+    if readback != expected_bytes {
+        return Err(JournalStoreError::Conflict);
+    }
+    let parsed = parse_receipt_bytes(&readback)?;
+    if parsed != *expected_receipt {
+        return Err(JournalStoreError::Conflict);
+    }
+    Ok(())
+}
+
+/// Create-new durable receipt install under an already-held `.receipt-install.lock`.
+///
+/// Caller must open `DestRoot` once and acquire the lock through that capability before calling.
+fn persist_receipt_install_locked(
+    dir: &DirHandle,
     dest_name: &str,
     receipt: &LocalFinalizationReceipt,
 ) -> Result<(), JournalStoreError> {
     let json_bytes = receipt_json_bytes(receipt)?;
-    let root = DestRoot::open(session_root).map_err(journal_from_fs)?;
-    let dir = root.handle();
-    let _install_lock = acquire_receipt_install_lock(session_root)?;
     let stage_name = format!(".receipt-write-{}", uuid::Uuid::new_v4().simple());
 
     if let Err(e) = write_durable_payload_create_new(dir, &stage_name, &json_bytes) {
@@ -563,6 +626,7 @@ fn persist_receipt_create_new(
                 let durability = sync_dir_exact(dir).map_err(journal_from_fs)?;
                 require_proven_namespace_durability(durability)?;
             }
+            verify_installed_receipt_readback(dir, dest_name, &json_bytes, receipt)?;
             Ok(())
         }
         Err(FsError::AlreadyExists) => {
@@ -574,6 +638,7 @@ fn persist_receipt_create_new(
                     receipt_install_collision_namespace_barrier(dir)?;
                     #[cfg(windows)]
                     receipt_install_collision_namespace_barrier(dir, dest_name)?;
+                    verify_installed_receipt_readback(dir, dest_name, &json_bytes, receipt)?;
                     Ok(())
                 }
                 _ => Err(JournalStoreError::Conflict),
@@ -584,6 +649,18 @@ fn persist_receipt_create_new(
             Err(journal_from_fs(e))
         }
     }
+}
+
+/// Create-new durable receipt install: unique stage file → platform no-replace install under lock.
+fn persist_receipt_create_new(
+    session_root: &Path,
+    dest_name: &str,
+    receipt: &LocalFinalizationReceipt,
+) -> Result<(), JournalStoreError> {
+    let root = DestRoot::open(session_root).map_err(journal_from_fs)?;
+    let dir = root.handle();
+    let _install_lock = acquire_receipt_install_lock_at_root(&root)?;
+    persist_receipt_install_locked(dir, dest_name, receipt)
 }
 
 fn parse_checkpoint_file(path: &Path) -> Result<DownloadCheckpoint, JournalStoreError> {
@@ -1355,6 +1432,140 @@ mod preflight_tests {
         let state = store.load_receipt_durable_state().unwrap();
         assert_eq!(state.intent.as_ref(), Some(&receipt));
         assert!(state.ack.is_none());
+    }
+
+    /// Receipt ack must join `.receipt-install.lock` before reading canonical intent.
+    #[test]
+    fn persist_receipt_ack_must_not_validate_intent_before_receipt_install_lock() {
+        use super::receipt_ack_transaction_observation::install_receipt_ack_after_intent_read_observation;
+        use super::{
+            install_receipt_dest_under_held_install_lock, test_acquire_receipt_install_lock,
+            RECEIPT_INTENT_FILE,
+        };
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let recording_parent = tmp.path().to_path_buf();
+        let store = open_test_store(&recording_parent);
+        let receipt = sample_receipt("550e8400-e29b-41d4-a716-446655440099");
+        store.persist_receipt_intent(&receipt).unwrap();
+
+        let session_root = store.session_root().to_path_buf();
+        let (_obs_guard, after_intent_read_rx) =
+            install_receipt_ack_after_intent_read_observation(&session_root);
+        let _external_lock =
+            test_acquire_receipt_install_lock(&session_root).expect("production install lock");
+
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        let child = std::thread::spawn({
+            let recording_parent = recording_parent.clone();
+            let receipt = receipt.clone();
+            move || {
+                let store =
+                    LocalJournalStore::open(&recording_parent, "test-session").expect("open");
+                started_tx.send(()).expect("signal start");
+                let result = store.persist_receipt_ack(&receipt);
+                done_tx.send(result).expect("signal done");
+            }
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("child thread must start persist_receipt_ack");
+
+        match after_intent_read_rx.recv_timeout(Duration::from_millis(750)) {
+            Ok(()) => {
+                panic!(
+                    "persist_receipt_ack must not read and validate receipt-intent.json before \
+                     joining .receipt-install.lock while another holder keeps that lock"
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("after-intent-read observation disconnected before ack finished");
+            }
+        }
+
+        match done_rx.recv_timeout(Duration::from_millis(750)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(result) => {
+                panic!(
+                    "persist_receipt_ack must not complete while external receipt-install lock is held; got {result:?}"
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("child exited before releasing external lock");
+            }
+        }
+
+        let mut rotated = receipt.clone();
+        rotated.completed_at_ms += 1;
+        let intent_path = session_root.join(RECEIPT_INTENT_FILE);
+        std::fs::remove_file(&intent_path)
+            .expect("remove intent for participating-writer rotation");
+        install_receipt_dest_under_held_install_lock(&session_root, RECEIPT_INTENT_FILE, &rotated)
+            .expect("install rotated intent under held lock");
+        drop(_external_lock);
+
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("persist_receipt_ack must complete after lock release");
+        assert!(
+            matches!(result, Err(JournalStoreError::Conflict)),
+            "ack must re-read canonical intent under lock and reject stale body; got {result:?}"
+        );
+        child.join().expect("join child");
+
+        let store = open_test_store(&recording_parent);
+        let state = store.load_receipt_durable_state().unwrap();
+        assert_eq!(state.intent.as_ref(), Some(&rotated));
+        assert!(state.ack.is_none());
+    }
+
+    /// GREEN: receipt ack joins `.receipt-install.lock` before intent validation signal fires.
+    #[test]
+    fn persist_receipt_ack_validates_intent_under_receipt_install_lock() {
+        use super::receipt_ack_transaction_observation::install_receipt_ack_after_intent_read_observation;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let recording_parent = tmp.path().to_path_buf();
+        let store = open_test_store(&recording_parent);
+        let receipt = sample_receipt("550e8400-e29b-41d4-a716-446655440099");
+        store.persist_receipt_intent(&receipt).unwrap();
+
+        let session_root = store.session_root().to_path_buf();
+        let (_obs_guard, after_intent_read_rx) =
+            install_receipt_ack_after_intent_read_observation(&session_root);
+
+        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        let child = std::thread::spawn({
+            let recording_parent = recording_parent.clone();
+            let receipt = receipt.clone();
+            move || {
+                let store =
+                    LocalJournalStore::open(&recording_parent, "test-session").expect("open");
+                let result = store.persist_receipt_ack(&receipt);
+                done_tx.send(result).expect("signal done");
+            }
+        });
+
+        after_intent_read_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("persist_receipt_ack must validate intent only after joining install lock");
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("persist_receipt_ack must complete");
+        result.expect("ack install");
+        child.join().expect("join child");
+
+        let store = open_test_store(&recording_parent);
+        let state = store.load_receipt_durable_state().unwrap();
+        assert_eq!(state.intent.as_ref(), Some(&receipt));
+        assert_eq!(state.ack.as_ref(), Some(&receipt));
     }
 
     /// Same collision-path durability requirement for acknowledgement installs.
