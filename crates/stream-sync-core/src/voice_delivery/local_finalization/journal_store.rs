@@ -10,7 +10,7 @@ use super::storage_preflight::{storage_preflight, StoragePreflightFailure};
 use crate::voice_delivery::fs::durability::{sync_dir_exact, NamespaceDurability};
 use crate::voice_delivery::fs::durable_payload::write_durable_payload_create_new;
 use crate::voice_delivery::fs::{
-    open_lock_file_at_root, rename_no_replace_same_parent, DestRoot, DirHandle, FsError,
+    open_lock_file_at, rename_no_replace_same_parent, DestRoot, DirHandle, FsError,
 };
 use crate::voice_delivery::hash::{sha256_hex_reader, DEFAULT_STREAM_CHUNK};
 use crate::voice_delivery::publication::verify_final_session_directory;
@@ -66,14 +66,17 @@ pub enum JournalStoreError {
 
 pub struct LocalJournalStore {
     session_root: PathBuf,
+    session_dir: DirHandle,
 }
 
 impl LocalJournalStore {
     pub fn open(recording_parent: &Path, session_id: &str) -> Result<Self, JournalStoreError> {
-        let root = recording_parent.join(IN_SYNC_DIR).join(session_id);
-        std::fs::create_dir_all(&root)?;
-        sync_dir(&root)?;
-        Ok(Self { session_root: root })
+        let session_dir = bootstrap_session_dir_handle(recording_parent, session_id)?;
+        let session_root = recording_parent.join(IN_SYNC_DIR).join(session_id);
+        Ok(Self {
+            session_root,
+            session_dir,
+        })
     }
 
     pub fn session_root(&self) -> &Path {
@@ -297,8 +300,7 @@ impl LocalJournalStore {
     }
 
     pub fn load_receipt_durable_state(&self) -> Result<ReceiptDurableState, JournalStoreError> {
-        let root = DestRoot::open(&self.session_root).map_err(journal_from_fs)?;
-        let dir = root.handle();
+        let dir = &self.session_dir;
         let intent = load_optional_receipt_from_dir(dir, RECEIPT_INTENT_FILE)?;
         let ack = load_optional_receipt_from_dir(dir, RECEIPT_ACK_FILE)?;
         if ack.is_some() && intent.is_none() {
@@ -317,7 +319,7 @@ impl LocalJournalStore {
         &self,
         receipt: &LocalFinalizationReceipt,
     ) -> Result<(), JournalStoreError> {
-        persist_receipt_create_new(&self.session_root, RECEIPT_INTENT_FILE, receipt)
+        persist_receipt_create_new_at_dir(&self.session_dir, RECEIPT_INTENT_FILE, receipt)
     }
 
     /// Durable acknowledgement bound to the persisted intent; must match intent exactly.
@@ -325,9 +327,8 @@ impl LocalJournalStore {
         &self,
         receipt: &LocalFinalizationReceipt,
     ) -> Result<(), JournalStoreError> {
-        let root = DestRoot::open(&self.session_root).map_err(journal_from_fs)?;
-        let dir = root.handle();
-        let _install_lock = acquire_receipt_install_lock_at_root(&root)?;
+        let dir = &self.session_dir;
+        let _install_lock = acquire_receipt_install_lock_at_dir(dir)?;
         let intent = match dir.read_file_all(RECEIPT_INTENT_FILE) {
             Ok(bytes) => parse_receipt_bytes(&bytes)?,
             Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -475,18 +476,45 @@ fn journal_from_fs(err: FsError) -> JournalStoreError {
     }
 }
 
+fn journal_bootstrap_from_fs(err: FsError) -> JournalStoreError {
+    match err {
+        FsError::Io(io) => JournalStoreError::Io(io),
+        FsError::SymlinkOrReparseRoot | FsError::SymlinkOrReparseComponent(_) => {
+            JournalStoreError::Conflict
+        }
+        other => JournalStoreError::Other(other.to_string()),
+    }
+}
+
+fn bootstrap_session_dir_handle(
+    recording_parent: &Path,
+    session_id: &str,
+) -> Result<DirHandle, JournalStoreError> {
+    let root = DestRoot::open(recording_parent).map_err(journal_bootstrap_from_fs)?;
+    let in_sync = root
+        .handle()
+        .create_or_open_child_dir(IN_SYNC_DIR)
+        .map_err(journal_bootstrap_from_fs)?;
+    let session = in_sync
+        .create_or_open_child_dir(session_id)
+        .map_err(journal_bootstrap_from_fs)?;
+    // Propagate real sync I/O errors; honest `Unavailable` is acceptable at bootstrap (Windows).
+    sync_dir_exact(&session).map_err(journal_from_fs)?;
+    Ok(session)
+}
+
 /// RAII exclusive receipt-install lock; file is never deleted on release.
 struct ReceiptInstallLockGuard {
     file: File,
 }
 
-fn acquire_receipt_install_lock_at_root(
-    root: &DestRoot,
+fn acquire_receipt_install_lock_at_dir(
+    dir: &DirHandle,
 ) -> Result<ReceiptInstallLockGuard, JournalStoreError> {
     use fs2::FileExt;
 
-    let file = open_lock_file_at_root(root, &[RECEIPT_INSTALL_LOCK.to_string()])
-        .map_err(journal_from_fs)?;
+    let file =
+        open_lock_file_at(dir, &[RECEIPT_INSTALL_LOCK.to_string()]).map_err(journal_from_fs)?;
     file.lock_exclusive().map_err(JournalStoreError::Io)?;
     Ok(ReceiptInstallLockGuard { file })
 }
@@ -508,7 +536,7 @@ pub(crate) fn test_acquire_receipt_install_lock(
     session_root: &Path,
 ) -> Result<TestReceiptInstallLockGuard, JournalStoreError> {
     let root = DestRoot::open(session_root).map_err(journal_from_fs)?;
-    acquire_receipt_install_lock_at_root(&root)
+    acquire_receipt_install_lock_at_dir(root.handle())
         .map(|guard| TestReceiptInstallLockGuard { _guard: guard })
 }
 
@@ -652,14 +680,12 @@ fn persist_receipt_install_locked(
 }
 
 /// Create-new durable receipt install: unique stage file → platform no-replace install under lock.
-fn persist_receipt_create_new(
-    session_root: &Path,
+fn persist_receipt_create_new_at_dir(
+    dir: &DirHandle,
     dest_name: &str,
     receipt: &LocalFinalizationReceipt,
 ) -> Result<(), JournalStoreError> {
-    let root = DestRoot::open(session_root).map_err(journal_from_fs)?;
-    let dir = root.handle();
-    let _install_lock = acquire_receipt_install_lock_at_root(&root)?;
+    let _install_lock = acquire_receipt_install_lock_at_dir(dir)?;
     persist_receipt_install_locked(dir, dest_name, receipt)
 }
 
@@ -1826,6 +1852,210 @@ mod preflight_tests {
         );
         let err = LocalJournalStore::disk_preflight_bytes(&manifest, 0).unwrap_err();
         assert_eq!(err, StoragePreflightFailure::RequiredBytesOverflow);
+    }
+
+    /// Journal bootstrap must tolerate honest `NamespaceDurability::Unavailable` (e.g. Windows).
+    #[test]
+    fn open_accepts_unavailable_session_dir_sync_after_bootstrap() {
+        use crate::voice_delivery::fs::durability::fail_next_sync_dir_exact::install_next_sync_dir_exact_unavailable;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = install_next_sync_dir_exact_unavailable();
+        LocalJournalStore::open(tmp.path(), "test-session")
+            .expect("bootstrap must not require proven namespace durability");
+    }
+
+    /// Injected `sync_dir_exact` I/O failure during bootstrap must still fail `open`.
+    #[test]
+    fn open_propagates_injected_session_dir_sync_io_error() {
+        use crate::voice_delivery::fs::durability::fail_next_sync_dir_exact::{
+            install_fail_next_sync_dir_exact, INJECTED_MESSAGE,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = install_fail_next_sync_dir_exact();
+        let err = match LocalJournalStore::open(tmp.path(), "test-session") {
+            Err(err) => err,
+            Ok(_) => panic!("bootstrap must propagate sync_dir_exact I/O errors"),
+        };
+        assert!(
+            matches!(&err, JournalStoreError::Io(io) if io.to_string().contains(INJECTED_MESSAGE)),
+            "expected injected sync_dir_exact durability error, got {err:?}"
+        );
+    }
+
+    /// Journal bootstrap must not follow a pre-existing `.in-sync` symlink before receipt capability exists.
+    #[cfg(unix)]
+    mod journal_session_bootstrap_security {
+        use super::*;
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        const SESSION_ID: &str = "test-session";
+
+        #[test]
+        fn open_rejects_preexisting_in_sync_symlink_and_leaves_external_untouched() {
+            let tmp = tempfile::tempdir().unwrap();
+            let recording_parent = tmp.path();
+            let external = tmp.path().join("external-in-sync-tree");
+            fs::create_dir(&external).unwrap();
+            let sentinel = external.join("sentinel-do-not-touch");
+            fs::write(&sentinel, b"untouched").unwrap();
+            let external_before = fs::read(&sentinel).unwrap();
+
+            let in_sync_link = recording_parent.join(IN_SYNC_DIR);
+            symlink(&external, &in_sync_link).unwrap();
+
+            let result = LocalJournalStore::open(recording_parent, SESSION_ID);
+            assert!(
+                result.is_err(),
+                "open must reject a pre-existing .in-sync symlink; ambient create_dir_all \
+                 followed the link and got Ok"
+            );
+            assert_eq!(
+                fs::read(&sentinel).unwrap(),
+                external_before,
+                "external target must remain untouched when .in-sync is a symlink"
+            );
+            assert!(
+                !external.join(SESSION_ID).exists(),
+                "session directory must not be created under the symlink target"
+            );
+        }
+
+        #[test]
+        fn open_rejects_preexisting_session_symlink_under_real_in_sync_and_leaves_external_untouched(
+        ) {
+            let tmp = tempfile::tempdir().unwrap();
+            let recording_parent = tmp.path();
+            fs::create_dir(recording_parent.join(IN_SYNC_DIR)).unwrap();
+            let external = tmp.path().join("external-session-tree");
+            fs::create_dir(&external).unwrap();
+            let sentinel = external.join("sentinel-do-not-touch");
+            fs::write(&sentinel, b"untouched").unwrap();
+            let external_before = fs::read(&sentinel).unwrap();
+
+            let session_link = recording_parent.join(IN_SYNC_DIR).join(SESSION_ID);
+            symlink(&external, &session_link).unwrap();
+
+            let result = LocalJournalStore::open(recording_parent, SESSION_ID);
+            assert!(
+                result.is_err(),
+                "open must reject a pre-existing session symlink under .in-sync"
+            );
+            assert_eq!(fs::read(&sentinel).unwrap(), external_before);
+            assert!(
+                session_link.is_symlink(),
+                "session link must remain in place when open rejects"
+            );
+        }
+
+        /// Production receipt paths must use the session `DirHandle` opened at bootstrap, not reopen
+        /// the ambient `session_root` path (which can diverge after rename).
+        #[test]
+        #[cfg(target_os = "linux")]
+        fn receipt_operations_use_retained_session_dir_after_ambient_path_replaced() {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = open_test_store(tmp.path());
+            let receipt = sample_receipt("550e8400-e29b-41d4-a716-446655440099");
+            store.persist_receipt_intent(&receipt).unwrap();
+
+            let ambient = store.session_root().to_path_buf();
+            let relocated = tmp.path().join("relocated-session-inode");
+            std::fs::rename(&ambient, &relocated).unwrap();
+            std::fs::create_dir(&ambient).unwrap();
+
+            let state = store.load_receipt_durable_state().unwrap();
+            assert_eq!(
+                state.intent.as_ref(),
+                Some(&receipt),
+                "load must read through retained capability, not the replacement directory at session_root"
+            );
+
+            store.persist_receipt_ack(&receipt).unwrap();
+            let state = store.load_receipt_durable_state().unwrap();
+            assert_eq!(state.ack.as_ref(), Some(&receipt));
+
+            let intent_on_cap = relocated.join(RECEIPT_INTENT_FILE);
+            assert!(intent_on_cap.is_file());
+            assert!(!ambient.join(RECEIPT_INTENT_FILE).exists());
+        }
+    }
+
+    #[cfg(windows)]
+    mod journal_session_bootstrap_security_windows {
+        use super::*;
+        use std::fs;
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+
+        const SESSION_ID: &str = "test-session";
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        fn directory_junction(link: &Path, target: &Path) -> Result<(), String> {
+            let link_s = link.to_string_lossy();
+            let target_s = target.to_string_lossy();
+            let output = Command::new("cmd")
+                .args(["/C", "mklink", "/J", &link_s, &target_s])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .map_err(|e| format!("spawn mklink /J: {e}"))?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "mklink /J failed (status {:?}): {}{}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ))
+            }
+        }
+
+        #[test]
+        fn open_rejects_preexisting_in_sync_junction_and_leaves_external_untouched() {
+            let tmp = tempfile::tempdir().unwrap();
+            let recording_parent = tmp.path();
+            let external = tmp.path().join("external-in-sync-tree");
+            fs::create_dir(&external).unwrap();
+            let sentinel = external.join("sentinel-do-not-touch");
+            fs::write(&sentinel, b"untouched").unwrap();
+            let external_before = fs::read(&sentinel).unwrap();
+
+            let in_sync_link = recording_parent.join(IN_SYNC_DIR);
+            directory_junction(&in_sync_link, &external)
+                .unwrap_or_else(|reason| panic!("in-sync junction fixture: {reason}"));
+
+            let result = LocalJournalStore::open(recording_parent, SESSION_ID);
+            assert!(
+                result.is_err(),
+                "open must reject a pre-existing .in-sync directory junction"
+            );
+            assert_eq!(fs::read(&sentinel).unwrap(), external_before);
+            assert!(!external.join(SESSION_ID).exists());
+        }
+
+        #[test]
+        fn open_rejects_preexisting_session_symlink_under_real_in_sync_and_leaves_external_untouched(
+        ) {
+            let tmp = tempfile::tempdir().unwrap();
+            let recording_parent = tmp.path();
+            fs::create_dir(recording_parent.join(IN_SYNC_DIR)).unwrap();
+            let external = tmp.path().join("external-session-tree");
+            fs::create_dir(&external).unwrap();
+            let sentinel = external.join("sentinel-do-not-touch");
+            fs::write(&sentinel, b"untouched").unwrap();
+            let external_before = fs::read(&sentinel).unwrap();
+
+            let session_link = recording_parent.join(IN_SYNC_DIR).join(SESSION_ID);
+            directory_junction(&session_link, &external)
+                .unwrap_or_else(|reason| panic!("session junction fixture: {reason}"));
+
+            let result = LocalJournalStore::open(recording_parent, SESSION_ID);
+            assert!(result.is_err());
+            assert_eq!(fs::read(&sentinel).unwrap(), external_before);
+            assert!(session_link.exists());
+        }
     }
 
     /// Receipt durable-state loads must not follow symlinks (ambient `exists`/`read`).

@@ -80,6 +80,7 @@ jobs:
           run_suite 'receipt_ack_identical_concurrent_idempotent_atomic'
           run_suite 'persist_receipt_ack_must_not_validate_intent_before_receipt_install_lock'
           run_suite 'persist_receipt_ack_validates_intent_under_receipt_install_lock'
+          run_suite 'journal_session_bootstrap_security_windows'
         shell: bash
 
   phase0c-linux-receipt-durability:
@@ -95,6 +96,7 @@ jobs:
           set -e
           count_suite_tests() { cargo test -p stream-sync-core "$1" -- --list 2>/dev/null | grep -cE ': test$' || true; }
           run_suite() { n=$(count_suite_tests "$1"); echo "filter '$1' matched $n tests"; test "$n" -gt 0; cargo test -p stream-sync-core "$1" -- --nocapture; }
+          run_suite 'journal_session_bootstrap_security'
           run_suite 'receipt_symlink_no_follow_security'
           run_suite 'receipt_intent_winning_install_rejects_unavailable_dir_sync'
           run_suite 'receipt_ack_winning_install_rejects_unavailable_dir_sync'
