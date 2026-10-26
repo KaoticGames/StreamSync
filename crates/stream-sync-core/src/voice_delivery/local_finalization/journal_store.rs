@@ -491,15 +491,16 @@ fn bootstrap_session_dir_handle(
     session_id: &str,
 ) -> Result<DirHandle, JournalStoreError> {
     let root = DestRoot::open(recording_parent).map_err(journal_bootstrap_from_fs)?;
-    let in_sync = root
-        .handle()
+    let recording_parent_handle = root.handle();
+    let in_sync = recording_parent_handle
         .create_or_open_child_dir(IN_SYNC_DIR)
         .map_err(journal_bootstrap_from_fs)?;
+    // Propagate real sync I/O errors; honest `Unavailable` is acceptable at bootstrap (Windows).
+    sync_dir_exact(recording_parent_handle).map_err(journal_from_fs)?;
     let session = in_sync
         .create_or_open_child_dir(session_id)
         .map_err(journal_bootstrap_from_fs)?;
-    // Propagate real sync I/O errors; honest `Unavailable` is acceptable at bootstrap (Windows).
-    sync_dir_exact(&session).map_err(journal_from_fs)?;
+    sync_dir_exact(&in_sync).map_err(journal_from_fs)?;
     Ok(session)
 }
 
@@ -1854,33 +1855,95 @@ mod preflight_tests {
         assert_eq!(err, StoragePreflightFailure::RequiredBytesOverflow);
     }
 
-    /// Journal bootstrap must tolerate honest `NamespaceDurability::Unavailable` (e.g. Windows).
+    /// Journal bootstrap must tolerate honest `NamespaceDurability::Unavailable` at hierarchy barriers.
     #[test]
-    fn open_accepts_unavailable_session_dir_sync_after_bootstrap() {
-        use crate::voice_delivery::fs::durability::fail_next_sync_dir_exact::install_next_sync_dir_exact_unavailable;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = install_next_sync_dir_exact_unavailable();
-        LocalJournalStore::open(tmp.path(), "test-session")
-            .expect("bootstrap must not require proven namespace durability");
-    }
-
-    /// Injected `sync_dir_exact` I/O failure during bootstrap must still fail `open`.
-    #[test]
-    fn open_propagates_injected_session_dir_sync_io_error() {
+    fn open_accepts_unavailable_recording_parent_barrier_sync() {
         use crate::voice_delivery::fs::durability::fail_next_sync_dir_exact::{
-            install_fail_next_sync_dir_exact, INJECTED_MESSAGE,
+            install_sync_dir_exact_outcome_queue, queue_unconsumed_len, QueuedOutcome,
         };
 
         let tmp = tempfile::tempdir().unwrap();
-        let _guard = install_fail_next_sync_dir_exact();
-        let err = match LocalJournalStore::open(tmp.path(), "test-session") {
+        let session_id = "test-session";
+        let _guard = install_sync_dir_exact_outcome_queue(vec![
+            QueuedOutcome::Unavailable,
+            QueuedOutcome::PassThrough,
+        ]);
+        LocalJournalStore::open(tmp.path(), session_id)
+            .expect("recording-parent barrier may report Unavailable");
+        assert_eq!(queue_unconsumed_len(), 0);
+    }
+
+    #[test]
+    fn open_accepts_unavailable_in_sync_barrier_sync() {
+        use crate::voice_delivery::fs::durability::fail_next_sync_dir_exact::{
+            install_sync_dir_exact_outcome_queue, queue_unconsumed_len, QueuedOutcome,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let session_id = "test-session";
+        let _guard = install_sync_dir_exact_outcome_queue(vec![
+            QueuedOutcome::PassThrough,
+            QueuedOutcome::Unavailable,
+        ]);
+        LocalJournalStore::open(tmp.path(), session_id)
+            .expect(".in-sync barrier may report Unavailable");
+        assert_eq!(queue_unconsumed_len(), 0);
+    }
+
+    /// Recording-parent durability barrier I/O failure must fail `open` before session creation.
+    #[test]
+    fn open_propagates_recording_parent_barrier_sync_io_error() {
+        use crate::voice_delivery::fs::durability::fail_next_sync_dir_exact::{
+            install_sync_dir_exact_outcome_queue, queue_unconsumed_len, QueuedOutcome,
+            INJECTED_MESSAGE,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let session_id = "test-session";
+        let session_path = tmp.path().join(IN_SYNC_DIR).join(session_id);
+        let _guard = install_sync_dir_exact_outcome_queue(vec![QueuedOutcome::Io]);
+        let err = match LocalJournalStore::open(tmp.path(), session_id) {
             Err(err) => err,
-            Ok(_) => panic!("bootstrap must propagate sync_dir_exact I/O errors"),
+            Ok(_) => panic!("bootstrap must propagate recording-parent barrier sync I/O errors"),
         };
         assert!(
             matches!(&err, JournalStoreError::Io(io) if io.to_string().contains(INJECTED_MESSAGE)),
             "expected injected sync_dir_exact durability error, got {err:?}"
+        );
+        assert_eq!(queue_unconsumed_len(), 0);
+        assert!(
+            !session_path.exists(),
+            "session directory must not be created when recording-parent barrier fails"
+        );
+    }
+
+    /// `.in-sync` durability barrier I/O failure must fail `open` after both hierarchy entries exist.
+    #[test]
+    fn open_propagates_in_sync_barrier_sync_io_error() {
+        use crate::voice_delivery::fs::durability::fail_next_sync_dir_exact::{
+            install_sync_dir_exact_outcome_queue, queue_unconsumed_len, QueuedOutcome,
+            INJECTED_MESSAGE,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let session_id = "test-session";
+        let session_path = tmp.path().join(IN_SYNC_DIR).join(session_id);
+        let _guard = install_sync_dir_exact_outcome_queue(vec![
+            QueuedOutcome::PassThrough,
+            QueuedOutcome::Io,
+        ]);
+        let err = match LocalJournalStore::open(tmp.path(), session_id) {
+            Err(err) => err,
+            Ok(_) => panic!("bootstrap must propagate .in-sync barrier sync I/O errors"),
+        };
+        assert!(
+            matches!(&err, JournalStoreError::Io(io) if io.to_string().contains(INJECTED_MESSAGE)),
+            "expected injected sync_dir_exact durability error, got {err:?}"
+        );
+        assert_eq!(queue_unconsumed_len(), 0);
+        assert!(
+            session_path.is_dir(),
+            "session directory must exist before .in-sync barrier failure is surfaced"
         );
     }
 
