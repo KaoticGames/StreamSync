@@ -15,6 +15,7 @@ use uuid::Uuid;
 pub const LOCAL_FINALIZATION_RECEIPT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LocalFinalizationReceiptStem {
     pub discord_user_id: String,
     pub relative_path: String,
@@ -23,6 +24,7 @@ pub struct LocalFinalizationReceiptStem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LocalFinalizationReceiptRecoveryReport {
     pub relative_path: String,
     pub byte_length: u64,
@@ -30,6 +32,7 @@ pub struct LocalFinalizationReceiptRecoveryReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LocalFinalizationReceipt {
     pub version: u32,
     pub session_id: String,

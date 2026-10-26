@@ -21,13 +21,12 @@ use super::receipt::{
     LocalFinalizationReceiptRecoveryReport, LocalFinalizationReceiptStem,
 };
 use super::storage_preflight::StoragePreflightFailure;
-use crate::voice_delivery::client::ReceiptRequestBody;
 use crate::voice_delivery::client::VoiceV2ClientError;
 use crate::voice_delivery::finalized_manifest::{
     compute_finalized_manifest_digest, expected_wav_file_bytes, SyndicateFinalizedStem,
     SyndicateRecoveryReport,
 };
-use crate::voice_delivery::orchestrator::{FinalizedVoiceDelivery, LOCAL_PUBLICATION_STATE};
+use crate::voice_delivery::orchestrator::FinalizedVoiceDelivery;
 use crate::voice_delivery::recovery_report::RECOVERY_REPORT_CONTENT_TYPE;
 use crate::voice_delivery::recovery_report::RECOVERY_REPORT_RELATIVE_PATH;
 use std::io::Seek;
@@ -44,6 +43,8 @@ pub enum LocalOrchestratorError {
     Cancelled,
     #[error("paused")]
     Paused,
+    #[error("pause lease release failed")]
+    PauseLeaseReleaseFailed,
     #[error("client: {0}")]
     Client(#[from] VoiceV2ClientError),
     #[error("store: {0}")]
@@ -142,9 +143,9 @@ impl LocalFinalizationOrchestrator {
 
     fn check_pause_cancel<C: LocalFinalizationClient + Clone + 'static>(
         &self,
-        client: &C,
-        session_id: &str,
-        lease: &mut LeaseSession<C>,
+        _client: &C,
+        _session_id: &str,
+        _lease: &mut LeaseSession<C>,
     ) -> Result<(), LocalOrchestratorError> {
         self.controls
             .cancel
@@ -152,10 +153,6 @@ impl LocalFinalizationOrchestrator {
             .map_err(|_| LocalOrchestratorError::Cancelled)?;
         if self.controls.paused.load(Ordering::SeqCst) {
             self.set_phase(LocalFinalizationPhase::Paused);
-            lease.stop_keeper();
-            if self.controls.release_lease_on_pause.load(Ordering::SeqCst) {
-                let _ = client.release_delivery(session_id, &self.device_id, lease.proof());
-            }
             return Err(LocalOrchestratorError::Paused);
         }
         Ok(())
@@ -208,12 +205,6 @@ impl LocalFinalizationOrchestrator {
                 ));
             }
 
-            if let Err(pref) =
-                LocalJournalStore::run_storage_preflight(&self.parent, &manifest, 512 * 1024 * 1024)
-            {
-                return Err(LocalOrchestratorError::StoragePreflight(pref));
-            }
-
             let store = LocalJournalStore::open(&self.parent, &manifest.session_id)
                 .map_err(map_journal_store_err)?;
             store
@@ -222,6 +213,18 @@ impl LocalFinalizationOrchestrator {
             self.emit(LocalFinalizationProgressEvent::JournalReady {
                 session_id: manifest.session_id.clone(),
             });
+
+            if self.try_receipt_only_completion(
+                client,
+                &store,
+                &manifest,
+                &pending.manifest_digest,
+                &mut lease,
+            )? {
+                lease.stop_keeper_without_release();
+                self.set_phase(LocalFinalizationPhase::Complete);
+                return Ok(());
+            }
 
             self.check_pause_cancel(client, &pending.session_id, &mut lease)?;
             self.ensure_lease_alive(&lease)?;
@@ -281,10 +284,17 @@ impl LocalFinalizationOrchestrator {
         if matches!(&run_result, Err(LocalOrchestratorError::Paused)) {
             lease.stop_keeper();
             if self.controls.release_lease_on_pause.load(Ordering::SeqCst) {
-                let _ =
-                    client.release_delivery(&pending.session_id, &self.device_id, lease.proof());
+                match client.release_delivery(&pending.session_id, &self.device_id, lease.proof()) {
+                    Ok(()) => return run_result,
+                    Err(_) => {
+                        return Err(LocalOrchestratorError::PauseLeaseReleaseFailed);
+                    }
+                }
             }
             return run_result;
+        }
+        if matches!(&run_result, Err(LocalOrchestratorError::Cancelled)) {
+            self.set_phase(LocalFinalizationPhase::Cancelled);
         }
         if run_result.is_err() && !lease.receipt_posted {
             lease.release_best_effort(client, &self.device_id);
@@ -419,6 +429,70 @@ impl LocalFinalizationOrchestrator {
         Ok(())
     }
 
+    fn try_receipt_only_completion<C: LocalFinalizationClient + Clone + 'static>(
+        &self,
+        client: &C,
+        store: &LocalJournalStore,
+        manifest: &LocalFinalizationManifest,
+        manifest_digest: &str,
+        lease: &mut LeaseSession<C>,
+    ) -> Result<bool, LocalOrchestratorError> {
+        let state = store
+            .load_receipt_durable_state()
+            .map_err(map_journal_store_err)?;
+        let intent = match state.intent {
+            None => return Ok(false),
+            Some(receipt) => receipt,
+        };
+        self.validate_durable_receipt_for_recovery(&intent, manifest, manifest_digest)?;
+        LocalJournalStore::verify_canonical_publication_matches_receipt(&self.parent, &intent)
+            .map_err(map_journal_store_err)?;
+
+        if state.ack.is_some() {
+            lease.receipt_posted = true;
+            return Ok(true);
+        }
+
+        self.set_phase(LocalFinalizationPhase::Receipting);
+        #[cfg(all(debug_assertions, feature = "lifecycle-test-support"))]
+        super::post_publication_receipt_gate::pause_post_publication_receipt_gate(
+            &self.parent,
+            &manifest.session_id,
+            super::post_publication_receipt_gate::PostPublicationReceiptBoundary::BeforeReceiptReplayPost,
+        );
+        self.check_pause_cancel(client, &manifest.session_id, lease)?;
+        lease.fence_lease_authority(client, &self.device_id)?;
+        self.check_pause_cancel(client, &manifest.session_id, lease)?;
+        client
+            .post_receipt(&manifest.session_id, &intent, lease.proof())
+            .map_err(LocalOrchestratorError::Client)?;
+        store
+            .persist_receipt_ack(&intent)
+            .map_err(map_journal_store_err)?;
+        lease.receipt_posted = true;
+        self.emit(LocalFinalizationProgressEvent::ReceiptAcknowledged {
+            session_id: manifest.session_id.clone(),
+        });
+        Ok(true)
+    }
+
+    fn validate_durable_receipt_for_recovery(
+        &self,
+        receipt: &LocalFinalizationReceipt,
+        manifest: &LocalFinalizationManifest,
+        manifest_digest: &str,
+    ) -> Result<(), LocalOrchestratorError> {
+        assert_local_finalization_receipt_matches_manifest(receipt, manifest)
+            .map_err(|_| LocalOrchestratorError::StoreConflict)?;
+        if receipt.device_id != self.device_id {
+            return Err(LocalOrchestratorError::StoreConflict);
+        }
+        if receipt.delivery_manifest_digest != manifest_digest {
+            return Err(LocalOrchestratorError::StoreConflict);
+        }
+        Ok(())
+    }
+
     fn publish_and_receipt<C: LocalFinalizationClient + Clone + 'static>(
         &self,
         client: &C,
@@ -428,6 +502,8 @@ impl LocalFinalizationOrchestrator {
         output: super::processor::LocalProcessOutput,
         lease: &mut LeaseSession<C>,
     ) -> Result<(), LocalOrchestratorError> {
+        let store = LocalJournalStore::open(&self.parent, &manifest.session_id)
+            .map_err(map_journal_store_err)?;
         self.set_phase(LocalFinalizationPhase::Publishing);
         let wav_bytes = expected_wav_file_bytes(manifest.target_sample_count_48k);
         let stems: Vec<SyndicateFinalizedStem> = manifest
@@ -463,6 +539,13 @@ impl LocalFinalizationOrchestrator {
         let delivery = FinalizedVoiceDelivery::open_recording_parent(&self.parent)
             .map_err(|e| LocalOrchestratorError::Other(e.to_string()))?
             .with_device_id(self.device_id.clone());
+        #[cfg(all(debug_assertions, feature = "lifecycle-test-support"))]
+        super::post_publication_receipt_gate::pause_post_publication_receipt_gate(
+            &self.parent,
+            &manifest.session_id,
+            super::post_publication_receipt_gate::PostPublicationReceiptBoundary::BeforePublication,
+        );
+        self.check_pause_cancel(client, &manifest.session_id, lease)?;
         let published = delivery
             .publish_local_decoded(&syndicate, &output_digest, sealed_at, &output)
             .map_err(|e| LocalOrchestratorError::Other(e.to_string()))?;
@@ -473,6 +556,15 @@ impl LocalFinalizationOrchestrator {
                 .recovery_report_path
                 .map(|p| p.to_string_lossy().to_string()),
         });
+        #[cfg(all(debug_assertions, feature = "lifecycle-test-support"))]
+        super::post_publication_receipt_gate::pause_post_publication_receipt_gate(
+            &self.parent,
+            &manifest.session_id,
+            super::post_publication_receipt_gate::PostPublicationReceiptBoundary::AfterPublicationBeforeReceiptIntent,
+        );
+        self.check_pause_cancel(client, &manifest.session_id, lease)?;
+        lease.fence_lease_authority(client, &self.device_id)?;
+        self.check_pause_cancel(client, &manifest.session_id, lease)?;
         self.set_phase(LocalFinalizationPhase::Receipting);
         let receipt = LocalFinalizationReceipt {
             version: 1,
@@ -508,19 +600,28 @@ impl LocalFinalizationOrchestrator {
         };
         assert_local_finalization_receipt_matches_manifest(&receipt, manifest)
             .map_err(|e| LocalOrchestratorError::Other(e.to_string()))?;
+        store
+            .persist_receipt_intent(&receipt)
+            .map_err(map_journal_store_err)?;
+        #[cfg(all(debug_assertions, feature = "lifecycle-test-support"))]
+        super::post_publication_receipt_gate::pause_post_publication_receipt_gate(
+            &self.parent,
+            &manifest.session_id,
+            super::post_publication_receipt_gate::PostPublicationReceiptBoundary::AfterReceiptIntentBeforeFreshReceiptPost,
+        );
+        self.check_pause_cancel(client, &manifest.session_id, lease)?;
+        lease.fence_lease_authority(client, &self.device_id)?;
+        self.check_pause_cancel(client, &manifest.session_id, lease)?;
         client
             .post_receipt(&manifest.session_id, &receipt, lease.proof())
             .map_err(LocalOrchestratorError::Client)?;
+        store
+            .persist_receipt_ack(&receipt)
+            .map_err(map_journal_store_err)?;
         lease.receipt_posted = true;
         self.emit(LocalFinalizationProgressEvent::ReceiptAcknowledged {
             session_id: manifest.session_id.clone(),
         });
-        let _ = ReceiptRequestBody {
-            manifest_digest: manifest_digest.to_string(),
-            device_id: self.device_id.clone(),
-            local_receipt_id: uuid::Uuid::new_v4().to_string(),
-            local_publication_state: LOCAL_PUBLICATION_STATE.to_string(),
-        };
         Ok(())
     }
 }
@@ -549,7 +650,7 @@ fn map_journal_store_err(e: JournalStoreError) -> LocalOrchestratorError {
 struct LeaseSession<C: LocalFinalizationClient + Clone> {
     session_id: String,
     proof: LeaseProof,
-    _expires_at_ms: i64,
+    expires_at_ms: i64,
     keeper: Option<LeaseKeeper>,
     receipt_posted: bool,
     _client: C,
@@ -568,10 +669,30 @@ impl<C: LocalFinalizationClient + Clone + 'static> LeaseSession<C> {
         Self {
             session_id: grant.session_id,
             proof,
-            _expires_at_ms: grant.expires_at_ms,
+            expires_at_ms: grant.expires_at_ms,
             keeper: Some(keeper),
             receipt_posted: false,
             _client: client,
+        }
+    }
+
+    /// Synchronous lease-authority fence at receipt boundaries (not the background keeper interval).
+    fn fence_lease_authority(
+        &mut self,
+        client: &C,
+        device_id: &str,
+    ) -> Result<(), LocalOrchestratorError> {
+        if self.keeper.as_ref().is_some_and(|k| k.renew_failed()) {
+            return Err(LocalOrchestratorError::Other("lease renewal failed".into()));
+        }
+        match client.renew_lease(&self.session_id, device_id, &self.proof) {
+            Ok(next_expires) => {
+                if let Some(ms) = next_expires {
+                    self.expires_at_ms = ms;
+                }
+                Ok(())
+            }
+            Err(err) => Err(LocalOrchestratorError::Client(err)),
         }
     }
 

@@ -309,6 +309,9 @@ mod injectable_rename_outcome_matrix {
     use crate::voice_delivery::fs::{DirHandle, FsError, ValidatedFinalName};
     use crate::voice_delivery::records::ledger_generation::LedgerStore;
     use crate::voice_delivery::state::LedgerState;
+    use std::sync::Mutex;
+
+    static DROP_STAGE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn inject_io() -> crate::voice_delivery::publication::publish::RenameInjectFn {
         fn wrap(
@@ -571,6 +574,9 @@ mod injectable_rename_outcome_matrix {
 
     #[test]
     fn rename_unknown_neither_operation_order() {
+        let _env_guard = DROP_STAGE_ENV_LOCK
+            .lock()
+            .expect("drop-stage injection environment lock");
         let fx = sealed_publish_intent_fixture("inj-neither-order", "inj-neither-final", &[]);
         std::env::set_var(
             "STREAMSYNC_INJECT_DROP_STAGE_ROOT",
@@ -615,6 +621,9 @@ mod injectable_rename_outcome_matrix {
 
     #[test]
     fn rename_error_neither_indeterminate() {
+        let _env_guard = DROP_STAGE_ENV_LOCK
+            .lock()
+            .expect("drop-stage injection environment lock");
         let fx = sealed_publish_intent_fixture("inj-neither", "inj-neither-final", &[]);
         std::env::set_var(
             "STREAMSYNC_INJECT_DROP_STAGE_ROOT",

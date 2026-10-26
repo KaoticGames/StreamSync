@@ -44,6 +44,18 @@ pub(crate) fn rename_no_replace_same_parent(
     }
 }
 
+/// Windows receipt install: `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` only (no replace).
+#[cfg(windows)]
+pub(crate) fn rename_no_replace_write_through_same_parent(
+    final_parent: &DirHandle,
+    src_name: &str,
+    dst_name: &str,
+) -> Result<(), FsError> {
+    validate_single_component(src_name)?;
+    validate_single_component(dst_name)?;
+    windows::rename_no_replace_write_through_same_parent(final_parent, src_name, dst_name)
+}
+
 /// Same final-parent handle; atomically replaces `dst_name` when it already exists.
 pub(crate) fn rename_replace_same_parent(
     final_parent: &DirHandle,
@@ -67,23 +79,30 @@ pub(crate) fn rename_replace_same_parent(
     }
 }
 
-pub(crate) fn open_lock_file_at_root(
-    root: &DestRoot,
+pub(crate) fn open_lock_file_at(
+    dir: &DirHandle,
     rel_components: &[String],
 ) -> Result<std::fs::File, FsError> {
     #[cfg(unix)]
     {
-        unix::open_lock_file(root.handle(), rel_components)
+        unix::open_lock_file(dir, rel_components)
     }
     #[cfg(windows)]
     {
-        windows::open_lock_file(root.handle(), rel_components)
+        windows::open_lock_file(dir, rel_components)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (root, rel_components);
+        let _ = (dir, rel_components);
         Err(FsError::Unsupported)
     }
+}
+
+pub(crate) fn open_lock_file_at_root(
+    root: &DestRoot,
+    rel_components: &[String],
+) -> Result<std::fs::File, FsError> {
+    open_lock_file_at(root.handle(), rel_components)
 }
 
 #[cfg(all(test, target_os = "linux"))]

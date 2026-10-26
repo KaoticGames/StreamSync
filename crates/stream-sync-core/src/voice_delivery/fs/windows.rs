@@ -31,11 +31,11 @@ use windows_sys::Win32::Foundation::{
     HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, FileAttributeTagInfo, GetFileInformationByHandleEx,
+    CreateDirectoryW, CreateFileW, FileAttributeTagInfo, GetFileInformationByHandleEx, MoveFileExW,
     SetFileInformationByHandle, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_WRITE_ATTRIBUTES, OPEN_ALWAYS, OPEN_EXISTING,
+    FILE_WRITE_ATTRIBUTES, MOVEFILE_WRITE_THROUGH, OPEN_ALWAYS, OPEN_EXISTING,
 };
 
 fn map_rename_buffer_err(e: RenameBufferError) -> FsError {
@@ -404,6 +404,44 @@ pub(crate) fn rename_no_replace_same_parent(
     Ok(())
 }
 
+/// Same-parent no-replace move with `MOVEFILE_WRITE_THROUGH` (receipt install namespace barrier).
+pub(crate) fn rename_no_replace_write_through_same_parent(
+    final_parent: &DirHandle,
+    src_name: &str,
+    dst_name: &str,
+) -> Result<(), FsError> {
+    let parent_path = final_parent.windows_handle().absolute_path();
+    let src_path = parent_path.join(src_name);
+    let dst_path = parent_path.join(dst_name);
+
+    let src_wide = wide_path(&src_path);
+    let src_handle = unsafe {
+        CreateFileW(
+            src_wide.as_ptr(),
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    let src = OwnedWinHandle::from_create_result(src_handle)?;
+    src.ensure_not_reparse_component(src_name)?;
+    drop(src);
+
+    let dst_wide = wide_path(&dst_path);
+    let ok = unsafe { MoveFileExW(src_wide.as_ptr(), dst_wide.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        if let Some(mapped) = map_exists_win32(err) {
+            return Err(mapped);
+        }
+        return Err(FsError::Io(io::Error::from_raw_os_error(err as i32)));
+    }
+    Ok(())
+}
+
 pub(crate) fn rename_replace_same_parent(
     final_parent: &DirHandle,
     src_name: &str,
@@ -759,7 +797,9 @@ mod probe_child_dir_tests {
                 Err(e) => assert!(matches!(e, FsError::SymlinkOrReparseComponent(_))),
                 Ok(_) => panic!("expected SymlinkOrReparseComponent for junction"),
             },
-            Err(reason) => eprintln!("SKIP reparse_directory_junction_rejected: {reason}"),
+            Err(reason) => {
+                panic!("reparse_directory_junction_rejected fixture mklink failed: {reason}")
+            }
         }
     }
 
@@ -775,7 +815,178 @@ mod probe_child_dir_tests {
                 Err(e) => assert!(matches!(e, FsError::SymlinkOrReparseComponent(_))),
                 Ok(_) => panic!("expected SymlinkOrReparseComponent for symlink"),
             },
-            Err(reason) => eprintln!("SKIP reparse_file_symlink_rejected: {reason}"),
+            Err(reason) => panic!("reparse_file_symlink_rejected fixture mklink failed: {reason}"),
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod read_file_all_reparse_leaf_tests {
+    use super::*;
+    use crate::voice_delivery::fs::{DestRoot, DirHandle};
+    use std::fs;
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    fn temp_parent() -> (tempfile::TempDir, DirHandle) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent_path = tmp.path().join("parent");
+        fs::create_dir_all(&parent_path).expect("mkdir");
+        let root = DestRoot::open(tmp.path()).expect("open root");
+        let parent = root.open_dir_relative(&["parent"]).expect("open parent");
+        (tmp, parent)
+    }
+
+    fn try_mklink_file(args: &[&str]) -> Result<(), String> {
+        let output = Command::new("cmd")
+            .args(["/C", "mklink"])
+            .args(args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("spawn mklink: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "mklink failed (status {:?}): {}{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
+    #[test]
+    fn read_file_all_rejects_file_symlink_external_target_unchanged() {
+        let (tmp, parent) = temp_parent();
+        let target = tmp.path().join("parent").join("external-body.json");
+        fs::write(&target, b"EXTERNAL_BYTES").expect("target");
+        let target_before = fs::read(&target).expect("read target");
+        let link = tmp.path().join("parent").join("receipt-intent.json");
+        match try_mklink_file(&[&link.to_string_lossy(), &target.to_string_lossy()]) {
+            Ok(()) => {
+                let result = parent.read_file_all("receipt-intent.json");
+                assert!(
+                    matches!(result, Err(FsError::SymlinkOrReparseComponent(_))),
+                    "read_file_all must not follow reparse leaf; got {result:?}"
+                );
+                assert_eq!(fs::read(&target).expect("read target"), target_before);
+            }
+            Err(reason) => {
+                panic!(
+                    "read_file_all_rejects_file_symlink_external_target_unchanged fixture mklink failed: {reason}"
+                )
+            }
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod rename_no_replace_write_through_same_parent_tests {
+    use super::*;
+    use crate::voice_delivery::fs::{DestRoot, DirHandle};
+    use std::fs;
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    fn temp_final_parent() -> (tempfile::TempDir, DirHandle) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent_path = tmp.path().join("final-parent");
+        fs::create_dir_all(&parent_path).expect("mkdir");
+        let root = DestRoot::open(tmp.path()).expect("open root");
+        let parent = root
+            .open_dir_relative(&["final-parent"])
+            .expect("open parent");
+        (tmp, parent)
+    }
+
+    fn try_mklink_file(args: &[&str]) -> Result<(), String> {
+        let output = Command::new("cmd")
+            .args(["/C", "mklink"])
+            .args(args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("spawn mklink: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "mklink failed (status {:?}): {}{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
+    #[test]
+    fn staged_file_moves_to_destination_write_through() {
+        let (tmp, parent) = temp_final_parent();
+        let stage_name = ".receipt-write-staged";
+        let dest_name = "receipt-intent.json";
+        let payload = br#"{"staged":true}"#;
+        fs::write(tmp.path().join("final-parent").join(stage_name), payload).expect("stage");
+        rename_no_replace_write_through_same_parent(&parent, stage_name, dest_name)
+            .expect("write-through rename");
+        let dest_path = tmp.path().join("final-parent").join(dest_name);
+        assert_eq!(fs::read(&dest_path).expect("read dest"), payload);
+        assert!(
+            !tmp.path().join("final-parent").join(stage_name).exists(),
+            "staged source must disappear after successful rename"
+        );
+    }
+
+    #[test]
+    fn pre_existing_destination_preserves_bytes_and_stage() {
+        let (tmp, parent) = temp_final_parent();
+        let stage_name = ".receipt-write-staged";
+        let dest_name = "receipt-intent.json";
+        let dest_path = tmp.path().join("final-parent").join(dest_name);
+        fs::write(&dest_path, b"KEEP_DEST").expect("dest");
+        let staged_payload = b"STAGED_BYTES";
+        fs::write(
+            tmp.path().join("final-parent").join(stage_name),
+            staged_payload,
+        )
+        .expect("stage");
+        let result = rename_no_replace_write_through_same_parent(&parent, stage_name, dest_name);
+        assert!(matches!(result, Err(FsError::AlreadyExists)));
+        assert_eq!(fs::read(&dest_path).expect("read dest"), b"KEEP_DEST");
+        assert_eq!(
+            fs::read(tmp.path().join("final-parent").join(stage_name)).expect("read stage"),
+            staged_payload
+        );
+    }
+
+    #[test]
+    fn reparse_stage_leaf_rejected_external_target_unchanged() {
+        let (tmp, parent) = temp_final_parent();
+        let target = tmp.path().join("final-parent").join("external-target.json");
+        fs::write(&target, b"EXTERNAL").expect("target");
+        let target_before = fs::read(&target).expect("read target");
+        let link = tmp.path().join("final-parent").join("reparse-stage");
+        match try_mklink_file(&[&link.to_string_lossy(), &target.to_string_lossy()]) {
+            Ok(()) => {
+                let result = rename_no_replace_write_through_same_parent(
+                    &parent,
+                    "reparse-stage",
+                    "receipt-intent.json",
+                );
+                assert!(
+                    matches!(result, Err(FsError::SymlinkOrReparseComponent(_))),
+                    "expected reparse rejection, got {result:?}"
+                );
+                assert_eq!(fs::read(&target).expect("read target"), target_before);
+            }
+            Err(reason) => {
+                panic!(
+                    "reparse_stage_leaf_rejected_external_target_unchanged fixture mklink failed: {reason}"
+                )
+            }
         }
     }
 }

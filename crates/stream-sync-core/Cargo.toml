@@ -42,6 +42,13 @@ audiopus_sys = { version = "0.2.2", optional = true }
 default = []
 local-opus-native = ["audiopus", "audiopus_sys"]
 local-opus-vendored = ["local-opus-native", "audiopus_sys/static"]
+# Integration-test hooks (publication→receipt gate, storage preflight injection). Debug-only; see lib.rs guard.
+lifecycle-test-support = []
+
+[[test]]
+name = "in_sync_lifecycle_receipt_after_publication_checkpoint"
+path = "tests/in_sync_lifecycle_receipt_after_publication_checkpoint.rs"
+required-features = ["local-opus-native", "lifecycle-test-support"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

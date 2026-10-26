@@ -70,6 +70,49 @@ jobs:
           run_suite 'publication_durability_order'
           run_suite 'crash_child_process_publication'
           run_suite 'delivery_bound_lock'
+          run_suite 'rename_no_replace_write_through_same_parent_tests'
+          run_suite 'read_file_all_rejects_file_symlink_external_target_unchanged'
+          run_suite 'receipt_intent_persist_and_reload'
+          run_suite 'receipt_intent_mismatch_is_conflict'
+          run_suite 'receipt_ack_must_match_intent'
+          run_suite 'receipt_intent_conflicting_concurrent_create_atomic'
+          run_suite 'receipt_intent_identical_concurrent_idempotent_atomic'
+          run_suite 'receipt_ack_identical_concurrent_idempotent_atomic'
+          run_suite 'persist_receipt_ack_must_not_validate_intent_before_receipt_install_lock'
+          run_suite 'persist_receipt_ack_validates_intent_under_receipt_install_lock'
+          run_suite 'journal_session_bootstrap_security_windows'
+        shell: bash
+
+  phase0c-linux-receipt-durability:
+    name: Phase 0C receipt durability (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-17
+
+      - name: receipt durability Linux gates
+        run: |
+          set -e
+          count_suite_tests() { cargo test -p stream-sync-core "$1" -- --list 2>/dev/null | grep -cE ': test$' || true; }
+          run_suite() { n=$(count_suite_tests "$1"); echo "filter '$1' matched $n tests"; test "$n" -gt 0; cargo test -p stream-sync-core "$1" -- --nocapture; }
+          run_suite 'journal_session_bootstrap_security'
+          run_suite 'receipt_symlink_no_follow_security'
+          run_suite 'receipt_intent_winning_install_rejects_unavailable_dir_sync'
+          run_suite 'receipt_ack_winning_install_rejects_unavailable_dir_sync'
+          run_suite 'persist_receipt_intent_blocks_on_external_receipt_install_lock'
+          run_suite 'collision_requires_dir_sync_before_ok'
+          FEATURES=local-opus-native,local-opus-vendored,lifecycle-test-support
+          TARGET=in_sync_lifecycle_receipt_after_publication_checkpoint
+          n=$(cargo test -p stream-sync-core --test "$TARGET" --features "$FEATURES" -- --list 2>/dev/null | grep -cE ': test$' || true)
+          echo "integration target $TARGET listed $n tests"
+          test "$n" -eq 9
+          cargo test -p stream-sync-core --test "$TARGET" --features "$FEATURES" -- --nocapture
+          TARGET=in_sync_lifecycle_cancel_checkpoint
+          n=$(cargo test -p stream-sync-core --test "$TARGET" --features "$FEATURES" -- --list 2>/dev/null | grep -cE ': test$' || true)
+          echo "integration target $TARGET listed $n tests"
+          test "$n" -eq 5
+          cargo test -p stream-sync-core --test "$TARGET" --features "$FEATURES" -- --nocapture
         shell: bash
 
   windows-installer:
