@@ -459,10 +459,10 @@ mod cancel_publication_receipt_boundaries {
     use super::progress_has_publication_or_receipt;
     use super::proofs_equal;
     use std::io::Write;
-    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use stream_sync_core::test_support::{
         install_post_publication_receipt_gate, PostPublicationReceiptBoundary,
@@ -486,6 +486,7 @@ mod cancel_publication_receipt_boundaries {
     const GUILD_ID: &str = "123456789012345678";
     const DEVICE_OPUS: &str = "lifecycle-cancel-opus-device";
     const SESSION_BEFORE_PUBLICATION: &str = "550e8400-e29b-41d4-a716-4466554400cc";
+    const SESSION_AFTER_PUBLICATION_RENEW: &str = "550e8400-e29b-41d4-a716-4466554400bb";
     const SESSION_FRESH_RECEIPT_POST: &str = "550e8400-e29b-41d4-a716-4466554400ee";
     const SESSION_RECEIPT_REPLAY: &str = "550e8400-e29b-41d4-a716-4466554400dd";
     const TARGET_SAMPLES: u64 = 4_800;
@@ -550,6 +551,50 @@ mod cancel_publication_receipt_boundaries {
         }
     }
 
+    /// Blocks the Nth `renew_lease` invocation until the test thread calls `resume`.
+    #[derive(Clone)]
+    struct RenewLeaseBarrier {
+        block_on_call: Option<u32>,
+        call_count: Arc<AtomicU32>,
+        entered: Arc<(Mutex<bool>, Condvar)>,
+        resume: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl RenewLeaseBarrier {
+        fn block_on_call(n: u32) -> Self {
+            Self {
+                block_on_call: Some(n),
+                call_count: Arc::new(AtomicU32::new(0)),
+                entered: Arc::new((Mutex::new(false), Condvar::new())),
+                resume: Arc::new((Mutex::new(false), Condvar::new())),
+            }
+        }
+
+        fn wait_entered(&self, budget: Duration) -> bool {
+            let deadline = Instant::now() + budget;
+            let (lock, cv) = &*self.entered;
+            let mut entered = lock.lock().unwrap();
+            while !*entered && Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let (guard, timeout) = cv.wait_timeout(entered, remaining).expect("renew barrier");
+                entered = guard;
+                if timeout.timed_out() && Instant::now() >= deadline {
+                    break;
+                }
+            }
+            *entered
+        }
+
+        fn resume(&self) {
+            let (lock, cv) = &*self.resume;
+            {
+                let mut resumed = lock.lock().unwrap();
+                *resumed = true;
+            }
+            cv.notify_all();
+        }
+    }
+
     #[derive(Clone)]
     struct OpusLifecycleCancelClient {
         manifest: LocalFinalizationManifest,
@@ -557,6 +602,7 @@ mod cancel_publication_receipt_boundaries {
         digest: String,
         next_generation: Arc<AtomicI64>,
         fail_receipt_once: Arc<AtomicBool>,
+        renew_barrier: Option<RenewLeaseBarrier>,
         releases: Arc<Mutex<Vec<LeaseProof>>>,
         receipt_posts: Arc<AtomicI64>,
     }
@@ -571,6 +617,23 @@ mod cancel_publication_receipt_boundaries {
             segment_body: Vec<u8>,
             fail_receipt_once: bool,
         ) -> Self {
+            Self::new_with_options(manifest, segment_body, fail_receipt_once, None)
+        }
+
+        fn new_with_renew_barrier(
+            manifest: LocalFinalizationManifest,
+            segment_body: Vec<u8>,
+            renew_barrier: RenewLeaseBarrier,
+        ) -> Self {
+            Self::new_with_options(manifest, segment_body, false, Some(renew_barrier))
+        }
+
+        fn new_with_options(
+            manifest: LocalFinalizationManifest,
+            segment_body: Vec<u8>,
+            fail_receipt_once: bool,
+            renew_barrier: Option<RenewLeaseBarrier>,
+        ) -> Self {
             let digest = compute_local_finalization_manifest_digest(&manifest);
             Self {
                 manifest,
@@ -578,6 +641,7 @@ mod cancel_publication_receipt_boundaries {
                 digest,
                 next_generation: Arc::new(AtomicI64::new(1)),
                 fail_receipt_once: Arc::new(AtomicBool::new(fail_receipt_once)),
+                renew_barrier,
                 releases: Arc::new(Mutex::new(Vec::new())),
                 receipt_posts: Arc::new(AtomicI64::new(0)),
             }
@@ -619,6 +683,22 @@ mod cancel_publication_receipt_boundaries {
             _device_id: &str,
             _proof: &LeaseProof,
         ) -> Result<Option<i64>, VoiceV2ClientError> {
+            if let Some(barrier) = &self.renew_barrier {
+                let call = barrier.call_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if barrier.block_on_call == Some(call) {
+                    let (lock, cv) = &*barrier.entered;
+                    {
+                        let mut entered = lock.lock().unwrap();
+                        *entered = true;
+                    }
+                    cv.notify_all();
+                    let (rlock, rcv) = &*barrier.resume;
+                    let mut resumed = rlock.lock().unwrap();
+                    while !*resumed {
+                        resumed = rcv.wait(resumed).expect("renew barrier resume");
+                    }
+                }
+            }
             Ok(None)
         }
 
@@ -765,12 +845,113 @@ mod cancel_publication_receipt_boundaries {
     }
 
     #[test]
+    fn cancel_during_post_publication_renew_must_not_create_receipt_intent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest = opus_manifest(SESSION_AFTER_PUBLICATION_RENEW);
+        let segment_body = valid_segment_body();
+        let digest = compute_local_finalization_manifest_digest(&manifest);
+        let renew_barrier = RenewLeaseBarrier::block_on_call(1);
+        let client = OpusLifecycleCancelClient::new_with_renew_barrier(
+            manifest.clone(),
+            segment_body,
+            renew_barrier.clone(),
+        );
+        let controls = LocalFinalizationControls::default();
+        let orch = Arc::new(LocalFinalizationOrchestrator::open_with_controls(
+            tmp.path(),
+            DEVICE_OPUS,
+            controls,
+        ));
+        let store = LocalJournalStore::open(tmp.path(), SESSION_AFTER_PUBLICATION_RENEW)
+            .expect("open store");
+        let pending = LocalPendingItem {
+            session_id: SESSION_AFTER_PUBLICATION_RENEW.into(),
+            manifest_digest: digest,
+            sealed_at_ms: 1,
+        };
+
+        let (_gate, arrived_rx, resume_tx) = install_post_publication_receipt_gate(
+            tmp.path(),
+            SESSION_AFTER_PUBLICATION_RENEW,
+            PostPublicationReceiptBoundary::AfterPublicationBeforeReceiptIntent,
+        );
+
+        let orch_run = Arc::clone(&orch);
+        let client_run = client.clone();
+        let worker = thread::spawn(move || orch_run.process_pending(&client_run, &pending));
+
+        arrived_rx
+            .recv_timeout(GATE_WAIT_BUDGET)
+            .expect("worker must block after publication at receipt-intent boundary");
+        stream_sync_core::voice_delivery::local_finalization::resolve_canonical_session_paths(
+            tmp.path(),
+            SESSION_AFTER_PUBLICATION_RENEW,
+        )
+        .expect("canonical publication must be committed before post-publication renew");
+        resume_tx
+            .send(())
+            .expect("release post-publication gate so synchronous renew can run");
+        assert!(
+            renew_barrier.wait_entered(GATE_WAIT_BUDGET),
+            "post-publication lease fence must block in renew_lease"
+        );
+        orch.cancellation().cancel();
+        renew_barrier.resume();
+
+        let cancelled = worker
+            .join()
+            .expect("process_pending thread")
+            .expect_err("cancel during post-publication renew must abort before receipt intent");
+        assert!(
+            matches!(cancelled, LocalOrchestratorError::Cancelled),
+            "expected Cancelled, got {cancelled:?}"
+        );
+        assert_eq!(
+            orch.phase(),
+            LocalFinalizationPhase::Cancelled,
+            "orchestrator must surface Cancelled phase"
+        );
+        let receipt_state = store.load_receipt_durable_state().expect("receipt state");
+        assert!(
+            receipt_state.intent.is_none(),
+            "cancel must not persist durable receipt intent after post-publication renew"
+        );
+        assert_eq!(client.receipt_posts(), 0, "cancel must not POST a receipt");
+        let events = orch.drain_events();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(
+                    e,
+                    stream_sync_core::voice_delivery::LocalFinalizationProgressEvent::ReceiptAcknowledged { .. }
+                )),
+            "cancel must not acknowledge receipt; got {events:?}"
+        );
+        stream_sync_core::voice_delivery::local_finalization::resolve_canonical_session_paths(
+            tmp.path(),
+            SESSION_AFTER_PUBLICATION_RENEW,
+        )
+        .expect("published output must remain durable for later replay");
+        let releases = client.releases();
+        assert_eq!(
+            releases.len(),
+            1,
+            "cancel must release the active lease once; got {releases:?}"
+        );
+    }
+
+    #[test]
     fn cancel_after_fresh_receipt_intent_before_post_must_not_post_receipt() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let manifest = opus_manifest(SESSION_FRESH_RECEIPT_POST);
         let segment_body = valid_segment_body();
         let digest = compute_local_finalization_manifest_digest(&manifest);
-        let client = OpusLifecycleCancelClient::new(manifest.clone(), segment_body);
+        let renew_barrier = RenewLeaseBarrier::block_on_call(2);
+        let client = OpusLifecycleCancelClient::new_with_renew_barrier(
+            manifest.clone(),
+            segment_body,
+            renew_barrier.clone(),
+        );
         let controls = LocalFinalizationControls::default();
         let orch = Arc::new(LocalFinalizationOrchestrator::open_with_controls(
             tmp.path(),
@@ -798,10 +979,23 @@ mod cancel_publication_receipt_boundaries {
         arrived_rx
             .recv_timeout(GATE_WAIT_BUDGET)
             .expect("fresh finalization must block after durable receipt intent before POST");
-        orch.cancellation().cancel();
+        assert!(
+            store
+                .load_receipt_durable_state()
+                .expect("receipt state")
+                .intent
+                .is_some(),
+            "durable receipt intent must exist before fresh POST renew fence"
+        );
         resume_tx
             .send(())
-            .expect("release fresh POST gate so cancel boundary can run");
+            .expect("release fresh POST gate so pre-POST renew fence can run");
+        assert!(
+            renew_barrier.wait_entered(GATE_WAIT_BUDGET),
+            "fresh receipt POST must block in renew_lease before POST"
+        );
+        orch.cancellation().cancel();
+        renew_barrier.resume();
 
         let cancelled = worker
             .join()
@@ -867,10 +1061,16 @@ mod cancel_publication_receipt_boundaries {
         let manifest = opus_manifest(SESSION_RECEIPT_REPLAY);
         let segment_body = valid_segment_body();
         let digest = compute_local_finalization_manifest_digest(&manifest);
-        let client = OpusLifecycleCancelClient::new_with_fail_receipt_once(
+        let prime_client = OpusLifecycleCancelClient::new_with_fail_receipt_once(
             manifest.clone(),
             segment_body.clone(),
             true,
+        );
+        let renew_barrier = RenewLeaseBarrier::block_on_call(1);
+        let client = OpusLifecycleCancelClient::new_with_renew_barrier(
+            manifest.clone(),
+            segment_body.clone(),
+            renew_barrier.clone(),
         );
         let controls = LocalFinalizationControls::default();
         let orch_prime = LocalFinalizationOrchestrator::open_with_controls(
@@ -887,7 +1087,7 @@ mod cancel_publication_receipt_boundaries {
         };
 
         let first = orch_prime
-            .process_pending(&client, &pending)
+            .process_pending(&prime_client, &pending)
             .expect_err("prime durable publication and receipt intent via failed POST");
         assert!(matches!(first, LocalOrchestratorError::Client(_)));
         assert!(
@@ -899,7 +1099,7 @@ mod cancel_publication_receipt_boundaries {
             "first run must persist receipt intent"
         );
         assert_eq!(
-            client.receipt_posts(),
+            prime_client.receipt_posts(),
             0,
             "failed POST must not count as a successful receipt"
         );
@@ -923,10 +1123,15 @@ mod cancel_publication_receipt_boundaries {
         arrived_rx
             .recv_timeout(GATE_WAIT_BUDGET)
             .expect("receipt-only replay must block at replay POST boundary");
-        orch.cancellation().cancel();
         resume_tx
             .send(())
-            .expect("release replay gate so cancel boundary can run");
+            .expect("release replay gate so pre-POST renew fence can run");
+        assert!(
+            renew_barrier.wait_entered(GATE_WAIT_BUDGET),
+            "receipt replay must block in renew_lease before POST"
+        );
+        orch.cancellation().cancel();
+        renew_barrier.resume();
 
         let cancelled = worker
             .join()
@@ -964,11 +1169,16 @@ mod cancel_publication_receipt_boundaries {
                 )),
             "cancel must not emit ReceiptAcknowledged during replay; got {events:?}"
         );
-        let releases = client.releases();
         assert_eq!(
-            releases.len(),
-            2,
-            "prime run and cancel replay must each release once; got {releases:?}"
+            prime_client.releases().len(),
+            1,
+            "prime run must release the active lease once"
+        );
+        assert_eq!(
+            client.releases().len(),
+            1,
+            "cancel replay must release the active lease once; got {:?}",
+            client.releases()
         );
     }
 }

@@ -462,6 +462,7 @@ impl LocalFinalizationOrchestrator {
         );
         self.check_pause_cancel(client, &manifest.session_id, lease)?;
         lease.fence_lease_authority(client, &self.device_id)?;
+        self.check_pause_cancel(client, &manifest.session_id, lease)?;
         client
             .post_receipt(&manifest.session_id, &intent, lease.proof())
             .map_err(LocalOrchestratorError::Client)?;
@@ -563,6 +564,7 @@ impl LocalFinalizationOrchestrator {
         );
         self.check_pause_cancel(client, &manifest.session_id, lease)?;
         lease.fence_lease_authority(client, &self.device_id)?;
+        self.check_pause_cancel(client, &manifest.session_id, lease)?;
         self.set_phase(LocalFinalizationPhase::Receipting);
         let receipt = LocalFinalizationReceipt {
             version: 1,
@@ -609,6 +611,7 @@ impl LocalFinalizationOrchestrator {
         );
         self.check_pause_cancel(client, &manifest.session_id, lease)?;
         lease.fence_lease_authority(client, &self.device_id)?;
+        self.check_pause_cancel(client, &manifest.session_id, lease)?;
         client
             .post_receipt(&manifest.session_id, &receipt, lease.proof())
             .map_err(LocalOrchestratorError::Client)?;

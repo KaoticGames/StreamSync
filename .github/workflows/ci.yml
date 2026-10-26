@@ -108,6 +108,11 @@ jobs:
           echo "integration target $TARGET listed $n tests"
           test "$n" -eq 9
           cargo test -p stream-sync-core --test "$TARGET" --features "$FEATURES" -- --nocapture
+          TARGET=in_sync_lifecycle_cancel_checkpoint
+          n=$(cargo test -p stream-sync-core --test "$TARGET" --features "$FEATURES" -- --list 2>/dev/null | grep -cE ': test$' || true)
+          echo "integration target $TARGET listed $n tests"
+          test "$n" -eq 5
+          cargo test -p stream-sync-core --test "$TARGET" --features "$FEATURES" -- --nocapture
         shell: bash
 
   windows-installer:
