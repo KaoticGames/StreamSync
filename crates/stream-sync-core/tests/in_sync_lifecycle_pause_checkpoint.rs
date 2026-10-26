@@ -3,7 +3,7 @@
 
 use std::io::Write;
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -85,10 +85,95 @@ fn sample_manifest(segment_count: u32) -> LocalFinalizationManifest {
     }
 }
 
+/// Blocks segment-0 `fetch_segment_range` after the segment byte is written but before
+/// returning `StemRangeMeta`, until the test thread calls `resume`.
+#[derive(Clone)]
+struct SegmentZeroFetchBarrier {
+    entered: Arc<(Mutex<bool>, Condvar)>,
+    resume: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl SegmentZeroFetchBarrier {
+    fn new() -> Self {
+        Self {
+            entered: Arc::new((Mutex::new(false), Condvar::new())),
+            resume: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    fn wait_entered(&self, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        let (lock, cv) = &*self.entered;
+        let mut entered = lock.lock().unwrap();
+        while !*entered && Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let (guard, timeout) = cv
+                .wait_timeout(entered, remaining)
+                .expect("segment 0 fetch barrier entered");
+            entered = guard;
+            if timeout.timed_out() && Instant::now() >= deadline {
+                break;
+            }
+        }
+        *entered
+    }
+
+    fn resume(&self) {
+        let (lock, cv) = &*self.resume;
+        {
+            let mut resumed = lock.lock().unwrap();
+            *resumed = true;
+        }
+        cv.notify_all();
+    }
+
+    fn wait_on_fetch_path(&self) {
+        let (lock, cv) = &*self.entered;
+        {
+            let mut entered = lock.lock().unwrap();
+            *entered = true;
+        }
+        cv.notify_all();
+        let (rlock, rcv) = &*self.resume;
+        let mut resumed = rlock.lock().unwrap();
+        while !*resumed {
+            resumed = rcv.wait(resumed).expect("segment 0 fetch barrier resume");
+        }
+    }
+}
+
+/// Releases the segment-0 fetch barrier on drop so a panicking test cannot wedge the worker.
+struct SegmentZeroFetchBarrierReleaseGuard {
+    barrier: SegmentZeroFetchBarrier,
+    armed: bool,
+}
+
+impl SegmentZeroFetchBarrierReleaseGuard {
+    fn arm(barrier: SegmentZeroFetchBarrier) -> Self {
+        Self {
+            barrier,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SegmentZeroFetchBarrierReleaseGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.barrier.resume();
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SegmentBoundaryPauseClient {
     manifest: LocalFinalizationManifest,
     digest: String,
+    seg0_fetch_barrier: SegmentZeroFetchBarrier,
     next_generation: Arc<AtomicI64>,
     active_proof: Arc<Mutex<Option<LeaseProof>>>,
     releases: Arc<Mutex<Vec<LeaseProof>>>,
@@ -105,6 +190,7 @@ impl SegmentBoundaryPauseClient {
         Self {
             manifest,
             digest,
+            seg0_fetch_barrier: SegmentZeroFetchBarrier::new(),
             next_generation: Arc::new(AtomicI64::new(1)),
             active_proof: Arc::new(Mutex::new(None)),
             releases: Arc::new(Mutex::new(Vec::new())),
@@ -114,6 +200,14 @@ impl SegmentBoundaryPauseClient {
             release_attempts: Arc::new(AtomicU32::new(0)),
             release_error: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn wait_for_seg0_fetch_barrier(&self, budget: Duration) -> bool {
+        self.seg0_fetch_barrier.wait_entered(budget)
+    }
+
+    fn seg0_fetch_barrier_release_guard(&self) -> SegmentZeroFetchBarrierReleaseGuard {
+        SegmentZeroFetchBarrierReleaseGuard::arm(self.seg0_fetch_barrier.clone())
     }
 
     fn fail_release_with(&self, err: VoiceV2ClientError) {
@@ -194,11 +288,16 @@ impl LocalFinalizationClient for SegmentBoundaryPauseClient {
         _proof: &LeaseProof,
         writer: &mut dyn Write,
     ) -> Result<StemRangeMeta, VoiceV2ClientError> {
-        self.segment_fetches.lock().unwrap().push(segment_seq);
         let byte = segment_seq as u8;
         writer
             .write_all(&[byte])
             .map_err(|e| VoiceV2ClientError::Parse(format!("mock segment write failed: {e}")))?;
+        self.segment_fetches.lock().unwrap().push(segment_seq);
+
+        if segment_seq == 0 {
+            self.seg0_fetch_barrier.wait_on_fetch_path();
+        }
+
         Ok(StemRangeMeta {
             status: 206,
             content_range: format!("bytes 0-{}/1", length.min(1)),
@@ -242,24 +341,18 @@ fn proofs_equal(a: &LeaseProof, b: &LeaseProof) -> bool {
     a.generation == b.generation && a.token == b.token
 }
 
-fn wait_for_segment_checkpoint(
-    store: &LocalJournalStore,
-    segment_seq: u32,
-    complete: bool,
-    budget: Duration,
-) -> bool {
-    let deadline = Instant::now() + budget;
-    while Instant::now() < deadline {
-        if let Ok(cp) = store.load_checkpoint() {
-            if let Some(entry) = cp.segments.iter().find(|s| s.segment_seq == segment_seq) {
-                if entry.complete == complete {
-                    return true;
-                }
-            }
-        }
-        thread::sleep(Duration::from_millis(2));
-    }
-    false
+fn arm_pause_at_seg0_boundary(
+    orch: &Arc<LocalFinalizationOrchestrator>,
+    client: &SegmentBoundaryPauseClient,
+) {
+    assert!(
+        client.wait_for_seg0_fetch_barrier(WAIT_BUDGET),
+        "segment 0 fetch must write its byte and reach the test barrier before pause is armed"
+    );
+    let guard = client.seg0_fetch_barrier_release_guard();
+    orch.set_paused(true);
+    client.seg0_fetch_barrier.resume();
+    guard.disarm();
 }
 
 #[test]
@@ -267,9 +360,9 @@ fn pause_at_segment_boundary_does_not_report_ordinary_paused_when_release_fails(
     let tmp = tempfile::tempdir().expect("tempdir");
     let manifest = sample_manifest(2);
     let digest = compute_local_finalization_manifest_digest(&manifest);
+    let controls = LocalFinalizationControls::default();
     let client = SegmentBoundaryPauseClient::new(manifest);
     client.fail_release_with(VoiceV2ClientError::DeliveryNotFound);
-    let controls = LocalFinalizationControls::default();
     let orch = Arc::new(LocalFinalizationOrchestrator::open_with_controls(
         tmp.path(),
         DEVICE_ID,
@@ -287,11 +380,7 @@ fn pause_at_segment_boundary_does_not_report_ordinary_paused_when_release_fails(
     let client_run = client.clone();
     let worker = thread::spawn(move || orch_run.process_pending(&client_run, &pending_first));
 
-    assert!(
-        wait_for_segment_checkpoint(&store, 0, true, WAIT_BUDGET),
-        "segment 0 must be checkpointed complete before pausing at the next boundary"
-    );
-    orch.set_paused(true);
+    arm_pause_at_seg0_boundary(&orch, &client);
 
     let result = worker.join().expect("process_pending thread");
     assert_eq!(
@@ -347,8 +436,8 @@ fn pause_at_segment_boundary_releases_lease_and_leaves_resumable_checkpoint() {
     let manifest = sample_manifest(2);
     let seg1_sha256 = manifest.segments[1].sha256.clone();
     let digest = compute_local_finalization_manifest_digest(&manifest);
-    let client = SegmentBoundaryPauseClient::new(manifest);
     let controls = LocalFinalizationControls::default();
+    let client = SegmentBoundaryPauseClient::new(manifest);
     let orch = Arc::new(LocalFinalizationOrchestrator::open_with_controls(
         tmp.path(),
         DEVICE_ID,
@@ -366,11 +455,7 @@ fn pause_at_segment_boundary_releases_lease_and_leaves_resumable_checkpoint() {
     let client_run = client.clone();
     let worker = thread::spawn(move || orch_run.process_pending(&client_run, &pending_first));
 
-    assert!(
-        wait_for_segment_checkpoint(&store, 0, true, WAIT_BUDGET),
-        "segment 0 must be checkpointed complete before pausing at the next boundary"
-    );
-    orch.set_paused(true);
+    arm_pause_at_seg0_boundary(&orch, &client);
 
     let paused = worker
         .join()
@@ -418,6 +503,11 @@ fn pause_at_segment_boundary_releases_lease_and_leaves_resumable_checkpoint() {
         "segment 1 must not be marked complete after boundary pause"
     );
     assert_eq!(seg1.bytes_complete, 0);
+    assert_eq!(
+        client.segment_fetches(),
+        vec![0],
+        "pause must be observed before any segment 1 fetch on the first run"
+    );
 
     orch.set_paused(false);
     let resume_result = orch.process_pending(&client, &pending);
