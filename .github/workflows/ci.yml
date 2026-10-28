@@ -142,6 +142,15 @@ jobs:
         run: npx tauri build --features windows-vendored-opus --bundles nsis --ci --no-sign --config tauri.ci.conf.json
         working-directory: crates/stream-sync-desktop
 
+      - uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
+        with:
+          name: StreamSync-2.1.001-windows-nsis-${{ github.sha }}
+          path: |
+            target/release/bundle/nsis/*.exe
+            crates/stream-sync-desktop/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
   signed-release:
     name: Signed artifacts (when signing infra exists)
     runs-on: windows-latest
