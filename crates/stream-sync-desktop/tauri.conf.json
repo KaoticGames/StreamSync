@@ -49,7 +49,6 @@
       "../../events-overlay.js": "events-overlay.js",
       "../../events-se-import.js": "events-se-import.js",
       "../../streamelements-auth-inject.js": "streamelements-auth-inject.js",
-      "../../in-sync-recordings.js": "in-sync-recordings.js",
       "../../update-modal.js": "update-modal.js"
     }
   },

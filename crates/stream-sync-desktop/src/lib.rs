@@ -202,7 +202,6 @@ pub fn run() {
             commands::overlay_media_upload,
             commands::open_external,
             commands::open_logs_folder,
-            commands::pick_recording_folder,
             commands::open_discord,
             commands::twitch_connect,
             commands::twitch_reconnect,
@@ -220,8 +219,6 @@ pub fn run() {
             commands::open_se_account_page,
             commands::export_backup,
             commands::restore_backup,
-            commands::reveal_in_sync_output,
-            commands::open_in_sync_recovery_report,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Stream Sync desktop");

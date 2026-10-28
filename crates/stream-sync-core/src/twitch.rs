@@ -2406,7 +2406,6 @@ async fn apply_exchange_session(
 
     crate::kick::sync_live_identity_for_generation(state.clone(), new_generation, Some(&services))
         .await;
-    crate::discord_voice::ensure_ingest_worker(state, services).await;
 
     Ok(())
 }
@@ -4699,10 +4698,6 @@ pub async fn maybe_autostart(state: Arc<AppState>, services: Arc<TwitchServices>
             .as_ref()
             .map(|d| d.connection_key.clone())
     };
-    if delegated_key.is_some() {
-        crate::discord_voice::ensure_ingest_worker(state.clone(), services.clone()).await;
-    }
-
     // Prefer refreshing a saved takeover key so tokens stay valid even if inactive.
     if let Some(key) = delegated_key {
         match syndicate_connection::refresh(&key).await {
