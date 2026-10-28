@@ -879,7 +879,7 @@ async fn consume_sse(
     if generation.is_some() {
         crate::delegated_refresh_observability::record_kick_sse_connect();
     }
-    let mut req = syndicate_connection::syndicate_http_client()
+    let mut req = syndicate_connection::syndicate_streaming_http_client()
         .get(url)
         .header("Accept", "text/event-stream");
     if let Some(token) = auth {
@@ -1631,6 +1631,24 @@ mod tests {
         assert!(
             result.is_err(),
             "generation/lease clear mid-stream must reject further delivery: {result:?}"
+        );
+    }
+
+    #[test]
+    fn consume_sse_uses_dedicated_syndicate_streaming_http_client() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/kick.rs"));
+        let body = src
+            .split("async fn consume_sse")
+            .nth(1)
+            .and_then(|rest| rest.split("\nasync fn ").next())
+            .expect("consume_sse source");
+        assert!(
+            body.contains("syndicate_streaming_http_client"),
+            "consume_sse must use the dedicated syndicate streaming HTTP client for Kick SSE"
+        );
+        assert!(
+            !body.contains("syndicate_http_client()"),
+            "consume_sse must not use syndicate_http_client (SYNDICATE_HTTP_TIMEOUT total deadline)"
         );
     }
 }
