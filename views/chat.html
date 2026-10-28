@@ -427,15 +427,39 @@
                 </div>
 
                 <div class="form-row hidden" id="overlay-local-font-row">
-                  <label class="field-label" for="overlay-font-upload">
+                  <span class="field-label" id="overlay-local-font-label">
                     Local font file
-                  </label>
+                  </span>
+                  <button
+                    type="button"
+                    class="btn btn-secondary"
+                    id="overlay-local-font-choose"
+                  >
+                    Choose font
+                  </button>
                   <input
                     id="overlay-font-upload"
-                    class="input"
                     type="file"
                     accept=".ttf,.otf,.woff,.woff2"
+                    tabindex="-1"
+                    aria-hidden="true"
+                    style="
+                      position: absolute;
+                      width: 1px;
+                      height: 1px;
+                      padding: 0;
+                      margin: -1px;
+                      overflow: hidden;
+                      clip: rect(0, 0, 0, 0);
+                      white-space: nowrap;
+                      border: 0;
+                    "
                   />
+                  <p
+                    id="overlay-local-font-status"
+                    class="field-help"
+                    aria-live="polite"
+                  ></p>
                 </div>
 
                 <div class="form-row">
