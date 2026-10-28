@@ -877,10 +877,9 @@ fn apply_secret_file_permissions(path: &Path) -> Result<()> {
         // Restrict to the current user via icacls (no world/Everyone read).
         let path_str = path.to_string_lossy().to_string();
         let user = std::env::var("USERNAME").unwrap_or_else(|_| "Administrators".into());
-        let inherit = std::process::Command::new("icacls")
-            .args([&path_str, "/inheritance:r"])
-            .output()
-            .map_err(|e| anyhow::anyhow!("icacls inheritance failed: {e}"))?;
+        let inherit =
+            crate::windows_process::command_output("icacls", [&path_str, "/inheritance:r"])
+                .map_err(|e| anyhow::anyhow!("icacls inheritance failed: {e}"))?;
         if !inherit.status.success() {
             anyhow::bail!(
                 "icacls inheritance failed for {}: {}",
@@ -889,10 +888,9 @@ fn apply_secret_file_permissions(path: &Path) -> Result<()> {
             );
         }
         let grant = format!("{user}:F");
-        let grant_out = std::process::Command::new("icacls")
-            .args([&path_str, "/grant:r", &grant])
-            .output()
-            .map_err(|e| anyhow::anyhow!("icacls grant failed: {e}"))?;
+        let grant_out =
+            crate::windows_process::command_output("icacls", [&path_str, "/grant:r", &grant])
+                .map_err(|e| anyhow::anyhow!("icacls grant failed: {e}"))?;
         if !grant_out.status.success() {
             anyhow::bail!(
                 "icacls grant failed for {}: {}",

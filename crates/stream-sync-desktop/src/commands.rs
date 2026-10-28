@@ -104,19 +104,6 @@ pub fn open_logs_folder(window: WebviewWindow, state: State<'_, AppState>) -> Re
 }
 
 #[tauri::command]
-pub fn pick_recording_folder(
-    window: WebviewWindow,
-    state: State<'_, AppState>,
-) -> Result<Option<String>, String> {
-    require_main_window(&window, state.overlay_port)?;
-    Ok(rfd::FileDialog::new()
-        .set_title("Choose Discord recording folder")
-        .set_parent(&window)
-        .pick_folder()
-        .map(|p| p.to_string_lossy().into_owned()))
-}
-
-#[tauri::command]
 pub fn open_discord(
     window: WebviewWindow,
     state: State<'_, AppState>,
@@ -443,55 +430,4 @@ pub fn open_download_page(
     updates: State<'_, Arc<UpdateService>>,
 ) -> Result<serde_json::Value, String> {
     open_update_fallback_page(window, state, app, updates)
-}
-
-fn recording_parent_from_disk() -> Result<std::path::PathBuf, String> {
-    let _userdata = legacy_user_data_dir();
-    let paths = get_paths().map_err(|e| e.to_string())?;
-    let raw = std::fs::read_to_string(&paths.discord_voice_config)
-        .map_err(|e| format!("discord voice config: {e}"))?;
-    let cfg: stream_sync_core::DiscordVoiceConfigFile =
-        serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-    let parent = cfg
-        .recording_parent
-        .filter(|p| !p.trim().is_empty())
-        .ok_or_else(|| "recording parent not configured".to_string())?;
-    Ok(std::path::PathBuf::from(parent))
-}
-
-#[tauri::command]
-pub fn reveal_in_sync_output(
-    window: WebviewWindow,
-    state: State<'_, AppState>,
-    app: AppHandle,
-    session_id: String,
-) -> Result<(), String> {
-    require_main_window(&window, state.overlay_port)?;
-    let parent = recording_parent_from_disk()?;
-    let paths = stream_sync_core::resolve_canonical_session_paths(&parent, session_id.trim())?;
-    let dir = stream_sync_core::validate_path_under_parent(&parent, &paths.final_session_dir)?;
-    app.opener()
-        .reveal_item_in_dir(&dir)
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn open_in_sync_recovery_report(
-    window: WebviewWindow,
-    state: State<'_, AppState>,
-    app: AppHandle,
-    session_id: String,
-) -> Result<(), String> {
-    require_main_window(&window, state.overlay_port)?;
-    let parent = recording_parent_from_disk()?;
-    let paths = stream_sync_core::resolve_canonical_session_paths(&parent, session_id.trim())?;
-    let report = paths
-        .recovery_report_path
-        .ok_or_else(|| "no recovery report for session".to_string())?;
-    let file = stream_sync_core::validate_path_under_parent(&parent, &report)?;
-    app.opener()
-        .open_path(file.to_string_lossy().to_string(), None::<&str>)
-        .map_err(|e| e.to_string())?;
-    Ok(())
 }

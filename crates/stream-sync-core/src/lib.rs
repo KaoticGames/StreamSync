@@ -16,11 +16,16 @@ mod delegated_lifecycle;
 mod delegated_refresh_observability;
 mod delegated_secrets;
 mod diagnostics;
+// Retain the hardened recording implementation for the future recording build,
+// while the revenue candidate intentionally omits its routes and workers.
+#[allow(dead_code)]
 mod discord_voice;
 mod discord_voice_v2;
 mod dock_capability;
 mod export;
+#[allow(dead_code)]
 mod in_sync;
+#[allow(dead_code)]
 mod in_sync_supervisor;
 mod kick;
 mod oauth_pending;
@@ -34,6 +39,7 @@ mod syndicate_connection;
 mod test_alert;
 mod twitch;
 pub mod voice_delivery;
+mod windows_process;
 
 pub use delegated_lifecycle::{
     redact_connection_key, AuthorityLeaseSnapshot, TeardownPhase, MAX_DELEGATED_REVOCATION_DELAY,
@@ -250,8 +256,6 @@ impl OverlayServer {
         let (router, state, twitch) = self.build_app().await?;
         twitch::maybe_autostart(state.clone(), twitch.clone()).await;
         kick::maybe_autostart(state.clone()).await;
-        discord_voice::maybe_autostart(state.clone(), twitch).await;
-        in_sync_supervisor::ensure_in_sync_supervisor(state.clone());
         let studio = state.overlay_server_dir.join("events-studio.html");
         info!(
             "stream-sync-core listening on http://localhost:{port} (readonly={}, twitch_redirect={}, repo_root={}, overlay_server={}, events_studio_exists={})",

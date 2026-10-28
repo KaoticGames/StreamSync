@@ -972,8 +972,10 @@ fn build_router_source_must_match_route_id_list() {
 }
 
 #[test]
-fn in_sync_overlay_proxy_routes_match_router_manifest() {
-    const IN_SYNC_ROUTES: &[(&str, &str)] = &[
+fn revenue_candidate_excludes_recording_routes() {
+    const OMITTED_ROUTES: &[(&str, &str)] = &[
+        ("POST", "/api/discord/recording-folder"),
+        ("POST", "/api/discord/connect-key/redeem"),
         ("GET", "/api/in-sync/status"),
         ("POST", "/api/in-sync/process-now"),
         ("POST", "/api/in-sync/processing-mode"),
@@ -985,26 +987,60 @@ fn in_sync_overlay_proxy_routes_match_router_manifest() {
         .iter()
         .map(|(method, path, _)| (*method, *path))
         .collect();
-    for route in IN_SYNC_ROUTES {
-        assert!(
-            router.contains(route),
-            "missing from BUILD_ROUTER_ROUTE_IDS: {:?}",
-            route
-        );
-        assert!(
-            manifest.contains(route),
-            "missing from ROUTE_MANIFEST: {:?}",
-            route
-        );
-    }
     let proxy_src =
         std::fs::read_to_string("../stream-sync-desktop/src/overlay_proxy.rs").expect("proxy");
-    for (method, path) in IN_SYNC_ROUTES {
+    for route in OMITTED_ROUTES {
+        assert!(
+            !router.contains(route),
+            "revenue candidate route remains in BUILD_ROUTER_ROUTE_IDS: {:?}",
+            route
+        );
+        assert!(
+            !manifest.contains(route),
+            "revenue candidate route remains in ROUTE_MANIFEST: {:?}",
+            route
+        );
+        let (method, path) = *route;
         let needle = format!("(\"{}\", \"{}\")", method, path);
         assert!(
-            proxy_src.contains(&needle),
-            "missing from OVERLAY_API_ALLOWLIST: {}",
+            !proxy_src.contains(&needle),
+            "revenue candidate route remains in OVERLAY_API_ALLOWLIST: {}",
             needle
+        );
+    }
+}
+
+#[tokio::test]
+async fn revenue_candidate_recording_routes_are_not_runtime_endpoints() {
+    let port = 14190;
+    let (router, state) = test_app(port).await;
+    let origin = trusted_origin(port);
+    let token = state.control_token().to_string();
+    let omitted = [
+        (Method::POST, "/api/discord/recording-folder"),
+        (Method::POST, "/api/discord/connect-key/redeem"),
+        (Method::GET, "/api/in-sync/status"),
+        (Method::POST, "/api/in-sync/process-now"),
+        (Method::POST, "/api/in-sync/processing-mode"),
+        (Method::POST, "/api/in-sync/pause"),
+        (Method::POST, "/api/in-sync/cancel"),
+    ];
+
+    for (method, path) in omitted {
+        let body = (method == Method::POST).then(|| json!({}));
+        let (status, _, _) = request_json(
+            &router,
+            method,
+            path,
+            Some(&origin),
+            Some(&token),
+            None,
+            body,
+        )
+        .await;
+        assert!(
+            status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+            "omitted recording route {path} unexpectedly resolved with {status}"
         );
     }
 }

@@ -898,6 +898,30 @@ const CHAT_OVERLAY_SETTINGS_PREFIX = "streamsync.chatOverlay.settings.v1.";
       syncOverlayGoogleFontDisplay(overlaySection, fam);
     }
 
+    const localUploadInput = overlaySection.querySelector("#overlay-font-upload");
+    const localFontStatus = overlaySection.querySelector("#overlay-local-font-status");
+    const localFontChoose = overlaySection.querySelector("#overlay-local-font-choose");
+    const hasPersistedLocalFont =
+      settings.fontSource === "local" &&
+      settings.localFontUrl != null &&
+      String(settings.localFontUrl).length > 0;
+
+    if (localUploadInput) localUploadInput.value = "";
+
+    if (localFontStatus) {
+      if (hasPersistedLocalFont) {
+        localFontStatus.textContent = "An uploaded font is active.";
+      } else if (settings.fontSource === "local") {
+        localFontStatus.textContent = "No uploaded font saved.";
+      } else {
+        localFontStatus.textContent = "";
+      }
+    }
+
+    if (localFontChoose) {
+      localFontChoose.textContent = hasPersistedLocalFont ? "Replace font" : "Choose font";
+    }
+
     const fontSizeInput = overlaySection.querySelector("#overlay-font-size");
     if (fontSizeInput) fontSizeInput.value = String(settings.fontSize);
 
@@ -1099,6 +1123,13 @@ const CHAT_OVERLAY_SETTINGS_PREFIX = "streamsync.chatOverlay.settings.v1.";
     const googleRadio = overlaySection.querySelector("#overlay-font-source-google");
     const localRadio = overlaySection.querySelector("#overlay-font-source-local");
     const localUploadInput = overlaySection.querySelector("#overlay-font-upload");
+    const localFontChoose = overlaySection.querySelector("#overlay-local-font-choose");
+
+    if (localFontChoose && localUploadInput) {
+      localFontChoose.addEventListener("click", () => {
+        localUploadInput.click();
+      });
+    }
 
     if (googleRadio)
       googleRadio.addEventListener("change", () => {
@@ -1122,7 +1153,9 @@ const CHAT_OVERLAY_SETTINGS_PREFIX = "streamsync.chatOverlay.settings.v1.";
         if (!file) return;
 
         const profileId = getActiveProfileId();
-        loadLocalFont(file, profileId, (mut) => update(mut));
+        void loadLocalFont(file, profileId, (mut) => update(mut)).finally(() => {
+          localUploadInput.value = "";
+        });
       });
     }
 

@@ -25,7 +25,7 @@ use stream_sync_core::voice_delivery::{
 const SESSION_ID: &str = "550e8400-e29b-41d4-a716-4466554400aa";
 const GUILD_ID: &str = "123456789012345678";
 const DEVICE_ID: &str = "lifecycle-test-device";
-const WAIT_BUDGET: Duration = Duration::from_secs(5);
+const WAIT_BUDGET: Duration = Duration::from_secs(30);
 
 fn sample_manifest(segment_count: u32) -> LocalFinalizationManifest {
     let user = LocalFinalizationUser {
@@ -97,6 +97,7 @@ struct SegmentBoundaryCancelClient {
     segment_fetches: Arc<Mutex<Vec<u32>>>,
     receipt_posts: Arc<AtomicI64>,
     seg1_download_started: Arc<(Mutex<bool>, Condvar)>,
+    seg1_download_release: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl SegmentBoundaryCancelClient {
@@ -111,6 +112,7 @@ impl SegmentBoundaryCancelClient {
             segment_fetches: Arc::new(Mutex::new(Vec::new())),
             receipt_posts: Arc::new(AtomicI64::new(0)),
             seg1_download_started: Arc::new((Mutex::new(false), Condvar::new())),
+            seg1_download_release: Arc::new((Mutex::new(false), Condvar::new())),
         }
     }
 
@@ -141,6 +143,12 @@ impl SegmentBoundaryCancelClient {
             }
         }
         *started
+    }
+
+    fn release_seg1_download(&self) {
+        let (lock, cv) = &*self.seg1_download_release;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
     }
 }
 
@@ -198,14 +206,34 @@ impl LocalFinalizationClient for SegmentBoundaryCancelClient {
     ) -> Result<StemRangeMeta, VoiceV2ClientError> {
         self.segment_fetches.lock().unwrap().push(segment_seq);
         if segment_seq == 1 {
-            // Signal test thread only; fetch still runs synchronously to completion unless
-            // production observes cancel at the next cooperative check after this returns.
+            // Hold this fetch open until the test has armed cancellation. Without this
+            // barrier the mock can return and enter processing before the test thread runs,
+            // turning the intended cancellation assertion into a scheduler race.
             let (lock, cv) = &*self.seg1_download_started;
             {
                 let mut started = lock.lock().unwrap();
                 *started = true;
             }
             cv.notify_all();
+
+            let deadline = Instant::now() + WAIT_BUDGET;
+            let (release_lock, release_cv) = &*self.seg1_download_release;
+            let mut released = release_lock.lock().unwrap();
+            while !*released && Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let (guard, timeout) = release_cv
+                    .wait_timeout(released, remaining)
+                    .expect("seg1 release condvar");
+                released = guard;
+                if timeout.timed_out() && Instant::now() >= deadline {
+                    break;
+                }
+            }
+            if !*released {
+                return Err(VoiceV2ClientError::Parse(
+                    "test timed out waiting to release segment 1 fetch".into(),
+                ));
+            }
         }
         let byte = segment_seq as u8;
         writer
@@ -372,6 +400,7 @@ fn cancel_during_segment_one_fetch_aborts_without_publication_or_receipt() {
         "cancel must be requested during segment 1 fetch (before cooperative cancel is observed)"
     );
     orch.cancellation().cancel();
+    client.release_seg1_download();
 
     let cancelled = worker
         .join()

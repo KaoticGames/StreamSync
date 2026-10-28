@@ -2,6 +2,7 @@
 /** Fail unless Cargo workspace, npm, and Tauri versions match. */
 const fs = require("fs");
 const path = require("path");
+const { uiVersionTag } = require("./version-labels");
 
 const ROOT = path.resolve(__dirname, "..");
 
@@ -52,9 +53,12 @@ for (const rel of crates) {
   }
 }
 
+const uiTag = uiVersionTag(cargoVersion);
 for (const rel of ["boot.html", "views/about.html"]) {
-  if (!read(rel).includes(`v${cargoVersion}`)) {
-    mismatches.push(`${rel} must display v${cargoVersion}`);
+  if (!read(rel).includes(uiTag)) {
+    mismatches.push(
+      `${rel} must display ${uiTag} (canonical ${cargoVersion}, not v${cargoVersion})`
+    );
   }
 }
 

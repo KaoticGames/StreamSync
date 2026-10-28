@@ -15,13 +15,74 @@ use stream_sync_core::rust_workspace_root;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    webview::PageLoadEvent,
+    Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tracing_subscriber::EnvFilter;
 use update_service::UpdateService;
 
 #[allow(dead_code)]
 struct InstanceLock(std::fs::File);
+
+fn emit_startup_progress(app: &tauri::AppHandle, percent: u8, stage: &str) {
+    let _ = app.emit(
+        "startup-progress",
+        serde_json::json!({
+            "percent": percent.min(100),
+            "stage": stage,
+        }),
+    );
+}
+
+fn close_startup_window(app: &tauri::AppHandle) {
+    if let Some(startup) = app.get_webview_window("startup") {
+        let _ = startup.close();
+    }
+}
+
+fn install_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "show", "Show Stream Sync", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let tray_menu = Menu::with_items(app, &[&show, &quit])?;
+
+    let _tray = TrayIconBuilder::new()
+        .icon(app.default_window_icon().unwrap().clone())
+        .menu(&tray_menu)
+        .tooltip("Stream Sync")
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+            "quit" => {
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let app = tray.app_handle();
+                if let Some(w) = app.get_webview_window("main") {
+                    if w.is_visible().unwrap_or(false) {
+                        let _ = w.hide();
+                    } else {
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                }
+            }
+        })
+        .build(app)?;
+
+    Ok(())
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -75,6 +136,23 @@ pub fn run() {
                 }
             }
 
+            WebviewWindowBuilder::new(
+                &handle,
+                "startup",
+                WebviewUrl::App("index.html".into()),
+            )
+            .title("Stream Sync")
+            .inner_size(420.0, 300.0)
+            .resizable(false)
+            .center()
+            .always_on_top(true)
+            .on_page_load(|window, payload| {
+                if payload.event() == PageLoadEvent::Finished {
+                    emit_startup_progress(window.app_handle(), 10, "Preparing data…");
+                }
+            })
+            .build()?;
+
             let logs_dir = user_data.join("logs");
             app.manage(AppState {
                 overlay_port: port,
@@ -84,67 +162,33 @@ pub fn run() {
             app.manage(update_service);
 
             let (instance_nonce, bind_rx) = spawn_overlay_server(ui_root.clone(), port);
-
-            let show = MenuItem::with_id(app, "show", "Show Stream Sync", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(app, &[&show, &quit])?;
-
-            let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
-                .menu(&tray_menu)
-                .tooltip("Stream Sync")
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.set_focus();
-                        }
-                    }
-                    "quit" => {
-                        app.exit(0);
-                    }
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        let app = tray.app_handle();
-                        if let Some(w) = app.get_webview_window("main") {
-                            if w.is_visible().unwrap_or(false) {
-                                let _ = w.hide();
-                            } else {
-                                let _ = w.show();
-                                let _ = w.set_focus();
-                            }
-                        }
-                    }
-                })
-                .build(app)?;
+            install_tray(&handle)?;
+            emit_startup_progress(&handle, 30, "Starting local services…");
 
             let handle2 = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                emit_startup_progress(&handle2, 55, "Restoring platform connections…");
                 let ready = tokio::select! {
                     start = bind_rx => {
                         match start.unwrap_or(OverlayStart::BindFailed {
                             detail: "overlay server failed to start".into(),
                         }) {
                             OverlayStart::AlreadyRunningSameApp => {
+                                close_startup_window(&handle2);
                                 startup_error_dialog(
                                     "Stream Sync is already running. Use the tray icon to show the window.",
                                 );
                                 false
                             }
                             OverlayStart::ForeignOccupant { detail } => {
+                                close_startup_window(&handle2);
                                 startup_error_dialog(&format!(
                                     "Port {port} is already in use by another program. Stream Sync will not attach to it.\n\n{detail}"
                                 ));
                                 false
                             }
                             OverlayStart::BindFailed { detail } => {
+                                close_startup_window(&handle2);
                                 startup_error_dialog(&format!(
                                     "Stream Sync could not start its overlay server.\n\n{detail}"
                                 ));
@@ -157,6 +201,7 @@ pub fn run() {
                             tracing::error!(
                                 "overlay server did not become healthy on port {port} — open http://127.0.0.1:{port}/health"
                             );
+                            close_startup_window(&handle2);
                             startup_error_dialog(&format!(
                                 "Stream Sync started but the overlay server on port {port} did not identify itself. Check that nothing else is bound to that port."
                             ));
@@ -173,6 +218,9 @@ pub fn run() {
                 let url = overlay::shell_url(port);
                 tracing::info!("opening UI at {url}");
 
+                emit_startup_progress(&handle2, 80, "Loading interface…");
+
+                let handoff = handle2.clone();
                 if WebviewWindowBuilder::new(
                     &handle2,
                     "main",
@@ -181,15 +229,32 @@ pub fn run() {
                 .title("Stream Sync")
                 .inner_size(1280.0, 800.0)
                 .min_inner_size(1024.0, 640.0)
+                .visible(false)
                 // Keep wry defaults + allow media autoplay (LiveKit / OBS overlays).
                 .additional_browser_args(
                     "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required",
                 )
                 .initialization_script(include_str!("../../../tauri-init.js"))
+                .on_page_load(move |window, payload| {
+                    if payload.event() != PageLoadEvent::Finished {
+                        return;
+                    }
+                    emit_startup_progress(window.app_handle(), 100, "Ready");
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                    if let Some(startup) = handoff.get_webview_window("startup") {
+                        let _ = startup.close();
+                    }
+                })
                 .build()
                 .is_err()
                 {
                     tracing::error!("failed to create main window");
+                    close_startup_window(&handle2);
+                    startup_error_dialog(
+                        "Stream Sync could not open its main window. Try restarting the app.",
+                    );
+                    handle2.exit(1);
                 }
             });
 
@@ -202,7 +267,6 @@ pub fn run() {
             commands::overlay_media_upload,
             commands::open_external,
             commands::open_logs_folder,
-            commands::pick_recording_folder,
             commands::open_discord,
             commands::twitch_connect,
             commands::twitch_reconnect,
@@ -220,8 +284,6 @@ pub fn run() {
             commands::open_se_account_page,
             commands::export_backup,
             commands::restore_backup,
-            commands::reveal_in_sync_output,
-            commands::open_in_sync_recovery_report,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Stream Sync desktop");

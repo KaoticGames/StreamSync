@@ -7,6 +7,7 @@ use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 const DEFAULT_API_BASE: &str = "https://api.syndicateai.net";
 
@@ -97,6 +98,18 @@ pub fn syndicate_http_client() -> &'static reqwest::Client {
             .build()
             .expect("syndicate HTTP client")
     })
+}
+
+fn build_syndicate_streaming_http_client(connect_timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .build()
+        .expect("syndicate streaming HTTP client")
+}
+
+pub fn syndicate_streaming_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| build_syndicate_streaming_http_client(SYNDICATE_HTTP_TIMEOUT))
 }
 
 pub async fn exchange(key: &str) -> Result<ExchangeSuccess> {
@@ -271,5 +284,90 @@ mod tests {
         let redacted = redact_connection_key(&bound_remote_message(&raw), key);
         assert!(!redacted.contains(key));
         assert!(redacted.contains("[redacted-connection-key]"));
+    }
+
+    /// Kick SSE stays open indefinitely; the syndicate streaming client must bound connect
+    /// latency only, not apply a total request/body deadline like `syndicate_http_client`.
+    #[tokio::test]
+    async fn streaming_http_client_connect_timeout_does_not_cap_idle_sse_body() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
+        const BODY_IDLE: Duration = Duration::from_millis(150);
+        const READ_BUDGET: Duration = Duration::from_millis(500);
+
+        async fn serve_delayed_sse(listener: &tokio::net::TcpListener) -> std::io::Result<()> {
+            let (mut socket, _) = listener.accept().await?;
+            let mut buf = [0u8; 2048];
+            loop {
+                let n = socket.read(&mut buf).await?;
+                if n == 0 {
+                    return Ok(());
+                }
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            socket.write_all(headers).await?;
+            tokio::time::sleep(BODY_IDLE).await;
+            let payload = b"data: {\"type\":\"chat\",\"message\":\"after-idle\"}\n\n";
+            let chunk = format!(
+                "{:x}\r\n{}\r\n0\r\n\r\n",
+                payload.len(),
+                String::from_utf8_lossy(payload)
+            );
+            socket.write_all(chunk.as_bytes()).await?;
+            Ok(())
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/events");
+        tokio::spawn(async move {
+            serve_delayed_sse(&listener).await.unwrap();
+            serve_delayed_sse(&listener).await.unwrap();
+        });
+
+        let total_timeout_client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(CONNECT_TIMEOUT)
+            .build()
+            .expect("control client");
+        let capped = tokio::time::timeout(READ_BUDGET, async {
+            let response = total_timeout_client
+                .get(&url)
+                .header("Accept", "text/event-stream")
+                .send()
+                .await?;
+            response.text().await
+        })
+        .await;
+        assert!(
+            capped.is_err() || capped.unwrap().is_err(),
+            "total request timeout must abort an idle SSE body (control proves server timing)"
+        );
+
+        let streaming = build_syndicate_streaming_http_client(CONNECT_TIMEOUT);
+        let res = tokio::time::timeout(
+            READ_BUDGET,
+            streaming
+                .get(&url)
+                .header("Accept", "text/event-stream")
+                .send(),
+        )
+        .await
+        .expect("streaming client must not hit total request timeout during idle body")
+        .expect("streaming client send");
+        assert!(res.status().is_success());
+        let body = tokio::time::timeout(READ_BUDGET, res.text())
+            .await
+            .expect("streaming client must read body after idle")
+            .expect("streaming body");
+        assert!(
+            body.contains("after-idle"),
+            "expected SSE payload after connect-only timeout: {body}"
+        );
     }
 }
