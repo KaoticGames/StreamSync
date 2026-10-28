@@ -39,6 +39,7 @@ mod syndicate_connection;
 mod test_alert;
 mod twitch;
 pub mod voice_delivery;
+mod windows_process;
 
 pub use delegated_lifecycle::{
     redact_connection_key, AuthorityLeaseSnapshot, TeardownPhase, MAX_DELEGATED_REVOCATION_DELAY,

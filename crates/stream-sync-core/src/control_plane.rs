@@ -383,14 +383,15 @@ fn lock_owner_is_alive(owner: &str) -> bool {
     }
     #[cfg(windows)]
     {
-        std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-            .output()
-            .map(|output| {
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
-            })
-            .unwrap_or(false)
+        crate::windows_process::command_output(
+            "tasklist",
+            ["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"],
+        )
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+        })
+        .unwrap_or(false)
     }
     #[cfg(not(any(unix, windows)))]
     {
