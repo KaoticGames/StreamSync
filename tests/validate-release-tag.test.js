@@ -29,7 +29,7 @@ describe("validateReleaseTag", () => {
   });
 
   it("reads the current tauri.conf.json version", () => {
-    assert.equal(readTauriVersion(), "2.1.1");
-    assert.equal(validateReleaseTag("v2.1.1").ok, true);
+    assert.equal(readTauriVersion(), "2.1.2");
+    assert.equal(validateReleaseTag("v2.1.2").ok, true);
   });
 });

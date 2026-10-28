@@ -44,8 +44,8 @@ describe("About view (kaoticgames.com/about summary)", () => {
   const aboutHtml = read("views/about.html");
   const aboutText = aboutVisibleText(aboutHtml);
 
-  it("shows the Stream Sync v2.1.001 version label", () => {
-    assert.match(aboutHtml, /Stream Sync v2\.1\.001/);
+  it("shows the Stream Sync v2.1.002 version label", () => {
+    assert.match(aboutHtml, /Stream Sync v2\.1\.002/);
   });
 
   it("summarizes current Kaotic company themes in concise copy", () => {

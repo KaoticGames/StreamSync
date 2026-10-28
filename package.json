@@ -1,7 +1,7 @@
 {
   "name": "stream-sync",
   "private": true,
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "Stream Sync 2.1 — Rust/Tauri desktop and overlay server",
   "scripts": {
     "dev": "node scripts/dev.js",
