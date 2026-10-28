@@ -1090,12 +1090,10 @@ document.addEventListener("DOMContentLoaded", () => {
     const btnSyndicate = viewEl.querySelector("#btn-about-syndicate-site");
     const btnKaotic = viewEl.querySelector("#btn-about-kaotic-site");
     const btnDiscord = viewEl.querySelector("#btn-about-discord");
-    const btnTwitch = viewEl.querySelector("#btn-about-twitch");
 
     const URLS = {
       syndicate: "https://syndicateai.net",
       kaotic: "https://kaoticgames.com",
-      twitch: "https://twitch.tv/fukiplays",
       // Discord is handled via electronAPI.openDiscord() so it stays consistent with Help.
     };
 
@@ -1130,16 +1128,6 @@ document.addEventListener("DOMContentLoaded", () => {
           );
         } else {
           console.log("Open Discord clicked");
-        }
-      });
-    }
-
-    if (btnTwitch) {
-      btnTwitch.addEventListener("click", () => {
-        if (window.electronAPI?.openExternal) {
-          window.electronAPI.openExternal(URLS.twitch);
-        } else {
-          console.log("Open external:", URLS.twitch);
         }
       });
     }
